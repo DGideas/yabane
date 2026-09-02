@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Yabane Admin</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">Y</div>
+    <div class="brand">Yabane</div>
+    <div class="search">Search settings</div>
+    <div class="avatar">A</div>
+  </header>
+  <div class="layout">
+    <aside>
+      <div class="nav-title">ADMIN CONSOLE</div>
+      <a class="nav active" href="#"><span>▦</span> Providers</a>
+      <a class="nav disabled" href="#"><span>↗</span> Routes <small>Soon</small></a>
+      <a class="nav disabled" href="#"><span>◷</span> Activity <small>Soon</small></a>
+    </aside>
+    <main>
+      <div class="page-head">
+        <div>
+          <h1>LLM providers</h1>
+          <p>Connect OpenAI-compatible and Anthropic endpoints.</p>
+        </div>
+        <button class="primary" id="open-dialog">＋ Add provider</button>
+      </div>
+      <section class="card">
+        <div class="table-head"><strong>Providers</strong><span id="provider-count">0 providers</span></div>
+        <div id="empty" class="empty">
+          <div class="empty-icon">⇄</div>
+          <h2>No providers yet</h2>
+          <p>Add an endpoint to start proxying requests through Yabane.</p>
+        </div>
+        <table id="providers-table" hidden>
+          <thead><tr><th>Name</th><th>Type</th><th>Endpoint</th><th>Models</th><th></th></tr></thead>
+          <tbody id="providers"></tbody>
+        </table>
+      </section>
+      <section class="help card">
+        <strong>Quick start</strong>
+        <code>POST /v1/chat/completions</code>
+        <code>POST /v1/responses</code>
+        <code>POST /v1/messages</code>
+        <p>Use <code>x-yabane-provider: provider-id</code> to select a provider explicitly.</p>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="provider-dialog">
+    <form id="provider-form">
+      <div class="dialog-head"><h2>Add LLM provider</h2><button type="button" class="icon-button" id="close-dialog">×</button></div>
+      <p class="muted">Yabane forwards request bodies without changing provider-specific fields.</p>
+      <label>Provider ID<input name="id" required pattern="[A-Za-z0-9_-]+" placeholder="chutes"></label>
+      <label>Display name<input name="name" required placeholder="Chutes"></label>
+      <label>API type<select name="kind"><option value="openai_compatible">OpenAI compatible</option><option value="anthropic">Anthropic</option></select></label>
+      <label>Base URL<input name="base_url" type="url" required placeholder="https://api.example.com/v1"></label>
+      <label>API key<input name="api_key" type="password" required autocomplete="new-password" placeholder="sk-..."></label>
+      <label>Models <span class="hint">comma separated, optional</span><input name="models" placeholder="qwen3.8-27b, gpt-5"></label>
+      <div id="form-error" class="error"></div>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancel-dialog">Cancel</button><button class="primary" type="submit">Add provider</button></div>
+    </form>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>
