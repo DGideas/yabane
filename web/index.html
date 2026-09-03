@@ -3,67 +3,95 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Yabane Admin</title>
+  <meta name="color-scheme" content="light">
+  <title>Providers · Yabane</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand-mark">Y</div>
-    <div class="brand">Yabane</div>
-    <div class="search">Search settings</div>
-    <div class="avatar">A</div>
+    <a class="brand" href="/"><span class="brand-mark">Y</span><span>Yabane</span></a>
+    <div class="search"><span>⌕</span><input id="settings-search" type="search" placeholder="Search settings" autocomplete="off"><div id="search-results" class="search-results" hidden></div></div>
+    <button class="avatar" aria-label="Account">A</button>
   </header>
+
   <div class="layout">
-    <aside>
-      <div class="nav-title">ADMIN CONSOLE</div>
-      <a class="nav active" href="#"><span>▦</span> Providers</a>
-      <a class="nav disabled" href="#"><span>↗</span> Routes <small>Soon</small></a>
-      <a class="nav disabled" href="#"><span>◷</span> Activity <small>Soon</small></a>
+    <aside class="sidebar">
+      <div class="nav-title">Admin console</div>
+      <nav><span class="nav-indicator"></span>
+        <button class="nav active" data-view="providers">▦ <span>Providers</span></button>
+        <button class="nav" data-view="models">↗ <span>Model routing</span></button>
+        <button class="nav" data-view="access">⌾ <span>API access</span></button>
+        <span class="nav disabled">◷ <span>Activity</span><small>Soon</small></span>
+      </nav>
     </aside>
+
     <main>
-      <div class="page-head">
-        <div>
-          <h1>LLM providers</h1>
-          <p>Connect OpenAI-compatible and Anthropic endpoints.</p>
+      <section id="providers-view">
+        <div id="provider-list-page"><div class="page-head">
+          <div><h1>LLM providers</h1><p>Manage providers, API endpoints, and weighted API keys.</p></div>
+          <button class="button primary" id="open-provider">＋ Add provider</button>
         </div>
-        <button class="primary" id="open-dialog">＋ Add provider</button>
-      </div>
-      <section class="card">
-        <div class="table-head"><strong>Providers</strong><span id="provider-count">0 providers</span></div>
-        <div id="empty" class="empty">
-          <div class="empty-icon">⇄</div>
-          <h2>No providers yet</h2>
-          <p>Add an endpoint to start proxying requests through Yabane.</p>
-        </div>
-        <table id="providers-table" hidden>
-          <thead><tr><th>Name</th><th>Type</th><th>Endpoint</th><th>Models</th><th></th></tr></thead>
-          <tbody id="providers"></tbody>
-        </table>
+        <section class="card providers-card">
+          <div class="card-head"><div><h2>Providers</h2><p>Each provider can contain multiple API endpoints</p></div><span class="count" id="provider-count">0 providers</span></div>
+          <div id="empty" class="empty"><div class="empty-illustration">⇄</div><h3>Add your first provider</h3><p>Connect an endpoint to start sending LLM requests through Yabane.</p><button class="button secondary" id="empty-add">Add provider</button></div>
+          <div class="provider-grid" id="providers" hidden></div>
+        </section></div>
+        <div id="provider-detail-page" hidden><button class="back-button" id="back-to-providers">← Providers</button><div id="provider-detail"></div></div>
       </section>
-      <section class="help card">
-        <strong>Quick start</strong>
-        <code>POST /v1/chat/completions</code>
-        <code>POST /v1/responses</code>
-        <code>POST /v1/messages</code>
-        <p>Use <code>x-yabane-provider: provider-id</code> to select a provider explicitly.</p>
+
+      <section id="models-view" hidden>
+        <div class="page-head"><div><h1>Model routing</h1><pp>Route exact model IDs or model prefixes to a specific API key.</p></div><button class="button primary" id="open-route">＋ Add route</button></div>
+        <section class="card">
+          <div class="card-head"><div><h2>Routing rules</h2><p>Exact names take priority, followed by the longest matching prefix</p></div></div>
+          <div id="routes-empty" class="empty"><h3>No routing rules</h3><p>Models use weighted key load balancing by default.</p></div>
+          <div class="table-wrap" id="routes-table" hidden><table><thead><tr><th>Provider</th><th>Model pattern</th><th>Endpoint</th><th>API key</th><th></th></tr></thead><tbody id="routes"></tbody></table></div>
+        </section>
+        <section class="card reference-card"><div class="card-head"><div><h2>Provider models</h2><p>Models reported by providers are shown for reference, not managed by Yabane</p></div><button class="button secondary" id="refresh-all-models">Refresh models</button></div><div id="model-reference" class="reference-list"></div></section>
+      </section>
+
+      <section id="access-view" hidden>
+        <div class="page-head"><div><h1>API access</h1><p>Control authentication for requests sent to Yabane.</p></div><button class="button primary" id="open-gateway-key">＋ Generate API key</button></div>
+        <section class="card"><div class="card-head"><div><h2>Authentication</h2><p>Require a Yabane API key on all <code>/v1</code> endpoints</p></div><label class="switch-label"><input id="auth-enabled" type="checkbox"><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">Enabled</span></label></div></section>
+        <section class="card"><div class="card-head"><div><h2>API keys</h2><p>Secrets are displayed only once when generated</p></div></div><div id="gateway-keys-empty" class="empty"><h3>No API keys</h3><p>Generate a key before making authenticated requests.</p></div><div class="table-wrap" id="gateway-keys-table" hidden><table><thead><tr><th>Key</th><th>Note</th><th>Provider access</th><th>Expires</th><th></th></tr></thead><tbody id="gateway-keys"></tbody></table></div></section>
       </section>
     </main>
   </div>
 
+  <dialog id="gateway-key-dialog">
+    <form id="gateway-key-form"><div class="dialog-head"><div><h2>Generate API key</h2><p>The generated secret will be shown only once.</p></div><button type="button" class="icon-button close-gateway-key">×</button></div><div class="form-body"><label class="field"><span class="field-label">Note <small>Optional</small></span><input name="note" placeholder="Production application"><span class="field-help">Describe where this key will be used.</span></label><label class="field"><span class="field-label">Expires <small>Optional</small></span><input name="expires_at" type="datetime-local"><span class="field-help">Leave empty to create a key that does not expire.</span></label><fieldset class="field scope-field"><legend class="field-label">Provider access <small>Optional</small></legend><p class="field-help scope-help">No selection means this key can access all providers.</p><div id="gateway-key-providers" class="provider-checklist"></div></fieldset><div id="gateway-key-error" class="error"></div></div><div class="dialog-actions"><button type="button" class="button text-button close-gateway-key">Cancel</button><button class="button primary" type="submit">Generate key</button></div></form>
+  </dialog>
+
+  <dialog id="generated-key-dialog">
+    <div class="dialog-head"><div><h2>API key generated</h2><p>Copy this key now. Yabane cannot display it again.</p></div></div><div class="form-body"><label class="field"><span class="field-label">Your API key</span><div class="generated-key-row"><input class="technical-input" id="generated-key" readonly><button type="button" class="button copy-key-button" id="copy-generated-key"><span aria-hidden="true">▣</span><span class="copy-key-label">Copy API key</span></button></div><span class="field-help" id="copy-key-status" aria-live="polite">Store it somewhere secure before closing this window.</span></label></div><div class="dialog-actions"><button class="button primary" id="close-generated-key">Done</button></div>
+  </dialog>
+
   <dialog id="provider-dialog">
     <form id="provider-form">
-      <div class="dialog-head"><h2>Add LLM provider</h2><button type="button" class="icon-button" id="close-dialog">×</button></div>
-      <p class="muted">Yabane forwards request bodies without changing provider-specific fields.</p>
-      <label>Provider ID<input name="id" required pattern="[A-Za-z0-9_-]+" placeholder="chutes"></label>
-      <label>Display name<input name="name" required placeholder="Chutes"></label>
-      <label>API type<select name="kind"><option value="openai_compatible">OpenAI compatible</option><option value="anthropic">Anthropic</option></select></label>
-      <label>Base URL<input name="base_url" type="url" required placeholder="https://api.example.com/v1"></label>
-      <label>API key<input name="api_key" type="password" required autocomplete="new-password" placeholder="sk-..."></label>
-      <label>Models <span class="hint">comma separated, optional</span><input name="models" placeholder="qwen3.8-27b, gpt-5"></label>
-      <div id="form-error" class="error"></div>
-      <div class="dialog-actions"><button type="button" class="secondary" id="cancel-dialog">Cancel</button><button class="primary" type="submit">Add provider</button></div>
+      <div class="dialog-head"><div><h2>Add provider</h2><p id="step-description">Choose the provider name and ID.</p></div><button type="button" class="icon-button close-dialog" aria-label="Close">×</button></div>
+      <div class="steps"><span class="step active" data-step-dot="1">1</span><i></i><span class="step" data-step-dot="2">2</span></div>
+      <div class="form-body form-step" data-step="1">
+        <label class="field"><span class="field-label">Display name</span><input name="name" id="display-name" required placeholder="My provider" autocomplete="off"><span class="field-help">A recognizable name shown in the admin console.</span></label>
+        <label class="field"><span class="field-label">Provider ID</span><input name="id" id="provider-id" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="my-provider" autocomplete="off" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true"><span class="field-help">This becomes the prefix of model IDs, for example <code>my-provider/model-id</code>.</span></label>
+      </div>
+      <div class="form-body form-step" data-step="2" hidden>
+        <label class="field"><span class="field-label">Base URL</span><input class="technical-input" name="base_url" id="base-url" type="url" required placeholder="https://api.example.com/v1"><span class="field-help">The API type is detected from common provider URLs. You can change it below.</span></label>
+        <label class="field"><span class="field-label">API type</span><div class="choice-grid" id="api-type-choices"><label class="choice selected"><input type="radio" name="api_type" value="openai_compatible" checked><strong>OpenAI compatible</strong><small>Chat Completions and Responses</small></label><label class="choice"><input type="radio" name="api_type" value="anthropic"><strong>Anthropic</strong><small>Messages API</small></label></div></label>
+        <label class="checkbox-row"><input type="checkbox" name="requires_api_key" id="requires-key" checked><span><strong>This endpoint requires an API key</strong><small>You can add more weighted keys later for load balancing.</small></span></label>
+        <div class="collapsible-field" id="initial-key-section"><div class="collapsible-inner"><label class="field"><span class="field-label">Initial API key</span><div class="password-input"><input class="technical-input" name="api_key" id="api-key" type="password" required autocomplete="new-password" placeholder="sk-…"><button type="button" class="toggle-key">Show</button></div></label></div></div>
+      </div>
+      <div id="provider-error" class="error dialog-error"></div>
+      <div class="dialog-actions"><button type="button" class="button text-button close-dialog">Cancel</button><button type="button" class="button primary" id="next-step">Next</button><button class="button primary" id="create-provider" type="submit" hidden>Add provider</button></div>
     </form>
   </dialog>
+
+  <dialog id="key-dialog">
+    <form id="key-form"><div class="dialog-head"><div><h2>Add API key</h2><p>Keys are selected using weighted round robin.</p></div><button type="button" class="icon-button close-key">×</button></div><div class="form-body"><input name="provider_id" type="hidden"><label class="field"><span class="field-label">Endpoint <b>Required</b></span><select name="endpoint_id" id="key-endpoint"></select></label><label class="field"><span class="field-label">Key name <b>Required</b></span><input name="name" required placeholder="Production key"></label><label class="field"><span class="field-label">API key <b>Required</b></span><div class="password-input"><input class="technical-input" name="secret" type="password" required autocomplete="new-password"><button type="button" class="toggle-key">Show</button></div></label><label class="field"><span class="field-label">Traffic weight <b>Required</b></span><div class="weight-editor"><input id="new-key-weight" name="weight" type="range" min="1" max="300" value="100" required><output id="new-key-weight-output">100</output></div><div class="weight-presets"><button type="button" data-weight="50">Low</button><button type="button" class="selected" data-weight="100">Standard</button><button type="button" data-weight="200">High</button></div><span class="field-help">Controls this key’s share of requests relative to other enabled keys. Equal weights split traffic evenly.</span></label></div><div class="dialog-actions"><button type="button" class="button text-button close-key">Cancel</button><button class="button primary">Add key</button></div></form>
+  </dialog>
+
+  <dialog id="route-dialog">
+    <form id="route-form"><div class="dialog-head"><div><h2>Add model route</h2><p>Models without a rule use weighted load balancing.</p></div><button type="button" class="icon-button close-route">×</button></div><div class="form-body"><label class="field"><span class="field-label">Provider</span><select name="provider_id" id="route-provider"></select></label><label class="field"><span class="field-label">Model pattern</span><input class="technical-input" name="pattern" required placeholder="qwen3.8-*"><span class="field-help">Use an exact model ID or a trailing wildcard, such as <code>qwen3*</code>.</span></label><label class="field"><span class="field-label">API key</span><select name="route_target" id="route-target"></select></label><div id="route-error" class="error"></div></div><div class="dialog-actions"><button type="button" class="button text-button close-route">Cancel</button><button class="button primary">Save route</button></div></form>
+  </dialog>
+
   <script src="/app.js"></script>
 </body>
 </html>
