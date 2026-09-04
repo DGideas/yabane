@@ -1,14 +1,9 @@
 # Yabane Agent Instructions
 
-## Behavior contract
-
-* Treat `GATEWAY_BEHAVIORS.md` as Yabane's authoritative end-to-end behavior checklist.
-* Read it before changing gateway, authentication, routing, provider, model-discovery, persistence, or admin-console behavior.
-* Update it in the same change whenever observable behavior is added, removed, or altered. Every behavior entry must begin with `*` and describe externally observable outcomes rather than implementation details.
-* Add or update automated tests for affected checklist entries. Run `tests/e2e.sh target/debug/yabane` when the change affects executable gateway behavior.
-* During reviews and maintenance, compare implementation and tests with the checklist; report or fix stale, missing, and contradictory entries instead of silently leaving drift.
-
-## Project structure
-
-* Keep protocol, authentication, model discovery, provider administration, and static web serving in focused modules; do not accumulate new unrelated responsibilities in `src/main.rs`.
-* Preserve Yabane's transparent routing rules: no model capability guessing, hidden parameter rewriting, arbitrary provider fallback, or credential exposure.
+* Read `GATEWAY_BEHAVIORS.md` before changing externally observable behavior. It is the authoritative end-to-end checklist; update it and its automated coverage in the same change, and report contradictory or stale entries instead of leaving drift.
+* Preserve transparent proxying: do not infer capabilities from model names, normalize parameters without explicit configuration, choose an arbitrary fallback Provider, hide upstream failures, or expose caller/upstream credentials.
+* Keep the three protocol surfaces independent: OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. Any future cross-protocol conversion must be explicit and independently tested.
+* Preserve the configured resource hierarchy in the console and APIs: Provider-wide settings → Endpoint → upstream keys. A key belongs to one Endpoint; Endpoint overrides take precedence over applicable Provider defaults.
+* Provider-facing model IDs remove only Yabane's first `provider/` segment. Preserve the remainder exactly, including native upstream namespaces such as `google/model-name`.
+* Activity records routing metadata and usage only; never persist prompt or response content.
+* Web assets are embedded with `include_str!` and `include_bytes!`; rebuild the binary before browser or E2E verification, otherwise tests may exercise stale UI resources.

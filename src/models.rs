@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Request, State},
     response::{IntoResponse, Response},
@@ -24,6 +26,12 @@ pub struct Model {
     pub created: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ProviderDiscovery {
+    models: Vec<Model>,
+    model_endpoints: HashMap<String, Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -84,8 +92,8 @@ pub async fn list_models(State(state): State<AppState>, request: Request) -> Res
     let mut data = Vec::new();
     for (provider, result) in &results {
         match result {
-            Ok(models) => {
-                data.extend(models.iter().cloned().map(|mut model| {
+            Ok(discovery) => {
+                data.extend(discovery.models.iter().cloned().map(|mut model| {
                     let upstream_id = model
                         .id
                         .strip_prefix(&format!("{}/", provider.id))
@@ -116,20 +124,25 @@ pub async fn refresh_provider(
 ) -> Response {
     let provider = match state.providers.read().await.get(&id).cloned() {
         Some(provider) => provider,
-        None => return crate::api_error(axum::http::StatusCode::NOT_FOUND, "Provider not found"),
+        None => {
+            return crate::error::api_error(
+                axum::http::StatusCode::NOT_FOUND,
+                "Provider not found",
+            );
+        }
     };
     let results = discover_providers(&state.client, vec![provider]).await;
     update_discoveries(&state, &results).await;
     match &results[0].1 {
-        Ok(models) => axum::Json(serde_json::json!({"models": models.iter().map(|model| &model.id).collect::<Vec<_>>() })).into_response(),
-        Err(error) => crate::api_error(axum::http::StatusCode::BAD_GATEWAY, error.clone()),
+        Ok(discovery) => axum::Json(serde_json::json!({"models": discovery.models.iter().map(|model| &model.id).collect::<Vec<_>>() })).into_response(),
+        Err(error) => crate::error::api_error(axum::http::StatusCode::BAD_GATEWAY, error.clone()),
     }
 }
 
 async fn discover_providers(
     client: &reqwest::Client,
     providers: Vec<Provider>,
-) -> Vec<(Provider, Result<Vec<Model>, String>)> {
+) -> Vec<(Provider, Result<ProviderDiscovery, String>)> {
     join_all(providers.into_iter().map(|provider| {
         let client = client.clone();
         async move {
@@ -140,15 +153,22 @@ async fn discover_providers(
     .await
 }
 
-async fn update_discoveries(state: &AppState, results: &[(Provider, Result<Vec<Model>, String>)]) {
+async fn update_discoveries(
+    state: &AppState,
+    results: &[(Provider, Result<ProviderDiscovery, String>)],
+) {
     let mut providers = state.providers.write().await;
     for (provider, result) in results {
         if let Some(stored) = providers.get_mut(&provider.id) {
             stored.models_discovered_at = Some(crate::auth::now());
             match result {
-                Ok(models) => {
-                    stored.discovered_models =
-                        models.iter().map(|model| model.id.clone()).collect();
+                Ok(discovery) => {
+                    stored.discovered_models = discovery
+                        .models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect();
+                    stored.model_endpoints = discovery.model_endpoints.clone();
                     stored.model_discovery_error = None;
                 }
                 Err(error) => stored.model_discovery_error = Some(error.clone()),
@@ -163,19 +183,28 @@ async fn update_discoveries(state: &AppState, results: &[(Provider, Result<Vec<M
 async fn discover_provider_models(
     client: &reqwest::Client,
     provider: &Provider,
-) -> Result<Vec<Model>, String> {
-    let results = join_all(
-        provider
-            .endpoints
-            .iter()
-            .map(|endpoint| list_endpoint_models(client, provider, endpoint)),
-    )
+) -> Result<ProviderDiscovery, String> {
+    let results = join_all(provider.endpoints.iter().map(|endpoint| async move {
+        (
+            endpoint.id.clone(),
+            list_endpoint_models(client, provider, endpoint).await,
+        )
+    }))
     .await;
     let mut models = Vec::new();
+    let mut model_endpoints: HashMap<String, Vec<String>> = HashMap::new();
     let mut errors = Vec::new();
-    for result in results {
+    for (endpoint_id, result) in results {
         match result {
-            Ok(endpoint_models) => models.extend(endpoint_models),
+            Ok(endpoint_models) => {
+                for model in endpoint_models {
+                    model_endpoints
+                        .entry(model.id.clone())
+                        .or_default()
+                        .push(endpoint_id.clone());
+                    models.push(model);
+                }
+            }
             Err(err) => errors.push(err),
         }
     }
@@ -184,7 +213,10 @@ async fn discover_provider_models(
     if models.is_empty() && !errors.is_empty() {
         return Err(errors.join("; "));
     }
-    Ok(models)
+    Ok(ProviderDiscovery {
+        models,
+        model_endpoints,
+    })
 }
 
 async fn list_endpoint_models(
@@ -238,6 +270,7 @@ async fn fetch_models(
         ApiType::OpenaiCompatible => "/v1/models",
         ApiType::Anthropic => "/v1/models?limit=1000",
     };
+    let client = endpoint.client(client)?;
     let mut request = client.get(join_upstream_url(&endpoint.base_url, path));
     if let Some(key) = key {
         request = match endpoint.api_type {
@@ -323,11 +356,14 @@ mod tests {
         Provider {
             id: "test".to_owned(),
             name: "Test".to_owned(),
+            extra_headers: std::collections::HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            defaults_endpoint_ids: Vec::new(),
             endpoints: Vec::new(),
             discovered_models: Vec::new(),
+            model_endpoints: std::collections::HashMap::new(),
             models_discovered_at: None,
             model_discovery_error: None,
-            model_routes: Vec::new(),
         }
     }
 

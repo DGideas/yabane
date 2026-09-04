@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::ErrorKind,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -10,7 +10,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::auth::SharedAuth;
+use crate::{
+    activity::ActivityStore, admin_user::AdminState, auth::SharedAuth, routes::RouteStore,
+};
 
 pub const PROVIDERS_FILE: &str = "data/providers.json";
 
@@ -19,6 +21,9 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub providers: Arc<RwLock<HashMap<String, Provider>>>,
     pub auth: SharedAuth,
+    pub admin: AdminState,
+    pub activity: ActivityStore,
+    pub routes: RouteStore,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -51,10 +56,18 @@ pub struct ApiEndpoint {
     pub id: String,
     pub api_type: ApiType,
     pub base_url: String,
+    #[serde(default)]
+    pub socks5_proxy: Option<String>,
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
     pub requires_api_key: bool,
     pub api_keys: Vec<ApiKey>,
     #[serde(skip, default = "default_cursor")]
     pub(crate) cursor: Arc<AtomicU64>,
+    #[serde(skip, default = "default_proxy_client")]
+    pub(crate) proxy_client: Arc<OnceLock<Result<reqwest::Client, String>>>,
 }
 
 impl Default for ApiEndpoint {
@@ -63,14 +76,37 @@ impl Default for ApiEndpoint {
             id: String::new(),
             api_type: ApiType::OpenaiCompatible,
             base_url: String::new(),
+            socks5_proxy: None,
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
             requires_api_key: true,
             api_keys: Vec::new(),
             cursor: default_cursor(),
+            proxy_client: default_proxy_client(),
         }
     }
 }
 
 impl ApiEndpoint {
+    pub fn client(&self, default: &reqwest::Client) -> Result<reqwest::Client, String> {
+        let Some(proxy_url) = &self.socks5_proxy else {
+            return Ok(default.clone());
+        };
+        self.proxy_client
+            .get_or_init(|| {
+                let proxy = reqwest::Proxy::all(proxy_url).map_err(|err| {
+                    format!("invalid SOCKS5 proxy for endpoint '{}': {err}", self.id)
+                })?;
+                reqwest::Client::builder()
+                    .proxy(proxy)
+                    .pool_max_idle_per_host(64)
+                    .tcp_nodelay(true)
+                    .build()
+                    .map_err(|err| format!("build client for endpoint '{}': {err}", self.id))
+            })
+            .clone()
+    }
+
     pub fn select_api_key(&self) -> Option<&ApiKey> {
         let total_weight: u64 = self
             .api_keys
@@ -92,42 +128,33 @@ impl ApiEndpoint {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ModelRoute {
-    pub pattern: String,
-    pub endpoint_id: String,
-    pub api_key_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Provider {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub defaults_endpoint_ids: Vec<String>,
     pub endpoints: Vec<ApiEndpoint>,
     #[serde(default)]
     pub discovered_models: Vec<String>,
     #[serde(default)]
+    pub model_endpoints: HashMap<String, Vec<String>>,
+    #[serde(default)]
     pub models_discovered_at: Option<u64>,
     #[serde(default)]
     pub model_discovery_error: Option<String>,
-    #[serde(default)]
-    pub model_routes: Vec<ModelRoute>,
 }
 
 impl Provider {
-    pub fn route_for_model(&self, model: &str) -> Option<&ModelRoute> {
-        self.model_routes
-            .iter()
-            .find(|route| route.pattern == model)
-            .or_else(|| {
-                self.model_routes
-                    .iter()
-                    .filter_map(|route| {
-                        let prefix = route.pattern.strip_suffix('*')?;
-                        model.starts_with(prefix).then_some((prefix.len(), route))
-                    })
-                    .max_by_key(|(prefix_len, _)| *prefix_len)
-                    .map(|(_, route)| route)
-            })
+    pub fn request_defaults_apply_to(&self, endpoint_id: &str) -> bool {
+        self.defaults_endpoint_ids.is_empty()
+            || self
+                .defaults_endpoint_ids
+                .iter()
+                .any(|configured| configured == endpoint_id)
     }
 
     pub fn endpoint_and_key(
@@ -159,20 +186,24 @@ pub async fn load_providers() -> Result<HashMap<String, Provider>, String> {
 }
 
 pub async fn save_providers(providers: &HashMap<String, Provider>) -> Result<(), std::io::Error> {
-    tokio::fs::create_dir_all("data").await?;
     let mut values: Vec<_> = providers.values().cloned().collect();
     values.sort_by(|a, b| a.id.cmp(&b.id));
-    let contents = serde_json::to_vec_pretty(&values).expect("serialize providers");
-    tokio::fs::write(PROVIDERS_FILE, contents).await
+    crate::storage::write_json_atomic(PROVIDERS_FILE, &values).await
 }
 
 fn default_cursor() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
 
+fn default_proxy_client() -> Arc<OnceLock<Result<reqwest::Client, String>>> {
+    Arc::new(OnceLock::new())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiEndpoint, ApiKey, ApiType, ModelRoute, Provider};
+    use std::collections::HashMap;
+
+    use super::{ApiEndpoint, ApiKey, ApiType};
 
     fn key(id: &str, weight: u32, enabled: bool) -> ApiKey {
         ApiKey {
@@ -190,6 +221,9 @@ mod tests {
             id: "openai".to_owned(),
             api_type: ApiType::OpenaiCompatible,
             base_url: "https://example.com/v1".to_owned(),
+            socks5_proxy: None,
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
             requires_api_key: true,
             api_keys: vec![
                 key("primary", 2, true),
@@ -197,6 +231,7 @@ mod tests {
                 key("off", 9, false),
             ],
             cursor: super::default_cursor(),
+            proxy_client: super::default_proxy_client(),
         };
         let selected: Vec<_> = (0..6)
             .map(|_| endpoint.select_api_key().expect("select key").id.as_str())
@@ -212,50 +247,6 @@ mod tests {
                 "primary",
                 "secondary"
             ]
-        );
-    }
-
-    #[test]
-    fn exact_route_wins_then_longest_prefix() {
-        let provider = Provider {
-            id: "test".to_owned(),
-            name: "Test".to_owned(),
-            endpoints: Vec::new(),
-            discovered_models: Vec::new(),
-            models_discovered_at: None,
-            model_discovery_error: None,
-            model_routes: vec![
-                ModelRoute {
-                    pattern: "qwen*".to_owned(),
-                    endpoint_id: "openai".to_owned(),
-                    api_key_id: "a".to_owned(),
-                },
-                ModelRoute {
-                    pattern: "qwen3.8*".to_owned(),
-                    endpoint_id: "openai".to_owned(),
-                    api_key_id: "b".to_owned(),
-                },
-                ModelRoute {
-                    pattern: "qwen3.8-27b".to_owned(),
-                    endpoint_id: "openai".to_owned(),
-                    api_key_id: "c".to_owned(),
-                },
-            ],
-        };
-
-        assert_eq!(
-            provider
-                .route_for_model("qwen3.8-27b")
-                .expect("exact")
-                .api_key_id,
-            "c"
-        );
-        assert_eq!(
-            provider
-                .route_for_model("qwen3.8-max")
-                .expect("prefix")
-                .api_key_id,
-            "b"
         );
     }
 }

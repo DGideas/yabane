@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API docs · Yabane</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+.docs-title{margin-left:4px;color:var(--muted);font-size:14px}
+.docs-auth{display:flex;align-items:center;gap:9px;margin-left:auto}
+.docs-auth select{width:auto;min-width:150px}
+.docs-auth input{width:280px}
+.docs-layout{display:grid;grid-template-columns:320px minmax(0,1fr);min-height:calc(100vh - 64px)}
+.docs-nav{padding:20px 12px;background:#fff;border-right:1px solid var(--border);overflow:auto}
+.docs-tag{margin:16px 16px 8px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.7px}
+.docs-op{display:flex;align-items:center;gap:9px;width:100%;padding:8px 14px;color:#3c4043;background:none;border:0;border-radius:8px;text-align:left;cursor:pointer;font:12px ui-monospace,monospace}
+.docs-op:hover{background:var(--soft)}
+.docs-op.active{background:#eaf2ff;color:#001d35}
+.docs-op .method{flex:0 0 52px;padding:3px 0;text-align:center;border-radius:6px;color:#fff;font:600 10px 'Ubuntu Sans';text-transform:uppercase}
+.docs-op span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.m-get{background:#1e8e3e}.m-post{background:#0b57d0}.m-patch{background:#ff8f00}.m-delete{background:#d93025}
+.docs-main{padding:32px clamp(24px,3vw,56px);min-width:0}
+.docs-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.docs-head .method{padding:6px 12px;border-radius:8px;color:#fff;font:600 12px 'Ubuntu Sans';text-transform:uppercase}
+.docs-head code{font-size:15px}
+.docs-summary{margin:0 0 6px;font-size:16px;font-weight:500;color:#202124}
+.docs-desc,.docs-security{margin:0 0 8px;color:var(--muted);font-size:13px;line-height:1.5}
+.docs-section{margin:22px 0 10px;font-size:13px;font-weight:500}
+.docs-table{width:100%;border-collapse:collapse;font-size:12px}
+.docs-table th,.docs-table td{padding:9px 12px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top}
+.docs-card{background:#fff;border:1px solid var(--border);border-radius:12px;padding:18px;margin-top:14px}
+.docs-card textarea{width:100%;min-height:130px;padding:12px;border:1px solid #747775;border-radius:8px;font:12px/1.6 ui-monospace,monospace;resize:vertical;outline:0}
+.docs-card textarea:focus{border:2px solid var(--blue);padding:11px}
+.docs-run-row{display:flex;align-items:center;gap:10px;margin-top:12px}
+.docs-response{margin-top:14px}
+.docs-response header{display:flex;gap:12px;align-items:center;margin-bottom:8px}
+.docs-status{padding:4px 10px;border-radius:12px;font-weight:500;font-size:12px}
+.docs-status.ok{color:#137333;background:#e6f4ea}.docs-status.bad{color:#b3261e;background:#fce8e6}
+.docs-response pre{max-height:420px;margin:0;padding:14px;background:#0f172a;color:#e2e8f0;border-radius:10px;overflow:auto;font:12px/1.6 ui-monospace,monospace}
+.docs-empty{padding:80px 20px;color:var(--muted);text-align:center}
+.param-input{width:220px;height:36px}
+@media(max-width:900px){.docs-layout{display:block}.docs-nav{border-right:0;border-bottom:1px solid var(--border)}.docs-auth input{width:160px}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark">Y</span><span>Yabane</span></a>
+  <span class="docs-title">Live API reference</span>
+  <div class="docs-auth">
+    <select id="auth-mode"><option value="session">Browser session</option><option value="bearer">Bearer key</option></select>
+    <input id="auth-key" class="technical-input" hidden placeholder="yab_mgmt_… or sk-…" autocomplete="off" spellcheck="false">
+  </div>
+</header>
+<div class="docs-layout">
+  <aside class="docs-nav" id="docs-nav"></aside>
+  <main class="docs-main" id="docs-main"><div class="docs-empty">Loading OpenAPI specification…</div></main>
+</div>
+<script>
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+let spec = null;
+let operations = [];
+const authMode = $('#auth-mode'); const authKey = $('#auth-key');
+authKey.value = sessionStorage.getItem('yabane-docs-key') || '';
+authMode.addEventListener('change', () => { authKey.hidden = authMode.value !== 'bearer'; });
+authKey.addEventListener('input', () => sessionStorage.setItem('yabane-docs-key', authKey.value));
+
+function headersFor() {
+  const headers = {'content-type': 'application/json'};
+  if (authMode.value === 'bearer' && authKey.value.trim()) headers['authorization'] = `Bearer ${authKey.value.trim()}`;
+  return headers;
+}
+
+async function load() {
+  spec = await (await fetch('/openapi.json')).json();
+  operations = Object.entries(spec.paths).flatMap(([path, item]) => Object.entries(item)
+    .filter(([method]) => ['get', 'post', 'patch', 'delete'].includes(method))
+    .map(([method, op]) => ({method, path, op})));
+  const tags = [...new Set(operations.map(operation => operation.op.tags?.[0] || 'Other'))];
+  $('#docs-nav').innerHTML = tags.map(tag => `<div class="docs-tag">${tag}</div>` + operations
+    .filter(operation => (operation.op.tags || ['Other'])[0] === tag)
+    .map((operation, index) => `<button class="docs-op" data-path="${operation.path}" data-method="${operation.method}"><span class="method m-${operation.method}">${operation.method}</span><span>${operation.path}</span></button>`).join('')).join('');
+  $('#docs-nav').addEventListener('click', event => { const button = event.target.closest('.docs-op'); if (button) render(button.dataset.method, button.dataset.path); });
+  $('#docs-main').innerHTML = `<div class="docs-empty"><h3>${operations.length} operations</h3><p>Select an operation on the left. Requests execute against this Yabane instance using the selected authentication.</p></div>`;
+}
+
+function schemaExample(schema) {
+  if (!schema) return undefined;
+  if (schema.example !== undefined) return schema.example;
+  if (schema.type === 'object' || schema.properties) {
+    const result = {}; for (const [name, property] of Object.entries(schema.properties || {})) result[name] = schemaExample(property);
+    return result;
+  }
+  if (schema.type === 'array') return [schemaExample(schema.items)];
+  if (schema.type === 'integer') return 0;
+  if (schema.type === 'boolean') return false;
+  return schema.type === 'string' ? '' : null;
+}
+
+function render(method, path) {
+  const operation = operations.find(item => item.method === method && item.path === path);
+  $$('.docs-op').forEach(button => button.classList.toggle('active', button.dataset.path === path && button.dataset.method === method));
+  const parameters = operation.op.parameters || [];
+  const pathParams = parameters.filter(parameter => parameter.in === 'path');
+  const queryParams = parameters.filter(parameter => parameter.in === 'query');
+  const bodySchema = operation.op.requestBody?.content?.['application/json']?.schema;
+  const bodyExample = operation.op.requestBody?.content?.['application/json']?.example ?? schemaExample(bodySchema);
+  const security = (operation.op.security || []).map(schemes => Object.keys(schemes).map(name => spec.components.securitySchemes[name]?.description || name).join(' or '));
+  $('#docs-main').innerHTML = `
+    <div class="docs-head"><span class="method m-${method}">${method}</span><code>${path}</code></div>
+    <p class="docs-summary">${operation.op.summary || ''}</p>
+    ${operation.op.description ? `<p class="docs-desc">${operation.op.description}</p>` : ''}
+    ${security.length ? `<p class="docs-security"><strong>Authentication:</strong> ${security.join(' · ')}</p>` : '<p class="docs-security"><strong>Authentication:</strong> none</p>'}
+    ${pathParams.length || queryParams.length ? `<h4 class="docs-section">Parameters</h4><table class="docs-table"><thead><tr><th>Name</th><th>In</th><th>Value</th></tr></thead><tbody>${parameters.map(parameter => `<tr><td><code>${parameter.name}</code></td><td>${parameter.in}</td><td><input class="technical-input param-input" data-in="${parameter.in}" data-name="${parameter.name}" placeholder="${parameter.schema?.default ?? parameter.schema?.pattern ?? ''}"></td></tr>`).join('')}</tbody></table>` : ''}
+    ${bodyExample !== undefined ? `<h4 class="docs-section">Request body</h4><div class="docs-card"><textarea id="docs-body" spellcheck="false">${JSON.stringify(bodyExample, null, 2)}</textarea></div>` : ''}
+    <div class="docs-run-row"><button class="button primary" id="docs-run">Send request</button><span class="docs-desc">Executed live against this instance.</span></div>
+    <div class="docs-response" id="docs-response" hidden></div>`;
+  $('#docs-run').addEventListener('click', async () => {
+    let url = path;
+    for (const input of $$('#docs-main .param-input[data-in="path"]')) url = url.replace(`{${input.dataset.name}}`, encodeURIComponent(input.value || input.dataset.name));
+    const query = $$('#docs-main .param-input[data-in="query"]').filter(input => input.value).map(input => `${encodeURIComponent(input.dataset.name)}=${encodeURIComponent(input.value)}`).join('&');
+    if (query) url += `?${query}`;
+    const init = {method: method.toUpperCase(), headers: headersFor(), credentials: 'same-origin'};
+    if (method === 'get' || method === 'delete') delete init.headers['content-type'];
+    const bodyInput = $('#docs-body');
+    if (bodyInput) { try { init.body = JSON.stringify(JSON.parse(bodyInput.value)); } catch { $('#docs-response').hidden = false; $('#docs-response').innerHTML = '<pre>Request body is not valid JSON.</pre>'; return; } }
+    const started = performance.now();
+    try {
+      const response = await fetch(url, init);
+      const text = await response.text();
+      let pretty = text; try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+      $('#docs-response').hidden = false;
+      $('#docs-response').innerHTML = `<header><span class="docs-status ${response.ok ? 'ok' : 'bad'}">${response.status} ${response.statusText}</span><span class="docs-desc">${Math.round(performance.now() - started)} ms</span></header><pre>${pretty.replace(/</g, '&lt;')}</pre>`;
+    } catch (error) {
+      $('#docs-response').hidden = false;
+      $('#docs-response').innerHTML = `<pre>${String(error)}</pre>`;
+    }
+  });
+}
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,1862 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Yabane API",
+    "version": "1.0.0",
+    "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured upstream providers. Control endpoints manage providers, endpoints, upstream keys, model routes, gateway access, and activity. Every action available in the web console is available here."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "name": "System",
+      "description": "Liveness and embedded documentation."
+    },
+    {
+      "name": "Sessions",
+      "description": "Administrator setup, login, and session inspection."
+    },
+    {
+      "name": "Inference",
+      "description": "LLM proxy endpoints. Authenticated with Gateway API keys when gateway authentication is enabled."
+    },
+    {
+      "name": "Administrator",
+      "description": "Administrator profile. Requires a browser session."
+    },
+    {
+      "name": "Management keys",
+      "description": "Management API keys for programmatic control-plane access. Requires a browser session."
+    },
+    {
+      "name": "Gateway access",
+      "description": "Gateway authentication settings and Gateway API keys."
+    },
+    {
+      "name": "Providers",
+      "description": "Providers, endpoints, upstream keys, request defaults, and model discovery."
+    },
+    {
+      "name": "Model routes",
+      "description": "Public model aliases with weighted destinations."
+    },
+    {
+      "name": "Activity",
+      "description": "Request logs and statistics."
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "gatewayKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Gateway API key (sk-…) for inference endpoints. Provider scopes apply."
+      },
+      "managementKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Management API key (yab_mgmt_…) for control endpoints."
+      },
+      "adminSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "yabane_session",
+        "description": "Administrator browser session cookie."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "SessionView": {
+        "type": "object",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "authenticated": {
+            "type": "boolean"
+          },
+          "username": {
+            "type": "string",
+            "nullable": true
+          },
+          "email": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ManagementApiKeyView": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "expires_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "last_used_at": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
+      },
+      "CreatedManagementApiKey": {
+        "type": "object",
+        "properties": {
+          "api_key": {
+            "$ref": "#/components/schemas/ManagementApiKeyView"
+          },
+          "secret": {
+            "type": "string",
+            "description": "Shown once."
+          }
+        }
+      },
+      "ProviderView": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "extra_headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "extra_body": {
+            "type": "object"
+          },
+          "defaults_endpoint_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "discovered_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "model_endpoints": {
+            "type": "object"
+          },
+          "models_discovered_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "model_discovery_error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "RequestLog": {
+        "type": "object",
+        "properties": {
+          "timestamp": {
+            "type": "integer"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "integer"
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number",
+            "nullable": true
+          },
+          "streaming": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "properties": {
+          "requests": {
+            "type": "integer"
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "by_provider": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "NoContent": {
+        "description": "Success, no body."
+      },
+      "BadRequest": {
+        "description": "Validation failure.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid credentials.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Liveness probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Live API documentation",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "HTML documentation page"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "OpenAPI specification",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "This document"
+          }
+        }
+      }
+    },
+    "/admin/session": {
+      "get": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Inspect administrator session state",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Session view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionView"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/turnstile-config": {
+      "get": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Turnstile widget configuration for login",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "enabled and site_key"
+          }
+        }
+      }
+    },
+    "/admin/setup": {
+      "post": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Create the first administrator",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "email",
+                  "password"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "minLength": 8
+                  },
+                  "turnstile_token": {
+                    "type": "string"
+                  }
+                }
+              },
+              "example": {
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "password123",
+                "turnstile_token": ""
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Administrator created and session cookie set"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "Already configured"
+          }
+        }
+      }
+    },
+    "/admin/login": {
+      "post": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Sign in with username or email",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "password"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "password": {
+                    "type": "string"
+                  },
+                  "turnstile_token": {
+                    "type": "string"
+                  }
+                }
+              },
+              "example": {
+                "username": "admin",
+                "email": null,
+                "password": "password123",
+                "turnstile_token": ""
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Session cookie set"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Turnstile verification failed"
+          }
+        }
+      }
+    },
+    "/admin/logout": {
+      "post": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Revoke the current session",
+        "security": [],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "OpenAI-compatible model list",
+        "description": "Aggregated discovered models across providers allowed for the presented Gateway API key.",
+        "security": [
+          {
+            "gatewayKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OpenAI list envelope"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "Proxy OpenAI Chat Completions",
+        "description": "The model field selects routing: provider/model, or a public model route alias. The provider prefix is stripped before forwarding; the remaining namespaced model ID is preserved.",
+        "security": [
+          {
+            "gatewayKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "model"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  },
+                  "stream": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "example": {
+                "model": "my-provider/model-id",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello"
+                  }
+                ],
+                "stream": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upstream response, streamed when requested"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Gateway key provider scope denied"
+          },
+          "502": {
+            "description": "Upstream connection failure"
+          }
+        }
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "Proxy OpenAI Responses",
+        "security": [
+          {
+            "gatewayKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "model"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "string"
+                  }
+                }
+              },
+              "example": {
+                "model": "my-provider/model-id",
+                "input": "Hello"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upstream response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "502": {
+            "description": "Upstream connection failure"
+          }
+        }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": [
+          "Inference"
+        ],
+        "summary": "Proxy Anthropic Messages",
+        "security": [
+          {
+            "gatewayKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "model"
+                ],
+                "properties": {
+                  "model": {
+                    "type": "string"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "items": {
+                      "type": "object"
+                    }
+                  },
+                  "max_tokens": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "example": {
+                "model": "my-provider/model-id",
+                "max_tokens": 1024,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Hello"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upstream response"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "502": {
+            "description": "Upstream connection failure"
+          }
+        }
+      }
+    },
+    "/admin/profile": {
+      "patch": {
+        "tags": [
+          "Administrator"
+        ],
+        "summary": "Update administrator username, email, or password",
+        "description": "Browser session only; Management and Gateway keys are rejected. Changing the password requires the correct current password.",
+        "security": [
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "username",
+                  "email"
+                ],
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "email": {
+                    "type": "string"
+                  },
+                  "current_password": {
+                    "type": "string"
+                  },
+                  "new_password": {
+                    "type": "string"
+                  }
+                }
+              },
+              "example": {
+                "username": "admin",
+                "email": "admin@example.com",
+                "current_password": "",
+                "new_password": ""
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Current password incorrect"
+          }
+        }
+      }
+    },
+    "/admin/management-keys": {
+      "get": {
+        "tags": [
+          "Management keys"
+        ],
+        "summary": "List Management API keys",
+        "security": [
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Keys",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ManagementApiKeyView"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "401": {
+          "$ref": "#/components/responses/Unauthorized"
+        }
+      },
+      "post": {
+        "tags": [
+          "Management keys"
+        ],
+        "summary": "Create a Management API key",
+        "description": "The secret is returned once and never stored in recoverable form; only a SHA-256 hash is persisted.",
+        "security": [
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "type": "integer",
+                    "nullable": true
+                  }
+                }
+              },
+              "example": {
+                "name": "CI automation",
+                "expires_at": null
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created key and one-time secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedManagementApiKey"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/management-keys/{id}": {
+      "delete": {
+        "tags": [
+          "Management keys"
+        ],
+        "summary": "Revoke a Management API key",
+        "security": [
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/auth": {
+      "get": {
+        "tags": [
+          "Gateway access"
+        ],
+        "summary": "Gateway authentication settings and keys",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "enabled flag and gateway key views"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Gateway access"
+        ],
+        "summary": "Enable or disable gateway API-key authentication",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "example": {
+                "enabled": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/auth/keys": {
+      "post": {
+        "tags": [
+          "Gateway access"
+        ],
+        "summary": "Generate a Gateway API key",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "note": {
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "provider_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "example": {
+                "note": "Production application",
+                "expires_at": null,
+                "provider_ids": []
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created key and secret"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/auth/keys/{id}": {
+      "delete": {
+        "tags": [
+          "Gateway access"
+        ],
+        "summary": "Delete a Gateway API key",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "List providers with endpoints, keys, and discovery state",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Providers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Create a provider with its first endpoint",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "name",
+                  "endpoint"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "endpoint": {
+                    "type": "object",
+                    "required": [
+                      "api_type",
+                      "base_url",
+                      "requires_api_key"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "api_type": {
+                        "type": "string",
+                        "enum": [
+                          "openai_compatible",
+                          "anthropic"
+                        ]
+                      },
+                      "base_url": {
+                        "type": "string"
+                      },
+                      "socks5_proxy": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "requires_api_key": {
+                        "type": "boolean"
+                      },
+                      "api_key": {
+                        "type": "string",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              },
+              "example": {
+                "id": "my-provider",
+                "name": "My provider",
+                "endpoint": {
+                  "api_type": "openai_compatible",
+                  "base_url": "https://api.example.com/v1",
+                  "socks5_proxy": null,
+                  "requires_api_key": true,
+                  "api_key": "sk-…"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}": {
+      "patch": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Update provider request defaults and their endpoint scope",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "extra_headers": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "string"
+                    }
+                  },
+                  "extra_body": {
+                    "type": "object"
+                  },
+                  "defaults_endpoint_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Empty means all current and future endpoints."
+                  }
+                }
+              },
+              "example": {
+                "extra_headers": {
+                  "x-custom": "yes"
+                },
+                "extra_body": {
+                  "temperature": 0.7
+                },
+                "defaults_endpoint_ids": []
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Delete a provider",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}/endpoints": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Add an API endpoint to a provider",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "api_type",
+                  "base_url",
+                  "requires_api_key"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "api_type": {
+                    "type": "string",
+                    "enum": [
+                      "openai_compatible",
+                      "anthropic"
+                    ]
+                  },
+                  "base_url": {
+                    "type": "string"
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "requires_api_key": {
+                    "type": "boolean"
+                  },
+                  "api_key": {
+                    "type": "string",
+                    "nullable": true
+                  }
+                }
+              },
+              "example": {
+                "id": "regional",
+                "api_type": "openai_compatible",
+                "base_url": "https://api.example.com/v1",
+                "socks5_proxy": null,
+                "requires_api_key": true,
+                "api_key": "sk-…"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}/keys": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Add a weighted upstream API key to an endpoint",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "endpoint_id",
+                  "name",
+                  "secret",
+                  "weight"
+                ],
+                "properties": {
+                  "endpoint_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "secret": {
+                    "type": "string"
+                  },
+                  "weight": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              },
+              "example": {
+                "endpoint_id": "openai",
+                "name": "Production key",
+                "secret": "sk-…",
+                "weight": 100
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}/models/refresh": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Refresh model discovery for one provider",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Discovery result"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/routes": {
+      "get": {
+        "tags": [
+          "Model routes"
+        ],
+        "summary": "List public model routes",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Routes"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Model routes"
+        ],
+        "summary": "Create or replace a public model route",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pattern",
+                  "targets"
+                ],
+                "properties": {
+                  "pattern": {
+                    "type": "string",
+                    "description": "Exact model ID or one trailing * wildcard."
+                  },
+                  "targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "provider_id",
+                        "endpoint_id",
+                        "api_key_id",
+                        "upstream_model",
+                        "weight"
+                      ],
+                      "properties": {
+                        "provider_id": {
+                          "type": "string"
+                        },
+                        "endpoint_id": {
+                          "type": "string"
+                        },
+                        "api_key_id": {
+                          "type": "string"
+                        },
+                        "upstream_model": {
+                          "type": "string"
+                        },
+                        "weight": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": {
+                "pattern": "fast-model",
+                "targets": [
+                  {
+                    "provider_id": "my-provider",
+                    "endpoint_id": "openai",
+                    "api_key_id": "default",
+                    "upstream_model": "model-id",
+                    "weight": 100
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/routes/{pattern}": {
+      "delete": {
+        "tags": [
+          "Model routes"
+        ],
+        "summary": "Delete a model route",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "pattern",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/activity/logs": {
+      "get": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Request logs",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Unix seconds lower bound."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 1000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RequestLog"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/activity/stats": {
+      "get": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Aggregated request and token statistics",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Totals and per-provider breakdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/providers/{provider_id}/endpoints/{endpoint_id}/keys/{key_id}": {
+      "patch": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Update upstream key weight or enabled state",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "weight": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "example": {
+                "weight": 200,
+                "enabled": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Delete an upstream API key",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  }
+}

@@ -4,18 +4,38 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 
 ## Service and administration
 
+* Yabane loads local environment configuration from `.env` when present while preserving variables already supplied by the process environment.
 * Yabane listens on `YABANE_ADDR`, defaulting to `127.0.0.1:8080`.
 * `GET /healthz` returns `200` and does not require a gateway API key.
-* The web admin console and `/admin/*` APIs do not require a gateway API key.
-* Provider and authentication configuration is persisted under `data/` and is restored after restart.
-* The Providers top-level page presents a concise provider list; selecting one provider opens its detailed endpoints, upstream keys, and model-discovery controls.
+* The web admin console uses a separate administrator session and never accepts gateway API keys as admin authentication.
+* Admin HTML, CSS, and JavaScript responses disable browser caching so a restarted local binary does not leave stale CAPTCHA behavior in the console.
+* On first use, the console requires creation of the single administrator with username, email, and a password of at least eight characters.
+* After setup, unauthenticated visitors see the login screen and can sign in with username or email plus password.
+* Administrator passwords are persisted only as Argon2 password hashes.
+* Successful setup or login creates an HttpOnly, SameSite=Strict session cookie with a 24-hour server-enforced lifetime; expired sessions are removed from memory, and logout revokes the current session.
+* The top-right administrator avatar opens an account menu showing the signed-in username and email, with explicit Manage profile and Sign out actions.
+* An administrator session can update its username and email from the profile dialog; changing the password additionally requires the correct current password and a new password of at least eight characters, and Gateway API keys cannot modify the administrator profile.
+* Protected `/admin/*` APIs return `401` without a valid administrator session, while session, setup, login, static resources, and health remain public.
+* Initial administrator setup does not require a CAPTCHA.
+* Login requires a Cloudflare Turnstile token only when both a secret and a matching site key are available; the backend validates success, the `login` action, and an allowed hostname with Siteverify, while an unconfigured or incomplete Turnstile configuration disables CAPTCHA.
+* The login console renders Turnstile with `TURNSTILE_SITE_KEY`; when the always-pass Turnstile test secret is configured and no site key is specified, it uses Cloudflare's matching test site key so local verification works without a production widget.
+* Provider, gateway authentication, administrator, and model-route configuration is persisted under `data/`, restored after restart, and replaced through a synced temporary file plus rename so interrupted writes do not expose partial JSON.
+* The Providers top-level page presents a concise provider list; selecting one provider opens a visually distinct Provider settings page with breadcrumb context, a Provider identity summary, Provider-wide settings, and a separate child-endpoint hierarchy.
+* Provider details visually nest upstream API keys inside their owning Endpoint, and key-creation actions name and preselect that Endpoint so Provider, Endpoint, and key actions are not presented as peers.
 * The sidebar selection background and blue indicator animate when switching top-level sections.
 * Settings search finds top-level settings, provider-model discovery, gateway-key generation, and configured providers, then navigates to the selected result.
+* Home, Providers, provider details, model routing, API access, Activity, and login have distinct browser URLs that can be opened directly and support browser Back/Forward navigation.
+* Authenticated console pages use the full width available beside the sidebar with responsive horizontal gutters, rather than remaining capped to a narrow fixed content column on wide displays.
+* The authenticated Home page summarizes 24-hour requests and token usage and links to configured providers.
+* Gateway API keys authenticate inference requests and model listing with provider scopes, while Management API keys authenticate the control API; administrator profile and Management-key endpoints require a browser session.
+* Each administrator can create named Management API keys beginning with `yab_mgmt_`, with optional expiry; the secret is shown once, only its hash is persisted, last-use times are tracked, and revocation is immediate.
+* The embedded live API reference at `/docs` renders the bundled OpenAPI specification served at `/openapi.json` and can execute requests against the running instance using the browser session or a pasted Bearer key.
 * Boolean settings use an accessible animated switch instead of the browser's default checkbox presentation.
 * Forms visibly identify required and optional fields.
 * Provider-scope selection uses individually labeled checkboxes and an empty selection clearly means unrestricted access.
 * Secret-entry fields use the same Show/Hide interaction throughout the admin console.
 * Upstream-key traffic weights explain relative distribution and provide an immediately visible slider value and common presets.
+* The Model routing page explains that rules bind matching models to a specific endpoint and upstream key, shows exact and prefix examples, and makes clear that unmatched models retain weighted load balancing.
 * Missing configuration files produce empty/default configuration; malformed or unreadable configuration fails startup visibly.
 * `YABANE_LOG` controls logging, defaults to `info`, and an invalid filter fails startup.
 
@@ -33,9 +53,9 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * A provider-scoped gateway API key receives `403` when an inference request selects a provider outside its scope.
 * `GET /v1/models` returns only models belonging to providers allowed by the gateway API key.
 * Generated gateway API keys begin with `sk-` and use cryptographically secure random bytes.
-* A generated gateway API-key secret is returned only by the create operation and is never returned by list operations.
-* The one-time generated-key dialog provides an explicit Copy API key action, confirms a successful clipboard copy, and selects the secret for manual copying if clipboard access is blocked.
-* Gateway API-key secrets are persisted as SHA-256 hashes, not plaintext.
+* A generated gateway API-key secret is returned by the create operation and remains available to authenticated administrators in subsequent list operations.
+* The generated-key dialog and API-key list provide Copy API key actions with a standard copy icon and visible success feedback.
+* Gateway API-key secrets are persisted so the administrator can reveal or copy them later; their SHA-256 hashes are also retained for request authentication.
 * Gateway API keys support an optional note, optional expiration time, and optional provider allowlist.
 * Creating a gateway API key with an expiration time in the past is rejected with `400`.
 * Creating a gateway API key with an unknown provider in its allowlist is rejected with `400`.
@@ -51,16 +71,26 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * OpenAI Chat Completions requests are accepted only at `POST /v1/chat/completions`.
 * OpenAI Responses requests are accepted only at `POST /v1/responses`.
 * Anthropic Messages requests are accepted only at `POST /v1/messages`.
-* Request fields other than the provider prefix in `model` are forwarded without semantic rewriting.
+* Request fields other than the provider prefix in `model` are forwarded without semantic rewriting unless explicit Provider or Endpoint extra request-body fields are configured.
+* Provider-level extra headers and JSON request-body fields can apply to every current and future endpoint or to an explicit non-empty selection of that Provider’s endpoints; endpoint-level values override matching provider-level values where the Provider defaults apply.
+* The provider Request defaults editor uses structured header and body-field rows, offers all-endpoint and selected-endpoint scope controls, validates endpoint selection, duplicate names, HTTP header syntax, reserved authentication and hop-by-hop headers, and each body field’s JSON value before saving, and shows a live JSON body preview.
 * Upstream status codes and response bodies are visible to the caller.
 * Upstream response bodies, including SSE, are streamed without full response buffering.
+* Proxying strips standard hop-by-hop request and response headers while preserving end-to-end upstream headers, status codes, and body bytes.
 * Multiple inference requests can execute concurrently and reuse pooled upstream connections.
 * Upstream connection failures return `502` without exposing credentials.
 * Request bodies larger than 32 MiB are rejected.
 
 ## Upstream endpoints and keys
 
-* A provider can contain multiple API endpoints.
+* A provider can contain multiple API endpoints, and the admin console can add endpoints after provider creation.
+* Model discovery records which endpoint exposes each model.
+* A request for `provider/model` is sent to an endpoint that reported that model, hiding endpoint topology from the caller.
+* Models unique to different endpoints of one provider remain externally accessible through the same provider prefix.
+* If multiple compatible endpoints report the same model, the first configured matching endpoint is selected unless an explicit model route overrides it.
+* An explicit model route can select a compatible endpoint different from the first endpoint.
+* Each endpoint can optionally route both model-discovery and inference traffic through a `socks5://` or `socks5h://` proxy.
+* SOCKS5 proxy settings using another URL scheme are rejected with `400`.
 * An endpoint can require an upstream API key or operate without one.
 * An endpoint requiring a key cannot proxy when it has no enabled positive-weight key.
 * An endpoint can contain multiple independently enabled upstream API keys.
@@ -72,31 +102,51 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 
 ## Model-specific routing
 
+* A model route creates a public model alias that clients call without a `provider/` prefix.
+* A route target explicitly maps that public pattern to an upstream provider, endpoint, API key, and the exact model ID understood by that upstream; the upstream model does not include Yabane’s Provider prefix, though native namespaced IDs such as `google/model-name` remain valid.
+* The route editor explains upstream model IDs, uses a model discovered from the selected endpoint as its example when available, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
+* A model route can contain multiple positive-weight targets and selects them using weighted round robin.
 * A model route can be an exact model ID or one trailing prefix wildcard.
 * Exact model routes take precedence over wildcard routes.
 * The longest matching wildcard prefix takes precedence over shorter prefixes.
 * If no model route matches, weighted key selection is used.
 * A model route explicitly selects both an endpoint and one enabled upstream API key.
-* Routes referring to deleted keys are removed when the key is deleted.
+* Upstream-key update and deletion URLs include both Provider and Endpoint identity because key IDs are unique only within an Endpoint.
+* Deleting an upstream key removes global-route targets referring to that exact Provider, Endpoint, and key; a route with no remaining targets is removed.
 
 ## Model discovery
 
 * Creating a provider automatically starts model discovery without blocking provider creation.
 * An administrator can explicitly refresh models for one provider or all providers.
 * The console distinguishes discovery not yet run, successful empty results, and discovery failures.
+* Provider details show only a compact model count by default; the searchable, bounded model browser opens only on request and displays each model with its endpoint availability.
 * Large provider model collections are collapsed by default and can be searched in a bounded model browser instead of rendering an unbounded wall of model labels.
 * Successful model discovery and the latest discovery status are persisted for the admin console.
 * `GET /v1/models` returns an OpenAI-compatible list envelope.
 * Model discovery concurrently queries configured provider endpoints and enabled upstream keys.
 * OpenAI-compatible discovery accepts both `{ "data": [...] }` and a top-level model array.
 * Anthropic discovery uses the Anthropic authentication and version headers.
-* Models are merged, deduplicated by ID, and sorted.
+* Models are merged across endpoints, deduplicated by ID, and sorted while retaining endpoint availability metadata for internal routing.
 * Returned model IDs use the `provider/model` form without duplicating an existing provider prefix.
 * Failure to discover models from one provider does not hide successfully discovered models from other providers.
 * Discovered models are reference data and do not create locally managed model definitions.
 
+## Activity and statistics
+
+* Each completed proxied response records request timestamp, request ID, API path, public model, provider, endpoint, status, latency, streaming flag, available usage totals, and upstream-reported cost when present; prompts and response content are not retained.
+* Upstream cost is read from `usage.cost`, `usage.total_cost`, or `response.usage.cost` in OpenAI and Anthropic responses, including SSE usage events; requests without upstream cost record `null`, which the console displays as `—` or `$0.00` rather than fabricating a value.
+* Activity statistics aggregate reported cost alongside request and token totals, and the console shows cost in the Overview metric, chart tooltips, and Request explorer rows.
+* OpenAI Chat Completions and Responses usage and Anthropic Messages usage are normalized to input, output, and cached token counters when upstream reports them.
+* SSE usage parsing honors event framing across arbitrary network chunks, supports CRLF and multiline data fields, ignores comments and `[DONE]`, reads OpenAI Responses usage nested under `response`, and combines Anthropic usage split across `message_start` and `message_delta` events.
+* Activity statistics aggregate request and token totals over a caller-selected time range and group them by provider.
+* The Activity Overview presents request, total-token, cache-hit, success-rate, streaming, and average-latency summaries with sparklines, a time-bucketed request/token chart, and ranked Provider and model breakdowns.
+* Activity can be filtered by time range and Provider, refreshed on demand, and switched between the visual Overview and a searchable Request explorer with status filtering and detailed request metadata.
+* Activity remains immediately queryable in memory and is batch-written after 10 records or 60 seconds rather than writing every request synchronously.
+* Normal Activity flushes append JSON Lines instead of rewriting the full history; each periodic flush atomically compacts records older than `YABANE_ACTIVITY_RETENTION_DAYS`, defaulting to 30 days, even when no new requests arrive.
+* Pending Activity records are flushed when Yabane completes graceful shutdown.
+
 ## Admin data safety
 
 * Admin provider responses never expose upstream API-key secrets.
-* Admin gateway API-key list responses never expose generated secrets or secret hashes.
+* Authenticated admin gateway API-key list responses expose generated secrets for reveal/copy but never expose secret hashes.
 * Technical identifiers, URLs, credentials, and model patterns use monospace presentation in the console.
