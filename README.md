@@ -16,14 +16,18 @@ Yabane is a small, performance-oriented LLM gateway written in Rust. Its first r
 - Provider routing through `provider/model` IDs
 - Optional exact-name and trailing-wildcard model routes to specific API keys
 - Gateway API-key authentication with expiration and provider scopes
+- Separate one-time-secret Management API keys for control-plane automation
+- Activity analytics with tokens, latency, routing metadata, and upstream-reported cost
+- Embedded interactive OpenAPI reference at `/docs` (`/openapi.json`)
 
 ## Run
 
 ```bash
+cp .env.example .env
 cargo run --release
 ```
 
-Open <http://127.0.0.1:8080>, add a provider, then send requests to Yabane. Set `YABANE_ADDR` to change the listen address. Logs default to `info`; set `YABANE_LOG` to a valid tracing filter to override it.
+Yabane automatically loads local environment variables from the repository-root `.env` file, which is ignored by Git. Open <http://127.0.0.1:8080>, add a provider, then send requests to Yabane. Set `YABANE_ADDR` to change the listen address. Logs default to `info`; set `YABANE_LOG` to a valid tracing filter to override it. Request activity metadata is buffered and persisted to `data/activity.jsonl`; set `YABANE_ACTIVITY_RETENTION_DAYS` to change the default 30-day retention.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -32,7 +36,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"chutes/qwen3.8-27b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Provider credentials are stored locally in `data/providers.json`; gateway access configuration is stored in `data/auth.json`. Gateway API-key authentication is enabled by default, so generate a key in **API access** before calling `/v1/*`. The admin console itself has no authentication in this development release; do not expose it publicly.
+Provider credentials are stored locally in `data/providers.json`; gateway access configuration is stored in `data/auth.json`; the administrator and hashed Management API keys are stored in `data/admin.json`. Gateway API-key authentication is enabled by default, so generate a key in **API access** before calling `/v1/*`. Use a separately generated Management API key for control endpoints, or use the browser session. Management-key creation and revocation remain browser-session-only.
+
+On first use, the admin console asks you to create its administrator account without a CAPTCHA. Login CAPTCHA is optional: configure a matching Cloudflare Turnstile widget pair with `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET`; if either value is unavailable, CAPTCHA is disabled. Optionally set `TURNSTILE_HOSTNAMES` to a comma-separated list of allowed frontend hostnames (defaults to `localhost,127.0.0.1`). The widget must allow the hostname used in the browser. When Cloudflare's documented always-pass test secret is used for local/E2E testing, Yabane automatically serves its matching test site key unless `TURNSTILE_SITE_KEY` is explicitly set. Never commit the Turnstile secret.
 
 End-to-end behavior requirements are maintained in [`GATEWAY_BEHAVIORS.md`](GATEWAY_BEHAVIORS.md). Run the automated authentication E2E suite with:
 

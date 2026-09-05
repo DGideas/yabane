@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::{api_error, config::AppState};
+use crate::{config::AppState, error::api_error};
 
 pub const AUTH_FILE: &str = "data/auth.json";
 
@@ -45,6 +45,8 @@ pub struct GatewayApiKey {
     pub id: String,
     pub note: String,
     pub secret_hash: String,
+    #[serde(default)]
+    pub secret: String,
     pub prefix: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
@@ -57,6 +59,7 @@ pub struct GatewayApiKeyView {
     pub id: String,
     pub note: String,
     pub prefix: String,
+    pub secret: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub provider_ids: Vec<String>,
@@ -68,6 +71,7 @@ impl From<&GatewayApiKey> for GatewayApiKeyView {
             id: key.id.clone(),
             note: key.note.clone(),
             prefix: key.prefix.clone(),
+            secret: key.secret.clone(),
             created_at: key.created_at,
             expires_at: key.expires_at,
             provider_ids: key.provider_ids.clone(),
@@ -85,9 +89,7 @@ pub async fn load_auth() -> Result<AuthConfig, String> {
 }
 
 pub async fn save_auth(auth: &AuthConfig) -> Result<(), std::io::Error> {
-    tokio::fs::create_dir_all("data").await?;
-    let contents = serde_json::to_vec_pretty(auth).expect("serialize auth configuration");
-    tokio::fs::write(AUTH_FILE, contents).await
+    crate::storage::write_json_atomic(AUTH_FILE, auth).await
 }
 
 pub fn generate_secret() -> String {
@@ -130,7 +132,7 @@ pub async fn authorize(State(state): State<AppState>, request: Request, next: Ne
     let key = auth
         .api_keys
         .iter()
-        .find(|key| key.secret_hash == secret_hash);
+        .find(|key| key.secret_hash == secret_hash || key.secret == secret);
     let Some(key) = key else {
         return api_error(StatusCode::UNAUTHORIZED, "Invalid API key");
     };
@@ -157,7 +159,7 @@ pub async fn authorized_provider_ids(
     let hash = hash_secret(secret);
     auth.api_keys
         .iter()
-        .find(|key| key.secret_hash == hash)
+        .find(|key| key.secret_hash == hash || key.secret == secret)
         .map(|key| key.provider_ids.clone())
 }
 
