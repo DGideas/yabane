@@ -26,7 +26,7 @@ pub struct AppState {
     pub routes: RouteStore,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiType {
     OpenaiCompatible,
@@ -128,6 +128,13 @@ impl ApiEndpoint {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ModelEndpointPreference {
+    pub model: String,
+    pub api_type: ApiType,
+    pub endpoint_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Provider {
     pub id: String,
     pub name: String,
@@ -143,6 +150,8 @@ pub struct Provider {
     #[serde(default)]
     pub model_endpoints: HashMap<String, Vec<String>>,
     #[serde(default)]
+    pub model_endpoint_preferences: Vec<ModelEndpointPreference>,
+    #[serde(default)]
     pub models_discovered_at: Option<u64>,
     #[serde(default)]
     pub model_discovery_error: Option<String>,
@@ -155,6 +164,13 @@ impl Provider {
                 .defaults_endpoint_ids
                 .iter()
                 .any(|configured| configured == endpoint_id)
+    }
+
+    pub fn preferred_endpoint_id(&self, model: &str, api_type: ApiType) -> Option<&str> {
+        self.model_endpoint_preferences
+            .iter()
+            .find(|preference| preference.model == model && preference.api_type == api_type)
+            .map(|preference| preference.endpoint_id.as_str())
     }
 
     pub fn endpoint_and_key(

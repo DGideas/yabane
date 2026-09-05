@@ -5,10 +5,11 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 ## Service and administration
 
 * Yabane loads local environment configuration from `.env` when present while preserving variables already supplied by the process environment.
-* Yabane listens on `YABANE_ADDR`, defaulting to `127.0.0.1:8080`.
+* `yabane --help` and `yabane --version` print information and exit without loading configuration or starting the server; unknown or malformed command-line arguments fail visibly.
+* Yabane listens on the address passed through `--addr`, defaulting to `127.0.0.1:8080`; the listen address is intentionally not configured through an environment variable.
 * `GET /healthz` returns `200` and does not require a gateway API key.
 * The web admin console uses a separate administrator session and never accepts gateway API keys as admin authentication.
-* Admin HTML, CSS, and JavaScript responses disable browser caching so a restarted local binary does not leave stale CAPTCHA behavior in the console.
+* Admin HTML, CSS, JavaScript, and the Yabane SVG application icon are embedded in the binary and disable browser caching so a restarted local binary does not leave stale console resources.
 * On first use, the console requires creation of the single administrator with username, email, and a password of at least eight characters.
 * After setup, unauthenticated visitors see the login screen and can sign in with username or email plus password.
 * Administrator passwords are persisted only as Argon2 password hashes.
@@ -23,18 +24,18 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * The Providers top-level page presents a concise provider list; selecting one provider opens a visually distinct Provider settings page with breadcrumb context, a Provider identity summary, Provider-wide settings, and a separate child-endpoint hierarchy.
 * Provider details visually nest upstream API keys inside their owning Endpoint, and key-creation actions name and preselect that Endpoint so Provider, Endpoint, and key actions are not presented as peers.
 * The sidebar selection background and blue indicator animate when switching top-level sections.
-* Settings search finds top-level settings, provider-model discovery, gateway-key generation, and configured providers, then navigates to the selected result.
+* Settings search finds top-level settings, provider-model discovery, gateway-key generation, and configured providers, visibly selects the active result, supports Arrow Up/Down, Home/End, Enter, and Escape from the combobox, then navigates to the selected result.
 * Home, Providers, provider details, model routing, API access, Activity, and login have distinct browser URLs that can be opened directly and support browser Back/Forward navigation.
 * Authenticated console pages use the full width available beside the sidebar with responsive horizontal gutters, rather than remaining capped to a narrow fixed content column on wide displays.
 * The authenticated Home page summarizes 24-hour requests and token usage and links to configured providers.
 * Gateway API keys authenticate inference requests and model listing with provider scopes, while Management API keys authenticate the control API; administrator profile and Management-key endpoints require a browser session.
 * Each administrator can create named Management API keys beginning with `yab_mgmt_`, with optional expiry; the secret is shown once, only its hash is persisted, last-use times are tracked, and revocation is immediate.
 * The embedded live API reference at `/docs` renders the bundled OpenAPI specification served at `/openapi.json` and can execute requests against the running instance using the browser session or a pasted Bearer key.
-* Boolean settings use an accessible animated switch instead of the browser's default checkbox presentation.
+* Boolean settings use accessible animated switches or check controls instead of the browser's default checkbox presentation, and conditionally revealed form fields animate their height and opacity instead of abruptly changing the dialog layout.
 * Forms visibly identify required and optional fields.
 * Provider-scope selection uses individually labeled checkboxes and an empty selection clearly means unrestricted access.
 * Secret-entry fields use the same Show/Hide interaction throughout the admin console.
-* Upstream-key traffic weights explain relative distribution and provide an immediately visible slider value and common presets.
+* Upstream-key traffic distribution is presented as percentages that must total 100% across enabled keys; newly added keys use the standard default weight, while the stored positive weights preserve deterministic weighted round robin.
 * The Model routing page explains that rules bind matching models to a specific endpoint and upstream key, shows exact and prefix examples, and makes clear that unmatched models retain weighted load balancing.
 * Missing configuration files produce empty/default configuration; malformed or unreadable configuration fails startup visibly.
 * `YABANE_LOG` controls logging, defaults to `info`, and an invalid filter fails startup.
@@ -83,11 +84,16 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 
 ## Upstream endpoints and keys
 
-* A provider can contain multiple API endpoints, and the admin console can add endpoints after provider creation.
+* A provider can contain multiple API endpoints, and the admin console can add, edit, or delete endpoints after provider creation; editing supports API type, base URL, SOCKS5 proxy, and whether credentials are required without exposing or replacing existing secrets or Endpoint request defaults.
+* Endpoint IDs are immutable after creation because discovery metadata, model preferences, routes, credentials, and Activity all reference them.
+* Changing or adding an Endpoint clears model availability and preferences tied to that Endpoint before persisting when applicable, then starts one background discovery refresh; the console does not issue a duplicate refresh.
+* Deleting a Provider or Endpoint also removes every model-route target referring to that exact resource; routes left without targets are removed, and Endpoint deletion additionally removes its discovered-model availability and preferences.
 * Model discovery records which endpoint exposes each model.
 * A request for `provider/model` is sent to an endpoint that reported that model, hiding endpoint topology from the caller.
 * Models unique to different endpoints of one provider remain externally accessible through the same provider prefix.
-* If multiple compatible endpoints report the same model, the first configured matching endpoint is selected unless an explicit model route overrides it.
+* If multiple compatible endpoints report the same model, the first configured matching endpoint is the visible automatic default.
+* An administrator can configure one preferred Endpoint for a discovered model and protocol within a Provider; inference uses that preference before the first-compatible-endpoint default, while explicit public model routes remain higher priority.
+* Stale model Endpoint preferences are removed when discovery no longer reports the model on that compatible Endpoint, and deleting an Endpoint removes its preferences.
 * An explicit model route can select a compatible endpoint different from the first endpoint.
 * Each endpoint can optionally route both model-discovery and inference traffic through a `socks5://` or `socks5h://` proxy.
 * SOCKS5 proxy settings using another URL scheme are rejected with `400`.
@@ -104,7 +110,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 
 * A model route creates a public model alias that clients call without a `provider/` prefix.
 * A route target explicitly maps that public pattern to an upstream provider, endpoint, API key, and the exact model ID understood by that upstream; the upstream model does not include Yabane’s Provider prefix, though native namespaced IDs such as `google/model-name` remain valid.
-* The route editor explains upstream model IDs, uses a model discovered from the selected endpoint as its example when available, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
+* The route editor explains upstream model IDs, uses a model discovered from the selected endpoint as its example when available, lets administrators add and remove weighted destinations while retaining at least one destination, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
 * A model route can contain multiple positive-weight targets and selects them using weighted round robin.
 * A model route can be an exact model ID or one trailing prefix wildcard.
 * Exact model routes take precedence over wildcard routes.
@@ -112,6 +118,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * If no model route matches, weighted key selection is used.
 * A model route explicitly selects both an endpoint and one enabled upstream API key.
 * Upstream-key update and deletion URLs include both Provider and Endpoint identity because key IDs are unique only within an Endpoint.
+* The Provider detail console can delete each upstream key from within its owning Endpoint.
 * Deleting an upstream key removes global-route targets referring to that exact Provider, Endpoint, and key; a route with no remaining targets is removed.
 
 ## Model discovery
@@ -119,7 +126,8 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Creating a provider automatically starts model discovery without blocking provider creation.
 * An administrator can explicitly refresh models for one provider or all providers.
 * The console distinguishes discovery not yet run, successful empty results, and discovery failures.
-* Provider details show only a compact model count by default; the searchable, bounded model browser opens only on request and displays each model with its endpoint availability.
+* Provider details summarize the model catalog with unique-model count, shared-model count, configured Endpoint-default count, per-Endpoint coverage, discovery freshness, and a bounded searchable catalog instead of presenting an empty count-only card.
+* The model catalog displays each model’s Endpoint availability and effective default routing, provides working search, clear, and complete Previous/Next pagination over all matches, and lets shared models be managed in a searchable bounded preference editor without rendering the full collection by default.
 * Large provider model collections are collapsed by default and can be searched in a bounded model browser instead of rendering an unbounded wall of model labels.
 * Successful model discovery and the latest discovery status are persisted for the admin console.
 * `GET /v1/models` returns an OpenAI-compatible list envelope.
@@ -144,6 +152,8 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Activity remains immediately queryable in memory and is batch-written after 10 records or 60 seconds rather than writing every request synchronously.
 * Normal Activity flushes append JSON Lines instead of rewriting the full history; each periodic flush atomically compacts records older than `YABANE_ACTIVITY_RETENTION_DAYS`, defaulting to 30 days, even when no new requests arrive.
 * Pending Activity records are flushed when Yabane completes graceful shutdown.
+* An administrator can export retained Activity as a versioned Yabane JSON file and import it into another instance without requiring matching Provider or Endpoint configuration; imported routing metadata remains visible as originally recorded.
+* Every installation persists a random Activity instance ID; Activity import is idempotent by source instance ID plus request ID, so repeated and transitive imports are skipped without treating coincident request IDs from different instances as the same record. Records outside the destination retention window are reported and skipped, accepted records are atomically persisted, and the result reports imported, duplicate, expired, and total counts.
 
 ## Admin data safety
 

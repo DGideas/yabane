@@ -169,6 +169,18 @@ async fn update_discoveries(
                         .map(|model| model.id.clone())
                         .collect();
                     stored.model_endpoints = discovery.model_endpoints.clone();
+                    stored.model_endpoint_preferences.retain(|preference| {
+                        discovery
+                            .model_endpoints
+                            .get(&preference.model)
+                            .is_some_and(|endpoint_ids| {
+                                endpoint_ids.contains(&preference.endpoint_id)
+                            })
+                            && stored.endpoints.iter().any(|endpoint| {
+                                endpoint.id == preference.endpoint_id
+                                    && endpoint.api_type == preference.api_type
+                            })
+                    });
                     stored.model_discovery_error = None;
                 }
                 Err(error) => stored.model_discovery_error = Some(error.clone()),
@@ -362,6 +374,7 @@ mod tests {
             endpoints: Vec::new(),
             discovered_models: Vec::new(),
             model_endpoints: std::collections::HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
             models_discovered_at: None,
             model_discovery_error: None,
         }

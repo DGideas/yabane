@@ -125,10 +125,21 @@ async fn resolve_provider(
             .find(|endpoint| endpoint.id == target.endpoint_id)
     } else {
         let discovered = provider.model_endpoints.get(upstream_model);
-        provider.endpoints.iter().find(|endpoint| {
-            endpoint.api_type == expected_type
-                && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
-        })
+        let preferred = provider.preferred_endpoint_id(upstream_model, expected_type);
+        provider
+            .endpoints
+            .iter()
+            .find(|endpoint| {
+                preferred == Some(endpoint.id.as_str())
+                    && endpoint.api_type == expected_type
+                    && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
+            })
+            .or_else(|| {
+                provider.endpoints.iter().find(|endpoint| {
+                    endpoint.api_type == expected_type
+                        && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
+                })
+            })
     }
     .ok_or_else(|| RoutingError {
         status: StatusCode::BAD_REQUEST,
@@ -282,7 +293,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             }
         }
         let usage = usage.finish();
-        activity.record(RequestLog { timestamp: crate::auth::now(), request_id, path, model, provider: provider_id, endpoint: endpoint_id, status: status.as_u16(), latency_ms: started.elapsed().as_millis() as u64, input_tokens: usage.input, output_tokens: usage.output, cached_tokens: usage.cached, cost: usage.cost, streaming: requested_streaming || event_stream }).await;
+        activity.record(RequestLog { timestamp: crate::auth::now(), request_id, source_instance_id: None, path, model, provider: provider_id, endpoint: endpoint_id, status: status.as_u16(), latency_ms: started.elapsed().as_millis() as u64, input_tokens: usage.input, output_tokens: usage.output, cached_tokens: usage.cached, cost: usage.cost, streaming: requested_streaming || event_stream }).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
