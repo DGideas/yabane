@@ -3,6 +3,7 @@ let authSettings = {enabled: true, api_keys: []};
 let modelRoutes = [];
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
+const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
 const providerDialog = $('#provider-dialog');
 const providerForm = $('#provider-form');
 let providerStep = 1;
@@ -10,6 +11,7 @@ let providerIdEdited = false;
 let selectedProviderId = null;
 let adminSession = null;
 let turnstileWidgetId = null;
+let aboutInfo = null;
 
 async function renderTurnstile(action) {
   const widget = $('#turnstile-widget');
@@ -51,7 +53,7 @@ async function initializeAdmin() {
   const initial = (adminSession.username || 'A').slice(0, 1).toUpperCase();
   $('#account-menu').textContent = initial; $('.account-avatar-large').textContent = initial;
   $('#account-name').textContent = adminSession.username || 'Administrator'; $('#account-email').textContent = adminSession.email || '';
-  await Promise.all([loadProviders(), loadAuth(), loadRoutes()]);
+  await Promise.all([loadProviders(), loadAuth(), loadRoutes(), loadAbout()]);
 }
 
 $('#login-form').addEventListener('submit', async event => {
@@ -128,6 +130,7 @@ function setProviderStep(step) {
 
 function openProviderDialog() {
   providerForm.reset();
+  providerForm.querySelector('.base-url-notice').textContent = '';
   providerIdEdited = false;
   $('#provider-error').textContent = '';
   toggleKeyRequirement();
@@ -155,11 +158,20 @@ function setApiType(type) {
   $$('#api-type-choices .choice').forEach(choice => choice.classList.toggle('selected', choice.contains(input)));
 }
 $$('input[name="api_type"]').forEach(input => input.addEventListener('change', () => setApiType(input.value)));
+function operationPathNotice(input) {
+  const notice = input.closest('.field').querySelector('.base-url-notice');
+  if (!notice) return;
+  const path = new URL(input.value, 'http://invalid').pathname.replace(/\/$/, '');
+  const operation = ['/chat/completions', '/responses', '/messages', '/models'].find(suffix => path.endsWith(suffix));
+  notice.textContent = operation ? `This looks like a specific ${operation} operation URL. Use the shared API root instead so discovery and inference can append their own paths.` : '';
+}
 $('#base-url').addEventListener('input', event => {
   const hostname = new URL(event.target.value, 'http://invalid').hostname;
   if (hostname === 'api.anthropic.com' || hostname.endsWith('.anthropic.com')) setApiType('anthropic');
-  if (hostname.includes('openai.com') || hostname.includes('azure.com')) setApiType('openai_compatible');
+  if (hostname.includes('openai.com') || hostname.includes('azure.com') || hostname === 'opencode.ai') setApiType('openai_compatible');
+  operationPathNotice(event.target);
 });
+$('#endpoint-dialog [name="base_url"]').addEventListener('input', event => operationPathNotice(event.target));
 
 function toggleKeyRequirement() {
   const required = $('#requires-key').checked;
@@ -216,7 +228,7 @@ function renderProviders() {
     card.className = 'provider-list-item';
     card.dataset.provider = provider.id;
     const modelStatus = provider.model_discovery_error ? 'Model discovery failed' : provider.models_discovered_at ? `${provider.discovered_models.length} models` : 'Discovering models…';
-    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${keyCount(provider)} key${keyCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">›</span>`;
+    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${keyCount(provider)} key${keyCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
     card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); });
     return card;
   }));
@@ -233,7 +245,7 @@ function renderProviderPage() {
     const endpointModels = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length;
     const enabledKeys = endpoint.api_keys.filter(key => key.enabled);
     const shares = trafficShares(enabledKeys);
-    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">＋ Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
+    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
@@ -243,7 +255,7 @@ function renderProviderPage() {
   const bodyCount = Object.keys(provider.extra_body || {}).length;
   const defaultsScope = provider.defaults_endpoint_ids?.length ? `${provider.defaults_endpoint_ids.length} selected endpoint${provider.defaults_endpoint_ids.length === 1 ? '' : 's'}` : 'All endpoints';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button><span>›</span><strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${keyCount(provider)} upstream key${keyCount(provider) === 1 ? '' : 's'}.</p></div><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>×</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys are configured inside the endpoint they belong to.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">＋ Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${keyCount(provider)} upstream key${keyCount(provider) === 1 ? '' : 's'}.</p></div><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys are configured inside the endpoint they belong to.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -261,7 +273,7 @@ function renderProviderPage() {
     $('#provider-detail .model-table-body').replaceChildren(...pageModels.map(model => {
       const row = document.createElement('div'); const modelVariants = variants.filter(variant => variant.model === model);
       const endpoints = [...new Set(modelVariants.flatMap(variant => variant.endpointIds))];
-      const routing = modelVariants.map(variant => `${formatType(variant.apiType)} → ${variant.preferredEndpointId || variant.endpointIds[0]}${variant.preferredEndpointId ? ' (set)' : ''}`).join(' · ');
+      const routing = modelVariants.map(variant => `${formatType(variant.apiType)} to ${variant.preferredEndpointId || variant.endpointIds[0]}${variant.preferredEndpointId ? ' (set)' : ''}`).join(' · ');
       row.innerHTML = `<code>${escapeHtml(model)}</code><span>${endpoints.map(id => `<code>${escapeHtml(id)}</code>`).join(' ')}</span><small>${escapeHtml(routing)}</small>`; return row;
     }));
     if (!pageModels.length) $('#provider-detail .model-table-body').innerHTML = '<div class="model-catalog-empty">No models match your search.</div>';
@@ -372,7 +384,7 @@ async function patchKey(providerId, endpointId, keyId, update) {
 
 const endpointDialog = $('#endpoint-dialog');
 function openEndpointDialog(providerId, endpointId = null) {
-  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; $('#endpoint-error').textContent = '';
+  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
   const endpoint = endpointId ? providers.find(item => item.id === providerId)?.endpoints.find(item => item.id === endpointId) : null;
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
   $('#endpoint-dialog .dialog-head p').textContent = endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
@@ -381,6 +393,7 @@ function openEndpointDialog(providerId, endpointId = null) {
   if (endpoint) {
     form.elements.id.value = endpoint.id; form.elements.base_url.value = endpoint.base_url; form.elements.api_type.value = endpoint.api_type;
     form.elements.socks5_proxy.value = endpoint.socks5_proxy || ''; form.elements.requires_api_key.checked = endpoint.requires_api_key;
+    operationPathNotice(form.elements.base_url);
   }
   toggleEndpointKeyRequirement(); bindSecretToggles(endpointDialog); endpointDialog.showModal();
 }
@@ -408,7 +421,7 @@ function openKeyDialog(providerId, endpointId = null) {
   $('#key-endpoint').replaceChildren(...provider.endpoints.map(endpoint => new Option(`${endpoint.id} · ${formatType(endpoint.api_type)}`, endpoint.id)));
   if (endpointId) $('#key-endpoint').value = endpointId;
   $('#key-dialog-title').textContent = endpointId ? `Add key to ${endpointId}` : 'Add API key';
-  $('#key-dialog-description').textContent = `Add an upstream credential under ${provider.name}${endpointId ? ` › ${endpointId}` : ''}.`;
+  $('#key-dialog-description').textContent = `Add an upstream credential under ${provider.name}${endpointId ? ` / ${endpointId}` : ''}.`;
   keyDialog.showModal();
 }
 $$('.close-key').forEach(button => button.addEventListener('click', () => keyDialog.close()));
@@ -463,7 +476,7 @@ let requestDefaultsProviderId = null;
 function addDefaultsRow(container, kind, name = '', value = '') {
   const row = document.createElement('div');
   row.className = 'defaults-row';
-  row.innerHTML = `<label><span>${kind === 'header' ? 'Header name' : 'Field name'}</span><input class="technical-input defaults-name" placeholder="${kind === 'header' ? 'x-api-version' : 'temperature'}"></label><label><span>${kind === 'header' ? 'Header value' : 'JSON value'}</span>${kind === 'header' ? '<input class="technical-input defaults-value" placeholder="2025-01-01">' : '<textarea class="technical-input defaults-value" rows="2" placeholder="0.7"></textarea>'}</label><button type="button" class="icon-button remove-default-row" aria-label="Remove">×</button><span class="row-error"></span>`;
+  row.innerHTML = `<label><span>${kind === 'header' ? 'Header name' : 'Field name'}</span><input class="technical-input defaults-name" placeholder="${kind === 'header' ? 'x-api-version' : 'temperature'}"></label><label><span>${kind === 'header' ? 'Header value' : 'JSON value'}</span>${kind === 'header' ? '<input class="technical-input defaults-value" placeholder="2025-01-01">' : '<textarea class="technical-input defaults-value" rows="2" placeholder="0.7"></textarea>'}</label><button type="button" class="icon-button remove-default-row" aria-label="Remove">${icon('close')}</button><span class="row-error"></span>`;
   row.dataset.kind = kind;
   row.querySelector('.defaults-name').value = name;
   row.querySelector('.defaults-value').value = value;
@@ -522,7 +535,7 @@ function openRequestDefaultsDialog(provider) {
   const selectedIds = provider.defaults_endpoint_ids || [];
   const selectedScope = selectedIds.length ? 'selected' : 'all';
   $(`#request-defaults-form [name="defaults_scope"][value="${selectedScope}"]`).checked = true;
-  $('#defaults-endpoint-selection').replaceChildren(...provider.endpoints.map(endpoint => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" value="${escapeHtml(endpoint.id)}" ${selectedIds.includes(endpoint.id) ? 'checked' : ''}><span class="custom-check">✓</span><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span>`; label.querySelector('input').addEventListener('change', validateRequestDefaults); return label; }));
+  $('#defaults-endpoint-selection').replaceChildren(...provider.endpoints.map(endpoint => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" value="${escapeHtml(endpoint.id)}" ${selectedIds.includes(endpoint.id) ? 'checked' : ''}><span class="custom-check">${icon('check')}</span><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span>`; label.querySelector('input').addEventListener('change', validateRequestDefaults); return label; }));
   $('#defaults-endpoint-selection').hidden = selectedScope !== 'selected';
   Object.entries(provider.extra_headers || {}).forEach(([name, value]) => addDefaultsRow($('#default-header-rows'), 'header', name, value));
   Object.entries(provider.extra_body || {}).forEach(([name, value]) => addDefaultsRow($('#default-body-rows'), 'body', name, JSON.stringify(value, null, 2)));
@@ -540,51 +553,123 @@ $('#request-defaults-form').addEventListener('submit', async event => {
 });
 
 const routeDialog = $('#route-dialog');
+let editingRoutePattern = null;
 function routeTargetOptions() { return providers.flatMap(provider => provider.endpoints.flatMap(endpoint => endpoint.api_keys.filter(key => key.enabled).map(key => { const option = new Option(`${provider.name} · ${endpoint.id} · ${key.name}`, `${provider.id}\n${endpoint.id}\n${key.id}`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; return option; }))); }
-function updateRouteTargetRemoval() {
-  const editors = $$('#route-targets .route-target-editor');
-  editors.forEach(editor => {
-    const button = editor.querySelector('.remove-route-target');
-    button.disabled = editors.length === 1;
-    button.setAttribute('aria-disabled', String(button.disabled));
+function routeTargetValue(target) { return `${target.provider_id}\n${target.endpoint_id}\n${target.api_key_id}`; }
+function routeTargetEditors() { return $$('#route-targets .route-target-editor'); }
+function distributeRouteShares(weights) {
+  const count = weights.length;
+  if (count === 1) return [100];
+  const total = weights.reduce((sum, weight) => sum + Math.max(0, weight), 0) || count;
+  const exact = weights.map(weight => Math.max(0, weight) / total * 100);
+  const shares = exact.map(Math.floor);
+  let remainder = 100 - shares.reduce((sum, share) => sum + share, 0);
+  exact.map((value, index) => ({index, fraction: value - Math.floor(value)})).sort((a, b) => b.fraction - a.fraction).slice(0, remainder).forEach(item => shares[item.index]++);
+  shares.forEach((share, index) => {
+    if (share > 0) return;
+    const donor = shares.reduce((best, value, candidate) => value > shares[best] ? candidate : best, 0);
+    shares[index] = 1; shares[donor]--;
   });
+  return shares;
 }
-function initializeRouteTarget(editor) {
+function validateRouteSplit() {
+  const editors = routeTargetEditors();
+  const multiple = editors.length > 1;
+  const total = editors.reduce((sum, editor) => sum + Number(editor.querySelector('[name="target_weight"]').value || 0), 0);
+  const totalLabel = $('#route-split-total');
+  totalLabel.textContent = `${total}%`;
+  totalLabel.classList.toggle('invalid', multiple && total !== 100);
+  totalLabel.setAttribute('aria-label', multiple && total !== 100 ? `Invalid total: ${total}%` : `Total: ${total}%`);
+  const hasDestinations = editors.every(editor => editor.querySelector('.route-target').options.length > 0);
+  $('#save-route').disabled = !hasDestinations || (multiple && total !== 100);
+}
+function updateRouteTargetMode(normalize = false) {
+  const editors = routeTargetEditors();
+  const multiple = editors.length > 1;
+  $('#route-targets').classList.toggle('multiple', multiple);
+  $('#route-split-head').hidden = !multiple;
+  $('#add-route-target-label').textContent = multiple ? 'Add another destination' : 'Split traffic across destinations';
+  const weights = editors.map(editor => Number(editor.querySelector('[name="target_weight"]').value) || 1);
+  const shares = multiple && normalize ? distributeRouteShares(weights) : multiple ? weights : [100];
+  editors.forEach((editor, index) => {
+    const input = editor.querySelector('[name="target_weight"]');
+    input.value = shares[index]; input.max = multiple ? 99 : 100;
+    const button = editor.querySelector('.remove-route-target');
+    button.disabled = !multiple; button.setAttribute('aria-disabled', String(button.disabled));
+  });
+  validateRouteSplit();
+}
+function initializeRouteTarget(editor, target = null) {
   const select = editor.querySelector('.route-target');
-  const existingValue = select.value;
+  const existingValue = target ? routeTargetValue(target) : select.value;
   select.replaceChildren(...routeTargetOptions());
   if (existingValue && [...select.options].some(option => option.value === existingValue)) select.value = existingValue;
-  const updateSuggestion = () => {
+  const input = editor.querySelector('.upstream-model-input');
+  const notice = editor.querySelector('.upstream-model-notice');
+  const updateNotice = () => {
+    const models = JSON.parse(input.dataset.suggestions || '[]');
+    if (!models.length) notice.textContent = 'No models have been discovered for this endpoint yet. You can still enter a valid custom model ID.';
+    else if (input.value.trim() && !models.includes(input.value.trim())) notice.textContent = 'Custom model ID — this value was not reported by the selected endpoint. It will still be saved.';
+    else notice.textContent = `${models.length} discovered model${models.length === 1 ? '' : 's'} available as suggestions; custom IDs are also accepted.`;
+  };
+  const updateSuggestions = () => {
     const option = select.selectedOptions[0];
     const provider = providers.find(item => item.id === option?.dataset.provider);
     const endpointId = option?.dataset.endpoint;
     const models = provider?.discovered_models.filter(model => (provider.model_endpoints[model] || []).includes(endpointId)) || [];
-    const input = editor.querySelector('.upstream-model-input');
+    let list = editor.querySelector('datalist');
+    if (!list) { list = document.createElement('datalist'); editor.append(list); }
+    list.id = `upstream-model-suggestions-${crypto.randomUUID()}`;
+    list.replaceChildren(...models.map(model => new Option(model)));
+    input.setAttribute('list', list.id);
+    input.dataset.suggestions = JSON.stringify(models);
     input.placeholder = models[0] ? `e.g. ${models[0]}` : 'e.g. model-name or org/model-name';
+    updateNotice();
   };
-  select.addEventListener('change', updateSuggestion); updateSuggestion();
+  input.value = target?.upstream_model || input.value;
+  if (target) editor.querySelector('[name="target_weight"]').value = target.weight;
+  select.addEventListener('change', updateSuggestions); input.addEventListener('input', updateNotice); updateSuggestions();
 }
-function openRouteDialog() {
-  $('#route-form').reset(); $('#route-error').textContent = '';
-  $$('#route-targets .route-target-editor').slice(1).forEach(editor => editor.remove()); initializeRouteTarget($('#route-targets .route-target-editor')); updateRouteTargetRemoval();
+function addRouteTargetEditor(target = null) {
+  const template = $('#route-targets .route-target-editor');
+  const editor = template.cloneNode(true);
+  editor.querySelector('[name="upstream_model"]').value = '';
+  editor.querySelector('[name="target_weight"]').value = 100;
+  editor.querySelector('datalist')?.remove();
+  $('#route-targets').append(editor); initializeRouteTarget(editor, target);
+  return editor;
+}
+function openRouteDialog(route = null) {
+  const form = $('#route-form'); form.reset(); $('#route-error').textContent = ''; editingRoutePattern = route?.pattern || null;
+  routeDialog.querySelector('h2').textContent = route ? 'Edit model route' : 'Add model route';
+  routeDialog.querySelector('.dialog-head p').textContent = route ? 'Update the public alias and its destination.' : 'Create a short alias for an upstream model.';
+  $('#save-route').textContent = route ? 'Save changes' : 'Save route';
+  const editors = $$('#route-targets .route-target-editor'); editors.slice(1).forEach(editor => editor.remove());
+  if (route) {
+    form.elements.pattern.value = route.pattern;
+    initializeRouteTarget(editors[0], route.targets[0]);
+    route.targets.slice(1).forEach(addRouteTargetEditor);
+  } else initializeRouteTarget(editors[0]);
+  updateRouteTargetMode(Boolean(route && route.targets.length > 1));
   const hasDestinations = $('#route-targets .route-target').options.length > 0;
   $('#route-error').textContent = hasDestinations ? '' : 'Add and enable an upstream API key before creating a route.';
-  $('#save-route').disabled = !hasDestinations;
+  validateRouteSplit();
   routeDialog.showModal();
 }
 $('#models-view').addEventListener('click', event => {
   if (event.target.closest('#open-route, #empty-add-route')) openRouteDialog();
 });
-$('#add-route-target').addEventListener('click', () => { const editor = $('#route-targets .route-target-editor').cloneNode(true); editor.querySelector('[name="upstream_model"]').value = ''; editor.querySelector('[name="target_weight"]').value = 100; $('#route-targets').append(editor); initializeRouteTarget(editor); updateRouteTargetRemoval(); });
+$('#add-route-target').addEventListener('click', () => { addRouteTargetEditor(); updateRouteTargetMode(true); });
+$('#route-targets').addEventListener('input', event => { if (event.target.matches('[name="target_weight"]')) validateRouteSplit(); });
 $('#route-targets').addEventListener('click', event => {
   const remove = event.target.closest('.remove-route-target');
   if (!remove || remove.disabled) return;
-  remove.closest('.route-target-editor').remove(); updateRouteTargetRemoval();
+  remove.closest('.route-target-editor').remove(); updateRouteTargetMode(true);
 });
 $$('.close-route').forEach(button => button.addEventListener('click', () => routeDialog.close()));
 $('#route-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.target); const targets = [...event.target.querySelectorAll('.route-target-editor')].map(editor => { const [provider_id, endpoint_id, api_key_id] = editor.querySelector('.route-target').value.split('\n'); return {provider_id, endpoint_id, api_key_id, upstream_model: editor.querySelector('[name="upstream_model"]').value, weight: Number(editor.querySelector('[name="target_weight"]').value)}; });
-  const response = await fetch('/admin/routes', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pattern: data.get('pattern'), targets})});
+  const response = await fetch(editingRoutePattern ? `/admin/routes/${encodeURIComponent(editingRoutePattern)}` : '/admin/routes', {method: editingRoutePattern ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pattern: data.get('pattern'), targets})});
   if (!response.ok) return showApiError(response, $('#route-error'));
   routeDialog.close(); await loadRoutes();
 });
@@ -606,8 +691,9 @@ $('#refresh-all-models').addEventListener('click', async event => {
 
 function renderRoutes() {
   $('#routes-empty').hidden = modelRoutes.length > 0; $('#routes-table').hidden = modelRoutes.length === 0;
-  $('#routes').replaceChildren(...modelRoutes.map(route => { const row = document.createElement('tr'); const targets = route.targets.map(target => `${target.provider_id}/${target.upstream_model} · ${target.endpoint_id} · weight ${target.weight}`).join('<br>'); row.innerHTML = `<td><code>${escapeHtml(route.pattern)}</code></td><td>${targets}</td><td><button class="delete-route text-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></td>`; return row; }));
-  $$('.delete-route').forEach(button => button.addEventListener('click', async () => { await fetch(`/admin/routes/${button.dataset.pattern}`, {method: 'DELETE'}); await loadRoutes(); }));
+  $('#routes').replaceChildren(...modelRoutes.map((route, index) => { const row = document.createElement('tr'); const targets = route.targets.map(target => `${escapeHtml(target.provider_id)}/${escapeHtml(target.upstream_model)} · ${escapeHtml(target.endpoint_id)} · weight ${target.weight}`).join('<br>'); row.innerHTML = `<td><code>${escapeHtml(route.pattern)}</code></td><td>${targets}</td><td><div class="route-row-actions"><button class="edit-route text-link" data-index="${index}">Edit</button><button class="delete-route text-link danger-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></div></td>`; return row; }));
+  $$('.edit-route').forEach(button => button.addEventListener('click', () => openRouteDialog(modelRoutes[Number(button.dataset.index)])));
+  $$('.delete-route').forEach(button => button.addEventListener('click', async () => { if (confirm('Delete this model route?')) { await fetch(`/admin/routes/${button.dataset.pattern}`, {method: 'DELETE'}); await loadRoutes(); } }));
   renderModelReference();
 }
 
@@ -615,17 +701,66 @@ function renderModelReference() {
   $('#model-reference').replaceChildren(...providers.map(provider => {
     const item = document.createElement('article'); item.className = 'model-provider';
     const status = provider.model_discovery_error ? `<span class="error-text">Discovery failed: ${escapeHtml(provider.model_discovery_error)}</span>` : provider.models_discovered_at ? `${provider.discovered_models.length} models` : 'Discovery has not run yet';
-    item.innerHTML = `<header><div><strong>${escapeHtml(provider.name)}</strong><small>${status}</small></div><div class="model-actions"><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button>${provider.discovered_models.length ? '<button class="text-link toggle-models">Browse models</button>' : ''}</div></header>${provider.discovered_models.length ? `<div class="model-browser" hidden><div class="model-filter"><span>⌕</span><input type="search" placeholder="Filter ${provider.discovered_models.length} models"></div><div class="model-list"></div></div>` : ''}`;
+    item.innerHTML = `<header><div><strong>${escapeHtml(provider.name)}</strong><small>${status}</small></div><div class="model-actions"><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button>${provider.discovered_models.length ? '<button class="text-link toggle-models">Browse models</button>' : ''}</div></header>${provider.discovered_models.length ? `<div class="model-browser" hidden><div class="model-filter">${icon('search')}<input type="search" placeholder="Filter ${provider.discovered_models.length} models"></div><div class="model-list"></div></div>` : ''}`;
     if (provider.discovered_models.length) { const list = item.querySelector('.model-list'); const render = query => { const matches = provider.discovered_models.filter(model => model.toLowerCase().includes(query.toLowerCase())); list.replaceChildren(...matches.slice(0, 100).map(model => { const code = document.createElement('code'); code.textContent = model; return code; })); }; render(''); item.querySelector('.model-filter input').addEventListener('input', event => render(event.target.value)); item.querySelector('.toggle-models').addEventListener('click', event => { const browser = item.querySelector('.model-browser'); browser.hidden = !browser.hidden; event.currentTarget.textContent = browser.hidden ? 'Browse models' : 'Hide models'; }); }
     return item;
   }));
   $$('#model-reference .refresh-models').forEach(button => button.addEventListener('click', () => refreshModels(button.dataset.provider, button)));
 }
 
+async function loadAbout() {
+  const response = await fetch('/about');
+  if (!response.ok) return;
+  aboutInfo = await response.json();
+  const commitDate = aboutInfo.commit_time === 'unknown' ? 'unknown time' : aboutInfo.commit_time.slice(0, 10);
+  $('#sidebar-build').textContent = `${aboutInfo.commit} · ${commitDate}`;
+}
+const aboutDialog = $('#about-dialog');
+$$('.open-about').forEach(button => button.addEventListener('click', async () => {
+  closeAccountMenu();
+  if (!aboutInfo) await loadAbout();
+  if (!aboutInfo) return;
+  $('#about-commit').textContent = aboutInfo.commit;
+  $('#about-commit-time').textContent = aboutInfo.commit_time; $('#about-commit-time').dateTime = aboutInfo.commit_time === 'unknown' ? '' : aboutInfo.commit_time;
+  $('#about-license').textContent = aboutInfo.license; $('#about-license-text').textContent = aboutInfo.license_text;
+  aboutDialog.showModal();
+}));
+$$('.close-about').forEach(button => button.addEventListener('click', () => aboutDialog.close()));
+
+const helpDialog = $('#help-dialog');
+function helpModels() {
+  const discovered = providers.flatMap(provider => provider.discovered_models.map(model => `${provider.id}/${model}`));
+  return [...new Set([...modelRoutes.map(route => route.pattern).filter(pattern => !pattern.endsWith('*')), ...discovered])].sort();
+}
+function updateHelpGuide() {
+  const modelSelect = $('#help-model'); const keySelect = $('#help-key');
+  const previousModel = modelSelect.value; const previousKey = keySelect.value;
+  const models = helpModels();
+  modelSelect.replaceChildren(...models.map(model => new Option(model, model)));
+  if (!models.length) modelSelect.append(new Option('No discovered models yet', ''));
+  if (models.includes(previousModel)) modelSelect.value = previousModel;
+  keySelect.replaceChildren(...authSettings.api_keys.map(key => new Option(`${key.note || 'Gateway API key'} · ${key.prefix}`, key.secret || '')));
+  if (!authSettings.api_keys.length) keySelect.append(new Option('Generate a Gateway API key first', ''));
+  if ([...keySelect.options].some(option => option.value === previousKey)) keySelect.value = previousKey;
+  const baseUrl = `${location.origin}/v1`; const model = modelSelect.value || 'provider/model-id'; const key = keySelect.value || 'sk-your-yabane-key';
+  $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an upstream Endpoint and key'}</small></span>`;
+  $('#help-key-check').innerHTML = `<b>${authSettings.api_keys.length ? icon('check') : '2'}</b><span><strong>Generate a Gateway key</strong><small>${authSettings.api_keys.length ? `${authSettings.api_keys.length} available` : 'Required while authentication is enabled'}</small></span>`;
+  $('#help-model-check').innerHTML = `<b>${models.length ? icon('check') : '3'}</b><span><strong>Select a model</strong><small>${models.length ? `${models.length} available` : 'Refresh Provider model discovery'}</small></span>`;
+  $('#help-opencode-code').textContent = JSON.stringify({$schema: 'https://opencode.ai/config.json', provider: {yabane: {npm: '@ai-sdk/openai-compatible', name: 'Yabane', options: {baseURL: baseUrl, apiKey: '{env:YABANE_API_KEY}'}, models: {[model]: {name: model}}}}, model: `yabane/${model}`, small_model: `yabane/${model}`}, null, 2);
+  $('#help-opencode-env').textContent = `export YABANE_API_KEY='${key}'`;
+  $('#help-base-url').textContent = baseUrl; $('#help-api-key').textContent = key; $('#help-model-id').textContent = model;
+  $('#help-curl-code').textContent = `curl '${baseUrl}/chat/completions' \\\n  -H 'Authorization: Bearer ${key}' \\\n  -H 'content-type: application/json' \\\n  -d '${JSON.stringify({model, messages: [{role: 'user', content: 'Hello'}]})}'`;
+}
+$('#open-help').addEventListener('click', () => { updateHelpGuide(); helpDialog.showModal(); });
+$$('.close-help').forEach(button => button.addEventListener('click', () => helpDialog.close()));
+$('#help-model').addEventListener('change', updateHelpGuide); $('#help-key').addEventListener('change', updateHelpGuide);
+$$('[data-help-tab]').forEach(button => button.addEventListener('click', () => { $$('[data-help-tab]').forEach(tab => { const active = tab === button; tab.classList.toggle('active', active); tab.setAttribute('aria-selected', String(active)); }); $$('[data-help-panel]').forEach(panel => { panel.hidden = panel.dataset.helpPanel !== button.dataset.helpTab; }); }));
+$$('.copy-help-code').forEach(button => button.addEventListener('click', async () => { await navigator.clipboard.writeText($(`#${button.dataset.copy}`).textContent); const original = button.textContent; button.textContent = 'Copied'; setTimeout(() => { button.textContent = original; }, 1200); }));
+
 const gatewayKeyDialog = $('#gateway-key-dialog');
 $('#open-gateway-key').addEventListener('click', () => {
   $('#gateway-key-form').reset(); $('#gateway-key-error').textContent = '';
-  $('#gateway-key-providers').replaceChildren(...providers.map(provider => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" name="provider_ids" value="${escapeHtml(provider.id)}"><span class="custom-check">✓</span><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.id)}</small></span>`; return label; }));
+  $('#gateway-key-providers').replaceChildren(...providers.map(provider => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" name="provider_ids" value="${escapeHtml(provider.id)}"><span class="custom-check">${icon('check')}</span><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.id)}</small></span>`; return label; }));
   gatewayKeyDialog.showModal();
 });
 $$('.close-gateway-key').forEach(button => button.addEventListener('click', () => gatewayKeyDialog.close()));
@@ -692,6 +827,7 @@ const searchItems = [
   {label: 'Activity', description: 'Requests, tokens, latency, upstream cost, and routing logs', view: 'activity'},
   {label: 'Management API', description: 'Programmatic control keys and live docs', view: 'management'},
   {label: 'Create Management API key', description: 'Create a control-plane credential', view: 'management', action: () => $('#open-management-key').click()},
+  {label: 'Getting started', description: 'Connect an Agent to Yabane', view: 'home', action: () => $('#open-help').click()},
   {label: 'Live API docs', description: 'Interactive OpenAPI documentation', view: 'management', action: () => location.assign('/docs')}
 ];
 let selectedSearchIndex = -1;
@@ -782,16 +918,67 @@ $('#activity-view').addEventListener('click', event => {
 });
 $('#activity-search').addEventListener('input', renderActivityLogs); $('#activity-status-filter').addEventListener('change', renderActivityLogs);
 $('#activity-range').addEventListener('change', loadActivity); $('#activity-provider-filter').addEventListener('change', loadActivity); $('#refresh-activity').addEventListener('click', loadActivity);
-$('#export-activity').addEventListener('click', () => { location.href = '/admin/activity/export'; });
-$('#import-activity').addEventListener('click', () => $('#activity-import-file').click());
+const activityDataDialog = $('#activity-data-dialog');
+let activityImportBytes = null;
+function formatBytes(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB']; let value = bytes / 1024; let unit = units.shift(); while (value >= 1024 && units.length) { value /= 1024; unit = units.shift(); } return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`; }
+function formatActivityDate(timestamp) { return timestamp == null ? 'No records' : new Date(timestamp * 1000).toLocaleString(); }
+function renderDataSummary(target, items) { target.innerHTML = items.map(([label, value, tone]) => `<div class="${tone || ''}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join(''); }
+function activitySince(range) { const seconds = Number(range); return seconds ? Math.floor(Date.now() / 1000) - seconds : 0; }
+async function loadActivityExportPreview() {
+  const target = $('#activity-export-summary'); target.innerHTML = '<p>Calculating export…</p>'; $('#activity-export-error').textContent = '';
+  const response = await fetch(`/admin/activity/export/preview?since=${activitySince($('#activity-export-range').value)}`);
+  if (!response.ok) return showApiError(response, $('#activity-export-error'));
+  const summary = await response.json();
+  renderDataSummary(target, [['Records', summary.records.toLocaleString()], ['Estimated file size', formatBytes(summary.estimated_bytes)], ['Oldest record', formatActivityDate(summary.oldest_at)], ['Newest record', formatActivityDate(summary.newest_at)]]);
+  $('#export-activity').disabled = summary.records === 0;
+}
+async function loadActivityStorage() {
+  const [settingsResponse, summaryResponse] = await Promise.all([fetch('/admin/activity/settings'), fetch('/admin/activity/export/preview?since=0')]);
+  if (!settingsResponse.ok || !summaryResponse.ok) return;
+  const settings = await settingsResponse.json(); const summary = await summaryResponse.json();
+  $('#activity-retention-days').value = settings.retention_days;
+  renderDataSummary($('#activity-storage-summary'), [['Currently retained', `${summary.records.toLocaleString()} records`], ['Estimated disk data', formatBytes(summary.estimated_bytes)], ['Oldest retained record', formatActivityDate(summary.oldest_at)], ['Retention limit', `${settings.retention_days} days`]]);
+}
+function showActivityDataTab(tab) {
+  $$('.activity-data-tabs button').forEach(button => button.classList.toggle('active', button.dataset.activityDataTab === tab));
+  $$('[data-activity-data-panel]').forEach(panel => panel.hidden = panel.dataset.activityDataPanel !== tab);
+  if (tab === 'export') loadActivityExportPreview(); if (tab === 'storage') loadActivityStorage();
+}
+$('#manage-activity-data').addEventListener('click', () => { showActivityDataTab('export'); activityDataDialog.showModal(); });
+$$('.close-activity-data').forEach(button => button.addEventListener('click', () => activityDataDialog.close()));
+$('.activity-data-tabs').addEventListener('click', event => { const button = event.target.closest('[data-activity-data-tab]'); if (button) showActivityDataTab(button.dataset.activityDataTab); });
+$('#activity-export-range').addEventListener('change', loadActivityExportPreview);
+$('#export-activity').addEventListener('click', () => { location.href = `/admin/activity/export?since=${activitySince($('#activity-export-range').value)}`; });
+$('#choose-activity-import').addEventListener('click', () => { $('#activity-import-file').value = ''; $('#activity-import-file').click(); });
 $('#activity-import-file').addEventListener('change', async event => {
   const file = event.target.files[0]; if (!file) return;
-  if (!confirm(`Import activity from “${file.name}”?\n\nExisting request IDs are skipped, so importing the same file more than once is safe.`)) { event.target.value = ''; return; }
-  const button = $('#import-activity'); button.disabled = true; button.textContent = 'Importing…';
-  const response = await fetch('/admin/activity/import', {method: 'POST', headers: {'content-type': 'application/json'}, body: await file.arrayBuffer()});
-  if (response.ok) { const result = await response.json(); alert(`Activity import complete.\n\n${result.imported} imported\n${result.duplicates} duplicates skipped\n${result.expired} outside retention skipped`); await loadActivity(); }
-  else await showApiError(response, null);
-  event.target.value = ''; button.disabled = false; button.textContent = 'Import';
+  $('#activity-import-error').textContent = ''; $('#import-activity').disabled = true;
+  if (file.size > 64 * 1024 * 1024) { activityImportBytes = null; $('#activity-import-summary').hidden = true; $('#activity-import-error').textContent = 'This file is larger than the 64 MB import limit.'; return; }
+  activityImportBytes = await file.arrayBuffer();
+  const fileInfo = $('#activity-import-file-info'); fileInfo.hidden = false; fileInfo.innerHTML = `<strong>${escapeHtml(file.name)}</strong><span>${formatBytes(file.size)}</span>`;
+  const summary = $('#activity-import-summary'); summary.hidden = false; summary.innerHTML = '<p>Validating file and checking existing records…</p>';
+  const response = await fetch('/admin/activity/import/preview', {method: 'POST', headers: {'content-type': 'application/json'}, body: activityImportBytes});
+  if (!response.ok) { summary.hidden = true; activityImportBytes = null; return showApiError(response, $('#activity-import-error')); }
+  const result = await response.json();
+  renderDataSummary(summary, [['Records in file', result.total.toLocaleString()], ['New records', result.imported.toLocaleString(), 'positive'], ['Already present', result.duplicates.toLocaleString()], ['Outside retention', result.expired.toLocaleString(), result.expired ? 'warning' : ''], ['Oldest record', formatActivityDate(result.oldest_at)], ['Newest record', formatActivityDate(result.newest_at)]]);
+  $('#import-activity').disabled = result.imported === 0;
+  $('#import-activity').textContent = result.imported ? `Import ${result.imported.toLocaleString()} new records` : 'Nothing new to import';
+});
+$('#import-activity').addEventListener('click', async () => {
+  if (!activityImportBytes) return; const button = $('#import-activity'); button.disabled = true; button.textContent = 'Importing…';
+  const response = await fetch('/admin/activity/import', {method: 'POST', headers: {'content-type': 'application/json'}, body: activityImportBytes});
+  if (!response.ok) { button.disabled = false; return showApiError(response, $('#activity-import-error')); }
+  const result = await response.json(); activityImportBytes = null;
+  renderDataSummary($('#activity-import-summary'), [['Imported', result.imported.toLocaleString(), 'positive'], ['Duplicates skipped', result.duplicates.toLocaleString()], ['Outside retention', result.expired.toLocaleString()], ['Result', 'Import complete', 'positive']]);
+  button.textContent = 'Import complete'; await loadActivity();
+});
+$('#save-activity-retention').addEventListener('click', async () => {
+  const days = Number($('#activity-retention-days').value); const button = $('#save-activity-retention'); $('#activity-retention-error').textContent = '';
+  if (!Number.isInteger(days) || days < 1 || days > 3650) { $('#activity-retention-error').textContent = 'Enter a retention period between 1 and 3650 days.'; return; }
+  button.disabled = true; button.textContent = 'Saving…';
+  const response = await fetch('/admin/activity/settings', {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({retention_days: days})});
+  if (!response.ok) await showApiError(response, $('#activity-retention-error')); else { await loadActivityStorage(); await loadActivity(); }
+  button.disabled = false; button.textContent = 'Save retention';
 });
 async function loadDashboard() { const since = Math.floor(Date.now() / 1000) - 86400; const stats = await fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()); $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens); $('#home-providers').replaceChildren(...providers.map(provider => { const item = document.createElement('button'); item.textContent = `${provider.name} · ${provider.discovered_models.length} models`; item.addEventListener('click', () => { selectedProviderId = provider.id; showView('providers'); }); return item; })); }
 

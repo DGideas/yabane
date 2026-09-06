@@ -5,15 +5,17 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 ## Service and administration
 
 * Yabane loads local environment configuration from `.env` when present while preserving variables already supplied by the process environment.
-* `yabane --help` and `yabane --version` print information and exit without loading configuration or starting the server; unknown or malformed command-line arguments fail visibly.
+* `yabane --help` and `yabane --version` print help or Git commit/time build information and exit without loading configuration or starting the server; Yabane does not present an application version, and unknown or malformed command-line arguments fail visibly.
 * Yabane listens on the address passed through `--addr`, defaulting to `127.0.0.1:8080`; the listen address is intentionally not configured through an environment variable.
 * `GET /healthz` returns `200` and does not require a gateway API key.
 * The web admin console uses a separate administrator session and never accepts gateway API keys as admin authentication.
 * Admin HTML, CSS, JavaScript, and the Yabane SVG application icon are embedded in the binary and disable browser caching so a restarted local binary does not leave stale console resources.
+* The console exposes the Yabane Git commit, commit time, and bundled MIT license information from a desktop sidebar footer and the account menu on narrow layouts; it does not present an application version. The About dialog uses an animated monochrome, faceted Yabane mark while respecting reduced-motion preferences.
 * On first use, the console requires creation of the single administrator with username, email, and a password of at least eight characters.
 * After setup, unauthenticated visitors see the login screen and can sign in with username or email plus password.
 * Administrator passwords are persisted only as Argon2 password hashes.
 * Successful setup or login creates an HttpOnly, SameSite=Strict session cookie with a 24-hour server-enforced lifetime; expired sessions are removed from memory, and logout revokes the current session.
+* A Help button beside the top-right administrator avatar opens a getting-started guide that uses current Gateway URLs, discovered `provider/model` IDs, public route aliases, and Gateway API keys to generate copyable OpenCode, generic OpenAI-compatible Agent, and curl setup instructions without exposing upstream credentials.
 * The top-right administrator avatar opens an account menu showing the signed-in username and email, with explicit Manage profile and Sign out actions.
 * An administrator session can update its username and email from the profile dialog; changing the password additionally requires the correct current password and a new password of at least eight characters, and Gateway API keys cannot modify the administrator profile.
 * Protected `/admin/*` APIs return `401` without a valid administrator session, while session, setup, login, static resources, and health remain public.
@@ -27,6 +29,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Settings search finds top-level settings, provider-model discovery, gateway-key generation, and configured providers, visibly selects the active result, supports Arrow Up/Down, Home/End, Enter, and Escape from the combobox, then navigates to the selected result.
 * Home, Providers, provider details, model routing, API access, Activity, and login have distinct browser URLs that can be opened directly and support browser Back/Forward navigation.
 * Authenticated console pages use the full width available beside the sidebar with responsive horizontal gutters, rather than remaining capped to a narrow fixed content column on wide displays.
+* Console dialogs remain contained within desktop, tablet, and iOS-sized visual viewports, use one-column controls where needed, provide touch-sized actions, account for safe-area insets, and keep headers and actions reachable while long content scrolls; responsive E2E runs desktop/tablet in Chrome and iPhone-sized layouts in WebKit.
 * The authenticated Home page summarizes 24-hour requests and token usage and links to configured providers.
 * Gateway API keys authenticate inference requests and model listing with provider scopes, while Management API keys authenticate the control API; administrator profile and Management-key endpoints require a browser session.
 * Each administrator can create named Management API keys beginning with `yab_mgmt_`, with optional expiry; the secret is shown once, only its hash is persisted, last-use times are tracked, and revocation is immediate.
@@ -95,6 +98,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * An administrator can configure one preferred Endpoint for a discovered model and protocol within a Provider; inference uses that preference before the first-compatible-endpoint default, while explicit public model routes remain higher priority.
 * Stale model Endpoint preferences are removed when discovery no longer reports the model on that compatible Endpoint, and deleting an Endpoint removes its preferences.
 * An explicit model route can select a compatible endpoint different from the first endpoint.
+* Endpoint base URLs identify a shared API root; configuration rejects operation-specific URLs ending in `/chat/completions`, `/responses`, `/messages`, or `/models`, while nested roots such as OpenCode Go’s `/zen/go/v1` remain valid for model discovery and inference.
 * Each endpoint can optionally route both model-discovery and inference traffic through a `socks5://` or `socks5h://` proxy.
 * SOCKS5 proxy settings using another URL scheme are rejected with `400`.
 * An endpoint can require an upstream API key or operate without one.
@@ -110,7 +114,9 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 
 * A model route creates a public model alias that clients call without a `provider/` prefix.
 * A route target explicitly maps that public pattern to an upstream provider, endpoint, API key, and the exact model ID understood by that upstream; the upstream model does not include Yabane’s Provider prefix, though native namespaced IDs such as `google/model-name` remain valid.
-* The route editor explains upstream model IDs, uses a model discovered from the selected endpoint as its example when available, lets administrators add and remove weighted destinations while retaining at least one destination, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
+* The route editor defaults to the simple alias task with only destination and upstream model fields, explains upstream model IDs, offers models discovered from the selected Endpoint as optional input suggestions, clearly permits custom IDs that were not discovered, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
+* Multi-destination traffic splitting is progressively disclosed behind an explicit action; only then does the editor show percentage shares, require a 100% total, and allow destinations to be added or removed while retaining at least one.
+* Existing model routes can be opened in the route editor, including all weighted destinations, and saved with either the original or a changed public model pattern.
 * A model route can contain multiple positive-weight targets and selects them using weighted round robin.
 * A model route can be an exact model ID or one trailing prefix wildcard.
 * Exact model routes take precedence over wildcard routes.
@@ -132,7 +138,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Successful model discovery and the latest discovery status are persisted for the admin console.
 * `GET /v1/models` returns an OpenAI-compatible list envelope.
 * Model discovery concurrently queries configured provider endpoints and enabled upstream keys.
-* OpenAI-compatible discovery accepts both `{ "data": [...] }` and a top-level model array.
+* OpenAI-compatible discovery accepts both `{ "data": [...] }` and a top-level model array; nested OpenAI-compatible API roots such as `https://opencode.ai/zen/go/v1` resolve discovery at that root’s `/models` resource.
 * Anthropic discovery uses the Anthropic authentication and version headers.
 * Models are merged across endpoints, deduplicated by ID, and sorted while retaining endpoint availability metadata for internal routing.
 * Returned model IDs use the `provider/model` form without duplicating an existing provider prefix.
@@ -150,10 +156,13 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * The Activity Overview presents request, total-token, cache-hit, success-rate, streaming, and average-latency summaries with sparklines, a time-bucketed request/token chart, and ranked Provider and model breakdowns.
 * Activity can be filtered by time range and Provider, refreshed on demand, and switched between the visual Overview and a searchable Request explorer with status filtering and detailed request metadata.
 * Activity remains immediately queryable in memory and is batch-written after 10 records or 60 seconds rather than writing every request synchronously.
-* Normal Activity flushes append JSON Lines instead of rewriting the full history; each periodic flush atomically compacts records older than `YABANE_ACTIVITY_RETENTION_DAYS`, defaulting to 30 days, even when no new requests arrive.
+* Normal Activity flushes append JSON Lines instead of rewriting the full history; each periodic flush atomically compacts records older than the persisted retention policy, defaulting initially to 30 days, even when no new requests arrive.
 * Pending Activity records are flushed when Yabane completes graceful shutdown.
-* An administrator can export retained Activity as a versioned Yabane JSON file and import it into another instance without requiring matching Provider or Endpoint configuration; imported routing metadata remains visible as originally recorded.
-* Every installation persists a random Activity instance ID; Activity import is idempotent by source instance ID plus request ID, so repeated and transitive imports are skipped without treating coincident request IDs from different instances as the same record. Records outside the destination retention window are reported and skipped, accepted records are atomically persisted, and the result reports imported, duplicate, expired, and total counts.
+* Activity data management uses a dedicated dialog rather than immediate Import/Export actions: export requires choosing a time range and previews record count, estimated size, and oldest/newest timestamps before download.
+* An administrator can export retained Activity as a timestamp-named, versioned Yabane JSON file and import it into another instance without requiring matching Provider or Endpoint configuration; imported routing metadata remains visible as originally recorded.
+* Before an Activity import writes anything, the console validates the selected file and previews its size plus total, new, already-present, and outside-retention record counts; invalid files remain visibly rejected, and the completed import reports its final outcome in the same dialog.
+* Every installation persists a random Activity instance ID; Activity import is idempotent by source instance ID plus request ID, so repeated and transitive imports are skipped without treating coincident request IDs from different instances as the same record. Records outside the destination retention window are reported and skipped, accepted records are atomically persisted, and preview and import results report imported, duplicate, expired, and total counts.
+* Activity retention defaults to 30 days or a valid initial `YABANE_ACTIVITY_RETENTION_DAYS` value from 1 to 3650, can be changed and persisted from the console, and continuously compacts both memory and `data/activity.jsonl`; invalid initial values fail startup visibly, and reducing retention immediately excludes and removes expired records.
 
 ## Admin data safety
 

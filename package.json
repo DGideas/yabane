@@ -1,0 +1,25 @@
+{
+  "name": "yabane",
+  "private": true,
+  "description": "A clear, reliable gateway to every LLM.",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test:responsive": "node tests/responsive-ui.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DGideas/yabane.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/DGideas/yabane/issues"
+  },
+  "homepage": "https://github.com/DGideas/yabane#readme",
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

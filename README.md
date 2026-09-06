@@ -27,7 +27,7 @@ cp .env.example .env
 cargo run --release
 ```
 
-Yabane automatically loads local environment variables from the repository-root `.env` file, which is ignored by Git. Open <http://127.0.0.1:8080>, add a provider, then send requests to Yabane. Use `yabane --addr 127.0.0.1:9090` to change the listen address, or `yabane --help` to see all command-line options. Logs default to `info`; set `YABANE_LOG` or pass `--log` to use another tracing filter. Request activity metadata is buffered and persisted to `data/activity.jsonl`; set `YABANE_ACTIVITY_RETENTION_DAYS` to change the default 30-day retention.
+Yabane automatically loads local environment variables from the repository-root `.env` file, which is ignored by Git. Open <http://127.0.0.1:8080>, add a provider, then send requests to Yabane. Use `yabane --addr 127.0.0.1:9090` to change the listen address, or `yabane --help` to see all command-line options. Logs default to `info`; set `YABANE_LOG` or pass `--log` to use another tracing filter. Request activity metadata is buffered and persisted to `data/activity.jsonl`. Retention is configurable from Activity → Manage data and continuously compacts older records; `YABANE_ACTIVITY_RETENTION_DAYS` changes the initial 30-day default before a setting has been saved.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \

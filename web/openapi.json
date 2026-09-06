@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Yabane API",
-    "version": "1.0.0",
+    "version": "unversioned",
     "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured upstream providers. Control endpoints manage providers, endpoints, upstream keys, model routes, gateway access, and activity. Every action available in the web console is available here."
   },
   "servers": [
@@ -215,6 +215,15 @@
           }
         }
       },
+      "ActivitySettings": {
+        "type":"object","required":["retention_days"],"properties":{"retention_days":{"type":"integer","minimum":1,"maximum":3650}}
+      },
+      "ActivitySummary": {
+        "type":"object","required":["records","estimated_bytes","retention_days"],"properties":{"records":{"type":"integer"},"estimated_bytes":{"type":"integer"},"oldest_at":{"type":"integer","nullable":true},"newest_at":{"type":"integer","nullable":true},"retention_days":{"type":"integer"}}
+      },
+      "ActivityImportResult": {
+        "type":"object","required":["imported","duplicates","expired","total"],"properties":{"imported":{"type":"integer"},"duplicates":{"type":"integer"},"expired":{"type":"integer"},"total":{"type":"integer"},"oldest_at":{"type":"integer","nullable":true},"newest_at":{"type":"integer","nullable":true}}
+      },
       "RequestLog": {
         "type": "object",
         "properties": {
@@ -339,6 +348,35 @@
         "responses": {
           "200": {
             "description": "ok"
+          }
+        }
+      }
+    },
+    "/about": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Application build and license information",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Yabane commit, commit time, and bundled license",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["name", "commit", "commit_time", "license", "license_text"],
+                  "properties": {
+                    "name": {"type": "string"},
+                    "commit": {"type": "string"},
+                    "commit_time": {"type": "string", "description": "ISO 8601 Git commit time, or unknown when unavailable"},
+                    "license": {"type": "string"},
+                    "license_text": {"type": "string"}
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1631,6 +1669,68 @@
       }
     },
     "/admin/routes/{pattern}": {
+      "patch": {
+        "tags": [
+          "Model routes"
+        ],
+        "summary": "Update a public model route",
+        "description": "Replaces the route identified by the current pattern. The request may also change the public pattern.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "pattern",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["pattern", "targets"],
+                "properties": {
+                  "pattern": {
+                    "type": "string",
+                    "description": "Exact model ID or one trailing * wildcard."
+                  },
+                  "targets": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["provider_id", "endpoint_id", "api_key_id", "upstream_model", "weight"],
+                      "properties": {
+                        "provider_id": {"type": "string"},
+                        "endpoint_id": {"type": "string"},
+                        "api_key_id": {"type": "string"},
+                        "upstream_model": {"type": "string"},
+                        "weight": {"type": "integer", "minimum": 1}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {"$ref": "#/components/responses/NoContent"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      },
       "delete": {
         "tags": [
           "Model routes"
@@ -2222,6 +2322,7 @@
         ],
         "summary": "Export retained activity records",
         "description": "Downloads a versioned portable JSON snapshot containing routing metadata and usage, never prompt or response content.",
+        "parameters": [{"name":"since","in":"query","schema":{"type":"integer"},"description":"Include records at or after this Unix timestamp; omit for all retained records."}],
         "security": [
           {
             "managementKey": []
@@ -2278,6 +2379,24 @@
             "$ref": "#/components/responses/Unauthorized"
           }
         }
+      }
+    },
+    "/admin/activity/export/preview": {
+      "get": {
+        "tags": ["Activity"], "summary": "Preview an activity export",
+        "parameters": [{"name":"since","in":"query","schema":{"type":"integer"}}],
+        "responses": {"200":{"description":"Export record count, approximate size, time bounds, and retention","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySummary"}}}},"401":{"$ref":"#/components/responses/Unauthorized"}}
+      }
+    },
+    "/admin/activity/settings": {
+      "get": {"tags":["Activity"],"summary":"Get activity retention","responses":{"200":{"description":"Retention settings","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"401":{"$ref":"#/components/responses/Unauthorized"}}},
+      "patch": {"tags":["Activity"],"summary":"Update and immediately enforce activity retention","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"responses":{"200":{"description":"Saved retention settings","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"}}}
+    },
+    "/admin/activity/import/preview": {
+      "post": {
+        "tags":["Activity"],"summary":"Validate and classify an activity import without writing data","description":"Returns the same idempotency and retention classification used by import.",
+        "requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}},
+        "responses":{"200":{"description":"Prospective import counts","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivityImportResult"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"}}
       }
     },
     "/admin/activity/import": {
@@ -2343,21 +2462,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "imported": {
-                      "type": "integer"
-                    },
-                    "duplicates": {
-                      "type": "integer"
-                    },
-                    "expired": {
-                      "type": "integer"
-                    },
-                    "total": {
-                      "type": "integer"
-                    }
-                  }
+                  "$ref": "#/components/schemas/ActivityImportResult"
                 }
               }
             }

@@ -32,10 +32,10 @@ Options:
   --addr <ADDRESS>  Listen address [default: 127.0.0.1:8080]
   --log <FILTER>    Tracing filter [env: YABANE_LOG] [default: info]
   -h, --help        Print help
-  -V, --version     Print version
+  -V, --version     Print commit information
 
 Environment:
-  YABANE_ACTIVITY_RETENTION_DAYS  Activity retention in days [default: 30]
+  YABANE_ACTIVITY_RETENTION_DAYS  Initial Activity retention before a setting is saved [default: 30]
   TURNSTILE_SITE_KEY              Cloudflare Turnstile widget site key
   TURNSTILE_SECRET                Cloudflare Turnstile server secret
   TURNSTILE_HOSTNAMES             Comma-separated accepted hostnames
@@ -66,7 +66,11 @@ impl Cli {
                     std::process::exit(0);
                 }
                 "-V" | "--version" => {
-                    println!("yabane {}", env!("CARGO_PKG_VERSION"));
+                    println!(
+                        "yabane {} ({})",
+                        env!("YABANE_GIT_COMMIT"),
+                        env!("YABANE_GIT_COMMIT_TIME")
+                    );
                     std::process::exit(0);
                 }
                 "--addr" => cli.address = Some(required_value(&mut args, "--addr")),
@@ -187,6 +191,7 @@ async fn main() {
             get(web::ubuntu_sans_medium),
         )
         .route("/healthz", get(web::health))
+        .route("/about", get(web::about))
         .route("/admin/session", get(admin_user::session))
         .route("/admin/turnstile-config", get(admin_user::turnstile_config))
         .route("/admin/setup", post(admin_user::setup))
