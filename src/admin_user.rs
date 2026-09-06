@@ -353,13 +353,17 @@ pub async fn delete_management_api_key(
     let Some(user) = user.as_mut() else {
         return api_error(StatusCode::NOT_FOUND, "Administrator is not configured");
     };
-    let before = user.management_api_keys.len();
-    user.management_api_keys.retain(|key| key.id != id);
-    if user.management_api_keys.len() == before {
+    let mut updated = user.clone();
+    let before = updated.management_api_keys.len();
+    updated.management_api_keys.retain(|key| key.id != id);
+    if updated.management_api_keys.len() == before {
         return api_error(StatusCode::NOT_FOUND, "Management API key not found");
     }
-    match save_admin(user).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match save_admin(&updated).await {
+        Ok(()) => {
+            *user = updated;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Could not revoke management API key: {err}"),

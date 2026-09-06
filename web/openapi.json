@@ -53,12 +53,12 @@
       "gatewayKey": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Gateway API key (sk-…) for inference endpoints. Provider scopes apply."
+        "description": "Gateway API key (sk-\u2026) for inference endpoints. Provider scopes apply."
       },
       "managementKey": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Management API key (yab_mgmt_…) for control endpoints."
+        "description": "Management API key (yab_mgmt_\u2026) for control endpoints."
       },
       "adminSession": {
         "type": "apiKey",
@@ -186,6 +186,32 @@
           "model_discovery_error": {
             "type": "string",
             "nullable": true
+          },
+          "model_endpoint_preferences": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "model",
+                "api_type",
+                "endpoint_id"
+              ],
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "api_type": {
+                  "type": "string",
+                  "enum": [
+                    "openai_compatible",
+                    "anthropic"
+                  ]
+                },
+                "endpoint_id": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       },
@@ -231,6 +257,11 @@
           },
           "streaming": {
             "type": "boolean"
+          },
+          "source_instance_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Originating instance for imported records; omitted for records created by this instance."
           }
         }
       },
@@ -1159,7 +1190,7 @@
                   "base_url": "https://api.example.com/v1",
                   "socks5_proxy": null,
                   "requires_api_key": true,
-                  "api_key": "sk-…"
+                  "api_key": "sk-\u2026"
                 }
               }
             }
@@ -1358,7 +1389,7 @@
                 "base_url": "https://api.example.com/v1",
                 "socks5_proxy": null,
                 "requires_api_key": true,
-                "api_key": "sk-…"
+                "api_key": "sk-\u2026"
               }
             }
           }
@@ -1431,7 +1462,7 @@
               "example": {
                 "endpoint_id": "openai",
                 "name": "Production key",
-                "secret": "sk-…",
+                "secret": "sk-\u2026",
                 "weight": 100
               }
             }
@@ -1854,6 +1885,488 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers/{provider_id}/endpoints/{endpoint_id}": {
+      "delete": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Delete an API endpoint and its route destinations",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Update an API endpoint",
+        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "id",
+                  "api_type",
+                  "base_url",
+                  "requires_api_key"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Must equal the existing endpoint ID."
+                  },
+                  "api_type": {
+                    "type": "string",
+                    "enum": [
+                      "openai_compatible",
+                      "anthropic"
+                    ]
+                  },
+                  "base_url": {
+                    "type": "string"
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "requires_api_key": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "example": {
+                "id": "regional",
+                "api_type": "openai_compatible",
+                "base_url": "https://api.example.com/v1",
+                "socks5_proxy": "socks5h://127.0.0.1:1080",
+                "requires_api_key": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers/{provider_id}/endpoints/{endpoint_id}/traffic": {
+      "patch": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Set traffic distribution across enabled endpoint API keys",
+        "description": "Set one positive integer percentage for every enabled key. Percentages must total 100.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "weights"
+                ],
+                "properties": {
+                  "weights": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "key_id",
+                        "weight"
+                      ],
+                      "properties": {
+                        "key_id": {
+                          "type": "string"
+                        },
+                        "weight": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    },
+                    "description": "Every enabled key exactly once; integer weights must total 100."
+                  }
+                }
+              },
+              "example": {
+                "weights": [
+                  {
+                    "key_id": "primary",
+                    "weight": 75
+                  },
+                  {
+                    "key_id": "secondary",
+                    "weight": 25
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}/model-endpoint-preferences": {
+      "patch": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Set preferred endpoints for shared discovered models",
+        "description": "One preferred endpoint may be configured per model and protocol. An empty list restores automatic first-compatible-endpoint routing.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "preferences"
+                ],
+                "properties": {
+                  "preferences": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "model",
+                        "api_type",
+                        "endpoint_id"
+                      ],
+                      "properties": {
+                        "model": {
+                          "type": "string"
+                        },
+                        "api_type": {
+                          "type": "string",
+                          "enum": [
+                            "openai_compatible",
+                            "anthropic"
+                          ]
+                        },
+                        "endpoint_id": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": {
+                "preferences": [
+                  {
+                    "model": "shared-model",
+                    "api_type": "openai_compatible",
+                    "endpoint_id": "regional"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/activity/export": {
+      "get": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Export retained activity records",
+        "description": "Downloads a versioned portable JSON snapshot containing routing metadata and usage, never prompt or response content.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Yabane activity export file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "format",
+                    "version",
+                    "exported_at",
+                    "records"
+                  ],
+                  "properties": {
+                    "format": {
+                      "type": "string",
+                      "enum": [
+                        "yabane-activity"
+                      ]
+                    },
+                    "version": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "exported_at": {
+                      "type": "integer"
+                    },
+                    "records": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RequestLog"
+                      }
+                    },
+                    "instance_id": {
+                      "type": "string",
+                      "description": "Stable random ID of the exporting Yabane installation."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/activity/import": {
+      "post": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Import a portable activity export idempotently",
+        "description": "Records are independent of current Provider configuration. Idempotency uses source instance ID plus request ID, including records forwarded through another instance; repeated records and records outside retention are skipped.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "format",
+                  "version",
+                  "records"
+                ],
+                "properties": {
+                  "format": {
+                    "type": "string",
+                    "enum": [
+                      "yabane-activity"
+                    ]
+                  },
+                  "version": {
+                    "type": "integer",
+                    "enum": [
+                      1
+                    ]
+                  },
+                  "exported_at": {
+                    "type": "integer"
+                  },
+                  "records": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/RequestLog"
+                    }
+                  },
+                  "instance_id": {
+                    "type": "string",
+                    "description": "Stable source installation ID used with request_id for idempotency."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Import counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "imported": {
+                      "type": "integer"
+                    },
+                    "duplicates": {
+                      "type": "integer"
+                    },
+                    "expired": {
+                      "type": "integer"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
           }
         }
       }

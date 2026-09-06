@@ -1,7 +1,8 @@
 use axum::{
     Router,
-    extract::{Path, State},
-    http::StatusCode,
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -12,7 +13,9 @@ use tracing::error;
 use crate::{
     admin_user,
     auth::{self, GatewayApiKey, GatewayApiKeyView, generate_secret, hash_secret, now, save_auth},
-    config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider, save_providers},
+    config::{
+        ApiEndpoint, ApiKey, ApiType, AppState, ModelEndpointPreference, Provider, save_providers,
+    },
     error::api_error,
     models, routes,
 };
@@ -36,15 +39,32 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/admin/routes/{pattern}", delete(delete_global_route))
         .route("/admin/activity/logs", get(activity_logs))
         .route("/admin/activity/stats", get(activity_stats))
+        .route("/admin/activity/export", get(export_activity))
+        .route(
+            "/admin/activity/import",
+            post(import_activity).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route(
             "/admin/providers/{id}",
             patch(update_provider_options).delete(delete_provider),
+        )
+        .route(
+            "/admin/providers/{id}/model-endpoint-preferences",
+            patch(update_model_endpoint_preferences),
         )
         .route(
             "/admin/providers/{id}/models/refresh",
             post(models::refresh_provider),
         )
         .route("/admin/providers/{id}/endpoints", post(create_endpoint))
+        .route(
+            "/admin/providers/{provider_id}/endpoints/{endpoint_id}",
+            patch(update_endpoint).delete(delete_endpoint),
+        )
+        .route(
+            "/admin/providers/{provider_id}/endpoints/{endpoint_id}/traffic",
+            patch(update_endpoint_traffic),
+        )
         .route("/admin/providers/{id}/keys", post(create_api_key))
         .route(
             "/admin/providers/{provider_id}/endpoints/{endpoint_id}/keys/{key_id}",
@@ -78,6 +98,15 @@ struct CreateEndpoint {
 }
 
 #[derive(Deserialize)]
+struct UpdateEndpoint {
+    id: Option<String>,
+    api_type: ApiType,
+    base_url: String,
+    socks5_proxy: Option<String>,
+    requires_api_key: bool,
+}
+
+#[derive(Deserialize)]
 struct CreateApiKey {
     endpoint_id: String,
     name: String,
@@ -89,6 +118,17 @@ struct CreateApiKey {
 struct UpdateApiKey {
     weight: Option<u32>,
     enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct UpdateEndpointTraffic {
+    weights: Vec<ApiKeyWeight>,
+}
+
+#[derive(Deserialize)]
+struct ApiKeyWeight {
+    key_id: String,
+    weight: u32,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +173,7 @@ struct ProviderView {
     endpoints: Vec<EndpointView>,
     discovered_models: Vec<String>,
     model_endpoints: std::collections::HashMap<String, Vec<String>>,
+    model_endpoint_preferences: Vec<ModelEndpointPreference>,
     models_discovered_at: Option<u64>,
     model_discovery_error: Option<String>,
 }
@@ -400,6 +441,53 @@ async fn activity_stats(
     axum::Json(state.activity.stats(query.since.unwrap_or(0)).await)
 }
 
+async fn export_activity(State(state): State<AppState>) -> Response {
+    let records = state.activity.export_records().await;
+    let export = crate::activity::ActivityExport {
+        format: "yabane-activity",
+        version: 1,
+        instance_id: state.activity.instance_id(),
+        exported_at: now(),
+        records: &records,
+    };
+    let body = serde_json::to_vec(&export).expect("serialize activity export");
+    (
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"yabane-activity.json\"",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+async fn import_activity(State(state): State<AppState>, body: Bytes) -> Response {
+    const MAX_IMPORT_SIZE: usize = 64 * 1024 * 1024;
+    if body.len() > MAX_IMPORT_SIZE {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Activity import is too large",
+        );
+    }
+    let import: crate::activity::ActivityImport = match serde_json::from_slice(&body) {
+        Ok(import) => import,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "Activity import must be a valid Yabane activity JSON file",
+            );
+        }
+    };
+    match state.activity.import(import).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(message) => api_error(StatusCode::BAD_REQUEST, message),
+    }
+}
+
 async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers = state.providers.read().await;
     let mut providers: Vec<_> = providers.values().map(provider_view).collect();
@@ -439,9 +527,15 @@ fn provider_view(provider: &Provider) -> ProviderView {
             .collect(),
         discovered_models: provider.discovered_models.clone(),
         model_endpoints: provider.model_endpoints.clone(),
+        model_endpoint_preferences: provider.model_endpoint_preferences.clone(),
         models_discovered_at: provider.models_discovered_at,
         model_discovery_error: provider.model_discovery_error.clone(),
     }
+}
+
+#[derive(Deserialize)]
+struct UpdateModelEndpointPreferences {
+    preferences: Vec<ModelEndpointPreference>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +546,49 @@ struct ProviderOptions {
     extra_body: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     defaults_endpoint_ids: Vec<String>,
+}
+
+async fn update_model_endpoint_preferences(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Json(input): axum::Json<UpdateModelEndpointPreferences>,
+) -> Response {
+    let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let Some(provider) = updated.get_mut(&id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    let mut unique = std::collections::HashSet::new();
+    for preference in &input.preferences {
+        if !unique.insert((preference.model.as_str(), preference.api_type)) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "Each model and API type can have only one preferred endpoint",
+            );
+        }
+        let available = provider
+            .model_endpoints
+            .get(&preference.model)
+            .is_some_and(|endpoint_ids| endpoint_ids.contains(&preference.endpoint_id));
+        let compatible = provider.endpoints.iter().any(|endpoint| {
+            endpoint.id == preference.endpoint_id && endpoint.api_type == preference.api_type
+        });
+        if !available || !compatible {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Endpoint '{}' does not expose model '{}' through the selected API type",
+                    preference.endpoint_id, preference.model
+                ),
+            );
+        }
+    }
+    provider.model_endpoint_preferences = input.preferences;
+    let response = persist_or_error(&updated).await;
+    if response.status().is_success() {
+        *providers = updated;
+    }
+    response
 }
 
 async fn update_provider_options(
@@ -557,6 +694,7 @@ async fn create_provider(
         }],
         discovered_models: Vec::new(),
         model_endpoints: std::collections::HashMap::new(),
+        model_endpoint_preferences: Vec::new(),
         models_discovered_at: None,
         model_discovery_error: None,
     };
@@ -584,15 +722,29 @@ async fn create_provider(
 
 async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let mut providers = state.providers.write().await;
-    let mut updated = providers.clone();
-    if updated.remove(&id).is_none() {
+    let mut updated_providers = providers.clone();
+    if updated_providers.remove(&id).is_none() {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
     }
-    let response = persist_or_error(&updated).await;
-    if response.status().is_success() {
-        *providers = updated;
+
+    let mut routes = state.routes.0.write().await;
+    let mut updated_routes = routes.clone();
+    for route in &mut updated_routes {
+        route.targets.retain(|target| target.provider_id != id);
     }
-    response
+    updated_routes.retain(|route| !route.targets.is_empty());
+    if let Err(err) =
+        save_provider_and_routes(&updated_providers, &updated_routes, &providers).await
+    {
+        error!(%err, "failed to persist provider deletion");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not delete Provider and its model routes",
+        );
+    }
+    *providers = updated_providers;
+    *routes = updated_routes;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn create_endpoint(
@@ -649,6 +801,171 @@ async fn create_endpoint(
         api_keys,
         ..ApiEndpoint::default()
     });
+    let response = persist_or_error(&updated).await;
+    if response.status().is_success() {
+        *providers = updated;
+    }
+    drop(providers);
+    if response.status().is_success() {
+        spawn_provider_refresh(state, provider_id);
+    }
+    response
+}
+
+async fn update_endpoint(
+    State(state): State<AppState>,
+    Path((provider_id, endpoint_id)): Path<(String, String)>,
+    axum::Json(input): axum::Json<UpdateEndpoint>,
+) -> Response {
+    if input.base_url.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "Endpoint base URL is required");
+    }
+    if input.id.as_deref().is_some_and(|id| id != endpoint_id) {
+        return api_error(StatusCode::BAD_REQUEST, "Endpoint ID cannot be changed");
+    }
+    if let Err(message) = validate_socks5_proxy(input.socks5_proxy.as_deref()) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+
+    let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let Some(provider) = updated.get_mut(&provider_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    let Some(endpoint) = provider
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == endpoint_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
+    };
+    endpoint.api_type = input.api_type;
+    endpoint.base_url = input.base_url.trim().trim_end_matches('/').to_owned();
+    endpoint.socks5_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
+    endpoint.requires_api_key = input.requires_api_key;
+    endpoint.proxy_client = Default::default();
+    remove_endpoint_discovery(provider, &endpoint_id);
+    let response = persist_or_error(&updated).await;
+    if response.status().is_success() {
+        *providers = updated;
+    }
+    drop(providers);
+    if response.status().is_success() {
+        spawn_provider_refresh(state, provider_id);
+    }
+    response
+}
+
+async fn delete_endpoint(
+    State(state): State<AppState>,
+    Path((provider_id, endpoint_id)): Path<(String, String)>,
+) -> Response {
+    let mut providers = state.providers.write().await;
+    let mut updated_providers = providers.clone();
+    let Some(provider) = updated_providers.get_mut(&provider_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    let original_count = provider.endpoints.len();
+    provider
+        .endpoints
+        .retain(|endpoint| endpoint.id != endpoint_id);
+    if provider.endpoints.len() == original_count {
+        return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
+    }
+
+    remove_endpoint_discovery(provider, &endpoint_id);
+    if !provider.defaults_endpoint_ids.is_empty() {
+        provider
+            .defaults_endpoint_ids
+            .retain(|id| id != &endpoint_id);
+        if provider.defaults_endpoint_ids.is_empty() {
+            provider.extra_headers.clear();
+            provider.extra_body.clear();
+        }
+    }
+
+    let mut routes = state.routes.0.write().await;
+    let mut updated_routes = routes.clone();
+    for route in &mut updated_routes {
+        route.targets.retain(|target| {
+            target.provider_id != provider_id || target.endpoint_id != endpoint_id
+        });
+    }
+    updated_routes.retain(|route| !route.targets.is_empty());
+    if let Err(err) =
+        save_provider_and_routes(&updated_providers, &updated_routes, &providers).await
+    {
+        error!(%err, "failed to persist endpoint deletion");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not delete API endpoint",
+        );
+    }
+    *providers = updated_providers;
+    *routes = updated_routes;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_endpoint_traffic(
+    State(state): State<AppState>,
+    Path((provider_id, endpoint_id)): Path<(String, String)>,
+    axum::Json(input): axum::Json<UpdateEndpointTraffic>,
+) -> Response {
+    if input.weights.is_empty()
+        || input.weights.iter().any(|item| item.weight == 0)
+        || input
+            .weights
+            .iter()
+            .map(|item| u64::from(item.weight))
+            .sum::<u64>()
+            != 100
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Enabled API key traffic percentages must total 100",
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    if input
+        .weights
+        .iter()
+        .any(|item| !seen.insert(item.key_id.as_str()))
+    {
+        return api_error(StatusCode::BAD_REQUEST, "API key IDs must be unique");
+    }
+
+    let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let Some(provider) = updated.get_mut(&provider_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    let Some(endpoint) = provider
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == endpoint_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
+    };
+    let enabled_key_ids: std::collections::HashSet<_> = endpoint
+        .api_keys
+        .iter()
+        .filter(|key| key.enabled)
+        .map(|key| key.id.as_str())
+        .collect();
+    if seen != enabled_key_ids {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Traffic distribution must include every enabled API key exactly once",
+        );
+    }
+    for item in &input.weights {
+        endpoint
+            .api_keys
+            .iter_mut()
+            .find(|key| key.id == item.key_id)
+            .expect("validated API key")
+            .weight = item.weight;
+    }
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
         *providers = updated;
@@ -770,6 +1087,25 @@ async fn delete_api_key(
     *providers = updated_providers;
     *routes = updated;
     StatusCode::NO_CONTENT.into_response()
+}
+
+fn remove_endpoint_discovery(provider: &mut Provider, endpoint_id: &str) {
+    provider.model_endpoints.retain(|_, endpoint_ids| {
+        endpoint_ids.retain(|id| id != endpoint_id);
+        !endpoint_ids.is_empty()
+    });
+    provider
+        .model_endpoint_preferences
+        .retain(|preference| preference.endpoint_id != endpoint_id);
+    provider
+        .discovered_models
+        .retain(|model| provider.model_endpoints.contains_key(model));
+}
+
+fn spawn_provider_refresh(state: AppState, provider_id: String) {
+    tokio::spawn(async move {
+        let _ = models::refresh_provider(State(state), Path(provider_id)).await;
+    });
 }
 
 fn validate_extra_headers(

@@ -24,15 +24,90 @@ mod web;
 use auth::load_auth;
 use config::{AppState, load_providers};
 
+const HELP: &str = "Yabane — a clear, reliable gateway to every LLM
+
+Usage: yabane [OPTIONS]
+
+Options:
+  --addr <ADDRESS>  Listen address [default: 127.0.0.1:8080]
+  --log <FILTER>    Tracing filter [env: YABANE_LOG] [default: info]
+  -h, --help        Print help
+  -V, --version     Print version
+
+Environment:
+  YABANE_ACTIVITY_RETENTION_DAYS  Activity retention in days [default: 30]
+  TURNSTILE_SITE_KEY              Cloudflare Turnstile widget site key
+  TURNSTILE_SECRET                Cloudflare Turnstile server secret
+  TURNSTILE_HOSTNAMES             Comma-separated accepted hostnames
+
+Yabane also reads a .env file in the current directory for non-listener settings.
+Persistent configuration is stored in data/.
+
+Examples:
+  yabane --addr 127.0.0.1:9090
+  yabane --addr 0.0.0.0:8080 --log debug
+  YABANE_ACTIVITY_RETENTION_DAYS=90 yabane
+";
+
+#[derive(Default)]
+struct Cli {
+    address: Option<String>,
+    log_filter: Option<String>,
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let mut cli = Self::default();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    print!("{HELP}");
+                    std::process::exit(0);
+                }
+                "-V" | "--version" => {
+                    println!("yabane {}", env!("CARGO_PKG_VERSION"));
+                    std::process::exit(0);
+                }
+                "--addr" => cli.address = Some(required_value(&mut args, "--addr")),
+                "--log" => cli.log_filter = Some(required_value(&mut args, "--log")),
+                _ if arg.starts_with("--addr=") => {
+                    cli.address = Some(arg["--addr=".len()..].to_owned())
+                }
+                _ if arg.starts_with("--log=") => {
+                    cli.log_filter = Some(arg["--log=".len()..].to_owned())
+                }
+                _ => cli_error(&format!("unexpected argument '{arg}'")),
+            }
+        }
+        cli
+    }
+}
+
+fn required_value(args: &mut impl Iterator<Item = String>, option: &str) -> String {
+    args.next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| cli_error(&format!("a value is required for '{option}'")))
+}
+
+fn cli_error(message: &str) -> ! {
+    eprintln!("error: {message}\n\nFor more information, try '--help'.");
+    std::process::exit(2);
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
     dotenvy::dotenv().ok();
 
     let log_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
-        .with_env_var("YABANE_LOG")
-        .from_env()
-        .expect("YABANE_LOG must contain a valid tracing filter");
+        .parse(
+            cli.log_filter
+                .or_else(|| env::var("YABANE_LOG").ok())
+                .unwrap_or_else(|| "info".to_owned()),
+        )
+        .unwrap_or_else(|error| cli_error(&format!("invalid log filter: {error}")));
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     let providers = load_providers().await.expect("load provider configuration");
@@ -102,6 +177,7 @@ async fn main() {
         .route("/openapi.json", get(web::openapi_spec))
         .route("/app.css", get(web::css))
         .route("/app.js", get(web::js))
+        .route("/favicon.svg", get(web::favicon))
         .route(
             "/fonts/ubuntu-sans-regular.woff2",
             get(web::ubuntu_sans_regular),
@@ -121,10 +197,11 @@ async fn main() {
         .merge(inference)
         .with_state(state.clone());
 
-    let address: SocketAddr = env::var("YABANE_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
+    let address: SocketAddr = cli
+        .address
+        .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
         .parse()
-        .expect("YABANE_ADDR must be an address");
+        .unwrap_or_else(|error| cli_error(&format!("invalid --addr value: {error}")));
     let listener = TcpListener::bind(address).await.expect("bind server");
     let browser_host = match address.ip() {
         std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_owned(),
