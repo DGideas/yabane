@@ -36,13 +36,28 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/admin/routes",
             get(list_global_routes).post(create_global_route),
         )
-        .route("/admin/routes/{pattern}", delete(delete_global_route))
+        .route(
+            "/admin/routes/{pattern}",
+            patch(update_global_route).delete(delete_global_route),
+        )
         .route("/admin/activity/logs", get(activity_logs))
         .route("/admin/activity/stats", get(activity_stats))
         .route("/admin/activity/export", get(export_activity))
         .route(
+            "/admin/activity/export/preview",
+            get(preview_activity_export),
+        )
+        .route(
             "/admin/activity/import",
             post(import_activity).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/admin/activity/import/preview",
+            post(preview_activity_import).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/admin/activity/settings",
+            get(activity_settings).patch(update_activity_settings),
         )
         .route(
             "/admin/providers/{id}",
@@ -311,6 +326,22 @@ async fn create_global_route(
     State(state): State<AppState>,
     axum::Json(input): axum::Json<CreateGlobalRoute>,
 ) -> Response {
+    save_global_route(state, None, input).await
+}
+
+async fn update_global_route(
+    State(state): State<AppState>,
+    Path(original_pattern): Path<String>,
+    axum::Json(input): axum::Json<CreateGlobalRoute>,
+) -> Response {
+    save_global_route(state, Some(original_pattern), input).await
+}
+
+async fn save_global_route(
+    state: AppState,
+    original_pattern: Option<String>,
+    input: CreateGlobalRoute,
+) -> Response {
     if !valid_model_pattern(input.pattern.trim())
         || input.targets.is_empty()
         || input
@@ -368,14 +399,27 @@ async fn create_global_route(
     drop(providers);
     let mut routes = state.routes.0.write().await;
     let mut updated = routes.clone();
-    if let Some(route) = updated
-        .iter_mut()
-        .find(|route| route.pattern == input.pattern)
-    {
+    let pattern = input.pattern.trim().to_owned();
+    if let Some(original) = original_pattern {
+        let Some(index) = updated.iter().position(|route| route.pattern == original) else {
+            return api_error(StatusCode::NOT_FOUND, "Model route not found");
+        };
+        if pattern != original && updated.iter().any(|route| route.pattern == pattern) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "A model route with that pattern already exists",
+            );
+        }
+        updated[index] = routes::ModelRoute {
+            pattern,
+            targets: input.targets,
+            cursor: Default::default(),
+        };
+    } else if let Some(route) = updated.iter_mut().find(|route| route.pattern == pattern) {
         route.targets = input.targets;
     } else {
         updated.push(routes::ModelRoute {
-            pattern: input.pattern.trim().to_owned(),
+            pattern,
             targets: input.targets,
             cursor: Default::default(),
         });
@@ -441,46 +485,113 @@ async fn activity_stats(
     axum::Json(state.activity.stats(query.since.unwrap_or(0)).await)
 }
 
-async fn export_activity(State(state): State<AppState>) -> Response {
-    let records = state.activity.export_records().await;
+async fn preview_activity_export(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
+) -> impl IntoResponse {
+    axum::Json(state.activity.summary(query.since.unwrap_or(0)).await)
+}
+
+async fn activity_settings(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(crate::activity::ActivitySettings {
+        retention_days: state.activity.retention_days(),
+    })
+}
+
+async fn update_activity_settings(
+    State(state): State<AppState>,
+    axum::Json(settings): axum::Json<crate::activity::ActivitySettings>,
+) -> Response {
+    if !(1..=3650).contains(&settings.retention_days) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Activity retention must be between 1 and 3650 days",
+        );
+    }
+    match state
+        .activity
+        .set_retention_days(settings.retention_days)
+        .await
+    {
+        Ok(()) => axum::Json(settings).into_response(),
+        Err(err) => {
+            error!(%err, "failed to persist activity retention");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to save activity retention",
+            )
+        }
+    }
+}
+
+async fn export_activity(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
+) -> Response {
+    let records = state
+        .activity
+        .export_records(query.since.unwrap_or(0))
+        .await;
+    let exported_at = now();
     let export = crate::activity::ActivityExport {
         format: "yabane-activity",
         version: 1,
         instance_id: state.activity.instance_id(),
-        exported_at: now(),
+        exported_at,
         records: &records,
     };
     let body = serde_json::to_vec(&export).expect("serialize activity export");
-    (
-        [
-            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-            (
-                header::CONTENT_DISPOSITION,
-                "attachment; filename=\"yabane-activity.json\"",
-            ),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        header::HeaderValue::from_str(&format!(
+            "attachment; filename=\"yabane-activity-{exported_at}.json\""
+        ))
+        .expect("valid activity export filename"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn parse_activity_import(
+    body: &Bytes,
+) -> Result<crate::activity::ActivityImport, (StatusCode, &'static str)> {
+    if body.len() > 64 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Activity import is too large",
+        ));
+    }
+    serde_json::from_slice(body).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Activity import must be a valid Yabane activity JSON file",
+        )
+    })
+}
+
+async fn preview_activity_import(State(state): State<AppState>, body: Bytes) -> Response {
+    let import = match parse_activity_import(&body) {
+        Ok(import) => import,
+        Err((status, message)) => return api_error(status, message),
+    };
+    match state.activity.preview_import(&import).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(message) => api_error(StatusCode::BAD_REQUEST, message),
+    }
 }
 
 async fn import_activity(State(state): State<AppState>, body: Bytes) -> Response {
-    const MAX_IMPORT_SIZE: usize = 64 * 1024 * 1024;
-    if body.len() > MAX_IMPORT_SIZE {
-        return api_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Activity import is too large",
-        );
-    }
-    let import: crate::activity::ActivityImport = match serde_json::from_slice(&body) {
+    let import: crate::activity::ActivityImport = match parse_activity_import(&body) {
         Ok(import) => import,
-        Err(_) => {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "Activity import must be a valid Yabane activity JSON file",
-            );
-        }
+        Err((status, message)) => return api_error(status, message),
     };
     match state.activity.import(import).await {
         Ok(result) => axum::Json(result).into_response(),
@@ -645,6 +756,9 @@ async fn create_provider(
     if let Err(message) = validate_socks5_proxy(input.endpoint.socks5_proxy.as_deref()) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Err(message) = validate_endpoint_base_url(&input.endpoint.base_url) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
     if let Err(message) = validate_extra_headers(&input.endpoint.extra_headers) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -764,6 +878,9 @@ async fn create_endpoint(
     if let Err(message) = validate_socks5_proxy(input.socks5_proxy.as_deref()) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Err(message) = validate_endpoint_base_url(&input.base_url) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
     if let Err(message) = validate_extra_headers(&input.extra_headers) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -824,6 +941,9 @@ async fn update_endpoint(
         return api_error(StatusCode::BAD_REQUEST, "Endpoint ID cannot be changed");
     }
     if let Err(message) = validate_socks5_proxy(input.socks5_proxy.as_deref()) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    if let Err(message) = validate_endpoint_base_url(&input.base_url) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
 
@@ -1139,6 +1259,24 @@ fn validate_extra_headers(
                 "Extra header '{name}' is managed by Yabane and cannot be overridden"
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_endpoint_base_url(value: &str) -> Result<(), &'static str> {
+    let path = value
+        .split_once("://")
+        .map(|(_, rest)| rest.split_once('/').map_or("", |(_, path)| path))
+        .unwrap_or(value)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if ["/chat/completions", "/responses", "/messages", "/models"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+    {
+        return Err("Endpoint base URL must be the shared API root, not a specific operation URL");
     }
     Ok(())
 }

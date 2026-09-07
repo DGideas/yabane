@@ -1,10 +1,18 @@
-use std::{io::ErrorKind, sync::Arc, time::Duration};
+use std::{
+    io::ErrorKind,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 use tracing::error;
 
 const ACTIVITY_FILE: &str = "data/activity.jsonl";
+const ACTIVITY_SETTINGS_FILE: &str = "data/activity-settings.json";
 const FLUSH_SIZE: usize = 10;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -34,6 +42,7 @@ pub struct ActivityStore {
     inner: Arc<Mutex<ActivityData>>,
     flush_lock: Arc<Mutex<()>>,
     instance_id: Arc<String>,
+    retention_days: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -60,12 +69,28 @@ pub struct ActivityImport {
     pub records: Vec<RequestLog>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ActivitySettings {
+    pub retention_days: u64,
+}
+
+#[derive(Serialize)]
+pub struct ActivitySummary {
+    pub records: usize,
+    pub estimated_bytes: usize,
+    pub oldest_at: Option<u64>,
+    pub newest_at: Option<u64>,
+    pub retention_days: u64,
+}
+
 #[derive(Serialize)]
 pub struct ImportResult {
     pub imported: usize,
     pub duplicates: usize,
     pub expired: usize,
     pub total: usize,
+    pub oldest_at: Option<u64>,
+    pub newest_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -95,7 +120,8 @@ impl ActivityStore {
             Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
             Err(err) => return Err(format!("read {ACTIVITY_FILE}: {err}")),
         };
-        let cutoff = retention_cutoff();
+        let retention_days = load_retention_days().await?;
+        let cutoff = retention_cutoff(retention_days);
         let persisted = contents
             .lines()
             .filter(|line| !line.is_empty())
@@ -114,6 +140,7 @@ impl ActivityStore {
             })),
             flush_lock: Arc::new(Mutex::new(())),
             instance_id: Arc::new(load_or_create_instance_id().await?),
+            retention_days: Arc::new(AtomicU64::new(retention_days)),
         })
     }
 
@@ -129,6 +156,7 @@ impl ActivityStore {
     }
 
     pub async fn logs(&self, since: u64, limit: usize) -> Vec<RequestLog> {
+        let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         data.persisted
             .iter()
@@ -144,12 +172,14 @@ impl ActivityStore {
         &self.instance_id
     }
 
-    pub async fn export_records(&self) -> Vec<RequestLog> {
+    pub async fn export_records(&self, since: u64) -> Vec<RequestLog> {
+        let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         let mut records: Vec<_> = data
             .persisted
             .iter()
             .chain(&data.pending)
+            .filter(|record| record.timestamp >= since)
             .cloned()
             .collect();
         records.sort_by(|a, b| {
@@ -160,76 +190,50 @@ impl ActivityStore {
         records
     }
 
+    pub async fn summary(&self, since: u64) -> ActivitySummary {
+        let records = self.export_records(since).await;
+        ActivitySummary {
+            records: records.len(),
+            estimated_bytes: serialize_logs(&records).len(),
+            oldest_at: records.first().map(|record| record.timestamp),
+            newest_at: records.last().map(|record| record.timestamp),
+            retention_days: self.retention_days(),
+        }
+    }
+
+    pub fn retention_days(&self) -> u64 {
+        self.retention_days.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_retention_days(&self, days: u64) -> Result<(), String> {
+        if !(1..=3650).contains(&days) {
+            return Err("Activity retention must be between 1 and 3650 days".to_owned());
+        }
+        let body = serde_json::to_vec_pretty(&ActivitySettings {
+            retention_days: days,
+        })
+        .expect("serialize activity settings");
+        crate::storage::write_atomic(ACTIVITY_SETTINGS_FILE, &body)
+            .await
+            .map_err(|err| format!("save activity settings: {err}"))?;
+        self.retention_days.store(days, Ordering::Relaxed);
+        self.flush().await;
+        Ok(())
+    }
+
+    pub async fn preview_import(&self, import: &ActivityImport) -> Result<ImportResult, String> {
+        self.validate_import(import)?;
+        let data = self.inner.lock().await;
+        Ok(self.classify_import(import, &data).0)
+    }
+
     pub async fn import(&self, import: ActivityImport) -> Result<ImportResult, String> {
-        if import.format != "yabane-activity" || import.version != 1 {
-            return Err("Unsupported activity export format or version".to_owned());
-        }
-        const MAX_IMPORT_RECORDS: usize = 1_000_000;
-        if import.records.len() > MAX_IMPORT_RECORDS {
-            return Err(format!(
-                "Activity import cannot contain more than {MAX_IMPORT_RECORDS} records"
-            ));
-        }
-        let total = import.records.len();
-        let cutoff = retention_cutoff();
+        self.validate_import(&import)?;
         let _flush_guard = self.flush_lock.lock().await;
         let mut data = self.inner.lock().await;
-        let source_id = import
-            .instance_id
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("legacy");
-        let local_source = self.instance_id.as_str();
-        let imported_identity = |record: &RequestLog| {
-            (
-                record
-                    .source_instance_id
-                    .as_deref()
-                    .unwrap_or(source_id)
-                    .to_owned(),
-                record.request_id.clone(),
-            )
-        };
-        let stored_identity = |record: &RequestLog| {
-            (
-                record
-                    .source_instance_id
-                    .as_deref()
-                    .unwrap_or(local_source)
-                    .to_owned(),
-                record.request_id.clone(),
-            )
-        };
-        let mut existing: std::collections::HashSet<(String, String)> = data
-            .persisted
-            .iter()
-            .chain(&data.pending)
-            .map(stored_identity)
-            .collect();
-        let mut imported = Vec::new();
-        let mut duplicates = 0;
-        let mut expired = 0;
-        for record in import.records {
-            if record.request_id.is_empty() {
-                return Err("Activity records must contain a request_id".to_owned());
-            }
-            if record.timestamp < cutoff {
-                expired += 1;
-            } else {
-                let identity = imported_identity(&record);
-                if !existing.insert(identity) {
-                    duplicates += 1;
-                    continue;
-                }
-                let mut record = record;
-                if record.source_instance_id.is_none() && source_id != local_source {
-                    record.source_instance_id = Some(source_id.to_owned());
-                }
-                imported.push(record);
-            }
-        }
-
+        let (result, imported) = self.classify_import(&import, &data);
         if !imported.is_empty() {
+            let cutoff = retention_cutoff(self.retention_days());
             let mut records: Vec<_> = data
                 .persisted
                 .iter()
@@ -237,7 +241,7 @@ impl ActivityStore {
                 .filter(|log| log.timestamp >= cutoff)
                 .cloned()
                 .collect();
-            records.extend(imported.iter().cloned());
+            records.extend(imported);
             records.sort_by(|a, b| {
                 a.timestamp
                     .cmp(&b.timestamp)
@@ -249,15 +253,94 @@ impl ActivityStore {
             data.persisted = records;
             data.pending.clear();
         }
-        Ok(ImportResult {
-            imported: imported.len(),
-            duplicates,
-            expired,
-            total,
-        })
+        Ok(result)
+    }
+
+    fn validate_import(&self, import: &ActivityImport) -> Result<(), String> {
+        if import.format != "yabane-activity" || import.version != 1 {
+            return Err("Unsupported activity export format or version".to_owned());
+        }
+        if import.records.len() > 1_000_000 {
+            return Err("Activity import cannot contain more than 1000000 records".to_owned());
+        }
+        if import
+            .records
+            .iter()
+            .any(|record| record.request_id.is_empty())
+        {
+            return Err("Activity records must contain a request_id".to_owned());
+        }
+        Ok(())
+    }
+
+    fn classify_import(
+        &self,
+        import: &ActivityImport,
+        data: &ActivityData,
+    ) -> (ImportResult, Vec<RequestLog>) {
+        let cutoff = retention_cutoff(self.retention_days());
+        let source_id = import
+            .instance_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("legacy");
+        let local_source = self.instance_id.as_str();
+        let mut existing: std::collections::HashSet<(String, String)> = data
+            .persisted
+            .iter()
+            .chain(&data.pending)
+            .map(|record| {
+                (
+                    record
+                        .source_instance_id
+                        .as_deref()
+                        .unwrap_or(local_source)
+                        .to_owned(),
+                    record.request_id.clone(),
+                )
+            })
+            .collect();
+        let mut accepted = Vec::new();
+        let mut duplicates = 0;
+        let mut expired = 0;
+        for record in &import.records {
+            if record.timestamp < cutoff {
+                expired += 1;
+                continue;
+            }
+            let identity = (
+                record
+                    .source_instance_id
+                    .as_deref()
+                    .unwrap_or(source_id)
+                    .to_owned(),
+                record.request_id.clone(),
+            );
+            if !existing.insert(identity) {
+                duplicates += 1;
+                continue;
+            }
+            let mut record = record.clone();
+            if record.source_instance_id.is_none() && source_id != local_source {
+                record.source_instance_id = Some(source_id.to_owned());
+            }
+            accepted.push(record);
+        }
+        (
+            ImportResult {
+                imported: accepted.len(),
+                duplicates,
+                expired,
+                total: import.records.len(),
+                oldest_at: import.records.iter().map(|record| record.timestamp).min(),
+                newest_at: import.records.iter().map(|record| record.timestamp).max(),
+            },
+            accepted,
+        )
     }
 
     pub async fn stats(&self, since: u64) -> Stats {
+        let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         let logs: Vec<_> = data
             .persisted
@@ -297,7 +380,7 @@ impl ActivityStore {
         let _flush_guard = self.flush_lock.lock().await;
         let (pending, retained, needs_compaction) = {
             let mut data = self.inner.lock().await;
-            let cutoff = retention_cutoff();
+            let cutoff = retention_cutoff(self.retention_days());
             let retained: Vec<_> = data
                 .persisted
                 .iter()
@@ -402,10 +485,36 @@ async fn load_or_create_instance_id() -> Result<String, String> {
     Ok(id)
 }
 
-fn retention_cutoff() -> u64 {
-    let days = std::env::var("YABANE_ACTIVITY_RETENTION_DAYS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_RETENTION_DAYS);
-    crate::auth::now().saturating_sub(days * 86_400)
+async fn load_retention_days() -> Result<u64, String> {
+    match tokio::fs::read(ACTIVITY_SETTINGS_FILE).await {
+        Ok(contents) => {
+            let settings: ActivitySettings = serde_json::from_slice(&contents)
+                .map_err(|err| format!("parse {ACTIVITY_SETTINGS_FILE}: {err}"))?;
+            if !(1..=3650).contains(&settings.retention_days) {
+                return Err(format!(
+                    "{ACTIVITY_SETTINGS_FILE} retention_days must be between 1 and 3650"
+                ));
+            }
+            Ok(settings.retention_days)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let days = match std::env::var("YABANE_ACTIVITY_RETENTION_DAYS") {
+                Ok(value) => value.parse::<u64>().map_err(|_| {
+                    "YABANE_ACTIVITY_RETENTION_DAYS must be an integer between 1 and 3650"
+                        .to_owned()
+                })?,
+                Err(std::env::VarError::NotPresent) => DEFAULT_RETENTION_DAYS,
+                Err(err) => return Err(format!("read YABANE_ACTIVITY_RETENTION_DAYS: {err}")),
+            };
+            if !(1..=3650).contains(&days) {
+                return Err("YABANE_ACTIVITY_RETENTION_DAYS must be between 1 and 3650".to_owned());
+            }
+            Ok(days)
+        }
+        Err(err) => Err(format!("read {ACTIVITY_SETTINGS_FILE}: {err}")),
+    }
+}
+
+fn retention_cutoff(days: u64) -> u64 {
+    crate::auth::now().saturating_sub(days.saturating_mul(86_400))
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${1:-target/debug/yabane}
 binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
 work=$(mktemp -d)
@@ -10,10 +11,24 @@ upstream_pid=
 cleanup() { [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; [[ -n "$upstream_pid" ]] && kill "$upstream_pid" 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT
 cd "$work"
+version_output=$("$binary" --version)
+[[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
+[[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
+if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-retention.log 2>&1; then
+  echo "invalid activity retention unexpectedly started" >&2; exit 1
+fi
+grep -q 'YABANE_ACTIVITY_RETENTION_DAYS must be between 1 and 3650' invalid-retention.log
 TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" "$binary" --addr "127.0.0.1:$port" >server.log 2>&1 & pid=$!
 for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$port/healthz" >/dev/null && break; sleep .1; done
 base="http://127.0.0.1:$port"
 cookie="$work/cookie.txt"
+about=$(curl -fsS "$base/about")
+[[ $(printf '%s' "$about" | jq -r .name) == yabane ]]
+[[ $(printf '%s' "$about" | jq -r 'has("version")') == false ]]
+[[ $(printf '%s' "$about" | jq -r .commit) =~ ^([0-9a-f]{8}|unknown)$ ]]
+[[ $(printf '%s' "$about" | jq -r .commit_time) =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T.*|unknown)$ ]]
+[[ $(printf '%s' "$about" | jq -r .license) == MIT ]]
+[[ $(printf '%s' "$about" | jq -r .license_text) == "MIT License"* ]]
 turnstile_config=$(curl -fsS "$base/admin/turnstile-config")
 [[ $(printf '%s' "$turnstile_config" | jq -r .enabled) == true ]]
 [[ $(printf '%s' "$turnstile_config" | jq -r .site_key) == 1x00000000000000000000AA ]]
@@ -27,7 +42,11 @@ import sys
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
-        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared']}.get(endpoint, [])
+        if self.path not in ['/v1/models', '/nested/v1/models']:
+            self.send_response(404); self.end_headers(); return
+        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared'], 'nested': ['nested-model']}.get(endpoint, [])
+        if self.path == '/nested/v1/models' and endpoint != 'nested':
+            models = []
         body = json.dumps({'object': 'list', 'data': [{'id': model} for model in models]}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
@@ -59,6 +78,12 @@ admin -f -X DELETE "$base/admin/auth/keys/$id" >/dev/null
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_api_key":false,"api_key":null}}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_api_key":false,"api_key":null}}') == 400 ]]
+# Nested OpenAI-compatible roots, including OpenCode Go's /zen/go/v1 shape, append /models at that shared root.
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"nested-root\",\"name\":\"Nested root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/nested/v1\",\"requires_api_key\":true,\"api_key\":\"nested\"}}") == 204 ]]
+admin -f -X POST "$base/admin/providers/nested-root/models/refresh" >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "nested-root") | .discovered_models[0]') == nested-model ]]
+admin -f -X DELETE "$base/admin/providers/nested-root" >/dev/null
 for provider in allowed denied; do
   admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"$provider\",\"name\":\"$provider\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:1/v1\",\"requires_api_key\":false,\"api_key\":null}}" >/dev/null
 done
@@ -100,6 +125,11 @@ admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/js
 route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":1},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":1}]}'
 [[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$route_payload" >/dev/null
+# Existing routes can be edited, including renaming the public pattern and replacing destinations.
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model-edited","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"custom-model-not-discovered","weight":1}]}' >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model-edited") | .targets[0].upstream_model') == custom-model-not-discovered ]]
+[[ $(admin_status -X PATCH "$base/admin/routes/missing-route" -H 'content-type: application/json' -d "$route_payload") == 404 ]]
+admin -f -X PATCH "$base/admin/routes/friendly-model-edited" -H 'content-type: application/json' -d "$route_payload" >/dev/null
 friendly_one=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"friendly-model","messages":[]}')
 friendly_two=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"friendly-model","messages":[]}')
 [[ $(printf '%s' "$friendly_one" | jq -r .endpoint) == one ]]
@@ -151,12 +181,31 @@ stats=$(admin -f "$base/admin/activity/stats?since=0")
 [[ $(printf '%s' "$stats" | jq -r '.cost > 0') == true ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
 [[ $(printf '%s' "$logs" | jq '[.[] | select(.cost == 0.0042)] | length') -ge 4 ]]
-# Activity exports are portable metadata snapshots. Imports deduplicate by source instance and request ID.
-admin -f "$base/admin/activity/export" > activity-export.json
+# Activity data can be previewed, range-filtered, and retention is persisted through the control API.
+summary=$(admin -f "$base/admin/activity/export/preview?since=0")
+[[ $(printf '%s' "$summary" | jq -r .records) -gt 0 ]]
+[[ $(printf '%s' "$summary" | jq -r .estimated_bytes) -gt 0 ]]
+[[ $(admin -f "$base/admin/activity/settings" | jq -r .retention_days) == 30 ]]
+[[ $(admin_status -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":0}') == 400 ]]
+[[ $(admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":45}' | jq -r .retention_days) == 45 ]]
+[[ $(jq -r .retention_days "$work/data/activity-settings.json") == 45 ]]
+old_retained_at=$(( $(date +%s) - 2 * 86400 ))
+old_retained_payload="{\"format\":\"yabane-activity\",\"version\":1,\"instance_id\":\"retention-test\",\"records\":[{\"timestamp\":$old_retained_at,\"request_id\":\"req-retention-old\",\"path\":\"/v1/responses\",\"model\":\"old/model\",\"provider\":\"old\",\"endpoint\":\"old\",\"status\":200,\"latency_ms\":1,\"input_tokens\":0,\"output_tokens\":0,\"cached_tokens\":0,\"cost\":null,\"streaming\":false}]}"
+[[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$old_retained_payload" | jq -r .imported) == 1 ]]
+admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":1}' >/dev/null
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.request_id == "req-retention-old")] | length') == 0 ]]
+! grep -q 'req-retention-old' "$work/data/activity.jsonl"
+admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":45}' >/dev/null
+# Activity exports are portable metadata snapshots. Imports preview and deduplicate by source instance and request ID.
+admin -f -D activity-export.headers "$base/admin/activity/export?since=0" > activity-export.json
+grep -Eq 'content-disposition: attachment; filename="yabane-activity-[0-9]+.json"' <(tr -d '\r' < activity-export.headers)
 [[ $(jq -r .format activity-export.json) == yabane-activity ]]
 [[ $(jq -r .version activity-export.json) == 1 ]]
 [[ $(jq -r '.instance_id | length' activity-export.json) == 32 ]]
 export_count=$(jq '.records | length' activity-export.json)
+import_preview=$(admin -f -X POST "$base/admin/activity/import/preview" -H 'content-type: application/json' --data-binary @activity-export.json)
+[[ $(printf '%s' "$import_preview" | jq -r .imported) == 0 ]]
+[[ $(printf '%s' "$import_preview" | jq -r .duplicates) == "$export_count" ]]
 import_result=$(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' --data-binary @activity-export.json)
 [[ $(printf '%s' "$import_result" | jq -r .imported) == 0 ]]
 [[ $(printf '%s' "$import_result" | jq -r .duplicates) == "$export_count" ]]
@@ -176,6 +225,7 @@ import_result=$(admin -f -X POST "$base/admin/activity/import" -H 'content-type:
 [[ $(printf '%s' "$import_result" | jq -r .imported) == 1 ]]
 import_result=$(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$relay_payload")
 [[ $(printf '%s' "$import_result" | jq -r .duplicates) == 1 ]]
+[[ $(admin_status -X POST "$base/admin/activity/import/preview" -H 'content-type: application/json' -d '{"format":"unknown","version":1,"records":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d '{"format":"unknown","version":1,"records":[]}') == 400 ]]
 # Management API keys call control endpoints without a browser session.
 management=$(admin -f -X POST "$base/admin/management-keys" -H 'content-type: application/json' -d '{"name":"E2E","expires_at":null}')
@@ -191,6 +241,8 @@ admin -f -X DELETE "$base/admin/management-keys/$management_id" >/dev/null
 # Live API docs and the embedded OpenAPI spec are public.
 [[ $(curl -sS -o /dev/null -w '%{http_code}' "$base/docs") == 200 ]]
 [[ $(curl -sS "$base/openapi.json" | jq -r .openapi) == 3.0.3 ]]
+session_cookie=$(awk '$6 == "yabane_session" { print $7 }' "$cookie" | tail -1)
+YABANE_UI_BASE="$base" YABANE_SESSION_COOKIE="$session_cookie" node "$repo/tests/responsive-ui.mjs"
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
 [[ $(status "$base/v1/models") == 200 ]]
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null

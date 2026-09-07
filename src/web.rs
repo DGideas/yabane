@@ -6,6 +6,7 @@ const APP_JS: &str = include_str!("../web/app.js");
 const API_DOCS: &str = include_str!("../web/docs.html");
 const OPENAPI_SPEC: &str = include_str!("../web/openapi.json");
 const FAVICON: &str = include_str!("../web/favicon.svg");
+const LICENSE: &str = include_str!("../LICENSE");
 const UBUNTU_SANS_REGULAR: &[u8] = include_bytes!("../web/fonts/ubuntu-sans-regular.woff2");
 const UBUNTU_SANS_MEDIUM: &[u8] = include_bytes!("../web/fonts/ubuntu-sans-medium.woff2");
 
@@ -43,6 +44,19 @@ pub async fn ubuntu_sans_medium() -> impl IntoResponse {
 
 pub async fn health() -> &'static str {
     "ok"
+}
+
+pub async fn about() -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(serde_json::json!({
+            "name": env!("CARGO_PKG_NAME"),
+            "commit": env!("YABANE_GIT_COMMIT"),
+            "commit_time": env!("YABANE_GIT_COMMIT_TIME"),
+            "license": env!("CARGO_PKG_LICENSE"),
+            "license_text": LICENSE,
+        })),
+    )
 }
 
 fn no_store(content_type: &'static str, contents: &'static str) -> impl IntoResponse {
