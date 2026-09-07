@@ -35,6 +35,15 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('.open-about').click());
     await assertDialog(page, '#about-dialog', project.name);
     await page.locator('#about-dialog .close-about').first().click();
+    await page.evaluate(() => document.querySelector('#open-provider').click());
+    await page.locator('#display-name').fill('OpenAI subscription');
+    await page.locator('#next-step').click();
+    await page.locator('#api-type-choices input[value="openai_codex"]').check();
+    await assertDialog(page, '#provider-dialog', project.name);
+    if (await page.locator('#base-url').isVisible()) throw new Error(`${project.name}: subscription setup exposes Base URL`);
+    if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: subscription setup exposes API key input`);
+    if (await page.locator('#create-provider').textContent() !== 'Connect OpenAI') throw new Error(`${project.name}: subscription setup has the wrong primary action`);
+    await page.locator('#provider-dialog .close-dialog').first().click();
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);

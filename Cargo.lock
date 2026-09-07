@@ -1734,6 +1734,7 @@ dependencies = [
  "argon2",
  "async-stream",
  "axum",
+ "base64",
  "bytes",
  "dotenvy",
  "futures-util",

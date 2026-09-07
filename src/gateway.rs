@@ -15,6 +15,7 @@ use crate::{
     auth,
     config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
     error::api_error,
+    openai_subscription,
     usage::UsageTracker,
 };
 
@@ -26,15 +27,41 @@ struct RoutingError {
     message: String,
 }
 
+#[derive(Clone, Copy)]
+enum ApiSurface {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+}
+
+impl ApiSurface {
+    fn supports(self, api_type: ApiType) -> bool {
+        matches!(
+            (self, api_type),
+            (Self::OpenAiChat, ApiType::OpenaiCompatible)
+                | (
+                    Self::OpenAiResponses,
+                    ApiType::OpenaiCompatible | ApiType::OpenaiCodex
+                )
+                | (Self::Anthropic, ApiType::Anthropic)
+        )
+    }
+}
+
 pub async fn proxy_openai(State(state): State<AppState>, request: Request) -> Response {
-    route_request(state, request, ApiType::OpenaiCompatible).await
+    let surface = if request.uri().path() == "/v1/responses" {
+        ApiSurface::OpenAiResponses
+    } else {
+        ApiSurface::OpenAiChat
+    };
+    route_request(state, request, surface).await
 }
 
 pub async fn proxy_anthropic(State(state): State<AppState>, request: Request) -> Response {
-    route_request(state, request, ApiType::Anthropic).await
+    route_request(state, request, ApiSurface::Anthropic).await
 }
 
-async fn route_request(state: AppState, request: Request, expected_type: ApiType) -> Response {
+async fn route_request(state: AppState, request: Request, surface: ApiSurface) -> Response {
     let allowed_providers = auth::authorized_provider_ids(&state, request.headers()).await;
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await {
@@ -46,10 +73,28 @@ async fn route_request(state: AppState, request: Request, expected_type: ApiType
         .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
     let (provider, endpoint, api_key, model, body) =
-        match resolve_provider(&state, &body, expected_type, allowed_providers.as_deref()).await {
+        match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
             Ok(resolved) => resolved,
             Err(err) => return api_error(err.status, err.message),
         };
+
+    let endpoint = if endpoint.api_type == ApiType::OpenaiCodex {
+        if !requested_streaming {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "OpenAI subscription Endpoints require stream=true on the Responses API",
+            );
+        }
+        match openai_subscription::refreshed_endpoint(&state, &provider.id, &endpoint.id).await {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "OpenAI subscription authentication failed");
+                return api_error(StatusCode::BAD_GATEWAY, err);
+            }
+        }
+    } else {
+        endpoint
+    };
 
     forward(
         state,
@@ -69,7 +114,7 @@ async fn route_request(state: AppState, request: Request, expected_type: ApiType
 async fn resolve_provider(
     state: &AppState,
     body: &[u8],
-    expected_type: ApiType,
+    surface: ApiSurface,
     allowed_providers: Option<&[String]>,
 ) -> Result<(Provider, ApiEndpoint, Option<ApiKey>, String, Vec<u8>), RoutingError> {
     let mut payload: serde_json::Value =
@@ -125,18 +170,18 @@ async fn resolve_provider(
             .find(|endpoint| endpoint.id == target.endpoint_id)
     } else {
         let discovered = provider.model_endpoints.get(upstream_model);
-        let preferred = provider.preferred_endpoint_id(upstream_model, expected_type);
         provider
             .endpoints
             .iter()
             .find(|endpoint| {
-                preferred == Some(endpoint.id.as_str())
-                    && endpoint.api_type == expected_type
+                surface.supports(endpoint.api_type)
+                    && provider.preferred_endpoint_id(upstream_model, endpoint.api_type)
+                        == Some(endpoint.id.as_str())
                     && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
             })
             .or_else(|| {
                 provider.endpoints.iter().find(|endpoint| {
-                    endpoint.api_type == expected_type
+                    surface.supports(endpoint.api_type)
                         && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
                 })
             })
@@ -145,13 +190,15 @@ async fn resolve_provider(
         status: StatusCode::BAD_REQUEST,
         message: format!("Provider '{provider_id}' has no endpoint for model '{upstream_model}'"),
     })?;
-    if endpoint.api_type != expected_type {
+    if !surface.supports(endpoint.api_type) {
         return Err(RoutingError {
             status: StatusCode::BAD_REQUEST,
             message: format!("Model '{upstream_model}' is not available through this API type"),
         });
     }
-    let api_key = if let Some(target) = &route_target {
+    let api_key = if endpoint.api_type == ApiType::OpenaiCodex {
+        None
+    } else if let Some(target) = &route_target {
         let key = endpoint
             .api_keys
             .iter()
@@ -225,6 +272,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         parts.headers,
         endpoint.api_type,
         api_key.as_ref(),
+        endpoint.openai_subscription.as_ref(),
         if provider_defaults_apply {
             &provider.extra_headers
         } else {
@@ -237,7 +285,11 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let target = join_upstream_url(&endpoint.base_url, path_and_query);
+    let target = if endpoint.api_type == ApiType::OpenaiCodex {
+        join_upstream_url(&endpoint.base_url, "/codex/responses")
+    } else {
+        join_upstream_url(&endpoint.base_url, path_and_query)
+    };
     let body = apply_extra_body(
         body,
         if provider_defaults_apply {
@@ -247,6 +299,11 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         },
         &endpoint.extra_body,
     );
+    let body = if endpoint.api_type == ApiType::OpenaiCodex {
+        apply_codex_body(body)
+    } else {
+        body
+    };
 
     let client = match endpoint.client(&state.client) {
         Ok(client) => client,
@@ -322,13 +379,18 @@ fn sanitize_request_headers(
     mut headers: HeaderMap,
     api_type: ApiType,
     api_key: Option<&ApiKey>,
+    subscription: Option<&crate::config::OpenAiSubscription>,
     provider_headers: &std::collections::HashMap<String, String>,
     endpoint_headers: &std::collections::HashMap<String, String>,
 ) -> HeaderMap {
     for name in [
         header::HOST.as_str(),
         header::AUTHORIZATION.as_str(),
+        header::COOKIE.as_str(),
         "x-api-key",
+        "chatgpt-account-id",
+        "originator",
+        "openai-beta",
         header::CONTENT_LENGTH.as_str(),
         "connection",
         "keep-alive",
@@ -341,6 +403,9 @@ fn sanitize_request_headers(
     ] {
         headers.remove(name);
     }
+    if api_type == ApiType::OpenaiCodex {
+        headers.remove(header::CONTENT_ENCODING);
+    }
     for (name, value) in provider_headers.iter().chain(endpoint_headers) {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
@@ -351,7 +416,7 @@ fn sanitize_request_headers(
     }
     if let Some(api_key) = api_key {
         let (name, value) = match api_type {
-            ApiType::OpenaiCompatible => (
+            ApiType::OpenaiCompatible | ApiType::OpenaiCodex => (
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {}", api_key.secret)),
             ),
@@ -362,7 +427,94 @@ fn sanitize_request_headers(
         };
         headers.insert(name, value.expect("validated API key header value"));
     }
+    if let Some(subscription) = subscription {
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", subscription.access_token))
+                .expect("validated OpenAI access token header value"),
+        );
+        headers.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_str(&subscription.account_id)
+                .expect("validated ChatGPT account ID header value"),
+        );
+        headers.insert(
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("yabane"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(concat!("yabane/", env!("YABANE_GIT_COMMIT"))),
+        );
+        headers.insert(
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("responses=experimental"),
+        );
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
     headers
+}
+
+fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("store".to_owned(), serde_json::Value::Bool(false));
+        object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        if object
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            object.insert(
+                "instructions".to_owned(),
+                serde_json::Value::String("You are a helpful assistant.".to_owned()),
+            );
+        }
+        if let Some(input) = object
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        {
+            object.insert(
+                "input".to_owned(),
+                serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": input}]}]),
+            );
+        }
+        object
+            .entry("text")
+            .or_insert_with(|| serde_json::json!({"verbosity": "low"}));
+        object
+            .entry("tool_choice")
+            .or_insert_with(|| serde_json::Value::String("auto".to_owned()));
+        object
+            .entry("parallel_tool_calls")
+            .or_insert(serde_json::Value::Bool(true));
+        let include = object
+            .entry("include")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if !include.is_array() {
+            *include = serde_json::Value::Array(Vec::new());
+        }
+        let items = include.as_array_mut().expect("normalized include array");
+        if !items
+            .iter()
+            .any(|item| item.as_str() == Some("reasoning.encrypted_content"))
+        {
+            items.push(serde_json::Value::String(
+                "reasoning.encrypted_content".to_owned(),
+            ));
+        }
+    }
+    serde_json::to_vec(&value).expect("serialize OpenAI subscription request")
 }
 
 fn apply_extra_body(
@@ -386,7 +538,10 @@ fn apply_extra_body(
 
 fn copy_response_headers(target: &mut HeaderMap, source: &reqwest::header::HeaderMap) {
     for (name, value) in source {
-        if is_hop_by_hop_header(name.as_str()) || name == reqwest::header::CONTENT_LENGTH {
+        if is_hop_by_hop_header(name.as_str())
+            || name == reqwest::header::CONTENT_LENGTH
+            || name == reqwest::header::SET_COOKIE
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -414,4 +569,99 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 
 fn to_reqwest_method(method: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::{
+        ApiSurface, ApiType, apply_codex_body, copy_response_headers, sanitize_request_headers,
+    };
+    use crate::config::OpenAiSubscription;
+
+    #[test]
+    fn codex_adapter_applies_required_response_fields() {
+        let body = apply_codex_body(
+            br#"{"model":"gpt-5.4","input":"hello","stream":true,"store":true}"#.to_vec(),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(value["instructions"], "You are a helpful assistant.");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(value["text"]["verbosity"], "low");
+        assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(value["parallel_tool_calls"], true);
+        assert_eq!(value["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn protocol_surfaces_keep_subscription_responses_only() {
+        assert!(ApiSurface::OpenAiResponses.supports(ApiType::OpenaiCodex));
+        assert!(!ApiSurface::OpenAiChat.supports(ApiType::OpenaiCodex));
+        assert!(!ApiSurface::Anthropic.supports(ApiType::OpenaiCodex));
+    }
+
+    #[test]
+    fn proxy_does_not_forward_caller_cookies_or_upstream_set_cookies() {
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert("cookie", HeaderValue::from_static("yabane_session=private"));
+        let sanitized = sanitize_request_headers(
+            request_headers,
+            ApiType::OpenaiCompatible,
+            None,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(!sanitized.contains_key("cookie"));
+
+        let mut upstream_headers = reqwest::header::HeaderMap::new();
+        upstream_headers.insert(
+            reqwest::header::SET_COOKIE,
+            reqwest::header::HeaderValue::from_static("yabane_session=attacker"),
+        );
+        upstream_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let mut response_headers = HeaderMap::new();
+        copy_response_headers(&mut response_headers, &upstream_headers);
+        assert!(!response_headers.contains_key("set-cookie"));
+        assert_eq!(response_headers["content-type"], "application/json");
+    }
+
+    #[test]
+    fn subscription_headers_replace_caller_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer caller"));
+        headers.insert(
+            "chatgpt-account-id",
+            HeaderValue::from_static("caller-account"),
+        );
+        headers.insert("content-encoding", HeaderValue::from_static("zstd"));
+        let credential = OpenAiSubscription {
+            access_token: "access-token".to_owned(),
+            refresh_token: "refresh-token".to_owned(),
+            expires_at: u64::MAX,
+            account_id: "account-123".to_owned(),
+        };
+        let sanitized = sanitize_request_headers(
+            headers,
+            ApiType::OpenaiCodex,
+            None,
+            Some(&credential),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(sanitized["authorization"], "Bearer access-token");
+        assert_eq!(sanitized["chatgpt-account-id"], "account-123");
+        assert_eq!(sanitized["originator"], "yabane");
+        assert_eq!(sanitized["openai-beta"], "responses=experimental");
+        assert!(!sanitized.contains_key("content-encoding"));
+    }
 }

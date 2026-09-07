@@ -158,38 +158,74 @@ async fn update_discoveries(
     results: &[(Provider, Result<ProviderDiscovery, String>)],
 ) {
     let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let mut changed = false;
     for (provider, result) in results {
-        if let Some(stored) = providers.get_mut(&provider.id) {
-            stored.models_discovered_at = Some(crate::auth::now());
-            match result {
-                Ok(discovery) => {
-                    stored.discovered_models = discovery
-                        .models
-                        .iter()
-                        .map(|model| model.id.clone())
-                        .collect();
-                    stored.model_endpoints = discovery.model_endpoints.clone();
-                    stored.model_endpoint_preferences.retain(|preference| {
-                        discovery
-                            .model_endpoints
-                            .get(&preference.model)
-                            .is_some_and(|endpoint_ids| {
-                                endpoint_ids.contains(&preference.endpoint_id)
-                            })
-                            && stored.endpoints.iter().any(|endpoint| {
-                                endpoint.id == preference.endpoint_id
-                                    && endpoint.api_type == preference.api_type
-                            })
-                    });
-                    stored.model_discovery_error = None;
-                }
-                Err(error) => stored.model_discovery_error = Some(error.clone()),
+        let Some(stored) = updated.get_mut(&provider.id) else {
+            continue;
+        };
+        if !discovery_inputs_match(stored, provider) {
+            continue;
+        }
+        changed = true;
+        stored.models_discovered_at = Some(crate::auth::now());
+        match result {
+            Ok(discovery) => {
+                stored.discovered_models = discovery
+                    .models
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect();
+                stored.model_endpoints = discovery.model_endpoints.clone();
+                stored.model_endpoint_preferences.retain(|preference| {
+                    discovery
+                        .model_endpoints
+                        .get(&preference.model)
+                        .is_some_and(|endpoint_ids| endpoint_ids.contains(&preference.endpoint_id))
+                        && stored.endpoints.iter().any(|endpoint| {
+                            endpoint.id == preference.endpoint_id
+                                && endpoint.api_type == preference.api_type
+                        })
+                });
+                stored.model_discovery_error = None;
             }
+            Err(error) => stored.model_discovery_error = Some(error.clone()),
         }
     }
-    if let Err(error) = crate::config::save_providers(&providers).await {
-        warn!(%error, "could not persist model discovery");
+    if !changed {
+        return;
     }
+    if let Err(error) = crate::config::save_providers(&updated).await {
+        warn!(%error, "could not persist model discovery");
+        return;
+    }
+    *providers = updated;
+}
+
+fn discovery_inputs_match(current: &Provider, snapshot: &Provider) -> bool {
+    current.endpoints.len() == snapshot.endpoints.len()
+        && current
+            .endpoints
+            .iter()
+            .zip(&snapshot.endpoints)
+            .all(|(current, snapshot)| {
+                current.id == snapshot.id
+                    && current.api_type == snapshot.api_type
+                    && current.base_url == snapshot.base_url
+                    && current.socks5_proxy == snapshot.socks5_proxy
+                    && current.requires_api_key == snapshot.requires_api_key
+                    && discovery_keys_match(&current.api_keys, &snapshot.api_keys)
+                    && current.openai_subscription == snapshot.openai_subscription
+            })
+}
+
+fn discovery_keys_match(current: &[ApiKey], snapshot: &[ApiKey]) -> bool {
+    current.len() == snapshot.len()
+        && current.iter().zip(snapshot).all(|(current, snapshot)| {
+            current.id == snapshot.id
+                && current.secret == snapshot.secret
+                && current.enabled == snapshot.enabled
+        })
 }
 
 async fn discover_provider_models(
@@ -236,6 +272,24 @@ async fn list_endpoint_models(
     provider: &Provider,
     endpoint: &ApiEndpoint,
 ) -> Result<Vec<Model>, String> {
+    if endpoint.api_type == ApiType::OpenaiCodex {
+        if endpoint.openai_subscription.is_none() {
+            return Err(format!(
+                "endpoint '{}' has no connected OpenAI subscription",
+                endpoint.id
+            ));
+        }
+        return Ok(crate::openai_subscription::MODELS
+            .iter()
+            .map(|id| Model {
+                id: (*id).to_owned(),
+                object: model_object(),
+                owned_by: "openai".to_owned(),
+                created: None,
+                context_window: None,
+            })
+            .collect());
+    }
     let keys: Vec<Option<ApiKey>> = if endpoint.requires_api_key {
         endpoint
             .api_keys
@@ -280,6 +334,7 @@ async fn fetch_models(
 ) -> Result<Vec<Model>, String> {
     let path = match endpoint.api_type {
         ApiType::OpenaiCompatible => "/v1/models",
+        ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
         ApiType::Anthropic => "/v1/models?limit=1000",
     };
     let client = endpoint.client(client)?;
@@ -287,6 +342,7 @@ async fn fetch_models(
     if let Some(key) = key {
         request = match endpoint.api_type {
             ApiType::OpenaiCompatible => request.bearer_auth(&key.secret),
+            ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
             ApiType::Anthropic => request
                 .header("x-api-key", &key.secret)
                 .header("anthropic-version", ANTHROPIC_VERSION),
@@ -309,6 +365,7 @@ async fn fetch_models(
 
     match endpoint.api_type {
         ApiType::OpenaiCompatible => parse_openai_models(&body, provider),
+        ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
         ApiType::Anthropic => parse_anthropic_models(&body, provider),
     }
 }
@@ -360,9 +417,9 @@ fn model_object() -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::Provider;
+    use crate::config::{ApiEndpoint, Provider};
 
-    use super::{parse_anthropic_models, parse_openai_models};
+    use super::{discovery_inputs_match, parse_anthropic_models, parse_openai_models};
 
     fn provider() -> Provider {
         Provider {
@@ -378,6 +435,26 @@ mod tests {
             models_discovered_at: None,
             model_discovery_error: None,
         }
+    }
+
+    #[test]
+    fn stale_discovery_snapshot_is_rejected_after_endpoint_changes() {
+        let mut snapshot = provider();
+        snapshot.endpoints.push(ApiEndpoint {
+            id: "primary".to_owned(),
+            base_url: "https://old.example/v1".to_owned(),
+            requires_api_key: false,
+            ..ApiEndpoint::default()
+        });
+        let mut current = snapshot.clone();
+        assert!(discovery_inputs_match(&current, &snapshot));
+
+        current.endpoints[0].base_url = "https://new.example/v1".to_owned();
+        assert!(!discovery_inputs_match(&current, &snapshot));
+
+        current = snapshot.clone();
+        current.endpoints.clear();
+        assert!(!discovery_inputs_match(&current, &snapshot));
     }
 
     #[test]

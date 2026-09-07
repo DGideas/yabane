@@ -15,6 +15,7 @@ const ROUTES_FILE: &str = "data/routes.json";
 pub struct RouteTarget {
     pub provider_id: String,
     pub endpoint_id: String,
+    #[serde(default)]
     pub api_key_id: String,
     pub upstream_model: String,
     pub weight: u32,

@@ -3,7 +3,7 @@
   "info": {
     "title": "Yabane API",
     "version": "unversioned",
-    "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured upstream providers. Control endpoints manage providers, endpoints, upstream keys, model routes, gateway access, and activity. Every action available in the web console is available here."
+    "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured upstream providers. OpenAI Responses can explicitly target a ChatGPT Plus/Pro OAuth subscription Endpoint. Control endpoints manage providers, endpoints, upstream credentials, model routes, gateway access, and activity. Every action available in the web console is available here."
   },
   "servers": [
     {
@@ -140,6 +140,22 @@
           }
         }
       },
+      "EndpointView": {
+        "type": "object",
+        "description": "An upstream connection. OAuth tokens and account IDs are never included.",
+        "properties": {
+          "id": {"type": "string"},
+          "api_type": {"type": "string", "enum": ["openai_compatible", "openai_codex", "anthropic"]},
+          "base_url": {"type": "string"},
+          "socks5_proxy": {"type": "string", "nullable": true},
+          "extra_headers": {"type": "object", "additionalProperties": {"type": "string"}},
+          "extra_body": {"type": "object"},
+          "requires_api_key": {"type": "boolean"},
+          "api_keys": {"type": "array", "items": {"type": "object"}},
+          "subscription_connected": {"type": "boolean"},
+          "subscription_expires_at": {"type": "integer", "nullable": true}
+        }
+      },
       "ProviderView": {
         "type": "object",
         "properties": {
@@ -167,7 +183,7 @@
           "endpoints": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/EndpointView"
             }
           },
           "discovered_models": {
@@ -204,6 +220,7 @@
                   "type": "string",
                   "enum": [
                     "openai_compatible",
+                    "openai_codex",
                     "anthropic"
                   ]
                 },
@@ -213,6 +230,19 @@
               }
             }
           }
+        }
+      },
+      "OpenAiDeviceFlow": {
+        "type": "object",
+        "required": ["id", "status", "user_code", "verification_uri", "interval_seconds", "expires_at"],
+        "properties": {
+          "id": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "complete", "failed"]},
+          "user_code": {"type": "string"},
+          "verification_uri": {"type": "string", "format": "uri"},
+          "interval_seconds": {"type": "integer"},
+          "expires_at": {"type": "integer"},
+          "error": {"type": "string", "nullable": true}
         }
       },
       "ActivitySettings": {
@@ -665,6 +695,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Responses",
+        "description": "OpenAI-compatible Endpoints preserve the request. ChatGPT Plus/Pro subscription Endpoints require stream=true and use the explicitly configured Codex backend adapter.",
         "security": [
           {
             "gatewayKey": []
@@ -684,13 +715,17 @@
                     "type": "string"
                   },
                   "input": {
-                    "type": "string"
+                    "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "object"}}]
+                  },
+                  "stream": {
+                    "type": "boolean"
                   }
                 }
               },
               "example": {
                 "model": "my-provider/model-id",
-                "input": "Hello"
+                "input": "Hello",
+                "stream": true
               }
             }
           }
@@ -1117,6 +1152,26 @@
             "$ref": "#/components/responses/NotFound"
           }
         }
+      }
+    },
+    "/admin/openai-subscriptions/device-code": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Start OpenAI subscription device sign-in",
+        "description": "Starts OpenAI device-code OAuth for a new Provider or a new Endpoint on an existing Provider. OAuth tokens are never returned by this API.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["provider_id"], "properties": {"provider_id": {"type": "string"}, "provider_name": {"type": "string", "nullable": true}, "endpoint_id": {"type": "string", "nullable": true}}}}}},
+        "responses": {"201": {"description": "Device sign-in started", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "502": {"description": "OpenAI OAuth service unavailable"}}
+      }
+    },
+    "/admin/openai-subscriptions/device-code/{id}": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "Poll OpenAI subscription device sign-in",
+        "description": "Returns pending status or completes OAuth and atomically creates the connected subscription Endpoint.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "Current device sign-in state", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}}
       }
     },
     "/admin/providers": {
@@ -1614,7 +1669,6 @@
                       "required": [
                         "provider_id",
                         "endpoint_id",
-                        "api_key_id",
                         "upstream_model",
                         "weight"
                       ],
@@ -1626,7 +1680,8 @@
                           "type": "string"
                         },
                         "api_key_id": {
-                          "type": "string"
+                          "type": "string",
+                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."
                         },
                         "upstream_model": {
                           "type": "string"
@@ -1709,11 +1764,11 @@
                     "type": "array",
                     "items": {
                       "type": "object",
-                      "required": ["provider_id", "endpoint_id", "api_key_id", "upstream_model", "weight"],
+                      "required": ["provider_id", "endpoint_id", "upstream_model", "weight"],
                       "properties": {
                         "provider_id": {"type": "string"},
                         "endpoint_id": {"type": "string"},
-                        "api_key_id": {"type": "string"},
+                        "api_key_id": {"type": "string", "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."},
                         "upstream_model": {"type": "string"},
                         "weight": {"type": "integer", "minimum": 1}
                       }
