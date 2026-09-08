@@ -16,6 +16,7 @@ mod control;
 mod error;
 mod gateway;
 mod models;
+mod openai_subscription;
 mod routes;
 mod storage;
 mod usage;
@@ -134,6 +135,7 @@ async fn main() {
         auth: Arc::new(RwLock::new(auth)),
         activity,
         routes,
+        openai_oauth: openai_subscription::OAuthState::default(),
         admin: admin_user::AdminState {
             user: Arc::new(RwLock::new(admin)),
             ..admin_user::AdminState::default()

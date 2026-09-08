@@ -24,12 +24,14 @@ pub struct AppState {
     pub admin: AdminState,
     pub activity: ActivityStore,
     pub routes: RouteStore,
+    pub openai_oauth: crate::openai_subscription::OAuthState,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Hash, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiType {
     OpenaiCompatible,
+    OpenaiCodex,
     Anthropic,
 }
 
@@ -37,18 +39,27 @@ impl ApiType {
     pub fn default_endpoint_id(self) -> &'static str {
         match self {
             Self::OpenaiCompatible => "openai",
+            Self::OpenaiCodex => "chatgpt",
             Self::Anthropic => "anthropic",
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApiKey {
     pub id: String,
     pub name: String,
     pub secret: String,
     pub weight: u32,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OpenAiSubscription {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64,
+    pub account_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -64,6 +75,8 @@ pub struct ApiEndpoint {
     pub extra_body: serde_json::Map<String, serde_json::Value>,
     pub requires_api_key: bool,
     pub api_keys: Vec<ApiKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_subscription: Option<OpenAiSubscription>,
     #[serde(skip, default = "default_cursor")]
     pub(crate) cursor: Arc<AtomicU64>,
     #[serde(skip, default = "default_proxy_client")]
@@ -81,6 +94,7 @@ impl Default for ApiEndpoint {
             extra_body: serde_json::Map::new(),
             requires_api_key: true,
             api_keys: Vec::new(),
+            openai_subscription: None,
             cursor: default_cursor(),
             proxy_client: default_proxy_client(),
         }
@@ -172,19 +186,6 @@ impl Provider {
             .find(|preference| preference.model == model && preference.api_type == api_type)
             .map(|preference| preference.endpoint_id.as_str())
     }
-
-    pub fn endpoint_and_key(
-        &self,
-        endpoint_id: &str,
-        api_key_id: &str,
-    ) -> Option<(&ApiEndpoint, &ApiKey)> {
-        let endpoint = self
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.id == endpoint_id)?;
-        let key = endpoint.api_keys.iter().find(|key| key.id == api_key_id)?;
-        Some((endpoint, key))
-    }
 }
 
 pub async fn load_providers() -> Result<HashMap<String, Provider>, String> {
@@ -241,6 +242,7 @@ mod tests {
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
             requires_api_key: true,
+            openai_subscription: None,
             api_keys: vec![
                 key("primary", 2, true),
                 key("secondary", 1, true),

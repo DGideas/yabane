@@ -17,7 +17,7 @@ use crate::{
         ApiEndpoint, ApiKey, ApiType, AppState, ModelEndpointPreference, Provider, save_providers,
     },
     error::api_error,
-    models, routes,
+    models, openai_subscription, routes,
 };
 
 pub fn router(state: AppState) -> Router<AppState> {
@@ -31,6 +31,14 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/providers",
             get(list_providers).post(create_provider),
+        )
+        .route(
+            "/admin/openai-subscriptions/device-code",
+            post(start_openai_subscription),
+        )
+        .route(
+            "/admin/openai-subscriptions/device-code/{id}",
+            get(poll_openai_subscription),
         )
         .route(
             "/admin/routes",
@@ -203,6 +211,8 @@ struct EndpointView {
     extra_body: serde_json::Map<String, serde_json::Value>,
     requires_api_key: bool,
     api_keys: Vec<ApiKeyView>,
+    subscription_connected: bool,
+    subscription_expires_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -362,12 +372,42 @@ async fn save_global_route(
                 format!("Unknown provider '{}'", target.provider_id),
             );
         };
-        let Some((_, key)) = provider.endpoint_and_key(&target.endpoint_id, &target.api_key_id)
+        let Some(endpoint) = provider
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == target.endpoint_id)
         else {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "Route target API key was not found",
+                "Route target Endpoint was not found",
             );
+        };
+        let key = if endpoint.api_type == ApiType::OpenaiCodex {
+            if !target.api_key_id.is_empty() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "OpenAI subscription route targets must not specify an API key",
+                );
+            }
+            if endpoint.openai_subscription.is_none() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Route target OpenAI subscription is not connected",
+                );
+            }
+            None
+        } else {
+            let Some(key) = endpoint
+                .api_keys
+                .iter()
+                .find(|key| key.id == target.api_key_id)
+            else {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Route target API key was not found",
+                );
+            };
+            Some(key)
         };
         let upstream_model = target.upstream_model.trim();
         if upstream_model
@@ -392,7 +432,7 @@ async fn save_global_route(
                 ),
             );
         }
-        if !key.enabled {
+        if key.is_some_and(|key| !key.enabled) {
             return api_error(StatusCode::BAD_REQUEST, "Route target API key is disabled");
         }
     }
@@ -624,6 +664,11 @@ fn provider_view(provider: &Provider) -> ProviderView {
                 extra_headers: endpoint.extra_headers.clone(),
                 extra_body: endpoint.extra_body.clone(),
                 requires_api_key: endpoint.requires_api_key,
+                subscription_connected: endpoint.openai_subscription.is_some(),
+                subscription_expires_at: endpoint
+                    .openai_subscription
+                    .as_ref()
+                    .map(|credential| credential.expires_at),
                 api_keys: endpoint
                     .api_keys
                     .iter()
@@ -740,10 +785,41 @@ async fn update_provider_options(
     response
 }
 
+async fn start_openai_subscription(
+    State(state): State<AppState>,
+    axum::Json(input): axum::Json<openai_subscription::StartSubscription>,
+) -> Response {
+    match openai_subscription::start(&state, input).await {
+        Ok(flow) => (StatusCode::CREATED, axum::Json(flow)).into_response(),
+        Err(openai_subscription::StartError::Invalid(message)) => {
+            api_error(StatusCode::BAD_REQUEST, message)
+        }
+        Err(openai_subscription::StartError::Upstream(message)) => {
+            api_error(StatusCode::BAD_GATEWAY, message)
+        }
+    }
+}
+
+async fn poll_openai_subscription(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match openai_subscription::poll(&state, &id).await {
+        Ok(flow) => axum::Json(flow).into_response(),
+        Err(message) => api_error(StatusCode::NOT_FOUND, message),
+    }
+}
+
 async fn create_provider(
     State(state): State<AppState>,
     axum::Json(input): axum::Json<CreateProvider>,
 ) -> Response {
+    if input.endpoint.api_type == ApiType::OpenaiCodex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Connect an OpenAI subscription with the device sign-in endpoint",
+        );
+    }
     if input.id.trim().is_empty()
         || input.name.trim().is_empty()
         || input.endpoint.base_url.trim().is_empty()
@@ -866,6 +942,12 @@ async fn create_endpoint(
     Path(provider_id): Path<String>,
     axum::Json(input): axum::Json<CreateEndpoint>,
 ) -> Response {
+    if input.api_type == ApiType::OpenaiCodex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Connect an OpenAI subscription with the device sign-in endpoint",
+        );
+    }
     if input.base_url.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "Endpoint base URL is required");
     }
@@ -934,6 +1016,12 @@ async fn update_endpoint(
     Path((provider_id, endpoint_id)): Path<(String, String)>,
     axum::Json(input): axum::Json<UpdateEndpoint>,
 ) -> Response {
+    if input.api_type == ApiType::OpenaiCodex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Subscription Endpoints cannot be converted; connect a new OpenAI subscription instead",
+        );
+    }
     if input.base_url.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "Endpoint base URL is required");
     }
@@ -959,6 +1047,12 @@ async fn update_endpoint(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
+    if endpoint.api_type == ApiType::OpenaiCodex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "OpenAI subscription Endpoints cannot be converted; delete and reconnect the Endpoint instead",
+        );
+    }
     endpoint.api_type = input.api_type;
     endpoint.base_url = input.base_url.trim().trim_end_matches('/').to_owned();
     endpoint.socks5_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
@@ -1116,6 +1210,12 @@ async fn create_api_key(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
+    if endpoint.api_type == ApiType::OpenaiCodex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "OpenAI subscription Endpoints use OAuth instead of API keys",
+        );
+    }
     let id = unique_key_id(endpoint, &slugify(&input.name));
     endpoint.api_keys.push(new_api_key(
         &id,
@@ -1371,4 +1471,47 @@ async fn persist_or_error(providers: &std::collections::HashMap<String, Provider
         );
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::config::{ApiEndpoint, ApiType, OpenAiSubscription, Provider};
+
+    #[test]
+    fn provider_view_redacts_subscription_tokens_and_account_id() {
+        let provider = Provider {
+            id: "openai".to_owned(),
+            name: "OpenAI".to_owned(),
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            defaults_endpoint_ids: Vec::new(),
+            endpoints: vec![ApiEndpoint {
+                id: "chatgpt".to_owned(),
+                api_type: ApiType::OpenaiCodex,
+                base_url: "https://chatgpt.com/backend-api".to_owned(),
+                requires_api_key: false,
+                openai_subscription: Some(OpenAiSubscription {
+                    access_token: "private-access".to_owned(),
+                    refresh_token: "private-refresh".to_owned(),
+                    expires_at: 123,
+                    account_id: "private-account".to_owned(),
+                }),
+                ..ApiEndpoint::default()
+            }],
+            discovered_models: Vec::new(),
+            model_endpoints: HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
+            models_discovered_at: None,
+            model_discovery_error: None,
+        };
+
+        let json = serde_json::to_string(&super::provider_view(&provider)).unwrap();
+        assert!(!json.contains("private-access"));
+        assert!(!json.contains("private-refresh"));
+        assert!(!json.contains("private-account"));
+        assert!(json.contains("\"subscription_connected\":true"));
+        assert!(json.contains("\"subscription_expires_at\":123"));
+    }
 }

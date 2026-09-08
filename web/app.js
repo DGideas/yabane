@@ -131,8 +131,10 @@ function setProviderStep(step) {
 function openProviderDialog() {
   providerForm.reset();
   providerForm.querySelector('.base-url-notice').textContent = '';
+  delete $('#base-url').dataset.previousValue;
   providerIdEdited = false;
   $('#provider-error').textContent = '';
+  setApiType('openai_compatible');
   toggleKeyRequirement();
   setProviderStep(1);
   providerDialog.showModal();
@@ -156,6 +158,15 @@ function setApiType(type) {
   const input = $(`input[name="api_type"][value="${type}"]`);
   input.checked = true;
   $$('#api-type-choices .choice').forEach(choice => choice.classList.toggle('selected', choice.contains(input)));
+  const subscription = type === 'openai_codex';
+  const base = $('#base-url');
+  [base.closest('.field'), providerForm.elements.socks5_proxy.closest('.field'), $('#requires-key').closest('.checkbox-row')].forEach(field => field.hidden = subscription);
+  if (subscription) { base.dataset.previousValue = base.value; base.value = 'https://chatgpt.com/backend-api'; }
+  else if (base.value === 'https://chatgpt.com/backend-api') base.value = base.dataset.previousValue || '';
+  base.required = !subscription;
+  $('#initial-key-section').hidden = subscription;
+  $('#api-key').required = !subscription && $('#requires-key').checked;
+  $('#create-provider').textContent = subscription ? 'Connect OpenAI' : 'Add provider';
 }
 $$('input[name="api_type"]').forEach(input => input.addEventListener('change', () => setApiType(input.value)));
 function operationPathNotice(input) {
@@ -208,6 +219,9 @@ providerForm.addEventListener('submit', async event => {
       api_key: data.get('requires_api_key') === 'on' ? data.get('api_key') : null
     }
   };
+  if (payload.endpoint.api_type === 'openai_codex') {
+    return beginOpenAiSubscription({provider_id: payload.id, provider_name: payload.name, endpoint_id: 'chatgpt'}, $('#provider-error'), providerDialog);
+  }
   const response = await fetch('/admin/providers', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#provider-error'));
   providerDialog.close();
@@ -215,8 +229,87 @@ providerForm.addEventListener('submit', async event => {
   [1000, 3000, 8000].forEach(delay => setTimeout(loadProviders, delay));
 });
 
-function keyCount(provider) {
-  return provider.endpoints.reduce((count, endpoint) => count + endpoint.api_keys.length, 0);
+const openAiSubscriptionDialog = $('#openai-subscription-dialog');
+let openAiSubscriptionFlowId = null;
+let openAiSubscriptionStartController = null;
+let openAiSubscriptionPollController = null;
+async function beginOpenAiSubscription(target, errorElement, parentDialog) {
+  openAiSubscriptionFlowId = null;
+  openAiSubscriptionPollController?.abort();
+  openAiSubscriptionPollController = null;
+  openAiSubscriptionStartController?.abort();
+  const controller = new AbortController();
+  openAiSubscriptionStartController = controller;
+  parentDialog.addEventListener('close', () => controller.abort(), {once: true});
+  const submit = parentDialog.querySelector('[type="submit"]');
+  submit.disabled = true;
+  let response;
+  try {
+    response = await fetch('/admin/openai-subscriptions/device-code', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(target), signal: controller.signal});
+  } catch (error) {
+    const current = openAiSubscriptionStartController === controller;
+    if (current) { openAiSubscriptionStartController = null; submit.disabled = false; }
+    if (error.name === 'AbortError' || !current) return;
+    errorElement.textContent = 'Could not start OpenAI sign-in.';
+    return;
+  }
+  if (openAiSubscriptionStartController !== controller) return;
+  openAiSubscriptionStartController = null;
+  submit.disabled = false;
+  if (!response.ok) return showApiError(response, errorElement);
+  const flow = await response.json();
+  parentDialog.close();
+  $('#openai-subscription-code').textContent = flow.user_code;
+  $('#openai-subscription-link').href = flow.verification_uri;
+  $('#openai-subscription-status').textContent = 'Waiting for OpenAI sign-in…';
+  $('#openai-subscription-error').textContent = '';
+  openAiSubscriptionPollController?.abort();
+  openAiSubscriptionFlowId = flow.id;
+  openAiSubscriptionDialog.showModal();
+  const poll = async () => {
+    if (openAiSubscriptionFlowId !== flow.id) return;
+    const controller = new AbortController();
+    openAiSubscriptionPollController = controller;
+    let statusResponse;
+    try {
+      statusResponse = await fetch(`/admin/openai-subscriptions/device-code/${encodeURIComponent(flow.id)}`, {signal: controller.signal});
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+      openAiSubscriptionFlowId = null;
+      $('#openai-subscription-error').textContent = 'Could not check OpenAI sign-in status.';
+      return;
+    }
+    if (openAiSubscriptionFlowId !== flow.id) return;
+    openAiSubscriptionPollController = null;
+    if (!statusResponse.ok) { openAiSubscriptionFlowId = null; return showApiError(statusResponse, $('#openai-subscription-error')); }
+    const status = await statusResponse.json();
+    if (status.status === 'complete') {
+      openAiSubscriptionFlowId = null;
+      $('#openai-subscription-status').textContent = 'Connected. Loading your OpenAI subscription…';
+      await Promise.all([loadProviders(), loadRoutes()]);
+      openAiSubscriptionDialog.close();
+      if (target.provider_name) { selectedProviderId = target.provider_id; history.pushState({}, '', `/providers/${encodeURIComponent(target.provider_id)}`); renderProviderPage(); }
+      return;
+    }
+    if (status.status === 'failed') { openAiSubscriptionFlowId = null; $('#openai-subscription-error').textContent = status.error || 'OpenAI sign-in failed.'; return; }
+    setTimeout(poll, Math.max(1000, Number(status.interval_seconds || 2) * 1000));
+  };
+  poll();
+}
+function stopOpenAiSubscriptionPolling() {
+  openAiSubscriptionFlowId = null;
+  openAiSubscriptionPollController?.abort();
+  openAiSubscriptionPollController = null;
+}
+$$('.close-openai-subscription').forEach(button => button.addEventListener('click', () => { stopOpenAiSubscriptionPolling(); openAiSubscriptionDialog.close(); }));
+openAiSubscriptionDialog.addEventListener('close', stopOpenAiSubscriptionPolling);
+$('#openai-subscription-code').addEventListener('click', async () => {
+  await navigator.clipboard?.writeText($('#openai-subscription-code').textContent);
+  $('#openai-subscription-status').textContent = 'Code copied. Complete sign-in on OpenAI, then return here.';
+});
+
+function credentialCount(provider) {
+  return provider.endpoints.reduce((count, endpoint) => count + endpoint.api_keys.length + (endpoint.subscription_connected ? 1 : 0), 0);
 }
 
 function renderProviders() {
@@ -228,7 +321,7 @@ function renderProviders() {
     card.className = 'provider-list-item';
     card.dataset.provider = provider.id;
     const modelStatus = provider.model_discovery_error ? 'Model discovery failed' : provider.models_discovered_at ? `${provider.discovered_models.length} models` : 'Discovering models…';
-    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${keyCount(provider)} key${keyCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
+    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
     card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); });
     return card;
   }));
@@ -245,6 +338,10 @@ function renderProviderPage() {
     const endpointModels = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length;
     const enabledKeys = endpoint.api_keys.filter(key => key.enabled);
     const shares = trafficShares(enabledKeys);
+    if (endpoint.api_type === 'openai_codex') {
+      const expiry = endpoint.subscription_expires_at ? new Date(endpoint.subscription_expires_at * 1000).toLocaleString() : 'Unknown';
+      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span></div><div class="endpoint-actions"><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head"><div><h4>OpenAI OAuth subscription</h4><p>Yabane refreshes this private credential automatically. The access and refresh tokens are never shown in the console or API.</p></div><span class="kind">Token expires ${escapeHtml(expiry)}</span></div></section></article>`;
+    }
     return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
@@ -255,7 +352,7 @@ function renderProviderPage() {
   const bodyCount = Object.keys(provider.extra_body || {}).length;
   const defaultsScope = provider.defaults_endpoint_ids?.length ? `${provider.defaults_endpoint_ids.length} selected endpoint${provider.defaults_endpoint_ids.length === 1 ? '' : 's'}` : 'All endpoints';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${keyCount(provider)} upstream key${keyCount(provider) === 1 ? '' : 's'}.</p></div><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys are configured inside the endpoint they belong to.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -291,7 +388,7 @@ function renderProviderPage() {
 
 function modelEndpointVariants(provider) {
   const preferences = provider.model_endpoint_preferences || [];
-  return provider.discovered_models.flatMap(model => ['openai_compatible', 'anthropic'].map(apiType => {
+  return provider.discovered_models.flatMap(model => ['openai_compatible', 'openai_codex', 'anthropic'].map(apiType => {
     const compatibleIds = new Set(provider.endpoints.filter(endpoint => endpoint.api_type === apiType).map(endpoint => endpoint.id));
     const endpointIds = (provider.model_endpoints[model] || []).filter(id => compatibleIds.has(id));
     const preferred = preferences.find(item => item.model === model && item.api_type === apiType);
@@ -355,7 +452,8 @@ function bindProviderActions() {
   $$('.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     const endpoint = provider.endpoints.find(item => item.id === button.dataset.endpoint);
-    const message = `Delete endpoint “${endpoint.id}”?\n\nThis also deletes its ${endpoint.api_keys.length} API key${endpoint.api_keys.length === 1 ? '' : 's'}, removes its discovered-model availability, and removes destinations that route to it.`;
+    const credentialImpact = endpoint.api_type === 'openai_codex' ? 'its connected OAuth subscription' : `its ${endpoint.api_keys.length} API key${endpoint.api_keys.length === 1 ? '' : 's'}`;
+    const message = `Delete endpoint “${endpoint.id}”?\n\nThis also deletes ${credentialImpact}, removes its discovered-model availability, and removes destinations that route to it.`;
     if (!confirm(message)) return;
     const response = await fetch(`/admin/providers/${provider.id}/endpoints/${endpoint.id}`, {method: 'DELETE'});
     if (!response.ok) return showApiError(response, null);
@@ -384,8 +482,9 @@ async function patchKey(providerId, endpointId, keyId, update) {
 
 const endpointDialog = $('#endpoint-dialog');
 function openEndpointDialog(providerId, endpointId = null) {
-  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
+  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
   const endpoint = endpointId ? providers.find(item => item.id === providerId)?.endpoints.find(item => item.id === endpointId) : null;
+  form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint);
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
   $('#endpoint-dialog .dialog-head p').textContent = endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
   $('#endpoint-dialog button[type="submit"]').textContent = endpoint ? 'Save changes' : 'Add endpoint';
@@ -395,17 +494,27 @@ function openEndpointDialog(providerId, endpointId = null) {
     form.elements.socks5_proxy.value = endpoint.socks5_proxy || ''; form.elements.requires_api_key.checked = endpoint.requires_api_key;
     operationPathNotice(form.elements.base_url);
   }
-  toggleEndpointKeyRequirement(); bindSecretToggles(endpointDialog); endpointDialog.showModal();
+  toggleEndpointMode(); bindSecretToggles(endpointDialog); endpointDialog.showModal();
 }
-function toggleEndpointKeyRequirement() {
-  const form = $('#endpoint-form'); const required = form.elements.requires_api_key.checked; const editing = Boolean(form.dataset.endpointId);
+function toggleEndpointMode() {
+  const form = $('#endpoint-form'); const subscription = form.elements.api_type.value === 'openai_codex'; const editing = Boolean(form.dataset.endpointId);
+  const required = form.elements.requires_api_key.checked && !subscription;
+  form.elements.base_url.closest('.field').hidden = subscription;
+  form.elements.socks5_proxy.closest('.field').hidden = subscription;
+  form.elements.requires_api_key.closest('.checkbox-row').hidden = subscription;
+  form.elements.base_url.required = !subscription;
+  if (subscription) { form.elements.base_url.dataset.previousValue = form.elements.base_url.value; form.elements.base_url.value = 'https://chatgpt.com/backend-api'; }
+  else if (form.elements.base_url.value === 'https://chatgpt.com/backend-api') form.elements.base_url.value = form.elements.base_url.dataset.previousValue || '';
   $('.endpoint-key-section').classList.toggle('collapsed', !required || editing); form.elements.api_key.required = required && !editing;
+  $('#endpoint-dialog button[type="submit"]').textContent = editing ? 'Save changes' : subscription ? 'Connect OpenAI' : 'Add endpoint';
 }
-$('#endpoint-form [name="requires_api_key"]').addEventListener('change', toggleEndpointKeyRequirement);
+$('#endpoint-form [name="requires_api_key"]').addEventListener('change', toggleEndpointMode);
+$('#endpoint-form [name="api_type"]').addEventListener('change', toggleEndpointMode);
 $$('.close-endpoint').forEach(button => button.addEventListener('click', () => endpointDialog.close()));
 $('#endpoint-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const data = new FormData(form); const providerId = data.get('provider_id'); const endpointId = form.dataset.endpointId;
   const payload = endpointId ? {id: endpointId, api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, requires_api_key: data.get('requires_api_key') === 'on'} : {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, extra_headers: {}, extra_body: {}, requires_api_key: data.get('requires_api_key') === 'on', api_key: data.get('requires_api_key') === 'on' ? data.get('api_key') : null};
+  if (!endpointId && payload.api_type === 'openai_codex') return beginOpenAiSubscription({provider_id: providerId, endpoint_id: payload.id}, $('#endpoint-error'), endpointDialog);
   const response = await fetch(endpointId ? `/admin/providers/${providerId}/endpoints/${endpointId}` : `/admin/providers/${providerId}/endpoints`, {method: endpointId ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#endpoint-error'));
   endpointDialog.close(); await loadProviders();
@@ -418,7 +527,7 @@ function openKeyDialog(providerId, endpointId = null) {
   $('#key-form [name="provider_id"]').value = providerId;
   $('#key-form [name="secret"]').type = 'password';
   $('#key-form .toggle-key').textContent = 'Show';
-  $('#key-endpoint').replaceChildren(...provider.endpoints.map(endpoint => new Option(`${endpoint.id} · ${formatType(endpoint.api_type)}`, endpoint.id)));
+  $('#key-endpoint').replaceChildren(...provider.endpoints.filter(endpoint => endpoint.api_type !== 'openai_codex').map(endpoint => new Option(`${endpoint.id} · ${formatType(endpoint.api_type)}`, endpoint.id)));
   if (endpointId) $('#key-endpoint').value = endpointId;
   $('#key-dialog-title').textContent = endpointId ? `Add key to ${endpointId}` : 'Add API key';
   $('#key-dialog-description').textContent = `Add an upstream credential under ${provider.name}${endpointId ? ` / ${endpointId}` : ''}.`;
@@ -554,7 +663,10 @@ $('#request-defaults-form').addEventListener('submit', async event => {
 
 const routeDialog = $('#route-dialog');
 let editingRoutePattern = null;
-function routeTargetOptions() { return providers.flatMap(provider => provider.endpoints.flatMap(endpoint => endpoint.api_keys.filter(key => key.enabled).map(key => { const option = new Option(`${provider.name} · ${endpoint.id} · ${key.name}`, `${provider.id}\n${endpoint.id}\n${key.id}`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; return option; }))); }
+function routeTargetOptions() { return providers.flatMap(provider => provider.endpoints.flatMap(endpoint => {
+  if (endpoint.api_type === 'openai_codex' && endpoint.subscription_connected) { const option = new Option(`${provider.name} · ${endpoint.id} · ChatGPT subscription`, `${provider.id}\n${endpoint.id}\n`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; return [option]; }
+  return endpoint.api_keys.filter(key => key.enabled).map(key => { const option = new Option(`${provider.name} · ${endpoint.id} · ${key.name}`, `${provider.id}\n${endpoint.id}\n${key.id}`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; return option; });
+})); }
 function routeTargetValue(target) { return `${target.provider_id}\n${target.endpoint_id}\n${target.api_key_id}`; }
 function routeTargetEditors() { return $$('#route-targets .route-target-editor'); }
 function distributeRouteShares(weights) {
@@ -652,7 +764,7 @@ function openRouteDialog(route = null) {
   } else initializeRouteTarget(editors[0]);
   updateRouteTargetMode(Boolean(route && route.targets.length > 1));
   const hasDestinations = $('#route-targets .route-target').options.length > 0;
-  $('#route-error').textContent = hasDestinations ? '' : 'Add and enable an upstream API key before creating a route.';
+  $('#route-error').textContent = hasDestinations ? '' : 'Connect an upstream credential before creating a route.';
   validateRouteSplit();
   routeDialog.showModal();
 }
@@ -743,7 +855,7 @@ function updateHelpGuide() {
   if (!authSettings.api_keys.length) keySelect.append(new Option('Generate a Gateway API key first', ''));
   if ([...keySelect.options].some(option => option.value === previousKey)) keySelect.value = previousKey;
   const baseUrl = `${location.origin}/v1`; const model = modelSelect.value || 'provider/model-id'; const key = keySelect.value || 'sk-your-yabane-key';
-  $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an upstream Endpoint and key'}</small></span>`;
+  $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an Endpoint and upstream credential'}</small></span>`;
   $('#help-key-check').innerHTML = `<b>${authSettings.api_keys.length ? icon('check') : '2'}</b><span><strong>Generate a Gateway key</strong><small>${authSettings.api_keys.length ? `${authSettings.api_keys.length} available` : 'Required while authentication is enabled'}</small></span>`;
   $('#help-model-check').innerHTML = `<b>${models.length ? icon('check') : '3'}</b><span><strong>Select a model</strong><small>${models.length ? `${models.length} available` : 'Refresh Provider model discovery'}</small></span>`;
   $('#help-opencode-code').textContent = JSON.stringify({$schema: 'https://opencode.ai/config.json', provider: {yabane: {npm: '@ai-sdk/openai-compatible', name: 'Yabane', options: {baseURL: baseUrl, apiKey: '{env:YABANE_API_KEY}'}, models: {[model]: {name: model}}}}, model: `yabane/${model}`, small_model: `yabane/${model}`}, null, 2);
@@ -820,7 +932,7 @@ async function loadManagementKeys() { const response = await fetch('/admin/manag
 const searchItems = [
   {label: 'Home', description: 'Gateway status and usage overview', view: 'home'},
   {label: 'Providers', description: 'Manage LLM providers', view: 'providers'},
-  {label: 'Model routing', description: 'Route model IDs to API keys', view: 'models'},
+  {label: 'Model routing', description: 'Route model IDs to upstream credentials', view: 'models'},
   {label: 'Provider models', description: 'Discover models from providers', view: 'models'},
   {label: 'API access', description: 'Authentication and gateway keys', view: 'access'},
   {label: 'Generate Gateway API key', description: 'Create an inference credential', view: 'access', action: () => $('#open-gateway-key').click()},
@@ -982,7 +1094,7 @@ $('#save-activity-retention').addEventListener('click', async () => {
 });
 async function loadDashboard() { const since = Math.floor(Date.now() / 1000) - 86400; const stats = await fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()); $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens); $('#home-providers').replaceChildren(...providers.map(provider => { const item = document.createElement('button'); item.textContent = `${provider.name} · ${provider.discovered_models.length} models`; item.addEventListener('click', () => { selectedProviderId = provider.id; showView('providers'); }); return item; })); }
 
-function formatType(type) { return type === 'anthropic' ? 'Anthropic' : 'OpenAI compatible'; }
+function formatType(type) { return type === 'anthropic' ? 'Anthropic' : type === 'openai_codex' ? 'OpenAI subscription' : 'OpenAI compatible'; }
 function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value); return node.innerHTML; }
 async function loadProviders() { const response = await fetch('/admin/providers'); providers = await response.json(); renderProviders(); }
 async function loadRoutes() { const response = await fetch('/admin/routes'); modelRoutes = await response.json(); renderRoutes(); }

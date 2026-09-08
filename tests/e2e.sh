@@ -52,8 +52,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('content-length', 0)); request = json.loads(self.rfile.read(length))
         endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
-        body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
-        self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
+        body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
+        self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
 
 ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
@@ -100,8 +100,10 @@ providers_json=$(admin -f "$base/admin/providers")
 [[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .model_endpoints["model-b"][0]') == two ]]
 [[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .model_endpoints["shared"] | join(",")') == one,two ]]
 # Shared models use the first configured compatible endpoint by default and accept an explicit preference.
-shared_default=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Shared model setup","expires_at":null,"provider_ids":[]}' | jq -r .secret)" -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
+shared_default=$(curl -sf -D shared-response.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Shared model setup","expires_at":null,"provider_ids":[]}' | jq -r .secret)" -H 'Cookie: yabane_session=caller-secret' -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
 [[ $(printf '%s' "$shared_default" | jq -r .endpoint) == one ]]
+[[ $(printf '%s' "$shared_default" | jq -r '.headers.cookie') == null ]]
+! grep -qi '^set-cookie:' shared-response.headers
 admin -f -X PATCH "$base/admin/providers/multi/model-endpoint-preferences" -H 'content-type: application/json' -d '{"preferences":[{"model":"shared","api_type":"openai_compatible","endpoint_id":"two"}]}' >/dev/null
 providers_json=$(admin -f "$base/admin/providers")
 [[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .model_endpoint_preferences[0].endpoint_id') == two ]]

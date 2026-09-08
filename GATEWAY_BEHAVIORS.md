@@ -39,7 +39,7 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Provider-scope selection uses individually labeled checkboxes and an empty selection clearly means unrestricted access.
 * Secret-entry fields use the same Show/Hide interaction throughout the admin console.
 * Upstream-key traffic distribution is presented as percentages that must total 100% across enabled keys; newly added keys use the standard default weight, while the stored positive weights preserve deterministic weighted round robin.
-* The Model routing page explains that rules bind matching models to a specific endpoint and upstream key, shows exact and prefix examples, and makes clear that unmatched models retain weighted load balancing.
+* The Model routing page explains that rules bind matching models to a specific Endpoint and upstream credential, shows exact and prefix examples, and makes clear that unmatched models retain default Endpoint credential selection.
 * Missing configuration files produce empty/default configuration; malformed or unreadable configuration fails startup visibly.
 * `YABANE_LOG` controls logging, defaults to `info`, and an invalid filter fails startup.
 
@@ -75,19 +75,24 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * OpenAI Chat Completions requests are accepted only at `POST /v1/chat/completions`.
 * OpenAI Responses requests are accepted only at `POST /v1/responses`.
 * Anthropic Messages requests are accepted only at `POST /v1/messages`.
-* Request fields other than the provider prefix in `model` are forwarded without semantic rewriting unless explicit Provider or Endpoint extra request-body fields are configured.
+* Request fields other than the provider prefix in `model` are forwarded without semantic rewriting unless explicit Provider or Endpoint extra request-body fields are configured, except that OpenAI subscription Endpoints explicitly require streaming Responses and force `stream: true`, `store: false`, inclusion of `reasoning.encrypted_content`, Codex defaults for missing instructions, text verbosity, tool choice, and parallel tool calls, and the standard Responses string-input shorthand's equivalent user-message form for the ChatGPT Codex backend.
+* OpenAI subscription Endpoints are compatible only with the OpenAI Responses surface; Chat Completions and Anthropic Messages requests do not silently convert to that protocol.
 * Provider-level extra headers and JSON request-body fields can apply to every current and future endpoint or to an explicit non-empty selection of that Provider’s endpoints; endpoint-level values override matching provider-level values where the Provider defaults apply.
 * The provider Request defaults editor uses structured header and body-field rows, offers all-endpoint and selected-endpoint scope controls, validates endpoint selection, duplicate names, HTTP header syntax, reserved authentication and hop-by-hop headers, and each body field’s JSON value before saving, and shows a live JSON body preview.
 * Upstream status codes and response bodies are visible to the caller.
 * Upstream response bodies, including SSE, are streamed without full response buffering.
-* Proxying strips standard hop-by-hop request and response headers while preserving end-to-end upstream headers, status codes, and body bytes.
+* Proxying strips standard hop-by-hop headers, caller cookies, and upstream `Set-Cookie` headers while preserving other end-to-end upstream headers, status codes, and body bytes; this prevents same-origin administrator sessions from reaching an upstream or being overwritten by one.
 * Multiple inference requests can execute concurrently and reuse pooled upstream connections.
 * Upstream connection failures return `502` without exposing credentials.
 * Request bodies larger than 32 MiB are rejected.
 
 ## Upstream endpoints and keys
 
-* A provider can contain multiple API endpoints, and the admin console can add, edit, or delete endpoints after provider creation; editing supports API type, base URL, SOCKS5 proxy, and whether credentials are required without exposing or replacing existing secrets or Endpoint request defaults.
+* A provider can contain multiple API endpoints, and the admin console can add, edit, or delete endpoints after provider creation; editing standard Endpoints supports API type, base URL, SOCKS5 proxy, and whether credentials are required without exposing or replacing existing secrets or Endpoint request defaults, while fixed OpenAI subscription Endpoints can be deleted and reconnected but not converted in place.
+* An administrator can connect a ChatGPT Plus or Pro subscription as either a new Provider or an Endpoint on an existing Provider through OpenAI's device-code OAuth page; Yabane never receives the account password.
+* OpenAI subscription access and refresh tokens and ChatGPT account ID are persisted only in the private Provider configuration, omitted from every management API response, refreshed before expiry under a per-Endpoint lock, and never accepted from or exposed to gateway callers; a refresh that began against an older credential cannot overwrite an Endpoint reconnected while it was in flight.
+* Each OpenAI device sign-in flow permits only one upstream poll at a time, and the console ignores and aborts stale polling when a newer flow starts or its dialog closes.
+* OpenAI subscription inference maps `POST /v1/responses` to `https://chatgpt.com/backend-api/codex/responses`, replaces caller authentication and Codex routing headers, and injects the connected account ID, OAuth bearer token, `originator: yabane`, `OpenAI-Beta: responses=experimental`, and SSE content negotiation.
 * Endpoint IDs are immutable after creation because discovery metadata, model preferences, routes, credentials, and Activity all reference them.
 * Changing or adding an Endpoint clears model availability and preferences tied to that Endpoint before persisting when applicable, then starts one background discovery refresh; the console does not issue a duplicate refresh.
 * Deleting a Provider or Endpoint also removes every model-route target referring to that exact resource; routes left without targets are removed, and Endpoint deletion additionally removes its discovered-model availability and preferences.
@@ -108,12 +113,12 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Disabled upstream keys receive no default traffic.
 * OpenAI-compatible upstream credentials are sent as `Authorization: Bearer <key>`.
 * Anthropic upstream credentials are sent as `x-api-key: <key>`.
-* The caller's authorization headers are never forwarded to the upstream provider.
+* The caller's authorization headers and cookies are never forwarded to the upstream provider.
 
 ## Model-specific routing
 
 * A model route creates a public model alias that clients call without a `provider/` prefix.
-* A route target explicitly maps that public pattern to an upstream provider, endpoint, API key, and the exact model ID understood by that upstream; the upstream model does not include Yabane’s Provider prefix, though native namespaced IDs such as `google/model-name` remain valid.
+* A route target explicitly maps that public pattern to an upstream provider, endpoint, credential (an API key or connected subscription), and the exact model ID understood by that upstream; the upstream model does not include Yabane’s Provider prefix, though native namespaced IDs such as `google/model-name` remain valid.
 * The route editor defaults to the simple alias task with only destination and upstream model fields, explains upstream model IDs, offers models discovered from the selected Endpoint as optional input suggestions, clearly permits custom IDs that were not discovered, and rejects an accidentally repeated Yabane Provider prefix while preserving legitimate native namespaced model IDs.
 * Multi-destination traffic splitting is progressively disclosed behind an explicit action; only then does the editor show percentage shares, require a 100% total, and allow destinations to be added or removed while retaining at least one.
 * Existing model routes can be opened in the route editor, including all weighted destinations, and saved with either the original or a changed public model pattern.
@@ -121,8 +126,8 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * A model route can be an exact model ID or one trailing prefix wildcard.
 * Exact model routes take precedence over wildcard routes.
 * The longest matching wildcard prefix takes precedence over shorter prefixes.
-* If no model route matches, weighted key selection is used.
-* A model route explicitly selects both an endpoint and one enabled upstream API key.
+* If no model route matches, each selected Endpoint uses its default credential behavior: weighted key selection for key-based Endpoints or the connected OAuth credential for an OpenAI subscription Endpoint.
+* A model route explicitly selects both an Endpoint and one enabled upstream credential; OpenAI subscription targets use the Endpoint's connected OAuth subscription and reject a non-empty API-key ID instead of silently ignoring it.
 * Upstream-key update and deletion URLs include both Provider and Endpoint identity because key IDs are unique only within an Endpoint.
 * The Provider detail console can delete each upstream key from within its owning Endpoint.
 * Deleting an upstream key removes global-route targets referring to that exact Provider, Endpoint, and key; a route with no remaining targets is removed.
@@ -135,7 +140,8 @@ This file is the source checklist for end-to-end gateway behavior. Every item be
 * Provider details summarize the model catalog with unique-model count, shared-model count, configured Endpoint-default count, per-Endpoint coverage, discovery freshness, and a bounded searchable catalog instead of presenting an empty count-only card.
 * The model catalog displays each model’s Endpoint availability and effective default routing, provides working search, clear, and complete Previous/Next pagination over all matches, and lets shared models be managed in a searchable bounded preference editor without rendering the full collection by default.
 * Large provider model collections are collapsed by default and can be searched in a bounded model browser instead of rendering an unbounded wall of model labels.
-* Successful model discovery and the latest discovery status are persisted for the admin console.
+* Successful model discovery and the latest discovery status are persisted for the admin console; results are discarded if their Provider Endpoint or credential inputs changed while discovery was in flight, and a persistence failure leaves the in-memory catalog unchanged.
+* OpenAI subscription Endpoints use Yabane's explicit ChatGPT Codex model catalog rather than calling an unsupported upstream `/models` operation.
 * `GET /v1/models` returns an OpenAI-compatible list envelope.
 * Model discovery concurrently queries configured provider endpoints and enabled upstream keys.
 * OpenAI-compatible discovery accepts both `{ "data": [...] }` and a top-level model array; nested OpenAI-compatible API roots such as `https://opencode.ai/zen/go/v1` resolve discovery at that root’s `/models` resource.
