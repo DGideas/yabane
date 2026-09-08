@@ -12,6 +12,9 @@ let selectedProviderId = null;
 let adminSession = null;
 let turnstileWidgetId = null;
 let aboutInfo = null;
+const LIVE_REFRESH_INTERVAL_MS = 10000;
+let activityLoadPromise = null;
+let dashboardLoadPromise = null;
 
 async function renderTurnstile(action) {
   const widget = $('#turnstile-widget');
@@ -54,6 +57,7 @@ async function initializeAdmin() {
   $('#account-menu').textContent = initial; $('.account-avatar-large').textContent = initial;
   $('#account-name').textContent = adminSession.username || 'Administrator'; $('#account-email').textContent = adminSession.email || '';
   await Promise.all([loadProviders(), loadAuth(), loadRoutes(), loadAbout()]);
+  refreshVisibleView();
 }
 
 $('#login-form').addEventListener('submit', async event => {
@@ -65,10 +69,25 @@ $('#login-form').addEventListener('submit', async event => {
 });
 const accountMenu = $('#account-menu');
 const accountPopover = $('#account-popover');
+const mobileNavToggle = $('#mobile-nav-toggle');
+const mobileNavBackdrop = $('#mobile-nav-backdrop');
+const consoleSidebar = $('#console-sidebar');
 function closeAccountMenu() { accountPopover.hidden = true; accountMenu.setAttribute('aria-expanded', 'false'); }
+function setMobileNavigation(open, returnFocus = false) {
+  consoleSidebar.classList.toggle('mobile-open', open);
+  mobileNavBackdrop.hidden = !open;
+  mobileNavToggle.setAttribute('aria-expanded', String(open));
+  mobileNavToggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
+  document.body.classList.toggle('mobile-nav-open', open);
+  if (open) requestAnimationFrame(() => consoleSidebar.querySelector('.nav.active')?.focus());
+  else if (returnFocus) mobileNavToggle.focus();
+}
+mobileNavToggle.addEventListener('click', () => setMobileNavigation(mobileNavToggle.getAttribute('aria-expanded') !== 'true', true));
+mobileNavBackdrop.addEventListener('click', () => setMobileNavigation(false, true));
+window.addEventListener('resize', () => { if (innerWidth > 760) setMobileNavigation(false); });
 accountMenu.addEventListener('click', event => { event.stopPropagation(); const opening = accountPopover.hidden; accountPopover.hidden = !opening; accountMenu.setAttribute('aria-expanded', String(opening)); });
 document.addEventListener('click', event => { if (!event.target.closest('.account-control')) closeAccountMenu(); });
-document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAccountMenu(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeAccountMenu(); if (mobileNavToggle.getAttribute('aria-expanded') === 'true') setMobileNavigation(false, true); } });
 $('#logout').addEventListener('click', async () => { await fetch('/admin/logout', {method: 'POST'}); location.href = '/login'; });
 const profileDialog = $('#profile-dialog');
 $('#open-profile').addEventListener('click', () => { closeAccountMenu(); const form = $('#profile-form'); form.reset(); form.elements.username.value = adminSession.username || ''; form.elements.email.value = adminSession.email || ''; $('#profile-error').textContent = ''; bindSecretToggles(profileDialog); profileDialog.showModal(); });
@@ -104,7 +123,7 @@ function showView(name, updateHistory = true) {
   if (updateHistory) history.pushState({}, '', selectedProviderId && name === 'providers' ? `/providers/${encodeURIComponent(selectedProviderId)}` : viewPaths[name]);
   document.title = `${active.textContent.trim()} · Yabane`;
 }
-$$('.nav[data-view]').forEach(item => item.addEventListener('click', () => showView(item.dataset.view)));
+$$('.nav[data-view]').forEach(item => item.addEventListener('click', () => { showView(item.dataset.view); if (innerWidth <= 760) setMobileNavigation(false); }));
 function routeFromLocation() {
   const path = location.pathname;
   if (path.startsWith('/providers/')) { selectedProviderId = decodeURIComponent(path.slice('/providers/'.length)); showView('providers', false); }
@@ -160,7 +179,7 @@ function setApiType(type) {
   $$('#api-type-choices .choice').forEach(choice => choice.classList.toggle('selected', choice.contains(input)));
   const subscription = type === 'openai_codex';
   const base = $('#base-url');
-  [base.closest('.field'), providerForm.elements.socks5_proxy.closest('.field'), $('#requires-key').closest('.checkbox-row')].forEach(field => field.hidden = subscription);
+  [base.closest('.field'), $('#requires-key').closest('.checkbox-row')].forEach(field => field.hidden = subscription);
   if (subscription) { base.dataset.previousValue = base.value; base.value = 'https://chatgpt.com/backend-api'; }
   else if (base.value === 'https://chatgpt.com/backend-api') base.value = base.dataset.previousValue || '';
   base.required = !subscription;
@@ -220,7 +239,7 @@ providerForm.addEventListener('submit', async event => {
     }
   };
   if (payload.endpoint.api_type === 'openai_codex') {
-    return beginOpenAiSubscription({provider_id: payload.id, provider_name: payload.name, endpoint_id: 'chatgpt'}, $('#provider-error'), providerDialog);
+    return beginOpenAiSubscription({provider_id: payload.id, provider_name: payload.name, endpoint_id: 'chatgpt', socks5_proxy: payload.endpoint.socks5_proxy}, $('#provider-error'), providerDialog);
   }
   const response = await fetch('/admin/providers', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#provider-error'));
@@ -340,7 +359,7 @@ function renderProviderPage() {
     const shares = trafficShares(enabledKeys);
     if (endpoint.api_type === 'openai_codex') {
       const expiry = endpoint.subscription_expires_at ? new Date(endpoint.subscription_expires_at * 1000).toLocaleString() : 'Unknown';
-      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span></div><div class="endpoint-actions"><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head"><div><h4>OpenAI OAuth subscription</h4><p>Yabane refreshes this private credential automatically. The access and refresh tokens are never shown in the console or API.</p></div><span class="kind">Token expires ${escapeHtml(expiry)}</span></div></section></article>`;
+      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit proxy</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head"><div><h4>OpenAI OAuth subscription</h4><p>Yabane refreshes this private credential automatically. The access and refresh tokens are never shown in the console or API.</p></div><span class="kind">Token expires ${escapeHtml(expiry)}</span></div></section></article>`;
     }
     return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
@@ -388,7 +407,7 @@ function renderProviderPage() {
 
 function modelEndpointVariants(provider) {
   const preferences = provider.model_endpoint_preferences || [];
-  return provider.discovered_models.flatMap(model => ['openai_compatible', 'openai_codex', 'anthropic'].map(apiType => {
+  return provider.discovered_models.flatMap(model => ['openai_compatible', 'openai_chat_completions', 'openai_responses', 'openai_codex', 'anthropic'].map(apiType => {
     const compatibleIds = new Set(provider.endpoints.filter(endpoint => endpoint.api_type === apiType).map(endpoint => endpoint.id));
     const endpointIds = (provider.model_endpoints[model] || []).filter(id => compatibleIds.has(id));
     const preferred = preferences.find(item => item.model === model && item.api_type === apiType);
@@ -484,9 +503,9 @@ const endpointDialog = $('#endpoint-dialog');
 function openEndpointDialog(providerId, endpointId = null) {
   const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
   const endpoint = endpointId ? providers.find(item => item.id === providerId)?.endpoints.find(item => item.id === endpointId) : null;
-  form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint);
+  form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint && endpoint.api_type !== 'openai_codex');
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
-  $('#endpoint-dialog .dialog-head p').textContent = endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
+  $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
   $('#endpoint-dialog button[type="submit"]').textContent = endpoint ? 'Save changes' : 'Add endpoint';
   form.elements.id.disabled = Boolean(endpoint);
   if (endpoint) {
@@ -500,7 +519,7 @@ function toggleEndpointMode() {
   const form = $('#endpoint-form'); const subscription = form.elements.api_type.value === 'openai_codex'; const editing = Boolean(form.dataset.endpointId);
   const required = form.elements.requires_api_key.checked && !subscription;
   form.elements.base_url.closest('.field').hidden = subscription;
-  form.elements.socks5_proxy.closest('.field').hidden = subscription;
+  form.elements.api_type.closest('.field').hidden = subscription && editing;
   form.elements.requires_api_key.closest('.checkbox-row').hidden = subscription;
   form.elements.base_url.required = !subscription;
   if (subscription) { form.elements.base_url.dataset.previousValue = form.elements.base_url.value; form.elements.base_url.value = 'https://chatgpt.com/backend-api'; }
@@ -514,7 +533,7 @@ $$('.close-endpoint').forEach(button => button.addEventListener('click', () => e
 $('#endpoint-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const data = new FormData(form); const providerId = data.get('provider_id'); const endpointId = form.dataset.endpointId;
   const payload = endpointId ? {id: endpointId, api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, requires_api_key: data.get('requires_api_key') === 'on'} : {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, extra_headers: {}, extra_body: {}, requires_api_key: data.get('requires_api_key') === 'on', api_key: data.get('requires_api_key') === 'on' ? data.get('api_key') : null};
-  if (!endpointId && payload.api_type === 'openai_codex') return beginOpenAiSubscription({provider_id: providerId, endpoint_id: payload.id}, $('#endpoint-error'), endpointDialog);
+  if (!endpointId && payload.api_type === 'openai_codex') return beginOpenAiSubscription({provider_id: providerId, endpoint_id: payload.id, socks5_proxy: payload.socks5_proxy}, $('#endpoint-error'), endpointDialog);
   const response = await fetch(endpointId ? `/admin/providers/${providerId}/endpoints/${endpointId}` : `/admin/providers/${providerId}/endpoints`, {method: endpointId ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#endpoint-error'));
   endpointDialog.close(); await loadProviders();
@@ -875,6 +894,7 @@ $('#open-gateway-key').addEventListener('click', () => {
   $('#gateway-key-providers').replaceChildren(...providers.map(provider => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" name="provider_ids" value="${escapeHtml(provider.id)}"><span class="custom-check">${icon('check')}</span><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.id)}</small></span>`; return label; }));
   gatewayKeyDialog.showModal();
 });
+$('#empty-gateway-key').addEventListener('click', () => $('#open-gateway-key').click());
 $$('.close-gateway-key').forEach(button => button.addEventListener('click', () => gatewayKeyDialog.close()));
 $('#auth-enabled').addEventListener('change', async event => {
   const response = await fetch('/admin/auth', {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({enabled: event.target.checked})});
@@ -915,6 +935,7 @@ async function loadAuth() { const response = await fetch('/admin/auth'); authSet
 
 const managementKeyDialog = $('#management-key-dialog');
 $('#open-management-key').addEventListener('click', () => { $('#management-key-form').reset(); $('#management-key-error').textContent = ''; managementKeyDialog.showModal(); });
+$('#empty-management-key').addEventListener('click', () => $('#open-management-key').click());
 $$('.close-management-key').forEach(button => button.addEventListener('click', () => managementKeyDialog.close()));
 $('#management-key-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.target); const expiry = data.get('expires_at');
@@ -1001,8 +1022,9 @@ function statusBadge(status) { const success = status >= 200 && status < 400; re
 function compactPath(path) { return path.replace('/v1/', '').replace('chat/completions', 'Chat').replace('responses', 'Responses').replace('messages', 'Messages'); }
 function activityRow(log, detailed = false) {
   const tokens = log.input_tokens + log.output_tokens; const time = new Date(log.timestamp * 1000);
-  if (detailed) return `<tr><td>${time.toLocaleString()}</td><td><code>${escapeHtml(log.request_id)}</code></td><td><code>${escapeHtml(log.model)}</code></td><td>${escapeHtml(log.provider)}</td><td>${escapeHtml(log.endpoint)}</td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}</span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td>${compactNumber(log.input_tokens)}</td><td>${compactNumber(log.output_tokens)}</td><td>${compactNumber(log.cached_tokens)}</td><td>${formatCost(log.cost)}</td></tr>`;
-  return `<tr><td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td></tr>`;
+  const conversion = log.caller_protocol && log.upstream_protocol && log.caller_protocol !== log.upstream_protocol ? ` · ${log.caller_protocol.replace('openai_', '').replace('_completions', '')} → ${log.upstream_protocol.replace('openai_', '').replace('_completions', '')}` : '';
+  if (detailed) return `<tr><td>${time.toLocaleString()}</td><td><code>${escapeHtml(log.request_id)}</code></td><td><code>${escapeHtml(log.model)}</code></td><td>${escapeHtml(log.provider)}</td><td>${escapeHtml(log.endpoint)}</td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td>${compactNumber(log.input_tokens)}</td><td>${compactNumber(log.output_tokens)}</td><td>${compactNumber(log.cached_tokens)}</td><td>${formatCost(log.cost)}</td></tr>`;
+  return `<tr><td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td></tr>`;
 }
 function renderActivityLogs() {
   const query = $('#activity-search').value.trim().toLowerCase(); const status = $('#activity-status-filter').value;
@@ -1010,17 +1032,21 @@ function renderActivityLogs() {
   $('#activity-logs').innerHTML = filtered.length ? filtered.map(log => activityRow(log, true)).join('') : '<tr><td colspan="12"><div class="activity-empty">No requests match these filters.</div></td></tr>';
 }
 async function loadActivity() {
-  const seconds = Number($('#activity-range').value); const since = Math.floor(Date.now() / 1000) - seconds;
-  const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=1000`).then(response => response.json())]);
-  const providerFilter = $('#activity-provider-filter').value; activityLogs = providerFilter ? logs.filter(log => log.provider === providerFilter) : logs;
-  const totals = activityLogs.reduce((total, log) => { total.input += log.input_tokens; total.output += log.output_tokens; total.cached += log.cached_tokens; total.cost += log.cost || 0; total.latency += log.latency_ms; total.success += Number(log.status < 400); total.streaming += Number(log.streaming); return total; }, {input: 0, output: 0, cached: 0, cost: 0, latency: 0, success: 0, streaming: 0});
-  const buckets = activityBuckets(activityLogs, seconds); const requests = activityLogs.length; const totalTokens = totals.input + totals.output;
-  $('#stat-requests').textContent = compactNumber(requests); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
-  $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}% successful`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = `${requests ? Math.round(totals.latency / requests).toLocaleString() : 0} ms avg · ${totals.streaming} streaming`;
-  $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00a67e'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
-  renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), aggregateActivity(activityLogs, 'provider')); renderRankings($('#model-stats'), aggregateActivity(activityLogs, 'model'));
-  $('#recent-activity-logs').innerHTML = activityLogs.length ? activityLogs.slice(0, 8).map(log => activityRow(log)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>'; renderActivityLogs();
-  const filter = $('#activity-provider-filter'); const previous = filter.value; filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.provider, provider.provider))); filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
+  if (activityLoadPromise) return activityLoadPromise;
+  activityLoadPromise = (async () => {
+    const seconds = Number($('#activity-range').value); const since = Math.floor(Date.now() / 1000) - seconds;
+    const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=1000`).then(response => response.json())]);
+    const providerFilter = $('#activity-provider-filter').value; activityLogs = providerFilter ? logs.filter(log => log.provider === providerFilter) : logs;
+    const totals = activityLogs.reduce((total, log) => { total.input += log.input_tokens; total.output += log.output_tokens; total.cached += log.cached_tokens; total.cost += log.cost || 0; total.latency += log.latency_ms; total.success += Number(log.status < 400); total.streaming += Number(log.streaming); return total; }, {input: 0, output: 0, cached: 0, cost: 0, latency: 0, success: 0, streaming: 0});
+    const buckets = activityBuckets(activityLogs, seconds); const requests = activityLogs.length; const totalTokens = totals.input + totals.output;
+    $('#stat-requests').textContent = compactNumber(requests); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
+    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}% successful`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = `${requests ? Math.round(totals.latency / requests).toLocaleString() : 0} ms avg · ${totals.streaming} streaming`;
+    $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00a67e'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
+    renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), aggregateActivity(activityLogs, 'provider')); renderRankings($('#model-stats'), aggregateActivity(activityLogs, 'model'));
+    $('#recent-activity-logs').innerHTML = activityLogs.length ? activityLogs.slice(0, 8).map(log => activityRow(log)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>'; renderActivityLogs();
+    const filter = $('#activity-provider-filter'); const previous = filter.value; filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.provider, provider.provider))); filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
+  })().finally(() => { activityLoadPromise = null; });
+  return activityLoadPromise;
 }
 function showActivityTab(tab) { $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); }); $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests'; }
 $('#activity-view').addEventListener('click', event => {
@@ -1092,9 +1118,25 @@ $('#save-activity-retention').addEventListener('click', async () => {
   if (!response.ok) await showApiError(response, $('#activity-retention-error')); else { await loadActivityStorage(); await loadActivity(); }
   button.disabled = false; button.textContent = 'Save retention';
 });
-async function loadDashboard() { const since = Math.floor(Date.now() / 1000) - 86400; const stats = await fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()); $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens); $('#home-providers').replaceChildren(...providers.map(provider => { const item = document.createElement('button'); item.textContent = `${provider.name} · ${provider.discovered_models.length} models`; item.addEventListener('click', () => { selectedProviderId = provider.id; showView('providers'); }); return item; })); }
+async function loadDashboard() {
+  if (dashboardLoadPromise) return dashboardLoadPromise;
+  dashboardLoadPromise = (async () => {
+    const since = Math.floor(Date.now() / 1000) - 86400; const stats = await fetch(`/admin/activity/stats?since=${since}`).then(response => response.json());
+    $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens);
+    $('#home-providers').replaceChildren(...providers.map(provider => { const item = document.createElement('button'); item.textContent = `${provider.name} · ${provider.discovered_models.length} models`; item.addEventListener('click', () => { selectedProviderId = provider.id; showView('providers'); }); return item; }));
+  })().finally(() => { dashboardLoadPromise = null; });
+  return dashboardLoadPromise;
+}
 
-function formatType(type) { return type === 'anthropic' ? 'Anthropic' : type === 'openai_codex' ? 'OpenAI subscription' : 'OpenAI compatible'; }
+function refreshVisibleView() {
+  if (!adminSession?.authenticated || document.hidden) return;
+  if (!$('#home-view').hidden) loadDashboard();
+  else if (!$('#activity-view').hidden) loadActivity();
+}
+setInterval(refreshVisibleView, LIVE_REFRESH_INTERVAL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisibleView(); });
+
+function formatType(type) { return type === 'anthropic' ? 'Anthropic Messages' : type === 'openai_codex' ? 'OpenAI subscription' : type === 'openai_chat_completions' ? 'OpenAI Chat Completions' : type === 'openai_responses' ? 'OpenAI Responses' : 'OpenAI compatible'; }
 function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value); return node.innerHTML; }
 async function loadProviders() { const response = await fetch('/admin/providers'); providers = await response.json(); renderProviders(); }
 async function loadRoutes() { const response = await fetch('/admin/routes'); modelRoutes = await response.json(); renderRoutes(); }

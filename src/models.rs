@@ -333,7 +333,9 @@ async fn fetch_models(
     provider: &Provider,
 ) -> Result<Vec<Model>, String> {
     let path = match endpoint.api_type {
-        ApiType::OpenaiCompatible => "/v1/models",
+        ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions | ApiType::OpenaiResponses => {
+            "/v1/models"
+        }
         ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
         ApiType::Anthropic => "/v1/models?limit=1000",
     };
@@ -341,7 +343,9 @@ async fn fetch_models(
     let mut request = client.get(join_upstream_url(&endpoint.base_url, path));
     if let Some(key) = key {
         request = match endpoint.api_type {
-            ApiType::OpenaiCompatible => request.bearer_auth(&key.secret),
+            ApiType::OpenaiCompatible
+            | ApiType::OpenaiChatCompletions
+            | ApiType::OpenaiResponses => request.bearer_auth(&key.secret),
             ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
             ApiType::Anthropic => request
                 .header("x-api-key", &key.secret)
@@ -364,7 +368,9 @@ async fn fetch_models(
     }
 
     match endpoint.api_type {
-        ApiType::OpenaiCompatible => parse_openai_models(&body, provider),
+        ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions | ApiType::OpenaiResponses => {
+            parse_openai_models(&body, provider)
+        }
         ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
         ApiType::Anthropic => parse_anthropic_models(&body, provider),
     }

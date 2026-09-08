@@ -27,6 +27,10 @@ pub struct RequestLog {
     pub model: String,
     pub provider: String,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<String>,
     pub status: u16,
     pub latency_ms: u64,
     pub input_tokens: u64,

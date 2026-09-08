@@ -145,7 +145,7 @@
         "description": "An upstream connection. OAuth tokens and account IDs are never included.",
         "properties": {
           "id": {"type": "string"},
-          "api_type": {"type": "string", "enum": ["openai_compatible", "openai_codex", "anthropic"]},
+          "api_type": {"type": "string", "enum": ["openai_compatible", "openai_chat_completions", "openai_responses", "openai_codex", "anthropic"]},
           "base_url": {"type": "string"},
           "socks5_proxy": {"type": "string", "nullable": true},
           "extra_headers": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -220,6 +220,8 @@
                   "type": "string",
                   "enum": [
                     "openai_compatible",
+                    "openai_chat_completions",
+                    "openai_responses",
                     "openai_codex",
                     "anthropic"
                   ]
@@ -275,8 +277,17 @@
           "endpoint": {
             "type": "string"
           },
+          "caller_protocol": {
+            "type": "string",
+            "nullable": true
+          },
+          "upstream_protocol": {
+            "type": "string",
+            "nullable": true
+          },
           "status": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Final proxy outcome. Streaming protocol-conversion failures are recorded as 502 even when HTTP response headers were sent before the failure was detected."
           },
           "latency_ms": {
             "type": "integer"
@@ -627,7 +638,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Chat Completions",
-        "description": "The model field selects routing: provider/model, or a public model route alias. The provider prefix is stripped before forwarding; the remaining namespaced model ID is preserved.",
+        "description": "The model field selects routing: provider/model, or a public model route alias. Yabane prefers a native Chat Completions Endpoint and otherwise converts the request and successful response to the configured upstream protocol; conversion is reported in the response header and Activity.",
         "security": [
           {
             "gatewayKey": []
@@ -695,7 +706,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Responses",
-        "description": "OpenAI-compatible Endpoints preserve the request. ChatGPT Plus/Pro subscription Endpoints require stream=true and use the explicitly configured Codex backend adapter.",
+        "description": "Yabane prefers a native Responses Endpoint and otherwise converts the request and successful response to the configured upstream protocol. ChatGPT Plus/Pro subscription Endpoints require stream=true upstream and use the explicitly configured Codex backend adapter.",
         "security": [
           {
             "gatewayKey": []
@@ -752,6 +763,7 @@
           "Inference"
         ],
         "summary": "Proxy Anthropic Messages",
+        "description": "Yabane prefers a native Anthropic Messages Endpoint and otherwise converts the request and successful response to the configured upstream protocol; native paths remain transparent.",
         "security": [
           {
             "gatewayKey": []
@@ -1158,9 +1170,9 @@
       "post": {
         "tags": ["Providers"],
         "summary": "Start OpenAI subscription device sign-in",
-        "description": "Starts OpenAI device-code OAuth for a new Provider or a new Endpoint on an existing Provider. OAuth tokens are never returned by this API.",
+        "description": "Starts OpenAI device-code OAuth for a new Provider or a new Endpoint on an existing Provider. When socks5_proxy is set, device authorization, token exchange, refresh, and inference use that proxy. OAuth tokens are never returned by this API.",
         "security": [{"managementKey": []}, {"adminSession": []}],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["provider_id"], "properties": {"provider_id": {"type": "string"}, "provider_name": {"type": "string", "nullable": true}, "endpoint_id": {"type": "string", "nullable": true}}}}}},
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["provider_id"], "properties": {"provider_id": {"type": "string"}, "provider_name": {"type": "string", "nullable": true}, "endpoint_id": {"type": "string", "nullable": true}, "socks5_proxy": {"type": "string", "nullable": true, "pattern": "^socks5h?://"}}}}}},
         "responses": {"201": {"description": "Device sign-in started", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "502": {"description": "OpenAI OAuth service unavailable"}}
       }
     },
@@ -1254,6 +1266,8 @@
                         "type": "string",
                         "enum": [
                           "openai_compatible",
+                          "openai_chat_completions",
+                          "openai_responses",
                           "anthropic"
                         ]
                       },
@@ -1457,6 +1471,8 @@
                     "type": "string",
                     "enum": [
                       "openai_compatible",
+                      "openai_chat_completions",
+                      "openai_responses",
                       "anthropic"
                     ]
                   },
@@ -2093,7 +2109,7 @@
           "Providers"
         ],
         "summary": "Update an API endpoint",
-        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed.",
+        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed. OpenAI subscription Endpoints accept only SOCKS5 proxy changes; their API type, base URL, and credential requirement remain fixed.",
         "security": [
           {
             "managementKey": []
@@ -2141,6 +2157,9 @@
                     "type": "string",
                     "enum": [
                       "openai_compatible",
+                      "openai_chat_completions",
+                      "openai_responses",
+                      "openai_codex",
                       "anthropic"
                     ]
                   },
@@ -2331,6 +2350,9 @@
                           "type": "string",
                           "enum": [
                             "openai_compatible",
+                            "openai_chat_completions",
+                            "openai_responses",
+                            "openai_codex",
                             "anthropic"
                           ]
                         },
