@@ -51,7 +51,60 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
         length = int(self.headers.get('content-length', 0)); request = json.loads(self.rfile.read(length))
-        endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
+        endpoint = self.headers.get('authorization', '').removeprefix('Bearer ') or self.headers.get('x-api-key', 'unknown')
+        if self.path == '/v1/messages':
+            if self.headers.get('openai-organization') or self.headers.get('openai-project') or self.headers.get('anthropic-version') != '2023-06-01' or self.headers.get('accept-encoding') != 'identity':
+                self.send_response(400); self.end_headers(); return
+            if not isinstance(request.get('messages'), list) or 'max_tokens' not in request:
+                self.send_response(400); self.end_headers(); return
+            if request.get('stream'):
+                frames = [
+                    ('message_start', {'type': 'message_start', 'message': {'id': 'msg-converted', 'type': 'message', 'role': 'assistant', 'model': request['model'], 'content': [], 'usage': {'input_tokens': 7, 'output_tokens': 0}}}),
+                    ('content_block_start', {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}),
+                    ('content_block_delta', {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'from-anthropic-stream'}}),
+                    ('content_block_stop', {'type': 'content_block_stop', 'index': 0}),
+                    ('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 2}}),
+                    ('message_stop', {'type': 'message_stop'}),
+                ]
+                body = ''.join(f'event: {event}\ndata: {json.dumps(data)}\n\n' for event, data in frames).encode()
+                self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.write(body); return
+            body = json.dumps({'id': 'msg-converted', 'type': 'message', 'role': 'assistant', 'model': request['model'], 'content': [{'type': 'text', 'text': 'from-anthropic'}], 'stop_reason': 'end_turn', 'stop_sequence': None, 'usage': {'input_tokens': 7, 'output_tokens': 2}}).encode()
+            self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('etag', '"anthropic-body"'); self.send_header('digest', 'sha-256=upstream'); self.end_headers(); self.wfile.write(body); return
+        if endpoint == 'responses-stream':
+            bad_format = request.get('text', {}).get('format', {}).get('type') == 'json_schema' and 'json_schema' in request.get('text', {}).get('format', {})
+            bad_choice = isinstance(request.get('tool_choice'), dict) and request['tool_choice'].get('type') == 'function' and 'function' in request['tool_choice']
+            if self.path != '/v1/responses' or not isinstance(request.get('input'), list) or 'max_tokens' in request or 'frequency_penalty' in request or bad_format or bad_choice:
+                self.send_response(400); self.end_headers(); return
+            if request.get('model') == 'gpt-document' and request.get('input', [{}])[0].get('content', [{}])[0].get('file_url') != 'https://example.com/report.pdf':
+                self.send_response(400); self.end_headers(); return
+            if request.get('model') == 'gpt-failed':
+                body = json.dumps({'id': 'resp-failed', 'object': 'response', 'status': 'failed', 'model': request['model'], 'error': {'code': 'server_error', 'message': 'mock overloaded'}, 'output': []}).encode()
+                self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
+            if request.get('model') == 'gpt-stream-failed':
+                frames = [
+                    ('response.created', {'type': 'response.created', 'response': {'id': 'resp-stream-failed', 'object': 'response', 'status': 'in_progress', 'model': request['model'], 'output': []}}),
+                    ('response.failed', {'type': 'response.failed', 'response': {'id': 'resp-stream-failed', 'object': 'response', 'status': 'failed', 'model': request['model'], 'error': {'code': 'server_error', 'message': 'mock stream overloaded'}, 'output': []}}),
+                ]
+                body = ''.join(f'event: {event}\ndata: {json.dumps(data)}\n\n' for event, data in frames).encode()
+                self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.write(body); return
+            response = {'id': 'resp-stream', 'object': 'response', 'created_at': 11, 'status': 'completed', 'model': request['model'], 'output': [{'id': 'msg-stream', 'type': 'message', 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': 'from-responses-stream'}]}], 'usage': {'input_tokens': 4, 'output_tokens': 2, 'total_tokens': 6}}
+            frames = [
+                ('response.created', {'type': 'response.created', 'response': {**response, 'status': 'in_progress', 'output': [], 'usage': None}}),
+                ('response.output_text.delta', {'type': 'response.output_text.delta', 'output_index': 0, 'content_index': 0, 'delta': 'from-responses-stream'}),
+                ('response.completed', {'type': 'response.completed', 'response': response}),
+            ]
+            body = ''.join(f'event: {event}\ndata: {json.dumps(data)}\n\n' for event, data in frames).encode()
+            self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.write(body); return
+        if endpoint == 'convert':
+            if self.headers.get('anthropic-beta') or self.headers.get('anthropic-version'):
+                self.send_response(400); self.end_headers(); return
+            malformed_tools = any(tool.get('type') != 'function' or not tool.get('function', {}).get('name') for tool in request.get('tools', []))
+            bad_format = request.get('response_format', {}).get('type') == 'json_schema' and 'json_schema' not in request.get('response_format', {})
+            bad_choice = isinstance(request.get('tool_choice'), dict) and not request['tool_choice'].get('function', {}).get('name')
+            if self.path != '/v1/chat/completions' or not isinstance(request.get('messages'), list) or 'max_tool_calls' in request or 'prompt_cache_key' in request or malformed_tools or bad_format or bad_choice:
+                self.send_response(400); self.end_headers(); return
+            body = json.dumps({'id': 'chat-converted', 'object': 'chat.completion', 'created': 10, 'model': request['model'], 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'from-openai'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8}}).encode()
+            self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
         body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
@@ -78,6 +131,7 @@ admin -f -X DELETE "$base/admin/auth/keys/$id" >/dev/null
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_api_key":false,"api_key":null}}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"bad-subscription-proxy","provider_name":"Bad subscription proxy","endpoint_id":"chatgpt","socks5_proxy":"http://127.0.0.1:1080"}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_api_key":false,"api_key":null}}') == 400 ]]
 # Nested OpenAI-compatible roots, including OpenCode Go's /zen/go/v1 shape, append /models at that shared root.
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"nested-root\",\"name\":\"Nested root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/nested/v1\",\"requires_api_key\":true,\"api_key\":\"nested\"}}") == 204 ]]
@@ -114,6 +168,35 @@ scoped_secret=$(printf '%s' "$scoped" | jq -r .secret)
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"allowed/model","messages":[]}') == 502 ]]
 unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi endpoint","expires_at":null,"provider_ids":[]}')
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
+# Cross-protocol adapters let every caller surface use providers with a different native API.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"anthropic\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-chat-only\",\"name\":\"OpenAI Chat only\",\"endpoint\":{\"id\":\"chat\",\"api_type\":\"openai_chat_completions\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"convert\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-responses-only\",\"name\":\"OpenAI Responses only\",\"endpoint\":{\"id\":\"responses\",\"api_type\":\"openai_responses\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"responses-stream\"}}" >/dev/null
+chat_converted=$(curl -sf -D conversion.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'OpenAI-Organization: org-caller' -H 'OpenAI-Project: project-caller' -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","messages":[{"role":"system","content":"Be concise"},{"role":"user","content":"hello"}],"max_completion_tokens":64}')
+[[ $(printf '%s' "$chat_converted" | jq -r '.choices[0].message.content') == from-anthropic ]]
+grep -qi '^x-yabane-protocol-conversion: anthropic_messages->openai_chat_completions' conversion.headers
+! grep -Eqi '^(etag|digest|content-encoding):' conversion.headers
+responses_converted=$(curl -sf -X POST "$base/v1/responses" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","input":"hello","max_output_tokens":64}')
+[[ $(printf '%s' "$responses_converted" | jq -r '.output[0].content[0].text') == from-anthropic ]]
+messages_converted=$(curl -sf -X POST "$base/v1/messages" -H "Authorization: Bearer $unrestricted_secret" -H 'anthropic-version: 2099-01-01' -H 'anthropic-beta: caller-secret-beta' -H 'content-type: application/json' -d '{"model":"openai-chat-only/gpt","messages":[{"role":"user","content":"hello"}],"max_tokens":64}')
+[[ $(printf '%s' "$messages_converted" | jq -r '.content[0].text') == from-openai ]]
+responses_via_chat=$(curl -sf -X POST "$base/v1/responses" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-chat-only/gpt","input":"hello","max_output_tokens":64,"max_tool_calls":3,"prompt_cache_key":"caller-cache","text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}},"tools":[{"type":"web_search_preview"},{"type":"function","name":"lookup","parameters":{"type":"object"},"strict":true}],"tool_choice":{"type":"function","name":"lookup"}}')
+[[ $(printf '%s' "$responses_via_chat" | jq -r '.output[0].content[0].text') == from-openai ]]
+chat_via_streaming_responses=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt","messages":[{"role":"user","content":"hello"}],"max_tokens":64,"frequency_penalty":1,"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}},"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"},"strict":true}}],"tool_choice":{"type":"function","function":{"name":"lookup"}}}')
+[[ $(printf '%s' "$chat_via_streaming_responses" | jq -r '.choices[0].message.content') == from-responses-stream ]]
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-failed","messages":[{"role":"user","content":"hello"}]}') == 502 ]]
+grep -q 'mock overloaded' response.json
+stream_failure=$(curl -sN -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-stream-failed","messages":[{"role":"user","content":"hello"}],"stream":true}')
+[[ $stream_failure == *'mock stream overloaded'* ]]
+document_via_responses=$(curl -sf -X POST "$base/v1/messages" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-document","messages":[{"role":"user","content":[{"type":"document","title":"report.pdf","source":{"type":"url","url":"https://example.com/report.pdf"}},{"type":"text","text":"summarize"}]}],"max_tokens":64}')
+[[ $(printf '%s' "$document_via_responses" | jq -r '.content[0].text') == from-responses-stream ]]
+stream_converted=$(curl -sfN -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":64,"stream":true}')
+[[ $stream_converted == *'from-anthropic-stream'* ]]
+[[ $stream_converted == *'data: [DONE]'* ]]
+conversion_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.caller_protocol == "openai_chat_completions" and .upstream_protocol == "anthropic_messages")] | length') -ge 2 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502)] | length') == 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true)] | length') == 1 ]]
 preferred_shared=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
 [[ $(printf '%s' "$preferred_shared" | jq -r .endpoint) == two ]]
 model_a=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}')
@@ -169,11 +252,15 @@ admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "provider-deletion-route")] | length') == 0 ]]
 # Recreate the Provider needed by the remaining Activity checks.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}}" >/dev/null
-# Ten completed requests trigger an Activity JSONL flush without waiting for the timer.
-for _ in $(seq 1 6); do
+# A completed batch is appended in groups of ten without depending on earlier Activity totals.
+before_batch_count=$(wc -l < data/activity.jsonl | tr -d ' ')
+after_batch_count=$before_batch_count
+for _ in $(seq 1 10); do
   curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}' >/dev/null
+  after_batch_count=$(wc -l < data/activity.jsonl | tr -d ' ')
+  [[ $after_batch_count -gt $before_batch_count ]] && break
 done
-[[ $(wc -l < data/activity.jsonl | tr -d ' ') -eq 10 ]]
+[[ $((after_batch_count - before_batch_count)) -eq 10 ]]
 stats=$(admin -f "$base/admin/activity/stats?since=0")
 [[ $(printf '%s' "$stats" | jq -r .requests) -ge 10 ]]
 [[ $(printf '%s' "$stats" | jq -r .input_tokens) -ge 4800 ]]
@@ -261,9 +348,10 @@ session=$(admin -f "$base/admin/session")
 [[ $(printf '%s' "$session" | jq -r .email) == owner@example.com ]]
 [[ $(admin_status -X PATCH "$base/admin/profile" -H 'content-type: application/json' -d '{"username":"owner","email":"owner@example.com","current_password":"wrong","new_password":"newpassword123"}') == 403 ]]
 # Graceful shutdown flushes a final batch smaller than ten records.
+before_shutdown_count=$(wc -l < data/activity.jsonl | tr -d ' ')
 curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}' >/dev/null
 kill -TERM "$pid"
 wait "$pid"
 pid=
-[[ $(wc -l < data/activity.jsonl | tr -d ' ') -eq 15 ]]
+[[ $(wc -l < data/activity.jsonl | tr -d ' ') -eq $((before_shutdown_count + 1)) ]]
 echo 'Authentication and routing E2E passed'

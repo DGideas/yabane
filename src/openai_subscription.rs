@@ -35,6 +35,8 @@ struct DeviceFlow {
     provider_name: Option<String>,
     create_provider: bool,
     endpoint_id: String,
+    socks5_proxy: Option<String>,
+    client: reqwest::Client,
     device_auth_id: String,
     user_code: String,
     interval_seconds: u64,
@@ -61,6 +63,7 @@ pub struct StartSubscription {
     pub provider_id: String,
     pub provider_name: Option<String>,
     pub endpoint_id: Option<String>,
+    pub socks5_proxy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -121,6 +124,16 @@ pub async fn start(
             "Endpoint ID must be a URL slug".to_owned(),
         ));
     }
+    let socks5_proxy =
+        normalized_socks5_proxy(input.socks5_proxy.as_deref()).map_err(StartError::Invalid)?;
+    let oauth_endpoint = ApiEndpoint {
+        id: endpoint_id.clone(),
+        socks5_proxy: socks5_proxy.clone(),
+        ..ApiEndpoint::default()
+    };
+    let client = oauth_endpoint
+        .client(&state.client)
+        .map_err(StartError::Invalid)?;
     let create_provider = {
         let providers = state.providers.read().await;
         match providers.get(&input.provider_id) {
@@ -147,8 +160,7 @@ pub async fn start(
         }
     };
 
-    let response = state
-        .client
+    let response = client
         .post(format!("{AUTH_BASE_URL}/api/accounts/deviceauth/usercode"))
         .json(&serde_json::json!({"client_id": CLIENT_ID}))
         .timeout(OAUTH_REQUEST_TIMEOUT)
@@ -181,6 +193,8 @@ pub async fn start(
         provider_name: input.provider_name.map(|name| name.trim().to_owned()),
         create_provider,
         endpoint_id,
+        socks5_proxy,
+        client,
         device_auth_id: device.device_auth_id,
         user_code: device.user_code,
         interval_seconds,
@@ -222,7 +236,7 @@ pub async fn poll(state: &AppState, id: &str) -> Result<DeviceFlowView, String> 
             .ok_or_else(|| "OpenAI sign-in flow not found".to_owned());
     };
 
-    match poll_openai(&state.client, &flow, AUTH_BASE_URL).await {
+    match poll_openai(&flow.client, &flow, AUTH_BASE_URL).await {
         Ok(None) => {}
         Ok(Some(credential)) => {
             if let Err(error) = attach_subscription(state, &flow, credential).await {
@@ -377,7 +391,8 @@ pub async fn refreshed_endpoint(
     if credential.expires_at > crate::auth::now().saturating_add(60) {
         return Ok(endpoint);
     }
-    let refreshed = refresh_token(&state.client, &credential.refresh_token, AUTH_BASE_URL).await?;
+    let client = endpoint.client(&state.client)?;
+    let refreshed = refresh_token(&client, &credential.refresh_token, AUTH_BASE_URL).await?;
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
     let stored = updated
@@ -449,18 +464,9 @@ async fn attach_subscription(
     {
         return Err("Endpoint ID already exists".to_owned());
     }
-    provider.endpoints.push(ApiEndpoint {
-        id: flow.endpoint_id.clone(),
-        api_type: ApiType::OpenaiCodex,
-        base_url: CHATGPT_BASE_URL.to_owned(),
-        socks5_proxy: None,
-        extra_headers: HashMap::new(),
-        extra_body: serde_json::Map::new(),
-        requires_api_key: false,
-        api_keys: Vec::new(),
-        openai_subscription: Some(credential),
-        ..ApiEndpoint::default()
-    });
+    provider
+        .endpoints
+        .push(subscription_endpoint(flow, credential));
     provider
         .discovered_models
         .extend(MODELS.iter().map(|model| (*model).to_owned()));
@@ -480,6 +486,31 @@ async fn attach_subscription(
         .map_err(|err| format!("Could not save OpenAI subscription: {err}"))?;
     *providers = updated;
     Ok(())
+}
+
+fn subscription_endpoint(flow: &DeviceFlow, credential: OpenAiSubscription) -> ApiEndpoint {
+    ApiEndpoint {
+        id: flow.endpoint_id.clone(),
+        api_type: ApiType::OpenaiCodex,
+        base_url: CHATGPT_BASE_URL.to_owned(),
+        socks5_proxy: flow.socks5_proxy.clone(),
+        extra_headers: HashMap::new(),
+        extra_body: serde_json::Map::new(),
+        requires_api_key: false,
+        api_keys: Vec::new(),
+        openai_subscription: Some(credential),
+        ..ApiEndpoint::default()
+    }
+}
+
+fn normalized_socks5_proxy(value: Option<&str>) -> Result<Option<String>, String> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    if value
+        .is_some_and(|value| !value.starts_with("socks5://") && !value.starts_with("socks5h://"))
+    {
+        return Err("SOCKS5 proxy URL must start with socks5:// or socks5h://".to_owned());
+    }
+    Ok(value.map(str::to_owned))
 }
 
 async fn set_flow_status(state: &AppState, id: &str, status: FlowStatus) {
@@ -565,6 +596,8 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use tokio::sync::Mutex;
 
+    use crate::config::OpenAiSubscription;
+
     #[test]
     fn extracts_chatgpt_account_id_from_access_token() {
         let payload = URL_SAFE_NO_PAD
@@ -615,6 +648,48 @@ mod tests {
             endpoint.openai_subscription.unwrap().access_token,
             current.access_token,
         );
+    }
+
+    #[test]
+    fn validates_and_normalizes_subscription_proxy() {
+        assert_eq!(
+            super::normalized_socks5_proxy(Some(" socks5h://127.0.0.1:1080 ")).unwrap(),
+            Some("socks5h://127.0.0.1:1080".to_owned()),
+        );
+        assert_eq!(super::normalized_socks5_proxy(Some("  ")).unwrap(), None);
+        assert!(super::normalized_socks5_proxy(Some("http://127.0.0.1:1080")).is_err());
+    }
+
+    #[test]
+    fn subscription_endpoint_keeps_flow_proxy() {
+        let credential = OpenAiSubscription {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at: 1,
+            account_id: "account".to_owned(),
+        };
+        let flow = super::DeviceFlow {
+            provider_id: "openai".to_owned(),
+            provider_name: None,
+            create_provider: true,
+            endpoint_id: "chatgpt".to_owned(),
+            socks5_proxy: Some("socks5h://127.0.0.1:1080".to_owned()),
+            client: reqwest::Client::new(),
+            device_auth_id: "device".to_owned(),
+            user_code: "CODE".to_owned(),
+            interval_seconds: 1,
+            next_poll_at: 0,
+            poll_lock: Arc::new(Mutex::new(())),
+            expires_at: u64::MAX,
+            status: super::FlowStatus::Pending,
+        };
+
+        let endpoint = super::subscription_endpoint(&flow, credential);
+        assert_eq!(
+            endpoint.socks5_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:1080"),
+        );
+        assert_eq!(endpoint.api_type, crate::config::ApiType::OpenaiCodex);
     }
 
     #[tokio::test]
@@ -675,6 +750,8 @@ mod tests {
             provider_name: None,
             create_provider: false,
             endpoint_id: "chatgpt".to_owned(),
+            socks5_proxy: None,
+            client: reqwest::Client::new(),
             device_auth_id: "device".to_owned(),
             user_code: "CODE".to_owned(),
             interval_seconds: 1,
@@ -684,11 +761,10 @@ mod tests {
             status: super::FlowStatus::Pending,
         };
 
-        let credential =
-            super::poll_openai(&reqwest::Client::new(), &flow, &format!("http://{address}"))
-                .await
-                .unwrap()
-                .unwrap();
+        let credential = super::poll_openai(&flow.client, &flow, &format!("http://{address}"))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(credential.account_id, "account-456");
         assert_eq!(credential.refresh_token, "refresh");
         assert!(credential.expires_at > crate::auth::now());

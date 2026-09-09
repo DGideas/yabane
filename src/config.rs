@@ -31,6 +31,8 @@ pub struct AppState {
 #[serde(rename_all = "snake_case")]
 pub enum ApiType {
     OpenaiCompatible,
+    OpenaiChatCompletions,
+    OpenaiResponses,
     OpenaiCodex,
     Anthropic,
 }
@@ -39,6 +41,8 @@ impl ApiType {
     pub fn default_endpoint_id(self) -> &'static str {
         match self {
             Self::OpenaiCompatible => "openai",
+            Self::OpenaiChatCompletions => "openai-chat",
+            Self::OpenaiResponses => "openai-responses",
             Self::OpenaiCodex => "chatgpt",
             Self::Anthropic => "anthropic",
         }

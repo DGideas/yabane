@@ -17,6 +17,8 @@ mod error;
 mod gateway;
 mod models;
 mod openai_subscription;
+mod protocol;
+mod protocol_stream;
 mod routes;
 mod storage;
 mod usage;

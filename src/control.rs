@@ -1016,12 +1016,6 @@ async fn update_endpoint(
     Path((provider_id, endpoint_id)): Path<(String, String)>,
     axum::Json(input): axum::Json<UpdateEndpoint>,
 ) -> Response {
-    if input.api_type == ApiType::OpenaiCodex {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "Subscription Endpoints cannot be converted; connect a new OpenAI subscription instead",
-        );
-    }
     if input.base_url.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "Endpoint base URL is required");
     }
@@ -1047,10 +1041,22 @@ async fn update_endpoint(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
-    if endpoint.api_type == ApiType::OpenaiCodex {
+    let subscription_endpoint = endpoint.api_type == ApiType::OpenaiCodex;
+    if subscription_endpoint {
+        let base_url = input.base_url.trim().trim_end_matches('/');
+        if input.api_type != ApiType::OpenaiCodex
+            || base_url != endpoint.base_url
+            || input.requires_api_key
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "OpenAI subscription Endpoints only allow SOCKS5 proxy changes; delete and reconnect to change other settings",
+            );
+        }
+    } else if input.api_type == ApiType::OpenaiCodex {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "OpenAI subscription Endpoints cannot be converted; delete and reconnect the Endpoint instead",
+            "Connect a new OpenAI subscription instead of converting an existing Endpoint",
         );
     }
     endpoint.api_type = input.api_type;
@@ -1058,13 +1064,15 @@ async fn update_endpoint(
     endpoint.socks5_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
     endpoint.requires_api_key = input.requires_api_key;
     endpoint.proxy_client = Default::default();
-    remove_endpoint_discovery(provider, &endpoint_id);
+    if !subscription_endpoint {
+        remove_endpoint_discovery(provider, &endpoint_id);
+    }
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
         *providers = updated;
     }
     drop(providers);
-    if response.status().is_success() {
+    if response.status().is_success() && !subscription_endpoint {
         spawn_provider_refresh(state, provider_id);
     }
     response

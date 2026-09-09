@@ -166,7 +166,10 @@ fn merge_event_usage(api_type: ApiType, bytes: &[u8], combined: &mut TokenUsage)
         combined.cost = Some(combined.cost.unwrap_or(0.0).max(cost));
     }
     let usage = match api_type {
-        ApiType::OpenaiCompatible | ApiType::OpenaiCodex => value
+        ApiType::OpenaiCompatible
+        | ApiType::OpenaiChatCompletions
+        | ApiType::OpenaiResponses
+        | ApiType::OpenaiCodex => value
             .pointer("/response/usage")
             .or_else(|| value.get("usage")),
         ApiType::Anthropic => value

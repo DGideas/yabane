@@ -11,12 +11,14 @@ use rand::RngCore;
 use tracing::error;
 
 use crate::{
-    activity::RequestLog,
+    activity::{ActivityStore, RequestLog},
     auth,
     config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
     error::api_error,
     openai_subscription,
-    usage::UsageTracker,
+    protocol::{self, Protocol},
+    protocol_stream::StreamConverter,
+    usage::{TokenUsage, UsageTracker},
 };
 
 const MAX_REQUEST_BODY_SIZE: usize = 32 * 1024 * 1024;
@@ -35,16 +37,37 @@ enum ApiSurface {
 }
 
 impl ApiSurface {
+    fn protocol(self) -> Protocol {
+        match self {
+            Self::OpenAiChat => Protocol::OpenAiChat,
+            Self::OpenAiResponses => Protocol::OpenAiResponses,
+            Self::Anthropic => Protocol::AnthropicMessages,
+        }
+    }
+
     fn supports(self, api_type: ApiType) -> bool {
         matches!(
             (self, api_type),
-            (Self::OpenAiChat, ApiType::OpenaiCompatible)
-                | (
-                    Self::OpenAiResponses,
-                    ApiType::OpenaiCompatible | ApiType::OpenaiCodex
-                )
-                | (Self::Anthropic, ApiType::Anthropic)
+            (
+                Self::OpenAiChat,
+                ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions
+            ) | (
+                Self::OpenAiResponses,
+                ApiType::OpenaiCompatible | ApiType::OpenaiResponses | ApiType::OpenaiCodex
+            ) | (Self::Anthropic, ApiType::Anthropic)
         )
+    }
+
+    fn upstream_protocol(self, api_type: ApiType) -> Protocol {
+        match api_type {
+            ApiType::Anthropic => Protocol::AnthropicMessages,
+            ApiType::OpenaiCodex | ApiType::OpenaiResponses => Protocol::OpenAiResponses,
+            ApiType::OpenaiChatCompletions => Protocol::OpenAiChat,
+            ApiType::OpenaiCompatible => match self {
+                Self::OpenAiResponses => Protocol::OpenAiResponses,
+                Self::OpenAiChat | Self::Anthropic => Protocol::OpenAiChat,
+            },
+        }
     }
 }
 
@@ -78,13 +101,13 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
             Err(err) => return api_error(err.status, err.message),
         };
 
+    let upstream_protocol = surface.upstream_protocol(endpoint.api_type);
+    let body = match protocol::convert_request(&body, surface.protocol(), upstream_protocol) {
+        Ok(body) => body,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, err),
+    };
+
     let endpoint = if endpoint.api_type == ApiType::OpenaiCodex {
-        if !requested_streaming {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                "OpenAI subscription Endpoints require stream=true on the Responses API",
-            );
-        }
         match openai_subscription::refreshed_endpoint(&state, &provider.id, &endpoint.id).await {
             Ok(endpoint) => endpoint,
             Err(err) => {
@@ -106,6 +129,8 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
             parts,
             body,
             requested_streaming,
+            caller_protocol: surface.protocol(),
+            upstream_protocol,
         },
     )
     .await
@@ -185,17 +210,16 @@ async fn resolve_provider(
                         && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
                 })
             })
+            .or_else(|| {
+                provider.endpoints.iter().find(|endpoint| {
+                    discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
+                })
+            })
     }
     .ok_or_else(|| RoutingError {
         status: StatusCode::BAD_REQUEST,
         message: format!("Provider '{provider_id}' has no endpoint for model '{upstream_model}'"),
     })?;
-    if !surface.supports(endpoint.api_type) {
-        return Err(RoutingError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Model '{upstream_model}' is not available through this API type"),
-        });
-    }
     let api_key = if endpoint.api_type == ApiType::OpenaiCodex {
         None
     } else if let Some(target) = &route_target {
@@ -242,6 +266,43 @@ fn request_id() -> String {
     id
 }
 
+struct ProxyActivity {
+    store: ActivityStore,
+    request_id: String,
+    path: String,
+    model: String,
+    provider: String,
+    endpoint: String,
+    caller_protocol: Protocol,
+    upstream_protocol: Protocol,
+    started: Instant,
+}
+
+impl ProxyActivity {
+    async fn record(&self, status: StatusCode, usage: TokenUsage, streaming: bool) {
+        self.store
+            .record(RequestLog {
+                timestamp: crate::auth::now(),
+                request_id: self.request_id.clone(),
+                source_instance_id: None,
+                path: self.path.clone(),
+                model: self.model.clone(),
+                provider: self.provider.clone(),
+                endpoint: self.endpoint.clone(),
+                caller_protocol: Some(self.caller_protocol.name().to_owned()),
+                upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
+                status: status.as_u16(),
+                latency_ms: self.started.elapsed().as_millis() as u64,
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                cached_tokens: usage.cached,
+                cost: usage.cost,
+                streaming,
+            })
+            .await;
+    }
+}
+
 struct ForwardRequest {
     provider: Provider,
     endpoint: ApiEndpoint,
@@ -250,6 +311,8 @@ struct ForwardRequest {
     parts: axum::http::request::Parts,
     body: Vec<u8>,
     requested_streaming: bool,
+    caller_protocol: Protocol,
+    upstream_protocol: Protocol,
 }
 
 async fn forward(state: AppState, request: ForwardRequest) -> Response {
@@ -261,6 +324,8 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         parts,
         body,
         requested_streaming,
+        caller_protocol,
+        upstream_protocol,
     } = request;
     let started = Instant::now();
     let path = parts.uri.path().to_owned();
@@ -271,6 +336,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let request_headers = sanitize_request_headers(
         parts.headers,
         endpoint.api_type,
+        (caller_protocol, upstream_protocol),
         api_key.as_ref(),
         endpoint.openai_subscription.as_ref(),
         if provider_defaults_apply {
@@ -285,10 +351,17 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
+    let target_path = match upstream_protocol {
+        Protocol::OpenAiChat => "/v1/chat/completions",
+        Protocol::OpenAiResponses => "/v1/responses",
+        Protocol::AnthropicMessages => "/v1/messages",
+    };
     let target = if endpoint.api_type == ApiType::OpenaiCodex {
         join_upstream_url(&endpoint.base_url, "/codex/responses")
-    } else {
+    } else if caller_protocol == upstream_protocol {
         join_upstream_url(&endpoint.base_url, path_and_query)
+    } else {
+        join_upstream_url(&endpoint.base_url, target_path)
     };
     let body = apply_extra_body(
         body,
@@ -333,28 +406,180 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .split(';')
         .next()
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let activity = state.activity.clone();
-    let provider_id = provider.id.clone();
-    let endpoint_id = endpoint.id.clone();
+    let activity = ProxyActivity {
+        store: state.activity.clone(),
+        request_id,
+        path,
+        model,
+        provider: provider.id.clone(),
+        endpoint: endpoint.id.clone(),
+        caller_protocol,
+        upstream_protocol,
+        started,
+    };
     let api_type = endpoint.api_type;
+    let converting = status.is_success() && caller_protocol != upstream_protocol;
+
+    if converting && event_stream && !requested_streaming {
+        let mut upstream = upstream_response.bytes_stream();
+        let mut usage = UsageTracker::new(api_type, true);
+        let mut converter = StreamConverter::new_aggregating(upstream_protocol, caller_protocol);
+        let mut failure = None;
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream stream for protocol conversion");
+                    failure = Some("Upstream stream failed".to_owned());
+                    break;
+                }
+            };
+            usage.observe(&chunk);
+            if let Err(err) = converter.push(&chunk) {
+                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not convert upstream stream");
+                failure = Some(err);
+                break;
+            }
+        }
+        if failure.is_none()
+            && let Err(err) = converter.finish()
+        {
+            failure = Some(err);
+        }
+        let converted = if failure.is_none() {
+            match converter.non_stream_response() {
+                Ok(converted) => Some(converted),
+                Err(err) => {
+                    failure = Some(err);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let usage = usage.finish();
+        if let Some(err) = failure {
+            activity.record(StatusCode::BAD_GATEWAY, usage, true).await;
+            return api_error(StatusCode::BAD_GATEWAY, err);
+        }
+        activity.record(status, usage, true).await;
+        let mut response = Response::new(Body::from(converted.expect("successful conversion")));
+        *response.status_mut() = status;
+        copy_response_headers(response.headers_mut(), &response_headers);
+        strip_transformed_response_headers(response.headers_mut());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
+        return response;
+    }
+
+    if converting && !event_stream {
+        let bytes = match upstream_response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream response for protocol conversion");
+                activity
+                    .record(StatusCode::BAD_GATEWAY, TokenUsage::default(), false)
+                    .await;
+                return api_error(StatusCode::BAD_GATEWAY, "Could not read upstream response");
+            }
+        };
+        let mut usage = UsageTracker::new(api_type, false);
+        usage.observe(&bytes);
+        let converted = protocol::convert_response(&bytes, upstream_protocol, caller_protocol);
+        let usage = usage.finish();
+        let converted = match converted {
+            Ok(converted) => converted,
+            Err(err) => {
+                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not convert upstream response");
+                activity
+                    .record(StatusCode::BAD_GATEWAY, usage, requested_streaming)
+                    .await;
+                return api_error(StatusCode::BAD_GATEWAY, err);
+            }
+        };
+        activity.record(status, usage, requested_streaming).await;
+        let mut response = Response::new(Body::from(converted));
+        *response.status_mut() = status;
+        copy_response_headers(response.headers_mut(), &response_headers);
+        strip_transformed_response_headers(response.headers_mut());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
+        return response;
+    }
+
     let stream = async_stream::stream! {
         let mut upstream = upstream_response.bytes_stream();
         let mut usage = UsageTracker::new(api_type, event_stream);
+        let mut converter = converting.then(|| StreamConverter::new(upstream_protocol, caller_protocol));
+        let mut conversion_failed = false;
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
                     usage.observe(&chunk);
-                    yield Ok::<bytes::Bytes, std::io::Error>(chunk);
+                    if let Some(converter) = &mut converter {
+                        match converter.push(&chunk) {
+                            Ok(converted) => {
+                                let failed = converter.has_failed();
+                                if !converted.is_empty() {
+                                    yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(converted));
+                                }
+                                if failed {
+                                    conversion_failed = true;
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                conversion_failed = true;
+                                yield Err(std::io::Error::other(err));
+                                break;
+                            }
+                        }
+                    } else {
+                        yield Ok::<bytes::Bytes, std::io::Error>(chunk);
+                    }
                 }
-                Err(err) => { yield Err(std::io::Error::other(err.to_string())); break; }
+                Err(err) => {
+                    conversion_failed = true;
+                    yield Err(std::io::Error::other(err.to_string()));
+                    break;
+                }
+            }
+        }
+        if !conversion_failed && let Some(converter) = &mut converter {
+            match converter.finish() {
+                Ok(converted) => {
+                    conversion_failed = converter.has_failed();
+                    if !converted.is_empty() {
+                        yield Ok(bytes::Bytes::from(converted));
+                    }
+                }
+                Err(err) => {
+                    conversion_failed = true;
+                    yield Err(std::io::Error::other(err));
+                }
             }
         }
         let usage = usage.finish();
-        activity.record(RequestLog { timestamp: crate::auth::now(), request_id, source_instance_id: None, path, model, provider: provider_id, endpoint: endpoint_id, status: status.as_u16(), latency_ms: started.elapsed().as_millis() as u64, input_tokens: usage.input, output_tokens: usage.output, cached_tokens: usage.cached, cost: usage.cost, streaming: requested_streaming || event_stream }).await;
+        let recorded_status = if conversion_failed { StatusCode::BAD_GATEWAY } else { status };
+        activity.record(recorded_status, usage, requested_streaming || event_stream).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(response.headers_mut(), &response_headers);
+    if converting {
+        strip_transformed_response_headers(response.headers_mut());
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
+    }
     response
 }
 
@@ -378,6 +603,7 @@ pub(crate) fn join_upstream_url(base_url: &str, path_and_query: &str) -> String 
 fn sanitize_request_headers(
     mut headers: HeaderMap,
     api_type: ApiType,
+    protocol_route: (Protocol, Protocol),
     api_key: Option<&ApiKey>,
     subscription: Option<&crate::config::OpenAiSubscription>,
     provider_headers: &std::collections::HashMap<String, String>,
@@ -403,6 +629,16 @@ fn sanitize_request_headers(
     ] {
         headers.remove(name);
     }
+    if protocol_route.0 != protocol_route.1 {
+        for name in [
+            "anthropic-beta",
+            "anthropic-version",
+            "openai-organization",
+            "openai-project",
+        ] {
+            headers.remove(name);
+        }
+    }
     if api_type == ApiType::OpenaiCodex {
         headers.remove(header::CONTENT_ENCODING);
     }
@@ -414,9 +650,18 @@ fn sanitize_request_headers(
             headers.insert(name, value);
         }
     }
+    if protocol_route.0 != protocol_route.1 {
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+    }
     if let Some(api_key) = api_key {
         let (name, value) = match api_type {
-            ApiType::OpenaiCompatible | ApiType::OpenaiCodex => (
+            ApiType::OpenaiCompatible
+            | ApiType::OpenaiChatCompletions
+            | ApiType::OpenaiResponses
+            | ApiType::OpenaiCodex => (
                 header::AUTHORIZATION,
                 HeaderValue::from_str(&format!("Bearer {}", api_key.secret)),
             ),
@@ -426,6 +671,11 @@ fn sanitize_request_headers(
             ),
         };
         headers.insert(name, value.expect("validated API key header value"));
+    }
+    if api_type == ApiType::Anthropic {
+        headers
+            .entry(HeaderName::from_static("anthropic-version"))
+            .or_insert(HeaderValue::from_static("2023-06-01"));
     }
     if let Some(subscription) = subscription {
         headers.insert(
@@ -536,6 +786,16 @@ fn apply_extra_body(
     serde_json::to_vec(&value).expect("serialize request with extra body")
 }
 
+fn set_conversion_header(headers: &mut HeaderMap, source: Protocol, target: Protocol) {
+    let value = format!("{}->{}", source.name(), target.name());
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(
+            HeaderName::from_static("x-yabane-protocol-conversion"),
+            value,
+        );
+    }
+}
+
 fn copy_response_headers(target: &mut HeaderMap, source: &reqwest::header::HeaderMap) {
     for (name, value) in source {
         if is_hop_by_hop_header(name.as_str())
@@ -550,6 +810,18 @@ fn copy_response_headers(target: &mut HeaderMap, source: &reqwest::header::Heade
         ) {
             target.append(name, value);
         }
+    }
+}
+
+fn strip_transformed_response_headers(headers: &mut HeaderMap) {
+    for name in [
+        header::CONTENT_ENCODING.as_str(),
+        header::CONTENT_RANGE.as_str(),
+        header::ETAG.as_str(),
+        "content-digest",
+        "digest",
+    ] {
+        headers.remove(name);
     }
 }
 
@@ -578,7 +850,8 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::{
-        ApiSurface, ApiType, apply_codex_body, copy_response_headers, sanitize_request_headers,
+        ApiSurface, ApiType, Protocol, apply_codex_body, copy_response_headers,
+        sanitize_request_headers, strip_transformed_response_headers,
     };
     use crate::config::OpenAiSubscription;
 
@@ -600,10 +873,19 @@ mod tests {
     }
 
     #[test]
-    fn protocol_surfaces_keep_subscription_responses_only() {
-        assert!(ApiSurface::OpenAiResponses.supports(ApiType::OpenaiCodex));
-        assert!(!ApiSurface::OpenAiChat.supports(ApiType::OpenaiCodex));
-        assert!(!ApiSurface::Anthropic.supports(ApiType::OpenaiCodex));
+    fn subscription_uses_responses_upstream_for_every_caller_surface() {
+        assert_eq!(
+            ApiSurface::OpenAiResponses.upstream_protocol(ApiType::OpenaiCodex),
+            Protocol::OpenAiResponses
+        );
+        assert_eq!(
+            ApiSurface::OpenAiChat.upstream_protocol(ApiType::OpenaiCodex),
+            Protocol::OpenAiResponses
+        );
+        assert_eq!(
+            ApiSurface::Anthropic.upstream_protocol(ApiType::OpenaiCodex),
+            Protocol::OpenAiResponses
+        );
     }
 
     #[test]
@@ -613,6 +895,7 @@ mod tests {
         let sanitized = sanitize_request_headers(
             request_headers,
             ApiType::OpenaiCompatible,
+            (Protocol::OpenAiChat, Protocol::OpenAiChat),
             None,
             None,
             &HashMap::new(),
@@ -629,10 +912,55 @@ mod tests {
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
         );
+        upstream_headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip"),
+        );
+        upstream_headers.insert(
+            reqwest::header::ETAG,
+            reqwest::header::HeaderValue::from_static("\"upstream-body\""),
+        );
         let mut response_headers = HeaderMap::new();
         copy_response_headers(&mut response_headers, &upstream_headers);
         assert!(!response_headers.contains_key("set-cookie"));
         assert_eq!(response_headers["content-type"], "application/json");
+        assert_eq!(response_headers["content-encoding"], "gzip");
+        strip_transformed_response_headers(&mut response_headers);
+        assert!(!response_headers.contains_key("content-encoding"));
+        assert!(!response_headers.contains_key("etag"));
+    }
+
+    #[test]
+    fn cross_protocol_headers_do_not_leak_caller_protocol_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "openai-organization",
+            HeaderValue::from_static("org-caller"),
+        );
+        headers.insert("openai-project", HeaderValue::from_static("proj-caller"));
+        headers.insert("anthropic-beta", HeaderValue::from_static("caller-beta"));
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static("caller-version"),
+        );
+        let endpoint_headers =
+            HashMap::from([("anthropic-beta".to_owned(), "endpoint-beta".to_owned())]);
+
+        let sanitized = sanitize_request_headers(
+            headers,
+            ApiType::Anthropic,
+            (Protocol::OpenAiChat, Protocol::AnthropicMessages),
+            None,
+            None,
+            &HashMap::new(),
+            &endpoint_headers,
+        );
+
+        assert_eq!(sanitized["accept-encoding"], "identity");
+        assert!(!sanitized.contains_key("openai-organization"));
+        assert!(!sanitized.contains_key("openai-project"));
+        assert_eq!(sanitized["anthropic-version"], "2023-06-01");
+        assert_eq!(sanitized["anthropic-beta"], "endpoint-beta");
     }
 
     #[test]
@@ -653,6 +981,7 @@ mod tests {
         let sanitized = sanitize_request_headers(
             headers,
             ApiType::OpenaiCodex,
+            (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
             None,
             Some(&credential),
             &HashMap::new(),
