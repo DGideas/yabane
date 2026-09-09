@@ -290,7 +290,28 @@
             "description": "Final proxy outcome. Streaming protocol-conversion failures are recorded as 502 even when HTTP response headers were sent before the failure was detected."
           },
           "latency_ms": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Total elapsed milliseconds from request arrival until the proxied response completes."
+          },
+          "gateway_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Milliseconds spent reading, routing, and preparing the request before starting the upstream call. Null for records created before timing breakdowns were introduced."
+          },
+          "upstream_response_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Milliseconds from starting the upstream call until upstream response headers arrive."
+          },
+          "first_byte_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Milliseconds from request arrival until the first upstream response-body chunk is observed; unavailable when no body chunk is observed."
+          },
+          "generation_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Milliseconds from the first observed response-body chunk until response completion."
           },
           "input_tokens": {
             "type": "integer"
@@ -1705,6 +1726,11 @@
                         "weight": {
                           "type": "integer",
                           "minimum": 1
+                        },
+                        "enabled": {
+                          "type": "boolean",
+                          "default": true,
+                          "description": "Disabled targets remain configured but receive no traffic. At least one target must be enabled."
                         }
                       }
                     }
@@ -1719,7 +1745,8 @@
                     "endpoint_id": "openai",
                     "api_key_id": "default",
                     "upstream_model": "model-id",
-                    "weight": 100
+                    "weight": 100,
+                    "enabled": true
                   }
                 ]
               }
@@ -1786,7 +1813,8 @@
                         "endpoint_id": {"type": "string"},
                         "api_key_id": {"type": "string", "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."},
                         "upstream_model": {"type": "string"},
-                        "weight": {"type": "integer", "minimum": 1}
+                        "weight": {"type": "integer", "minimum": 1},
+                        "enabled": {"type": "boolean", "default": true, "description": "Disabled targets remain configured but receive no traffic. At least one target must be enabled."}
                       }
                     }
                   }

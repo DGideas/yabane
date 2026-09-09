@@ -166,6 +166,8 @@ scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/
 scoped_secret=$(printf '%s' "$scoped" | jq -r .secret)
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"denied/model","messages":[]}') == 403 ]]
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"allowed/model","messages":[]}') == 502 ]]
+connection_failure_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null)] | length') == 1 ]]
 unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi endpoint","expires_at":null,"provider_ids":[]}')
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
 # Cross-protocol adapters let every caller surface use providers with a different native API.
@@ -197,6 +199,7 @@ conversion_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.caller_protocol == "openai_chat_completions" and .upstream_protocol == "anthropic_messages")] | length') -ge 2 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502)] | length') == 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true)] | length') == 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "anthropic-only/claude" and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms != null and .generation_ms != null and .latency_ms >= .first_byte_ms)] | length') == 1 ]]
 preferred_shared=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
 [[ $(printf '%s' "$preferred_shared" | jq -r .endpoint) == two ]]
 model_a=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}')
@@ -223,6 +226,15 @@ friendly_two=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: B
 [[ $(printf '%s' "$friendly_one" | jq -r '.headers["x-provider"]') == yes ]]
 [[ $(printf '%s' "$friendly_two" | jq -r .extra) == null ]]
 [[ $(printf '%s' "$friendly_two" | jq -r '.headers["x-provider"]') == null ]]
+# Disabled route targets remain configured and receive no traffic, enabling an instant A/B cutover.
+disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d "$disabled_route_payload" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model") | [.targets[].enabled] | join(",")') == false,true ]]
+for _ in $(seq 1 4); do
+  switched=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"friendly-model","messages":[]}')
+  [[ $(printf '%s' "$switched" | jq -r .endpoint) == two ]]
+done
+[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":false}]}') == 400 ]]
 # Endpoint identity is part of an upstream-key mutation, because key IDs are only endpoint-local.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Temporary","secret":"temporary","weight":10}' >/dev/null
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/temporary" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
@@ -338,6 +350,8 @@ admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"e
 [[ $(status "$base/v1/models") == 401 ]]
 admin -f -X POST "$base/admin/logout" >/dev/null
 [[ $(admin_status "$base/admin/providers") == 401 ]]
+# Exercise the real logged-out console separately: authenticated responsive coverage cannot verify login focus.
+YABANE_UI_BASE="$base" node "$repo/tests/responsive-ui.mjs"
 login_status=$(curl -sS -c "$cookie" -o response.json -w '%{http_code}' -X POST "$base/admin/login" -H 'content-type: application/json' -d '{"username":"admin","email":null,"password":"password123","turnstile_token":"XXXX.DUMMY.TOKEN.XXXX"}')
 [[ $login_status == 204 ]]
 [[ $(admin_status "$base/admin/providers") == 200 ]]

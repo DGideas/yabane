@@ -23,8 +23,11 @@ for (const project of projects) {
     const page = await context.newPage();
     const testLiveRefresh = project.name === 'desktop-chrome';
     if (testLiveRefresh) await page.clock.install();
-    await page.goto(base, { waitUntil: 'networkidle' });
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => !document.querySelector('#login-screen')?.hidden || !document.querySelector('#admin-app')?.hidden);
     if (await page.locator('#login-screen').isVisible()) {
+      await page.locator('#login-form [name="username"]').waitFor();
+      if (!(await page.locator('#login-form [name="username"]').evaluate(element => element === document.activeElement))) throw new Error(`${project.name}: login does not initially focus the username field`);
       const authBackdrop = page.locator('#login-screen > .auth-backdrop');
       if (!(await authBackdrop.isVisible())) throw new Error(`${project.name}: authentication background artwork is not visible`);
       const authBackdropBehavior = await authBackdrop.evaluate(element => ({ pointerEvents: getComputedStyle(element).pointerEvents, ariaHidden: element.getAttribute('aria-hidden') }));
@@ -83,7 +86,24 @@ for (const project of projects) {
         await page.keyboard.press('Escape');
       }
     }
+    await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+    const stretchedProviderLabels = await page.locator('.provider-list-main code').evaluateAll(labels => labels.filter(label => {
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const style = getComputedStyle(label);
+      const contentWidth = range.getBoundingClientRect().width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      return label.getBoundingClientRect().width > contentWidth + 1;
+    }).map(label => label.textContent));
+    if (stretchedProviderLabels.length) throw new Error(`${project.name}: Provider model labels stretch past their content (${stretchedProviderLabels.join(', ')})`);
     await page.evaluate(() => document.querySelector('[data-view="home"]').click());
+    const homeHero = page.locator('#home-view .home-hero');
+    if (!(await homeHero.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its gateway hero or traffic visualization`);
+    const homeArtwork = await page.locator('.home-hero-motion').evaluate(element => ({pointerEvents: getComputedStyle(element).pointerEvents, ariaHidden: element.getAttribute('aria-hidden')}));
+    if (homeArtwork.pointerEvents !== 'none' || homeArtwork.ariaHidden !== 'true') throw new Error(`${project.name}: Home hero artwork can interfere with interaction or accessibility`);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    const homeAnimations = await page.locator('.home-hero-motion g').evaluateAll(groups => groups.map(group => getComputedStyle(group).animationName));
+    if (homeAnimations.some(name => name !== 'none')) throw new Error(`${project.name}: Home hero ignores reduced-motion preference`);
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
 
     if (testLiveRefresh) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
@@ -97,6 +117,8 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('.open-about').click());
     await assertDialog(page, '#about-dialog', project.name);
     if (await page.getByText('Reproducible from Git').count()) throw new Error(`${project.name}: About dialog still shows redundant build text`);
+    const githubLink = page.locator('#about-dialog a[href="https://github.com/DGideas/yabane"]');
+    if (await githubLink.count() !== 1 || await githubLink.getAttribute('target') !== '_blank') throw new Error(`${project.name}: About dialog is missing the project GitHub link`);
     const logoAnimation = await page.locator('#about-dialog .about-logo').evaluate(element => getComputedStyle(element).animationName);
     if (logoAnimation !== 'none') throw new Error(`${project.name}: About icon still animates (${logoAnimation})`);
     const logoPaths = await page.locator('#about-dialog .about-logo path').evaluateAll(paths => paths.map(path => path.getAttribute('d')));
@@ -125,6 +147,12 @@ for (const project of projects) {
     await page.locator('#route-targets [name="target_weight"]').first().fill('60');
     if (!(await page.locator('#save-route').isDisabled())) throw new Error(`${project.name}: invalid traffic total does not disable saving`);
     if (await page.locator('#route-split-total').textContent() !== '110%') throw new Error(`${project.name}: invalid traffic total is not explained`);
+    await page.locator('#route-targets [name="target_enabled"]').first().uncheck();
+    const switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => ({value: input.value, disabled: input.disabled})));
+    if (!switchedShares[0].disabled || switchedShares[1].value !== '100') throw new Error(`${project.name}: disabling a route target does not move all traffic to the active target`);
+    if (await page.locator('#save-route').isDisabled()) throw new Error(`${project.name}: one active 100% target cannot be saved`);
+    await page.locator('#route-targets [name="target_enabled"]').nth(1).uncheck();
+    if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be disabled`);
     await page.locator('#route-dialog .close-route').first().click();
     const initialActivityLoad = testLiveRefresh ? Promise.all([
       page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=')),
@@ -140,14 +168,23 @@ for (const project of projects) {
       await page.clock.fastForward(10000);
       await activityRefresh;
     }
+    const activityRow = page.locator('#recent-activity-logs .activity-request-row').first();
+    if (await activityRow.count()) {
+      await activityRow.click();
+      await assertDialog(page, '#activity-detail-dialog', project.name);
+      if (!(await page.locator('#activity-detail-request').getByText('Request ID', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits request metadata`);
+      if (!(await page.locator('#activity-detail-timing').getByText('Total', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits timing`);
+      if (!(await page.locator('#activity-detail-dialog').getByText('Prompt and response content are not retained.').isVisible())) throw new Error(`${project.name}: request detail dialog omits the content-retention notice`);
+      await page.locator('#activity-detail-dialog .close-activity-detail').first().click();
+    }
     await page.locator('#manage-activity-data').click();
     await assertDialog(page, '#activity-data-dialog', project.name);
     await page.locator('[data-activity-data-tab="import"]').click();
     const previewRecord = {
       timestamp: Math.floor(Date.now() / 1000), request_id: `responsive-preview-${project.name}`,
       path: '/v1/responses', model: 'preview/model', provider: 'preview', endpoint: 'preview',
-      status: 200, latency_ms: 1, input_tokens: 0, output_tokens: 0, cached_tokens: 0,
-      cost: null, streaming: false,
+      status: 200, latency_ms: 1200, gateway_ms: 4, upstream_response_ms: 180, first_byte_ms: 250, generation_ms: 950,
+      input_tokens: 120, output_tokens: 40, cached_tokens: 20, cost: null, streaming: false,
     };
     await page.locator('#activity-import-file').setInputFiles({
       name: 'activity-preview.json', mimeType: 'application/json',

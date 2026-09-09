@@ -85,6 +85,7 @@ pub async fn proxy_anthropic(State(state): State<AppState>, request: Request) ->
 }
 
 async fn route_request(state: AppState, request: Request, surface: ApiSurface) -> Response {
+    let request_started = Instant::now();
     let allowed_providers = auth::authorized_provider_ids(&state, request.headers()).await;
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await {
@@ -129,6 +130,7 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
             parts,
             body,
             requested_streaming,
+            request_started,
             caller_protocol: surface.protocol(),
             upstream_protocol,
         },
@@ -276,10 +278,31 @@ struct ProxyActivity {
     caller_protocol: Protocol,
     upstream_protocol: Protocol,
     started: Instant,
+    gateway_ms: u64,
+    upstream_response_ms: u64,
 }
 
 impl ProxyActivity {
-    async fn record(&self, status: StatusCode, usage: TokenUsage, streaming: bool) {
+    async fn record(
+        &self,
+        status: StatusCode,
+        usage: TokenUsage,
+        streaming: bool,
+        first_byte_ms: Option<u64>,
+    ) {
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        self.record_at(status, usage, streaming, first_byte_ms, latency_ms)
+            .await;
+    }
+
+    async fn record_at(
+        &self,
+        status: StatusCode,
+        usage: TokenUsage,
+        streaming: bool,
+        first_byte_ms: Option<u64>,
+        latency_ms: u64,
+    ) {
         self.store
             .record(RequestLog {
                 timestamp: crate::auth::now(),
@@ -292,7 +315,12 @@ impl ProxyActivity {
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
                 upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
                 status: status.as_u16(),
-                latency_ms: self.started.elapsed().as_millis() as u64,
+                latency_ms,
+                gateway_ms: Some(self.gateway_ms),
+                upstream_response_ms: Some(self.upstream_response_ms),
+                first_byte_ms,
+                generation_ms: first_byte_ms
+                    .map(|first_byte_ms| latency_ms.saturating_sub(first_byte_ms)),
                 input_tokens: usage.input,
                 output_tokens: usage.output,
                 cached_tokens: usage.cached,
@@ -311,6 +339,7 @@ struct ForwardRequest {
     parts: axum::http::request::Parts,
     body: Vec<u8>,
     requested_streaming: bool,
+    request_started: Instant,
     caller_protocol: Protocol,
     upstream_protocol: Protocol,
 }
@@ -324,10 +353,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         parts,
         body,
         requested_streaming,
+        request_started: started,
         caller_protocol,
         upstream_protocol,
     } = request;
-    let started = Instant::now();
     let path = parts.uri.path().to_owned();
     let request_id = request_id();
     let provider_defaults_apply = provider.request_defaults_apply_to(&endpoint.id);
@@ -388,14 +417,42 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let mut upstream = client.request(to_reqwest_method(&parts.method), target);
     upstream = upstream.headers(request_headers).body(body);
 
+    let upstream_started = Instant::now();
     let upstream_response = match upstream.send().await {
         Ok(response) => response,
         Err(err) => {
             error!(provider = %provider.id, endpoint = %endpoint.id, %err, "upstream request failed");
+            let failed_at_ms = started.elapsed().as_millis() as u64;
+            state
+                .activity
+                .record(RequestLog {
+                    timestamp: crate::auth::now(),
+                    request_id,
+                    source_instance_id: None,
+                    path,
+                    model,
+                    provider: provider.id.clone(),
+                    endpoint: endpoint.id.clone(),
+                    caller_protocol: Some(caller_protocol.name().to_owned()),
+                    upstream_protocol: Some(upstream_protocol.name().to_owned()),
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    latency_ms: failed_at_ms,
+                    gateway_ms: Some(upstream_started.duration_since(started).as_millis() as u64),
+                    upstream_response_ms: Some(upstream_started.elapsed().as_millis() as u64),
+                    first_byte_ms: None,
+                    generation_ms: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    cost: None,
+                    streaming: requested_streaming,
+                })
+                .await;
             return api_error(StatusCode::BAD_GATEWAY, "Upstream request failed");
         }
     };
 
+    let upstream_response_ms = upstream_started.elapsed().as_millis() as u64;
     let status = upstream_response.status();
     let response_headers = upstream_response.headers().clone();
     let content_type = response_headers
@@ -416,6 +473,8 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         caller_protocol,
         upstream_protocol,
         started,
+        gateway_ms: upstream_started.duration_since(started).as_millis() as u64,
+        upstream_response_ms,
     };
     let api_type = endpoint.api_type;
     let converting = status.is_success() && caller_protocol != upstream_protocol;
@@ -425,9 +484,13 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         let mut usage = UsageTracker::new(api_type, true);
         let mut converter = StreamConverter::new_aggregating(upstream_protocol, caller_protocol);
         let mut failure = None;
+        let mut first_byte_ms = None;
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
-                Ok(chunk) => chunk,
+                Ok(chunk) => {
+                    first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                    chunk
+                }
                 Err(err) => {
                     error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream stream for protocol conversion");
                     failure = Some("Upstream stream failed".to_owned());
@@ -446,6 +509,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         {
             failure = Some(err);
         }
+        let completion_ms = started.elapsed().as_millis() as u64;
         let converted = if failure.is_none() {
             match converter.non_stream_response() {
                 Ok(converted) => Some(converted),
@@ -459,10 +523,20 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         };
         let usage = usage.finish();
         if let Some(err) = failure {
-            activity.record(StatusCode::BAD_GATEWAY, usage, true).await;
+            activity
+                .record_at(
+                    StatusCode::BAD_GATEWAY,
+                    usage,
+                    true,
+                    first_byte_ms,
+                    completion_ms,
+                )
+                .await;
             return api_error(StatusCode::BAD_GATEWAY, err);
         }
-        activity.record(status, usage, true).await;
+        activity
+            .record_at(status, usage, true, first_byte_ms, completion_ms)
+            .await;
         let mut response = Response::new(Body::from(converted.expect("successful conversion")));
         *response.status_mut() = status;
         copy_response_headers(response.headers_mut(), &response_headers);
@@ -481,7 +555,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Err(err) => {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream response for protocol conversion");
                 activity
-                    .record(StatusCode::BAD_GATEWAY, TokenUsage::default(), false)
+                    .record(StatusCode::BAD_GATEWAY, TokenUsage::default(), false, None)
                     .await;
                 return api_error(StatusCode::BAD_GATEWAY, "Could not read upstream response");
             }
@@ -495,12 +569,14 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Err(err) => {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not convert upstream response");
                 activity
-                    .record(StatusCode::BAD_GATEWAY, usage, requested_streaming)
+                    .record(StatusCode::BAD_GATEWAY, usage, requested_streaming, None)
                     .await;
                 return api_error(StatusCode::BAD_GATEWAY, err);
             }
         };
-        activity.record(status, usage, requested_streaming).await;
+        activity
+            .record(status, usage, requested_streaming, None)
+            .await;
         let mut response = Response::new(Body::from(converted));
         *response.status_mut() = status;
         copy_response_headers(response.headers_mut(), &response_headers);
@@ -518,9 +594,11 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         let mut usage = UsageTracker::new(api_type, event_stream);
         let mut converter = converting.then(|| StreamConverter::new(upstream_protocol, caller_protocol));
         let mut conversion_failed = false;
+        let mut first_byte_ms = None;
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(chunk) => {
+                    first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                     usage.observe(&chunk);
                     if let Some(converter) = &mut converter {
                         match converter.push(&chunk) {
@@ -567,7 +645,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         }
         let usage = usage.finish();
         let recorded_status = if conversion_failed { StatusCode::BAD_GATEWAY } else { status };
-        activity.record(recorded_status, usage, requested_streaming || event_stream).await;
+        activity.record(recorded_status, usage, requested_streaming || event_stream, first_byte_ms).await;
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
