@@ -33,6 +33,14 @@ pub struct RequestLog {
     pub upstream_protocol: Option<String>,
     pub status: u16,
     pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_response_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_ms: Option<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,

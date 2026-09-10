@@ -354,6 +354,7 @@ async fn save_global_route(
 ) -> Response {
     if !valid_model_pattern(input.pattern.trim())
         || input.targets.is_empty()
+        || !input.targets.iter().any(|target| target.enabled)
         || input
             .targets
             .iter()
@@ -361,7 +362,7 @@ async fn save_global_route(
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "A valid pattern and positive-weight route targets are required",
+            "A valid pattern, at least one enabled target, and positive target weights are required",
         );
     }
     let providers = state.providers.read().await;

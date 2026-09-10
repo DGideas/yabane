@@ -19,6 +19,8 @@ pub struct RouteTarget {
     pub api_key_id: String,
     pub upstream_model: String,
     pub weight: u32,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +36,7 @@ impl ModelRoute {
         let total: u64 = self
             .targets
             .iter()
+            .filter(|target| target.enabled)
             .map(|target| u64::from(target.weight))
             .sum();
         if total == 0 {
@@ -41,10 +44,13 @@ impl ModelRoute {
         }
         let position = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
         let mut cumulative = 0;
-        self.targets.iter().find(|target| {
-            cumulative += u64::from(target.weight);
-            position < cumulative
-        })
+        self.targets
+            .iter()
+            .filter(|target| target.enabled)
+            .find(|target| {
+                cumulative += u64::from(target.weight);
+                position < cumulative
+            })
     }
 }
 
@@ -91,6 +97,10 @@ fn default_cursor() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
 
+const fn enabled_by_default() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ModelRoute, RouteStore, RouteTarget};
@@ -104,6 +114,7 @@ mod tests {
                 api_key_id: "key".to_owned(),
                 upstream_model: model.to_owned(),
                 weight,
+                enabled: true,
             }],
             cursor: Default::default(),
         }
@@ -138,16 +149,25 @@ mod tests {
     }
 
     #[test]
-    fn target_selection_respects_weight() {
+    fn target_selection_respects_enabled_weights() {
         let route = ModelRoute {
             pattern: "model".to_owned(),
             targets: vec![
+                RouteTarget {
+                    provider_id: "provider".to_owned(),
+                    endpoint_id: "disabled".to_owned(),
+                    api_key_id: "key".to_owned(),
+                    upstream_model: "disabled".to_owned(),
+                    weight: 100,
+                    enabled: false,
+                },
                 RouteTarget {
                     provider_id: "provider".to_owned(),
                     endpoint_id: "one".to_owned(),
                     api_key_id: "key".to_owned(),
                     upstream_model: "one".to_owned(),
                     weight: 1,
+                    enabled: true,
                 },
                 RouteTarget {
                     provider_id: "provider".to_owned(),
@@ -155,6 +175,7 @@ mod tests {
                     api_key_id: "key".to_owned(),
                     upstream_model: "two".to_owned(),
                     weight: 2,
+                    enabled: true,
                 },
             ],
             cursor: Default::default(),
