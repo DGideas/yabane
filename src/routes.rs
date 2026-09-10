@@ -33,22 +33,25 @@ pub struct ModelRoute {
 
 impl ModelRoute {
     pub fn select_target(&self) -> Option<&RouteTarget> {
+        let divisor = self
+            .targets
+            .iter()
+            .filter(|target| target.enabled && target.weight > 0)
+            .map(|target| u64::from(target.weight))
+            .reduce(greatest_common_divisor)?;
         let total: u64 = self
             .targets
             .iter()
             .filter(|target| target.enabled)
-            .map(|target| u64::from(target.weight))
+            .map(|target| u64::from(target.weight) / divisor)
             .sum();
-        if total == 0 {
-            return None;
-        }
         let position = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
         let mut cumulative = 0;
         self.targets
             .iter()
             .filter(|target| target.enabled)
             .find(|target| {
-                cumulative += u64::from(target.weight);
+                cumulative += u64::from(target.weight) / divisor;
                 position < cumulative
             })
     }
@@ -91,6 +94,13 @@ impl RouteStore {
             .and_then(ModelRoute::select_target)
             .cloned()
     }
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn default_cursor() -> Arc<AtomicU64> {
@@ -185,5 +195,21 @@ mod tests {
             .map(|_| route.select_target().unwrap().upstream_model.as_str())
             .collect();
         assert_eq!(selected, ["one", "two", "two", "one", "two", "two"]);
+    }
+
+    #[test]
+    fn percentage_weights_use_the_smallest_equivalent_cycle() {
+        let route = ModelRoute {
+            pattern: "model".to_owned(),
+            targets: vec![
+                route("one", "one", 50).targets.remove(0),
+                route("two", "two", 50).targets.remove(0),
+            ],
+            cursor: Default::default(),
+        };
+        let selected: Vec<_> = (0..4)
+            .map(|_| route.select_target().unwrap().upstream_model.as_str())
+            .collect();
+        assert_eq!(selected, ["one", "two", "one", "two"]);
     }
 }

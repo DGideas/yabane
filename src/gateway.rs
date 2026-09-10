@@ -86,7 +86,7 @@ pub async fn proxy_anthropic(State(state): State<AppState>, request: Request) ->
 
 async fn route_request(state: AppState, request: Request, surface: ApiSurface) -> Response {
     let request_started = Instant::now();
-    let allowed_providers = auth::authorized_provider_ids(&state, request.headers()).await;
+    let allowed_providers = auth::authorized_provider_ids(&request).map(<[String]>::to_vec);
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await {
         Ok(body) => body,

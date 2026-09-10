@@ -338,29 +338,28 @@
       },
       "Stats": {
         "type": "object",
+        "required": ["requests", "input_tokens", "output_tokens", "cached_tokens", "cost", "successful", "streaming", "latency_ms", "by_provider", "by_model", "buckets"],
         "properties": {
-          "requests": {
-            "type": "integer"
-          },
-          "input_tokens": {
-            "type": "integer"
-          },
-          "output_tokens": {
-            "type": "integer"
-          },
-          "cached_tokens": {
-            "type": "integer"
-          },
-          "cost": {
-            "type": "number"
-          },
-          "by_provider": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
-          }
+          "requests": {"type": "integer"},
+          "input_tokens": {"type": "integer"},
+          "output_tokens": {"type": "integer"},
+          "cached_tokens": {"type": "integer"},
+          "cost": {"type": "number"},
+          "successful": {"type": "integer"},
+          "streaming": {"type": "integer"},
+          "latency_ms": {"type": "integer", "description": "Total latency across all matching requests."},
+          "by_provider": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityDimensionStats"}},
+          "by_model": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityDimensionStats"}},
+          "buckets": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityBucket"}}
         }
+      },
+      "ActivityDimensionStats": {
+        "type": "object",
+        "properties": {"name":{"type":"string"},"requests":{"type":"integer"},"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"},"cached_tokens":{"type":"integer"},"cost":{"type":"number"},"errors":{"type":"integer"},"latency_ms":{"type":"integer"}}
+      },
+      "ActivityBucket": {
+        "type": "object",
+        "properties": {"start":{"type":"integer"},"requests":{"type":"integer"},"tokens":{"type":"integer"},"cached":{"type":"integer"},"cost":{"type":"number"},"latency":{"type":"integer"},"samples":{"type":"integer"},"successful":{"type":"integer"},"errors":{"type":"integer"}}
       }
     },
     "responses": {
@@ -1138,7 +1137,7 @@
           }
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Created key and secret"
           },
           "400": {
@@ -1151,6 +1150,27 @@
       }
     },
     "/admin/auth/keys/{id}": {
+      "patch": {
+        "tags": ["Gateway access"],
+        "summary": "Edit a Gateway API key",
+        "description": "Updates any supplied note, expiration, or Provider allowlist field without changing the key secret. Omitted fields remain unchanged; expires_at: null removes expiry and provider_ids: [] grants access to every Provider.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object", "properties": {
+            "note": {"type": "string"},
+            "expires_at": {"type": "integer", "nullable": true},
+            "provider_ids": {"type": "array", "items": {"type": "string"}}
+          }}, "example": {"note": "Production application", "expires_at": null, "provider_ids": []}}}
+        },
+        "responses": {
+          "204": {"$ref": "#/components/responses/NoContent"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      },
       "delete": {
         "tags": [
           "Gateway access"
@@ -1275,13 +1295,16 @@
                   "endpoint": {
                     "type": "object",
                     "required": [
+                      "id",
                       "api_type",
                       "base_url",
                       "requires_api_key"
                     ],
                     "properties": {
                       "id": {
-                        "type": "string"
+                        "type": "string",
+                        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                        "description": "Immutable after creation. The console suggests an API-type-based ID."
                       },
                       "api_type": {
                         "type": "string",
@@ -1314,6 +1337,7 @@
                 "id": "my-provider",
                 "name": "My provider",
                 "endpoint": {
+                  "id": "openai",
                   "api_type": "openai_compatible",
                   "base_url": "https://api.example.com/v1",
                   "socks5_proxy": null,
@@ -1342,7 +1366,7 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Update provider request defaults and their endpoint scope",
+        "summary": "Update provider display name, request defaults, and endpoint scope",
         "security": [
           {
             "managementKey": []
@@ -1368,6 +1392,14 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Optional identity assertion. If supplied, it must equal the path ID because the Provider ID and public model prefix are immutable."
+                  },
+                  "name": {
+                    "type": "string",
+                    "description": "Optional console display name."
+                  },
                   "extra_headers": {
                     "type": "object",
                     "additionalProperties": {
@@ -1387,6 +1419,8 @@
                 }
               },
               "example": {
+                "id": "my-provider",
+                "name": "My provider",
                 "extra_headers": {
                   "x-custom": "yes"
                 },
@@ -1730,7 +1764,7 @@
                         "enabled": {
                           "type": "boolean",
                           "default": true,
-                          "description": "Disabled targets remain configured but receive no traffic. At least one target must be enabled."
+                          "description": "Disabled targets remain configured but receive no traffic. Enabled target percentages must total 100."
                         }
                       }
                     }
@@ -1814,7 +1848,7 @@
                         "api_key_id": {"type": "string", "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."},
                         "upstream_model": {"type": "string"},
                         "weight": {"type": "integer", "minimum": 1},
-                        "enabled": {"type": "boolean", "default": true, "description": "Disabled targets remain configured but receive no traffic. At least one target must be enabled."}
+                        "enabled": {"type": "boolean", "default": true, "description": "Disabled targets remain configured but receive no traffic. Enabled target percentages must total 100."}
                       }
                     }
                   }
@@ -1898,6 +1932,14 @@
               "default": 100,
               "maximum": 1000
             }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional exact Provider ID filter."
           }
         ],
         "responses": {
@@ -1942,11 +1984,28 @@
               "type": "integer",
               "default": 0
             }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "schema": {"type": "integer"},
+            "description": "Unix seconds upper bound; defaults to now."
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {"type": "string"},
+            "description": "Optional exact Provider ID filter."
+          },
+          {
+            "name": "buckets",
+            "in": "query",
+            "schema": {"type": "integer", "default": 24, "minimum": 1, "maximum": 120}
           }
         ],
         "responses": {
           "200": {
-            "description": "Totals and per-provider breakdown",
+            "description": "Exact totals, ranked Provider/model dimensions, and time buckets for the requested range",
             "content": {
               "application/json": {
                 "schema": {

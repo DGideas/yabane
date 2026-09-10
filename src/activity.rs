@@ -112,17 +112,37 @@ pub struct Stats {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cost: f64,
-    pub by_provider: Vec<ProviderStats>,
+    pub successful: usize,
+    pub streaming: usize,
+    pub latency_ms: u64,
+    pub by_provider: Vec<DimensionStats>,
+    pub by_model: Vec<DimensionStats>,
+    pub buckets: Vec<ActivityBucket>,
 }
 
 #[derive(Serialize)]
-pub struct ProviderStats {
-    pub provider: String,
+pub struct DimensionStats {
+    pub name: String,
     pub requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cost: f64,
+    pub errors: usize,
+    pub latency_ms: u64,
+}
+
+#[derive(Serialize)]
+pub struct ActivityBucket {
+    pub start: u64,
+    pub requests: usize,
+    pub tokens: u64,
+    pub cached: u64,
+    pub cost: f64,
+    pub latency: u64,
+    pub samples: usize,
+    pub successful: usize,
+    pub errors: usize,
 }
 
 impl ActivityStore {
@@ -167,13 +187,15 @@ impl ActivityStore {
         }
     }
 
-    pub async fn logs(&self, since: u64, limit: usize) -> Vec<RequestLog> {
+    pub async fn logs(&self, since: u64, provider: Option<&str>, limit: usize) -> Vec<RequestLog> {
         let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         data.persisted
             .iter()
             .chain(&data.pending)
-            .filter(|log| log.timestamp >= since)
+            .filter(|log| {
+                log.timestamp >= since && provider.is_none_or(|provider| log.provider == provider)
+            })
             .rev()
             .take(limit.min(1000))
             .cloned()
@@ -351,32 +373,86 @@ impl ActivityStore {
         )
     }
 
-    pub async fn stats(&self, since: u64) -> Stats {
+    pub async fn stats(
+        &self,
+        since: u64,
+        provider: Option<&str>,
+        bucket_count: usize,
+        until: u64,
+    ) -> Stats {
         let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         let logs: Vec<_> = data
             .persisted
             .iter()
             .chain(&data.pending)
-            .filter(|log| log.timestamp >= since)
+            .filter(|log| {
+                log.timestamp >= since
+                    && log.timestamp <= until
+                    && provider.is_none_or(|provider| log.provider == provider)
+            })
             .collect();
-        let mut providers = std::collections::BTreeMap::<String, ProviderStats>::new();
-        for log in &logs {
-            let stats = providers
-                .entry(log.provider.clone())
-                .or_insert_with(|| ProviderStats {
-                    provider: log.provider.clone(),
+        let dimensions = |key: fn(&RequestLog) -> &str| {
+            let mut values = std::collections::BTreeMap::<String, DimensionStats>::new();
+            for log in &logs {
+                let name = key(log).to_owned();
+                let stats = values.entry(name.clone()).or_insert(DimensionStats {
+                    name,
                     requests: 0,
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_tokens: 0,
                     cost: 0.0,
+                    errors: 0,
+                    latency_ms: 0,
                 });
-            stats.requests += 1;
-            stats.input_tokens += log.input_tokens;
-            stats.output_tokens += log.output_tokens;
-            stats.cached_tokens += log.cached_tokens;
-            stats.cost += log.cost.unwrap_or(0.0);
+                stats.requests += 1;
+                stats.input_tokens += log.input_tokens;
+                stats.output_tokens += log.output_tokens;
+                stats.cached_tokens += log.cached_tokens;
+                stats.cost += log.cost.unwrap_or(0.0);
+                stats.errors += usize::from(log.status >= 400);
+                stats.latency_ms += log.latency_ms;
+            }
+            let mut values: Vec<_> = values.into_values().collect();
+            values.sort_by(|left, right| {
+                right
+                    .requests
+                    .cmp(&left.requests)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            values
+        };
+        let bucket_count = bucket_count.clamp(1, 120);
+        let width = until
+            .saturating_sub(since)
+            .max(1)
+            .div_ceil(bucket_count as u64);
+        let mut buckets: Vec<_> = (0..bucket_count)
+            .map(|index| ActivityBucket {
+                start: since.saturating_add(index as u64 * width),
+                requests: 0,
+                tokens: 0,
+                cached: 0,
+                cost: 0.0,
+                latency: 0,
+                samples: 0,
+                successful: 0,
+                errors: 0,
+            })
+            .collect();
+        for log in &logs {
+            let index = ((log.timestamp.saturating_sub(since)) / width) as usize;
+            if let Some(bucket) = buckets.get_mut(index.min(bucket_count - 1)) {
+                bucket.requests += 1;
+                bucket.tokens += log.input_tokens + log.output_tokens;
+                bucket.cached += log.cached_tokens;
+                bucket.cost += log.cost.unwrap_or(0.0);
+                bucket.latency += log.latency_ms;
+                bucket.samples += 1;
+                bucket.successful += usize::from(log.status < 400);
+                bucket.errors += usize::from(log.status >= 400);
+            }
         }
         Stats {
             requests: logs.len(),
@@ -384,7 +460,12 @@ impl ActivityStore {
             output_tokens: logs.iter().map(|log| log.output_tokens).sum(),
             cached_tokens: logs.iter().map(|log| log.cached_tokens).sum(),
             cost: logs.iter().filter_map(|log| log.cost).sum(),
-            by_provider: providers.into_values().collect(),
+            successful: logs.iter().filter(|log| log.status < 400).count(),
+            streaming: logs.iter().filter(|log| log.streaming).count(),
+            latency_ms: logs.iter().map(|log| log.latency_ms).sum(),
+            by_provider: dimensions(|log| &log.provider),
+            by_model: dimensions(|log| &log.model),
+            buckets,
         }
     }
 

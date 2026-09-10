@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::{auth::hash_secret, config::AppState, error::api_error};
+use crate::{
+    auth::{constant_time_eq, hash_secret},
+    config::AppState,
+    error::api_error,
+};
 
 const ADMIN_FILE: &str = "data/admin.json";
 const SESSION_COOKIE: &str = "yabane_session";
@@ -189,13 +193,18 @@ pub async fn setup(
         password_hash,
         management_api_keys: Vec::new(),
     };
+    let mut current = state.admin.user.write().await;
+    if current.is_some() {
+        return api_error(StatusCode::CONFLICT, "Administrator is already configured");
+    }
     if let Err(err) = save_admin(&user).await {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Could not save administrator: {err}"),
         );
     }
-    *state.admin.user.write().await = Some(user);
+    *current = Some(user);
+    drop(current);
     create_session(&state).await
 }
 
@@ -520,7 +529,8 @@ async fn authenticate_management_key(state: &AppState, headers: &axum::http::Hea
         return false;
     };
     let Some(key) = user.management_api_keys.iter_mut().find(|key| {
-        key.secret_hash == hash && !key.expires_at.is_some_and(|expires| expires <= now)
+        constant_time_eq(&key.secret_hash, &hash)
+            && !key.expires_at.is_some_and(|expires| expires <= now)
     }) else {
         return false;
     };

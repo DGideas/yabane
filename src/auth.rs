@@ -102,6 +102,19 @@ pub fn hash_secret(secret: &str) -> String {
     hex(&Sha256::digest(secret.as_bytes()))
 }
 
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -109,10 +122,18 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-pub async fn authorize(State(state): State<AppState>, request: Request, next: Next) -> Response {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedProviders(pub Option<Vec<String>>);
+
+pub async fn authorize(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let auth = state.auth.read().await;
     if !auth.enabled {
         drop(auth);
+        request.extensions_mut().insert(AuthorizedProviders(None));
         return next.run(request).await;
     }
     let Some(secret) = request
@@ -132,35 +153,26 @@ pub async fn authorize(State(state): State<AppState>, request: Request, next: Ne
     let key = auth
         .api_keys
         .iter()
-        .find(|key| key.secret_hash == secret_hash || key.secret == secret);
+        .find(|key| constant_time_eq(&key.secret_hash, &secret_hash));
     let Some(key) = key else {
         return api_error(StatusCode::UNAUTHORIZED, "Invalid API key");
     };
     if key.expires_at.is_some_and(|expiry| expiry <= current_time) {
         return api_error(StatusCode::UNAUTHORIZED, "API key has expired");
     }
+    let provider_ids = key.provider_ids.clone();
     drop(auth);
+    request
+        .extensions_mut()
+        .insert(AuthorizedProviders(Some(provider_ids)));
     next.run(request).await
 }
 
-pub async fn authorized_provider_ids(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> Option<Vec<String>> {
-    let auth = state.auth.read().await;
-    if !auth.enabled {
-        return None;
-    }
-    let secret = headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")?;
-    let hash = hash_secret(secret);
-    auth.api_keys
-        .iter()
-        .find(|key| key.secret_hash == hash || key.secret == secret)
-        .map(|key| key.provider_ids.clone())
+pub fn authorized_provider_ids(request: &Request) -> Option<&[String]> {
+    request
+        .extensions()
+        .get::<AuthorizedProviders>()
+        .and_then(|authorization| authorization.0.as_deref())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -177,7 +189,12 @@ pub type SharedAuth = Arc<RwLock<AuthConfig>>;
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_secret, hash_secret};
+    use axum::body::Body;
+
+    use super::{
+        AuthorizedProviders, authorized_provider_ids, constant_time_eq, generate_secret,
+        hash_secret,
+    };
 
     #[test]
     fn generated_secrets_are_prefixed_and_unique() {
@@ -186,5 +203,31 @@ mod tests {
         assert!(first.starts_with("sk-"));
         assert_ne!(first, second);
         assert_eq!(hash_secret(&first).len(), 64);
+    }
+
+    #[test]
+    fn secret_hash_comparison_requires_an_exact_match() {
+        assert!(constant_time_eq("same-length", "same-length"));
+        assert!(!constant_time_eq("same-length", "different!!"));
+        assert!(!constant_time_eq("short", "longer"));
+    }
+
+    #[test]
+    fn provider_scope_comes_from_authorization_result_not_request_header() {
+        let mut request = axum::http::Request::new(Body::empty());
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer caller-secret".parse().expect("valid header"),
+        );
+        request
+            .extensions_mut()
+            .insert(AuthorizedProviders(Some(vec![
+                "allowed-provider".to_owned(),
+            ])));
+
+        assert_eq!(
+            authorized_provider_ids(&request),
+            Some(["allowed-provider".to_owned()].as_slice())
+        );
     }
 }

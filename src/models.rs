@@ -73,17 +73,13 @@ struct AnthropicModel {
 }
 
 pub async fn list_models(State(state): State<AppState>, request: Request) -> Response {
-    let allowed = crate::auth::authorized_provider_ids(&state, request.headers()).await;
+    let allowed = crate::auth::authorized_provider_ids(&request);
     let providers: Vec<_> = state
         .providers
         .read()
         .await
         .values()
-        .filter(|provider| {
-            allowed
-                .as_ref()
-                .is_none_or(|ids| ids.is_empty() || ids.contains(&provider.id))
-        })
+        .filter(|provider| allowed.is_none_or(|ids| ids.is_empty() || ids.contains(&provider.id)))
         .cloned()
         .collect();
     let results = discover_providers(&state.client, providers).await;
