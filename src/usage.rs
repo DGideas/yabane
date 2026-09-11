@@ -14,6 +14,7 @@ pub struct UsageTracker {
     api_type: ApiType,
     payload: Payload,
     usage: TokenUsage,
+    protocol_failed: bool,
 }
 
 enum Payload {
@@ -41,6 +42,7 @@ impl UsageTracker {
                 }
             },
             usage: TokenUsage::default(),
+            protocol_failed: false,
         }
     }
 
@@ -56,26 +58,29 @@ impl UsageTracker {
             }
             Payload::EventStream(decoder) => {
                 for event in decoder.push(chunk) {
+                    self.protocol_failed |= event_reports_failure(self.api_type, &event);
                     merge_event_usage(self.api_type, &event, &mut self.usage);
                 }
             }
         }
     }
 
-    pub fn finish(mut self) -> TokenUsage {
+    pub fn finish(mut self) -> (TokenUsage, bool) {
         match &mut self.payload {
             Payload::Json { body, overflowed } => {
                 if !*overflowed {
+                    self.protocol_failed |= event_reports_failure(self.api_type, body);
                     merge_event_usage(self.api_type, body, &mut self.usage);
                 }
             }
             Payload::EventStream(decoder) => {
                 for event in decoder.finish() {
+                    self.protocol_failed |= event_reports_failure(self.api_type, &event);
                     merge_event_usage(self.api_type, &event, &mut self.usage);
                 }
             }
         }
-        self.usage
+        (self.usage, self.protocol_failed)
     }
 }
 
@@ -146,6 +151,31 @@ impl EventStreamDecoder {
             self.data.clear();
         }
         self.discard_event = false;
+    }
+}
+
+fn event_reports_failure(api_type: ApiType, bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    match api_type {
+        ApiType::OpenaiCompatible
+        | ApiType::OpenaiChatCompletions
+        | ApiType::OpenaiResponses
+        | ApiType::OpenaiCodex => {
+            matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("error" | "response.failed")
+            ) || matches!(
+                value
+                    .pointer("/response/status")
+                    .and_then(serde_json::Value::as_str),
+                Some("failed" | "incomplete")
+            )
+        }
+        ApiType::Anthropic => {
+            value.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        }
     }
 }
 
@@ -231,7 +261,7 @@ mod tests {
         let mut tracker = UsageTracker::new(ApiType::OpenaiCompatible, false);
         tracker.observe(br#"{"usage":{"prompt_tokens":12,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3}}}"#);
         assert_eq!(
-            tracker.finish(),
+            tracker.finish().0,
             TokenUsage {
                 input: 12,
                 output: 4,
@@ -246,7 +276,7 @@ mod tests {
         let mut tracker = UsageTracker::new(ApiType::OpenaiCompatible, false);
         tracker
             .observe(br#"{"usage":{"prompt_tokens":12,"completion_tokens":4,"cost":"0.00125"}}"#);
-        assert_eq!(tracker.finish().cost, Some(0.00125));
+        assert_eq!(tracker.finish().0.cost, Some(0.00125));
     }
 
     #[test]
@@ -255,7 +285,7 @@ mod tests {
         tracker.observe(b": keepalive\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":20,");
         tracker.observe(b"\"output_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":7}}}}\r\n\r\ndata: [DONE]\r\n\r\n");
         assert_eq!(
-            tracker.finish(),
+            tracker.finish().0,
             TokenUsage {
                 input: 20,
                 output: 8,
@@ -266,12 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn detects_protocol_failures_without_retaining_upstream_error_text() {
+        let mut responses = UsageTracker::new(ApiType::OpenaiResponses, true);
+        responses.observe(b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"private upstream detail\"}}}\n\n");
+        assert!(responses.finish().1);
+
+        let mut anthropic = UsageTracker::new(ApiType::Anthropic, true);
+        anthropic.observe(
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"private upstream detail\"}}\n\n",
+        );
+        assert!(anthropic.finish().1);
+    }
+
+    #[test]
     fn combines_anthropic_usage_across_stream_events() {
         let mut tracker = UsageTracker::new(ApiType::Anthropic, true);
         tracker.observe(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"output_tokens\":1,\"cache_read_input_tokens\":9}}}\n\n");
         tracker.observe(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":11}}\n\n");
         assert_eq!(
-            tracker.finish(),
+            tracker.finish().0,
             TokenUsage {
                 input: 30,
                 output: 11,
@@ -288,7 +331,7 @@ mod tests {
             b"data: {\"usage\":{\"prompt_tokens\":2,\ndata: \"completion_tokens\":1}}\n\n",
         );
         assert_eq!(
-            tracker.finish(),
+            tracker.finish().0,
             TokenUsage {
                 input: 2,
                 output: 1,

@@ -24,6 +24,7 @@ pub struct AppState {
     pub admin: AdminState,
     pub activity: ActivityStore,
     pub routes: RouteStore,
+    pub extensions: Arc<crate::extensions::ExtensionRegistry>,
     pub openai_oauth: crate::openai_subscription::OAuthState,
 }
 
@@ -176,6 +177,7 @@ pub struct Provider {
 }
 
 impl Provider {
+    #[cfg(feature = "extension-request-defaults")]
     pub fn request_defaults_apply_to(&self, endpoint_id: &str) -> bool {
         self.defaults_endpoint_ids.is_empty()
             || self

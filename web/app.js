@@ -1,6 +1,7 @@
 let providers = [];
 let authSettings = {enabled: true, api_keys: []};
 let modelRoutes = [];
+let extensions = [];
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
@@ -14,9 +15,14 @@ let adminSession = null;
 let turnstileWidgetId = null;
 let aboutInfo = null;
 const LIVE_REFRESH_INTERVAL_MS = 30000;
-const ACTIVITY_RENDER_LIMIT = 100;
+const ACTIVITY_PAGE_SIZE = 100;
 let activityLoadPromise = null;
 let activityLogsLimit = 0;
+let activityPage = 0;
+let activityPageTotal = 0;
+let activityPageRequest = 0;
+let activityPageUntil = 0;
+let activitySearchTimer = null;
 let dashboardLoadPromise = null;
 
 async function renderTurnstile(action) {
@@ -60,7 +66,7 @@ async function initializeAdmin() {
   const initial = (adminSession.username || 'A').slice(0, 1).toUpperCase();
   $('#account-menu').textContent = initial; $('.account-avatar-large').textContent = initial;
   $('#account-name').textContent = adminSession.username || 'Administrator'; $('#account-email').textContent = adminSession.email || '';
-  await Promise.all([loadProviders(), loadAuth(), loadRoutes(), loadAbout()]);
+  await Promise.all([loadProviders(), loadAuth(), loadRoutes(), loadExtensions(), loadAbout()]);
   refreshVisibleView();
 }
 
@@ -107,11 +113,12 @@ function slugify(value) {
   return value.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-const viewPaths = {home: '/home', providers: '/providers', models: '/model-routing', access: '/api-access', activity: '/activity', management: '/management-api'};
+const viewPaths = {home: '/home', providers: '/providers', models: '/model-routing', extensions: '/extensions', access: '/api-access', activity: '/activity', management: '/management-api'};
 function showView(name, updateHistory = true) {
   $('#home-view').hidden = name !== 'home';
   $('#providers-view').hidden = name !== 'providers';
   $('#models-view').hidden = name !== 'models';
+  $('#extensions-view').hidden = name !== 'extensions';
   $('#access-view').hidden = name !== 'access';
   $('#activity-view').hidden = name !== 'activity';
   $('#management-view').hidden = name !== 'management';
@@ -122,6 +129,7 @@ function showView(name, updateHistory = true) {
   selectedProviderId = name === 'providers' ? selectedProviderId : null;
   if (name === 'providers') renderProviderPage();
   if (name === 'home') loadDashboard();
+  if (name === 'extensions') renderExtensions();
   if (name === 'activity') loadActivity();
   if (name === 'management') loadManagementKeys();
   if (updateHistory) history.pushState({}, '', selectedProviderId && name === 'providers' ? `/providers/${encodeURIComponent(selectedProviderId)}` : viewPaths[name]);
@@ -133,6 +141,7 @@ function routeFromLocation() {
   if (path.startsWith('/providers/')) { selectedProviderId = decodeURIComponent(path.slice('/providers/'.length)); showView('providers', false); }
   else if (path === '/home' || path === '/') showView('home', false);
   else if (path === '/model-routing') showView('models', false);
+  else if (path === '/extensions') showView('extensions', false);
   else if (path === '/api-access') showView('access', false);
   else if (path === '/activity') showView('activity', false);
   else if (path === '/management-api') showView('management', false);
@@ -381,8 +390,18 @@ function renderProviderPage() {
     const enabledKeys = endpoint.api_keys.filter(key => key.enabled);
     const shares = trafficShares(enabledKeys);
     if (endpoint.api_type === 'openai_codex') {
-      const expiry = endpoint.subscription_expires_at ? new Date(endpoint.subscription_expires_at * 1000).toLocaleString() : 'Unknown';
-      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit proxy</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head"><div><h4>OpenAI OAuth subscription</h4><p>Yabane refreshes this private credential automatically. The access and refresh tokens are never shown in the console or API.</p></div><span class="kind">Token expires ${escapeHtml(expiry)}</span></div></section></article>`;
+      const accessTokenExpiry = endpoint.subscription_expires_at ? new Date(endpoint.subscription_expires_at * 1000).toLocaleString() : null;
+      const credentialDetail = !endpoint.subscription_connected
+        ? 'No OAuth credential is connected. Delete this Endpoint and reconnect the OpenAI account to resume requests.'
+        : endpoint.subscription_expires_at && endpoint.subscription_expires_at * 1000 <= Date.now()
+          ? 'The current access token will be renewed when the next request uses this Endpoint.'
+          : accessTokenExpiry
+            ? `The current access token is valid until ${accessTokenExpiry} and will be renewed automatically when needed.`
+            : 'The current access token will be renewed automatically when needed.';
+      const renewal = endpoint.subscription_connected
+        ? `<div><h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or OpenAI revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(credentialDetail)} Access and refresh tokens are never shown in the console or API.</p></details></div><span class="renewal-status">Automatic renewal</span>`
+        : `<div><h4>Reconnect required</h4><p>${escapeHtml(credentialDetail)}</p></div><span class="renewal-status attention">Not connected</span>`;
+      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit proxy</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
     }
     return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
@@ -393,8 +412,12 @@ function renderProviderPage() {
   const headerCount = Object.keys(provider.extra_headers || {}).length;
   const bodyCount = Object.keys(provider.extra_body || {}).length;
   const defaultsScope = provider.defaults_endpoint_ids?.length ? `${provider.defaults_endpoint_ids.length} selected endpoint${provider.defaults_endpoint_ids.length === 1 ? '' : 's'}` : 'All endpoints';
+  const requestDefaultsExtension = extensions.find(extension => extension.id === 'request-defaults');
+  const defaultsAvailability = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'Extension enabled' : 'Extension disabled') : 'Extension not included';
+  const defaultsDescription = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'Add default headers and JSON fields to upstream requests.' : 'Saved defaults are retained but are not currently applied to requests.') : 'Rebuild Yabane with the Request Defaults Extension to configure these values.';
+  const defaultsAction = requestDefaultsExtension ? '<button class="button secondary edit-provider-options">Configure</button>' : '<button class="button secondary include-request-defaults-extension" type="button">How to include</button>';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -410,20 +433,29 @@ function renderProviderPage() {
     $('#provider-detail .model-page-next').disabled = modelPage >= pageCount - 1;
     $('#provider-detail .model-search-clear').hidden = !modelSearch.value;
     $('#provider-detail .model-table-body').replaceChildren(...pageModels.map(model => {
-      const row = document.createElement('div'); const modelVariants = variants.filter(variant => variant.model === model);
+      const row = document.createElement('div'); row.className = 'model-catalog-row'; const modelVariants = variants.filter(variant => variant.model === model);
       const endpoints = [...new Set(modelVariants.flatMap(variant => variant.endpointIds))];
       const routing = modelVariants.map(variant => `${formatType(variant.apiType)} to ${variant.preferredEndpointId || variant.endpointIds[0]}${variant.preferredEndpointId ? ' (set)' : ''}`).join(' · ');
       row.innerHTML = `<code>${escapeHtml(model)}</code><span>${endpoints.map(id => `<code>${escapeHtml(id)}</code>`).join(' ')}</span><small>${escapeHtml(routing)}</small>`; return row;
     }));
     if (!pageModels.length) $('#provider-detail .model-table-body').innerHTML = '<div class="model-catalog-empty">No models match your search.</div>';
   };
-  browse.addEventListener('click', () => { const browser = $('#provider-detail .provider-model-browser'); browser.hidden = !browser.hidden; browse.textContent = browser.hidden ? 'Browse catalog' : 'Close catalog'; if (!browser.hidden) { modelPage = 0; renderModels(); modelSearch.focus(); } });
+  browse.addEventListener('click', () => {
+    const browser = $('#provider-detail .provider-model-browser');
+    browser.hidden = !browser.hidden;
+    const expanded = !browser.hidden;
+    $('#provider-detail .provider-overview').classList.toggle('catalog-open', expanded);
+    browse.textContent = expanded ? 'Close catalog' : 'Browse catalog';
+    browse.setAttribute('aria-expanded', String(expanded));
+    if (expanded) { modelPage = 0; renderModels(); modelSearch.focus(); }
+  });
   modelSearch.addEventListener('input', () => { modelPage = 0; renderModels(); });
   $('#provider-detail .model-search-clear').addEventListener('click', event => { event.preventDefault(); modelSearch.value = ''; modelPage = 0; renderModels(); modelSearch.focus(); });
   $('#provider-detail .model-page-previous').addEventListener('click', () => { modelPage--; renderModels(); });
   $('#provider-detail .model-page-next').addEventListener('click', () => { modelPage++; renderModels(); });
   $('#provider-detail .manage-model-endpoints')?.addEventListener('click', () => openModelEndpointsDialog(provider));
-  $('#provider-detail .edit-provider-options').addEventListener('click', () => openRequestDefaultsDialog(provider));
+  $('#provider-detail .edit-provider-options')?.addEventListener('click', () => openRequestDefaultsDialog(provider));
+  $('#provider-detail .include-request-defaults-extension')?.addEventListener('click', () => showView('extensions'));
   $('#provider-detail #back-to-providers').addEventListener('click', () => { selectedProviderId = null; history.pushState({}, '', '/providers'); renderProviderPage(); });
   bindProviderActions();
 }
@@ -678,7 +710,7 @@ function collectDefaultsRows(container, kind) {
     if (!name && !rawValue) return;
     if (!name) { error.textContent = `${kind === 'header' ? 'Header' : 'Field'} name is required.`; valid = false; return; }
     if (kind === 'header') {
-      const managedHeaders = ['host', 'authorization', 'x-api-key', 'content-length', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
+      const managedHeaders = ['host', 'authorization', 'x-api-key', 'cookie', 'set-cookie', 'chatgpt-account-id', 'originator', 'content-length', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
       const normalizedName = name.toLowerCase();
       if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) { error.textContent = 'Use a valid HTTP header name.'; valid = false; return; }
       if (Object.hasOwn(result, normalizedName)) { error.textContent = `Duplicate header “${name}”.`; valid = false; return; }
@@ -1102,8 +1134,17 @@ function renderAuth() {
   $('#auth-enabled').checked = authSettings.enabled;
   $('.switch-status').textContent = authSettings.enabled ? 'Enabled' : 'Disabled';
   $('#gateway-keys-empty').hidden = authSettings.api_keys.length > 0; $('#gateway-keys-table').hidden = authSettings.api_keys.length === 0;
-  $('#gateway-keys').replaceChildren(...authSettings.api_keys.map(key => { const row = document.createElement('tr'); const expired = key.expires_at && key.expires_at * 1000 <= Date.now(); const expiry = key.expires_at ? new Date(key.expires_at * 1000).toLocaleString() : 'Never'; const access = key.provider_ids.length ? key.provider_ids.join(', ') : 'All providers'; row.innerHTML = `<td><div class="listed-key"><code>${escapeHtml(key.secret || key.prefix)}</code>${key.secret ? `<button class="icon-copy-key" data-secret="${escapeHtml(key.secret)}" title="Copy API key" aria-label="Copy API key">${copyIcon()}</button>` : ''}</div></td><td>${escapeHtml(key.note || '—')}</td><td>${escapeHtml(access)}</td><td><span class="key-expiry${expired ? ' expired' : ''}">${expired ? 'Expired · ' : ''}${escapeHtml(expiry)}</span></td><td><div class="gateway-key-actions"><button class="edit-gateway-key text-link" data-key="${key.id}">Edit</button><button class="delete-gateway-key text-link danger-link" data-key="${key.id}">Delete</button></div></td>`; return row; }));
-  $$('.icon-copy-key').forEach(button => button.addEventListener('click', async () => { await navigator.clipboard.writeText(button.dataset.secret); button.classList.add('copied'); setTimeout(() => button.classList.remove('copied'), 1200); }));
+  $('#gateway-keys').replaceChildren(...authSettings.api_keys.map(key => {
+    const row = document.createElement('tr'); const expired = key.expires_at && key.expires_at * 1000 <= Date.now(); const expiry = key.expires_at ? new Date(key.expires_at * 1000).toLocaleString() : 'Never'; const access = key.provider_ids.length ? key.provider_ids.join(', ') : 'All providers';
+    row.innerHTML = `<td><div class="listed-key"><code>${escapeHtml(key.prefix)}</code>${key.secret ? `<button class="icon-copy-key" title="Copy API key" aria-label="Copy API key">${copyIcon()}</button>` : ''}</div></td><td>${escapeHtml(key.note || '—')}</td><td>${escapeHtml(access)}</td><td><span class="key-expiry${expired ? ' expired' : ''}">${expired ? 'Expired · ' : ''}${escapeHtml(expiry)}</span></td><td><div class="gateway-key-actions"><button class="edit-gateway-key text-link" data-key="${key.id}">Edit</button><button class="delete-gateway-key text-link danger-link" data-key="${key.id}">Delete</button></div></td>`;
+    const copyButton = row.querySelector('.icon-copy-key');
+    copyButton?.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(key.secret);
+      copyButton.classList.add('copied'); copyButton.title = 'Copied'; copyButton.setAttribute('aria-label', 'API key copied');
+      setTimeout(() => { copyButton.classList.remove('copied'); copyButton.title = 'Copy API key'; copyButton.setAttribute('aria-label', 'Copy API key'); }, 1200);
+    });
+    return row;
+  }));
   $$('.edit-gateway-key').forEach(button => button.addEventListener('click', () => openEditGatewayKey(authSettings.api_keys.find(key => key.id === button.dataset.key))));
   $$('.delete-gateway-key').forEach(button => button.addEventListener('click', async () => { if (confirm('Delete this API key?')) { await fetch(`/admin/auth/keys/${button.dataset.key}`, {method: 'DELETE'}); await loadAuth(); } }));
 }
@@ -1131,6 +1172,8 @@ const searchItems = [
   {label: 'Providers', description: 'Manage LLM providers', view: 'providers'},
   {label: 'Model routing', description: 'Route model IDs to upstream credentials', view: 'models'},
   {label: 'Provider models', description: 'Discover models from providers', view: 'models'},
+  {label: 'Extensions', description: 'Compiled request Hooks and capabilities', view: 'extensions'},
+  {label: 'Request Defaults extension', description: 'Extra Header and Extra JSON Body Hooks', view: 'extensions'},
   {label: 'API access', description: 'Authentication and gateway keys', view: 'access'},
   {label: 'Generate Gateway API key', description: 'Create an inference credential', view: 'access', action: () => $('#open-gateway-key').click()},
   {label: 'Activity', description: 'Requests, tokens, latency, upstream cost, and routing logs', view: 'activity'},
@@ -1172,6 +1215,7 @@ async function showApiError(response, target) { const body = await response.json
 function compactNumber(value) { return Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); }
 function formatCost(value) { return value == null ? '—' : `$${new Intl.NumberFormat('en', {minimumFractionDigits: 2, maximumFractionDigits: 6}).format(value)}`; }
 let activityLogs = [];
+let activityOverviewLogs = [];
 const activityColors = ['#0b57d0', '#7c4dff', '#00a67e', '#ff8f00', '#d93025', '#00897b'];
 function activityBuckets(logs, seconds, end = Math.floor(Date.now() / 1000)) {
   const count = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30;
@@ -1218,11 +1262,12 @@ function renderRankings(target, items) {
   const max = Math.max(...items.map(item => item.requests), 1); target.innerHTML = items.length ? items.slice(0, 5).map((item, index) => `<div class="activity-ranking"><span class="ranking-number">${index + 1}</span><span class="ranking-dot" style="background:${activityColors[index % activityColors.length]}"></span><div><strong>${escapeHtml(item.name)}</strong><span class="ranking-track"><i style="width:${item.requests * 100 / max}%;background:${activityColors[index % activityColors.length]}"></i></span></div><span><strong>${item.requests}</strong><small>requests</small></span><span><strong>${compactNumber(item.tokens)}</strong><small>tokens</small></span></div>`).join('') : '<div class="activity-empty">No activity in this period.</div>';
 }
 function statusBadge(status) { const success = status >= 200 && status < 400; return `<span class="status-badge ${success ? 'success' : 'failure'}"><i></i>${status}</span>`; }
+function failureLabel(log) { return log.failure?.message || (log.status >= 400 ? `HTTP ${log.status}` : ''); }
 function compactPath(path) { return path.replace('/v1/', '').replace('chat/completions', 'Chat').replace('responses', 'Responses').replace('messages', 'Messages'); }
 function activityRow(log, detailed = false, index = -1) {
   const tokens = log.input_tokens + log.output_tokens; const time = new Date(log.timestamp * 1000);
   const conversion = log.caller_protocol && log.upstream_protocol && log.caller_protocol !== log.upstream_protocol ? ` · ${log.caller_protocol.replace('openai_', '').replace('_completions', '')} → ${log.upstream_protocol.replace('openai_', '').replace('_completions', '')}` : '';
-  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td><span class="activity-model"><code>${escapeHtml(log.model)}</code><small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small></span></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td>${statusBadge(log.status)}</td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${formatCost(log.cost)}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
+  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td><span class="activity-model"><code>${escapeHtml(log.model)}</code><small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small></span></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td><span class="activity-status-cell">${statusBadge(log.status)}${log.failure ? `<small title="${escapeHtml(failureLabel(log))}">${escapeHtml(failureLabel(log))}</small>` : ''}</span></td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${formatCost(log.cost)}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
   return `<tr class="activity-request-row" data-activity-index="${index}" tabindex="0" aria-label="Open details for ${escapeHtml(log.model)} request">${row}</tr>`;
 }
 function formatDuration(milliseconds) { return milliseconds == null ? 'Not available' : milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 1 : 2)} s` : `${milliseconds.toLocaleString()} ms`; }
@@ -1231,6 +1276,7 @@ function openActivityDetail(log) {
   const dialog = $('#activity-detail-dialog'); const firstByte = log.first_byte_ms; const total = log.latency_ms; const generation = log.generation_ms ?? (firstByte == null ? null : Math.max(total - firstByte, 0));
   $('#activity-detail-model').textContent = log.model; $('#activity-detail-time').textContent = new Date(log.timestamp * 1000).toLocaleString(); $('#activity-detail-status').innerHTML = statusBadge(log.status);
   $('#activity-detail-route').textContent = `${log.provider} / ${log.endpoint}`; $('#activity-detail-api').textContent = `${compactPath(log.path)}${log.streaming ? ' · Streaming' : ''}`;
+  const failure = $('#activity-detail-failure'); const failureMessage = log.failure?.message; const failureCategory = log.failure?.category; failure.hidden = !failureMessage; failure.querySelector('p').textContent = failureMessage || ''; failure.querySelector('small').textContent = failureCategory === 'proxy_connect_failed' ? 'Check that the proxy is reachable. If HTTPS works with socks5h but not socks5, let the proxy resolve target hostnames.' : 'Use the request ID below to match this failure with server logs if more detail is needed.';
   const timing = [['Gateway', log.gateway_ms, '#7c4dff'], ['Upstream response', log.upstream_response_ms, '#00a67e'], ['Time to first byte', firstByte, '#0b57d0'], ['Generation after first byte', generation, '#ff8f00'], ['Total', total, '#202124']];
   $('#activity-detail-timing').innerHTML = timing.map(([label, value, color]) => `<div><span>${escapeHtml(label)}</span><i><b style="width:${value == null ? 0 : Math.max(2, value * 100 / Math.max(total, 1))}%;background:${color}"></b></i><strong>${escapeHtml(formatDuration(value))}</strong></div>`).join('');
   $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], ['Upstream cost', formatCost(log.cost)], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
@@ -1241,60 +1287,78 @@ $$('.close-activity-detail').forEach(button => button.addEventListener('click', 
 $('#activity-detail-dialog').addEventListener('click', event => { if (event.target === event.currentTarget) event.currentTarget.close(); });
 function renderActivityLogs() {
   if ($('#activity-requests-panel').hidden) return;
-  const query = $('#activity-search').value.trim().toLowerCase(); const status = $('#activity-status-filter').value;
-  const matches = [];
-  for (let index = 0; index < activityLogs.length; index++) {
-    const log = activityLogs[index];
-    if ((!query || `${log.request_id} ${log.model} ${log.provider} ${log.endpoint}`.toLowerCase().includes(query)) && (!status || (status === 'success' ? log.status < 400 : log.status >= 400))) matches.push({log, index});
-  }
-  const visible = matches.slice(0, ACTIVITY_RENDER_LIMIT);
-  $('#activity-result-count').textContent = matches.length > visible.length ? `${matches.length.toLocaleString()} matching · showing ${visible.length}` : `${matches.length.toLocaleString()} request${matches.length === 1 ? '' : 's'}`;
-  $('#activity-logs').innerHTML = visible.length ? visible.map(({log, index}) => activityRow(log, true, index)).join('') : '<tr><td colspan="10"><div class="activity-empty">No requests match these filters.</div></td></tr>';
+  const pageCount = Math.max(1, Math.ceil(activityPageTotal / ACTIVITY_PAGE_SIZE));
+  const start = activityPage * ACTIVITY_PAGE_SIZE;
+  const end = Math.min(start + activityLogs.length, activityPageTotal);
+  $('#activity-result-count').textContent = `${activityPageTotal.toLocaleString()} matching`;
+  $('#activity-page-status').textContent = activityPageTotal ? `${start + 1}–${end} of ${activityPageTotal.toLocaleString()} · Page ${activityPage + 1} of ${pageCount}` : 'No matching requests';
+  $('#activity-page-previous').disabled = activityPage === 0;
+  $('#activity-page-next').disabled = activityPage >= pageCount - 1;
+  $('#activity-logs').innerHTML = activityLogs.length ? activityLogs.map((log, index) => activityRow(log, true, index)).join('') : '<tr><td colspan="10"><div class="activity-empty">No requests match these filters.</div></td></tr>';
+}
+async function loadActivityPage() {
+  if ($('#activity-requests-panel').hidden) return;
+  const request = ++activityPageRequest;
+  const seconds = Number($('#activity-range').value); const until = activityPageUntil || Math.floor(Date.now() / 1000); const since = until - seconds;
+  const params = new URLSearchParams({since, until, offset: activityPage * ACTIVITY_PAGE_SIZE, limit: ACTIVITY_PAGE_SIZE});
+  const provider = $('#activity-provider-filter').value; const query = $('#activity-search').value.trim(); const status = $('#activity-status-filter').value;
+  if (provider) params.set('provider', provider); if (query) params.set('query', query); if (status) params.set('status', status);
+  const response = await fetch(`/admin/activity/logs/page?${params}`); const page = await response.json();
+  if (request !== activityPageRequest) return;
+  activityLogs = page.data; activityPageTotal = page.total;
+  const lastPage = Math.max(0, Math.ceil(activityPageTotal / ACTIVITY_PAGE_SIZE) - 1);
+  if (activityPage > lastPage) { activityPage = lastPage; return loadActivityPage(); }
+  renderActivityLogs();
 }
 async function loadActivity(requestedLogLimit) {
   const explorerVisible = !$('#activity-requests-panel').hidden;
-  const logLimit = requestedLogLimit || (explorerVisible ? 1000 : 100);
+  const logLimit = requestedLogLimit || 100;
   if (activityLoadPromise) {
     await activityLoadPromise;
     if (logLimit <= activityLogsLimit) return;
   }
   activityLoadPromise = (async () => {
-    const seconds = Number($('#activity-range').value); const until = Math.floor(Date.now() / 1000); const since = until - seconds; const bucketCount = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30; const providerFilter = $('#activity-provider-filter').value;
+    const seconds = Number($('#activity-range').value); const until = Math.floor(Date.now() / 1000); activityPageUntil = until; const since = until - seconds; const bucketCount = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30; const providerFilter = $('#activity-provider-filter').value;
     const providerQuery = providerFilter ? `&provider=${encodeURIComponent(providerFilter)}` : '';
     const statsUrl = `/admin/activity/stats?since=${since}&until=${until}&buckets=${bucketCount}${providerQuery}`;
     const [stats, logs] = await Promise.all([fetch(statsUrl).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=${logLimit}${providerQuery}`).then(response => response.json())]);
-    activityLogs = logs; activityLogsLimit = logLimit;
+    activityOverviewLogs = logs; activityLogsLimit = logLimit;
     const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
     const buckets = stats.buckets; const requests = stats.requests; const totalTokens = totals.input + totals.output;
     $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
     $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
     $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
     renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), stats.by_provider.map(item => ({...item, tokens: item.input_tokens + item.output_tokens}))); renderRankings($('#model-stats'), stats.by_model.map(item => ({...item, tokens: item.input_tokens + item.output_tokens})));
-    $('#recent-activity-logs').innerHTML = activityLogs.length ? activityLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>'; renderActivityLogs();
+    $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
     const filter = $('#activity-provider-filter'); const previous = filter.value;
     if (!providerFilter) filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.name, provider.name)));
     filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
+    if (explorerVisible) loadActivityPage();
   })().finally(() => { activityLoadPromise = null; });
   return activityLoadPromise;
 }
 function showActivityTab(tab) {
   $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
   $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests';
-  if (tab === 'requests') { renderActivityLogs(); if (activityLogsLimit < 1000) loadActivity(1000); }
+  if (tab === 'requests') { activityPage = 0; activityPageUntil = Math.floor(Date.now() / 1000); $('#activity-page-previous').disabled = true; loadActivityPage(); }
 }
 $('#activity-view').addEventListener('click', event => {
   const tab = event.target.closest('[data-activity-tab]');
   if (tab) { showActivityTab(tab.dataset.activityTab); return; }
   if (event.target.closest('.show-request-explorer')) showActivityTab('requests');
 });
-$('#activity-search').addEventListener('input', renderActivityLogs); $('#activity-status-filter').addEventListener('change', renderActivityLogs);
+$('#activity-search').addEventListener('input', () => { clearTimeout(activitySearchTimer); activitySearchTimer = setTimeout(() => { activityPage = 0; loadActivityPage(); }, 250); });
+$('#activity-status-filter').addEventListener('change', () => { activityPage = 0; loadActivityPage(); });
+$('#activity-page-previous').addEventListener('click', () => { if (activityPage > 0) { activityPage--; loadActivityPage(); } });
+$('#activity-page-next').addEventListener('click', () => { if ((activityPage + 1) * ACTIVITY_PAGE_SIZE < activityPageTotal) { activityPage++; loadActivityPage(); } });
 $('.chart-metric-picker').addEventListener('click', event => { const button = event.target.closest('[data-chart-metric]'); if (!button) return; activityChartMetric = button.dataset.chartMetric; $$('.chart-metric-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); renderActivityChart(); });
 $('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
 $('#activity-chart').addEventListener('focusin', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
 $('#activity-chart').addEventListener('click', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
-$('#activity-view').addEventListener('click', event => { const row = event.target.closest('.activity-request-row'); if (row) openActivityDetail(activityLogs[Number(row.dataset.activityIndex)]); });
-$('#activity-view').addEventListener('keydown', event => { const row = event.target.closest('.activity-request-row'); if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openActivityDetail(activityLogs[Number(row.dataset.activityIndex)]); } });
-function resetAndLoadActivity() { activityLogsLimit = 0; loadActivity(); }
+function activityLogForRow(row) { return (row.closest('#recent-activity-logs') ? activityOverviewLogs : activityLogs)[Number(row.dataset.activityIndex)]; }
+$('#activity-view').addEventListener('click', event => { const row = event.target.closest('.activity-request-row'); if (row) openActivityDetail(activityLogForRow(row)); });
+$('#activity-view').addEventListener('keydown', event => { const row = event.target.closest('.activity-request-row'); if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openActivityDetail(activityLogForRow(row)); } });
+function resetAndLoadActivity() { activityLogsLimit = 0; activityPage = 0; activityPageUntil = 0; loadActivity(); }
 $('#activity-range').addEventListener('change', resetAndLoadActivity); $('#activity-provider-filter').addEventListener('change', resetAndLoadActivity); $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
 const activityDataDialog = $('#activity-data-dialog');
 let activityImportBytes = null;
@@ -1396,6 +1460,33 @@ function refreshVisibleView() {
 }
 setInterval(refreshVisibleView, LIVE_REFRESH_INTERVAL_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisibleView(); });
+
+$$('.copy-extension-command').forEach(button => button.addEventListener('click', async () => {
+  await navigator.clipboard.writeText(button.dataset.command);
+  const original = button.textContent; button.textContent = 'Copied';
+  setTimeout(() => { button.textContent = original; }, 1200);
+}));
+
+function renderExtensions() {
+  const list = $('#extensions-list');
+  if (!extensions.length) { list.innerHTML = '<section class="card empty extensions-empty"><h3>No extensions in this build</h3><p>The commands above show how to include bundled Extensions in the next build.</p></section>'; return; }
+  list.innerHTML = extensions.map(extension => {
+    const configuredProviders = extension.id === 'request-defaults' ? providers.filter(provider => Object.keys(provider.extra_headers || {}).length || Object.keys(provider.extra_body || {}).length || provider.endpoints.some(endpoint => Object.keys(endpoint.extra_headers || {}).length || Object.keys(endpoint.extra_body || {}).length)) : [];
+    const status = extension.enabled ? 'Enabled' : extension.runtime_configurable ? 'Disabled' : 'Disabled by CLI';
+    return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(hook => hook.replaceAll('_', ' ')).join(' · ')}</strong></span><span><small>Configured</small><strong>${configuredProviders.length} Provider${configuredProviders.length === 1 ? '' : 's'}</strong></span></div>${extension.id === 'request-defaults' ? `<footer><div><strong>Configured in Provider context</strong><p>Header and body defaults remain next to the Provider and Endpoint resources they affect.${extension.enabled ? '' : ' They are retained while this Extension is disabled.'}</p></div>${configuredProviders.length ? `<div class="extension-provider-links">${configuredProviders.map(provider => `<button class="text-link" type="button" data-extension-provider="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</button>`).join('')}</div>` : '<button class="button secondary extension-open-providers" type="button">Choose a Provider</button>'}</footer>` : ''}</article>`;
+  }).join('');
+  $$('[data-extension-toggle]').forEach(toggle => toggle.addEventListener('change', async () => {
+    toggle.disabled = true;
+    const response = await fetch(`/admin/extensions/${encodeURIComponent(toggle.dataset.extensionToggle)}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({enabled: toggle.checked})});
+    if (!response.ok) { toggle.checked = !toggle.checked; toggle.disabled = false; window.alert((await response.json()).error?.message || 'Could not update Extension'); return; }
+    const updated = await response.json();
+    extensions = extensions.map(extension => extension.id === updated.id ? updated : extension);
+    renderExtensions(); renderProviders();
+  }));
+  $$('.extension-open-providers').forEach(button => button.addEventListener('click', () => showView('providers')));
+  $$('[data-extension-provider]').forEach(button => button.addEventListener('click', () => { selectedProviderId = button.dataset.extensionProvider; showView('providers'); }));
+}
+async function loadExtensions() { const response = await fetch('/admin/extensions'); extensions = response.ok ? await response.json() : []; renderExtensions(); }
 
 function formatType(type) { return type === 'anthropic' ? 'Anthropic Messages' : type === 'openai_codex' ? 'OpenAI subscription' : type === 'openai_chat_completions' ? 'OpenAI Chat Completions' : type === 'openai_responses' ? 'OpenAI Responses' : 'OpenAI compatible'; }
 function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value); return node.innerHTML; }

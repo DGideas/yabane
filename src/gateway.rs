@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{error::Error as StdError, sync::OnceLock, time::Instant};
 
 use axum::{
     body::Body,
@@ -11,7 +11,7 @@ use rand::RngCore;
 use tracing::error;
 
 use crate::{
-    activity::{ActivityStore, RequestLog},
+    activity::{ActivityStore, RequestFailure, RequestLog},
     auth,
     config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
     error::api_error,
@@ -96,7 +96,7 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
         .ok()
         .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
-    let (provider, endpoint, api_key, model, body) =
+    let (provider, endpoint, api_key, model, upstream_model, body) =
         match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
             Ok(resolved) => resolved,
             Err(err) => return api_error(err.status, err.message),
@@ -127,6 +127,7 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
             endpoint,
             api_key,
             model,
+            upstream_model,
             parts,
             body,
             requested_streaming,
@@ -143,7 +144,17 @@ async fn resolve_provider(
     body: &[u8],
     surface: ApiSurface,
     allowed_providers: Option<&[String]>,
-) -> Result<(Provider, ApiEndpoint, Option<ApiKey>, String, Vec<u8>), RoutingError> {
+) -> Result<
+    (
+        Provider,
+        ApiEndpoint,
+        Option<ApiKey>,
+        String,
+        String,
+        Vec<u8>,
+    ),
+    RoutingError,
+> {
     let mut payload: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| RoutingError {
             status: StatusCode::BAD_REQUEST,
@@ -251,9 +262,10 @@ async fn resolve_provider(
     }
 
     let endpoint = endpoint.clone();
-    payload["model"] = serde_json::Value::String(upstream_model.to_owned());
+    let upstream_model = upstream_model.to_owned();
+    payload["model"] = serde_json::Value::String(upstream_model.clone());
     let body = serde_json::to_vec(&payload).expect("serialize validated request body");
-    Ok((provider, endpoint, api_key, model, body))
+    Ok((provider, endpoint, api_key, model, upstream_model, body))
 }
 
 fn request_id() -> String {
@@ -303,6 +315,39 @@ impl ProxyActivity {
         first_byte_ms: Option<u64>,
         latency_ms: u64,
     ) {
+        self.record_failure_at(status, usage, streaming, first_byte_ms, latency_ms, None)
+            .await;
+    }
+
+    async fn record_failure(
+        &self,
+        status: StatusCode,
+        usage: TokenUsage,
+        streaming: bool,
+        first_byte_ms: Option<u64>,
+        failure: RequestFailure,
+    ) {
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        self.record_failure_at(
+            status,
+            usage,
+            streaming,
+            first_byte_ms,
+            latency_ms,
+            Some(failure),
+        )
+        .await;
+    }
+
+    async fn record_failure_at(
+        &self,
+        status: StatusCode,
+        usage: TokenUsage,
+        streaming: bool,
+        first_byte_ms: Option<u64>,
+        latency_ms: u64,
+        failure: Option<RequestFailure>,
+    ) {
         self.store
             .record(RequestLog {
                 timestamp: crate::auth::now(),
@@ -315,6 +360,7 @@ impl ProxyActivity {
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
                 upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
                 status: status.as_u16(),
+                failure,
                 latency_ms,
                 gateway_ms: Some(self.gateway_ms),
                 upstream_response_ms: Some(self.upstream_response_ms),
@@ -336,6 +382,7 @@ struct ForwardRequest {
     endpoint: ApiEndpoint,
     api_key: Option<ApiKey>,
     model: String,
+    upstream_model: String,
     parts: axum::http::request::Parts,
     body: Vec<u8>,
     requested_streaming: bool,
@@ -350,6 +397,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         endpoint,
         api_key,
         model,
+        upstream_model: resolved_upstream_model,
         parts,
         body,
         requested_streaming,
@@ -359,21 +407,75 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     } = request;
     let path = parts.uri.path().to_owned();
     let request_id = request_id();
+    let upstream_model = resolved_upstream_model;
+    #[cfg(feature = "extension-request-defaults")]
     let provider_defaults_apply = provider.request_defaults_apply_to(&endpoint.id);
+    let extension_context = yabane_extension_api::RequestContext {
+        request_id: &request_id,
+        public_model: &model,
+        upstream_model: &upstream_model,
+        provider_id: &provider.id,
+        endpoint_id: &endpoint.id,
+        caller_protocol: extension_protocol(caller_protocol),
+        upstream_protocol: extension_protocol(upstream_protocol),
+        requested_streaming,
+    };
+    #[cfg(feature = "extension-request-defaults")]
+    let request_defaults_enabled = state.extensions.is_enabled("request-defaults");
+    #[cfg(feature = "extension-request-defaults")]
     let empty_headers = std::collections::HashMap::new();
+    #[cfg(feature = "extension-request-defaults")]
     let empty_body = serde_json::Map::new();
-    let request_headers = sanitize_request_headers(
-        parts.headers,
-        endpoint.api_type,
-        (caller_protocol, upstream_protocol),
-        api_key.as_ref(),
-        endpoint.openai_subscription.as_ref(),
+    #[cfg(feature = "extension-request-defaults")]
+    let request_defaults = yabane_extension_request_defaults::RequestDefaults::new(
         if provider_defaults_apply {
             &provider.extra_headers
         } else {
             &empty_headers
         },
         &endpoint.extra_headers,
+        if provider_defaults_apply {
+            &provider.extra_body
+        } else {
+            &empty_body
+        },
+        &endpoint.extra_body,
+    );
+    #[cfg(feature = "extension-request-defaults")]
+    let extension_hooks = if !request_defaults_enabled || request_defaults.is_empty() {
+        crate::extensions::RequestHooks::default()
+    } else {
+        crate::extensions::RequestHooks {
+            upstream_request: vec![&request_defaults],
+            upstream_headers: vec![&request_defaults],
+        }
+    };
+    #[cfg(not(feature = "extension-request-defaults"))]
+    let extension_hooks = crate::extensions::RequestHooks::default();
+    let mut request_headers = sanitize_request_headers(
+        parts.headers,
+        endpoint.api_type,
+        (caller_protocol, upstream_protocol),
+    );
+    if !extension_hooks.upstream_headers.is_empty() {
+        let overlay = match state
+            .extensions
+            .run_upstream_headers(&extension_context, &extension_hooks.upstream_headers)
+        {
+            Ok(crate::extensions::DispatchOutcome::Continue(headers)) => headers,
+            Ok(crate::extensions::DispatchOutcome::Reject(rejection)) => {
+                return crate::extensions::rejection_response(rejection);
+            }
+            Err(failure) => return crate::extensions::execution_error(failure),
+        };
+        request_headers.extend(overlay);
+    }
+    apply_core_upstream_headers(
+        &mut request_headers,
+        endpoint.api_type,
+        (caller_protocol, upstream_protocol),
+        api_key.as_ref(),
+        endpoint.openai_subscription.as_ref(),
     );
     let path_and_query = parts
         .uri
@@ -392,20 +494,32 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     } else {
         join_upstream_url(&endpoint.base_url, target_path)
     };
-    let body = apply_extra_body(
-        body,
-        if provider_defaults_apply {
-            &provider.extra_body
-        } else {
-            &empty_body
-        },
-        &endpoint.extra_body,
-    );
+    let body = if extension_hooks.upstream_request.is_empty() {
+        body
+    } else {
+        match state.extensions.run_upstream_request(
+            &extension_context,
+            bytes::Bytes::from(body),
+            &extension_hooks.upstream_request,
+        ) {
+            Ok(crate::extensions::DispatchOutcome::Continue(body)) => body.to_vec(),
+            Ok(crate::extensions::DispatchOutcome::Reject(rejection)) => {
+                return crate::extensions::rejection_response(rejection);
+            }
+            Err(failure) => return crate::extensions::execution_error(failure),
+        }
+    };
     let body = if endpoint.api_type == ApiType::OpenaiCodex {
         apply_codex_body(body)
     } else {
         body
     };
+    if endpoint.api_type == ApiType::OpenaiCodex
+        && let Some(session_id) = codex_session_id(&body)
+    {
+        request_headers.insert(HeaderName::from_static("session-id"), session_id.clone());
+        request_headers.insert(HeaderName::from_static("x-client-request-id"), session_id);
+    }
 
     let client = match endpoint.client(&state.client) {
         Ok(client) => client,
@@ -421,7 +535,18 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let upstream_response = match upstream.send().await {
         Ok(response) => response,
         Err(err) => {
-            error!(provider = %provider.id, endpoint = %endpoint.id, %err, "upstream request failed");
+            let using_socks5_proxy = endpoint.socks5_proxy.is_some();
+            let failure = upstream_transport_failure(&err, using_socks5_proxy);
+            error!(
+                provider = %provider.id,
+                endpoint = %endpoint.id,
+                request_id,
+                using_socks5_proxy,
+                failure_stage = %failure.stage,
+                failure_category = %failure.category,
+                failure = %failure.message,
+                "upstream request failed"
+            );
             let failed_at_ms = started.elapsed().as_millis() as u64;
             state
                 .activity
@@ -436,6 +561,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     caller_protocol: Some(caller_protocol.name().to_owned()),
                     upstream_protocol: Some(upstream_protocol.name().to_owned()),
                     status: StatusCode::BAD_GATEWAY.as_u16(),
+                    failure: Some(failure.clone()),
                     latency_ms: failed_at_ms,
                     gateway_ms: Some(upstream_started.duration_since(started).as_millis() as u64),
                     upstream_response_ms: Some(upstream_started.elapsed().as_millis() as u64),
@@ -448,21 +574,25 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     streaming: requested_streaming,
                 })
                 .await;
-            return api_error(StatusCode::BAD_GATEWAY, "Upstream request failed");
+            return api_error(StatusCode::BAD_GATEWAY, &failure.message);
         }
     };
 
     let upstream_response_ms = upstream_started.elapsed().as_millis() as u64;
     let status = upstream_response.status();
+    let api_type = endpoint.api_type;
     let response_headers = upstream_response.headers().clone();
     let content_type = response_headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let event_stream = content_type
-        .split(';')
-        .next()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    // The ChatGPT Codex endpoint is always SSE, but currently omits Content-Type
+    // on successful responses. pi-ai parses it as SSE by protocol, not by header.
+    let event_stream = api_type == ApiType::OpenaiCodex
+        || content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     let activity = ProxyActivity {
         store: state.activity.clone(),
         request_id,
@@ -476,7 +606,6 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         gateway_ms: upstream_started.duration_since(started).as_millis() as u64,
         upstream_response_ms,
     };
-    let api_type = endpoint.api_type;
     let converting = status.is_success() && caller_protocol != upstream_protocol;
 
     if converting && event_stream && !requested_streaming {
@@ -521,15 +650,19 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         } else {
             None
         };
-        let usage = usage.finish();
+        let (usage, protocol_failed) = usage.finish();
+        if failure.is_none() && protocol_failed {
+            failure = Some("Upstream stream reported a failure".to_owned());
+        }
         if let Some(err) = failure {
             activity
-                .record_at(
+                .record_failure_at(
                     StatusCode::BAD_GATEWAY,
                     usage,
                     true,
                     first_byte_ms,
                     completion_ms,
+                    Some(stream_failure(&err)),
                 )
                 .await;
             return api_error(StatusCode::BAD_GATEWAY, err);
@@ -555,7 +688,17 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Err(err) => {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream response for protocol conversion");
                 activity
-                    .record(StatusCode::BAD_GATEWAY, TokenUsage::default(), false, None)
+                    .record_failure(
+                        StatusCode::BAD_GATEWAY,
+                        TokenUsage::default(),
+                        false,
+                        None,
+                        RequestFailure::new(
+                            "upstream_response",
+                            "read_failed",
+                            "Could not read the upstream response",
+                        ),
+                    )
                     .await;
                 return api_error(StatusCode::BAD_GATEWAY, "Could not read upstream response");
             }
@@ -563,20 +706,45 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         let mut usage = UsageTracker::new(api_type, false);
         usage.observe(&bytes);
         let converted = protocol::convert_response(&bytes, upstream_protocol, caller_protocol);
-        let usage = usage.finish();
+        let (usage, protocol_failed) = usage.finish();
         let converted = match converted {
             Ok(converted) => converted,
             Err(err) => {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not convert upstream response");
                 activity
-                    .record(StatusCode::BAD_GATEWAY, usage, requested_streaming, None)
+                    .record_failure(
+                        StatusCode::BAD_GATEWAY,
+                        usage,
+                        requested_streaming,
+                        None,
+                        RequestFailure::new(
+                            "protocol_conversion",
+                            "invalid_response",
+                            "Could not convert the upstream response",
+                        ),
+                    )
                     .await;
                 return api_error(StatusCode::BAD_GATEWAY, err);
             }
         };
-        activity
-            .record(status, usage, requested_streaming, None)
-            .await;
+        if protocol_failed || status.is_client_error() || status.is_server_error() {
+            let failure = if protocol_failed {
+                RequestFailure::new(
+                    "upstream_response",
+                    "protocol_failure",
+                    "Upstream response reported a failure",
+                )
+            } else {
+                upstream_http_failure(status)
+            };
+            activity
+                .record_failure(status, usage, requested_streaming, None, failure)
+                .await;
+        } else {
+            activity
+                .record(status, usage, requested_streaming, None)
+                .await;
+        }
         let mut response = Response::new(Body::from(converted));
         *response.status_mut() = status;
         copy_response_headers(response.headers_mut(), &response_headers);
@@ -643,13 +811,53 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 }
             }
         }
-        let usage = usage.finish();
-        let recorded_status = if conversion_failed { StatusCode::BAD_GATEWAY } else { status };
-        activity.record(recorded_status, usage, requested_streaming || event_stream, first_byte_ms).await;
+        let (usage, protocol_failed) = usage.finish();
+        let recorded_status = if conversion_failed || protocol_failed { StatusCode::BAD_GATEWAY } else { status };
+        if conversion_failed {
+            activity.record_failure(
+                recorded_status,
+                usage,
+                requested_streaming || event_stream,
+                first_byte_ms,
+                RequestFailure::new(
+                    "upstream_stream",
+                    "interrupted",
+                    "Upstream stream ended or could not be converted",
+                ),
+            ).await;
+        } else if protocol_failed {
+            activity.record_failure(
+                recorded_status,
+                usage,
+                requested_streaming || event_stream,
+                first_byte_ms,
+                RequestFailure::new(
+                    "upstream_stream",
+                    "protocol_failure",
+                    "Upstream stream reported a failure",
+                ),
+            ).await;
+        } else if status.is_client_error() || status.is_server_error() {
+            activity.record_failure(
+                status,
+                usage,
+                requested_streaming || event_stream,
+                first_byte_ms,
+                upstream_http_failure(status),
+            ).await;
+        } else {
+            activity.record(status, usage, requested_streaming || event_stream, first_byte_ms).await;
+        }
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(response.headers_mut(), &response_headers);
+    if api_type == ApiType::OpenaiCodex {
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
     if converting {
         strip_transformed_response_headers(response.headers_mut());
         response.headers_mut().insert(
@@ -682,10 +890,6 @@ fn sanitize_request_headers(
     mut headers: HeaderMap,
     api_type: ApiType,
     protocol_route: (Protocol, Protocol),
-    api_key: Option<&ApiKey>,
-    subscription: Option<&crate::config::OpenAiSubscription>,
-    provider_headers: &std::collections::HashMap<String, String>,
-    endpoint_headers: &std::collections::HashMap<String, String>,
 ) -> HeaderMap {
     for name in [
         header::HOST.as_str(),
@@ -719,15 +923,20 @@ fn sanitize_request_headers(
     }
     if api_type == ApiType::OpenaiCodex {
         headers.remove(header::CONTENT_ENCODING);
+        headers.remove(header::USER_AGENT);
+        headers.remove("session-id");
+        headers.remove("x-client-request-id");
     }
-    for (name, value) in provider_headers.iter().chain(endpoint_headers) {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
+    headers
+}
+
+fn apply_core_upstream_headers(
+    headers: &mut HeaderMap,
+    api_type: ApiType,
+    protocol_route: (Protocol, Protocol),
+    api_key: Option<&ApiKey>,
+    subscription: Option<&crate::config::OpenAiSubscription>,
+) {
     if protocol_route.0 != protocol_route.1 {
         headers.insert(
             header::ACCEPT_ENCODING,
@@ -756,6 +965,13 @@ fn sanitize_request_headers(
             .or_insert(HeaderValue::from_static("2023-06-01"));
     }
     if let Some(subscription) = subscription {
+        // pi-ai's fetch transport transparently decodes compressed responses before
+        // parsing usage. Request identity encoding so Yabane can observe the same
+        // response bytes it forwards and record subscription usage accurately.
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", subscription.access_token))
@@ -768,12 +984,9 @@ fn sanitize_request_headers(
         );
         headers.insert(
             HeaderName::from_static("originator"),
-            HeaderValue::from_static("yabane"),
+            HeaderValue::from_static("pi"),
         );
-        headers.insert(
-            header::USER_AGENT,
-            HeaderValue::from_static(concat!("yabane/", env!("YABANE_GIT_COMMIT"))),
-        );
+        headers.insert(header::USER_AGENT, pi_user_agent().clone());
         headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses=experimental"),
@@ -787,7 +1000,34 @@ fn sanitize_request_headers(
             HeaderValue::from_static("application/json"),
         );
     }
-    headers
+}
+
+fn pi_user_agent() -> &'static HeaderValue {
+    static USER_AGENT: OnceLock<HeaderValue> = OnceLock::new();
+    USER_AGENT.get_or_init(|| {
+        let platform = match std::env::consts::OS {
+            "macos" => "darwin",
+            platform => platform,
+        };
+        let architecture = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x64",
+            architecture => architecture,
+        };
+        let release = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|release| release.trim().to_owned())
+            .filter(|release| !release.is_empty());
+        let value = match release {
+            Some(release) => format!("pi ({platform} {release}; {architecture})"),
+            None => format!("pi ({platform}; {architecture})"),
+        };
+        HeaderValue::from_str(&value).expect("pi user agent is a valid header value")
+    })
 }
 
 fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
@@ -797,6 +1037,19 @@ fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
     if let Some(object) = value.as_object_mut() {
         object.insert("store".to_owned(), serde_json::Value::Bool(false));
         object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        let leading_instructions = object
+            .get_mut("input")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|input| {
+                let first = input.first()?.as_object()?;
+                let role = first.get("role")?.as_str()?;
+                if !matches!(role, "developer" | "system") {
+                    return None;
+                }
+                let instructions = first.get("content")?.as_str()?.to_owned();
+                input.remove(0);
+                Some(instructions)
+            });
         if object
             .get("instructions")
             .and_then(serde_json::Value::as_str)
@@ -804,7 +1057,10 @@ fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
         {
             object.insert(
                 "instructions".to_owned(),
-                serde_json::Value::String("You are a helpful assistant.".to_owned()),
+                serde_json::Value::String(
+                    leading_instructions
+                        .unwrap_or_else(|| "You are a helpful assistant.".to_owned()),
+                ),
             );
         }
         if let Some(input) = object
@@ -817,6 +1073,9 @@ fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
                 serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": input}]}]),
             );
         }
+        // pi-ai's Codex request shape intentionally omits the public Responses
+        // output cap because the ChatGPT Codex backend rejects that parameter.
+        object.remove("max_output_tokens");
         object
             .entry("text")
             .or_insert_with(|| serde_json::json!({"verbosity": "low"}));
@@ -845,23 +1104,22 @@ fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
     serde_json::to_vec(&value).expect("serialize OpenAI subscription request")
 }
 
-fn apply_extra_body(
-    body: Vec<u8>,
-    provider: &serde_json::Map<String, serde_json::Value>,
-    endpoint: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<u8> {
-    if provider.is_empty() && endpoint.is_empty() {
-        return body;
+fn codex_session_id(body: &[u8]) -> Option<HeaderValue> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let key = value.get("prompt_cache_key")?.as_str()?;
+    if key.is_empty() {
+        return None;
     }
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    if let Some(object) = value.as_object_mut() {
-        for (key, value) in provider.iter().chain(endpoint) {
-            object.insert(key.clone(), value.clone());
-        }
+    let clamped: String = key.chars().take(64).collect();
+    HeaderValue::from_str(&clamped).ok()
+}
+
+fn extension_protocol(protocol: Protocol) -> yabane_extension_api::Protocol {
+    match protocol {
+        Protocol::OpenAiChat => yabane_extension_api::Protocol::OpenAiChatCompletions,
+        Protocol::OpenAiResponses => yabane_extension_api::Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages => yabane_extension_api::Protocol::AnthropicMessages,
     }
-    serde_json::to_vec(&value).expect("serialize request with extra body")
 }
 
 fn set_conversion_header(headers: &mut HeaderMap, source: Protocol, target: Protocol) {
@@ -917,19 +1175,121 @@ fn is_hop_by_hop_header(name: &str) -> bool {
     )
 }
 
+fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) -> RequestFailure {
+    let route = if using_socks5_proxy {
+        " through the configured SOCKS5 proxy"
+    } else {
+        ""
+    };
+    if err.is_timeout() {
+        return RequestFailure::new(
+            "upstream_connect",
+            "timeout",
+            format!("Upstream request{route} timed out"),
+        );
+    }
+    let detail = io_failure_detail(err).map(|detail| format!(": {detail}"));
+    if err.is_connect() {
+        let category = if using_socks5_proxy {
+            "proxy_connect_failed"
+        } else {
+            "connect_failed"
+        };
+        return RequestFailure::new(
+            "upstream_connect",
+            category,
+            format!(
+                "Could not connect to upstream{route}{}",
+                detail.unwrap_or_default()
+            ),
+        );
+    }
+    RequestFailure::new(
+        "upstream_transport",
+        "request_failed",
+        format!(
+            "Upstream request{route} failed{}",
+            detail.unwrap_or_default()
+        ),
+    )
+}
+
+fn upstream_http_failure(status: StatusCode) -> RequestFailure {
+    let category = match status.as_u16() {
+        401 | 403 => "authentication",
+        408 | 504 => "timeout",
+        429 => "rate_limited",
+        400..=499 => "rejected",
+        _ => "server_error",
+    };
+    RequestFailure::new(
+        "upstream_response",
+        category,
+        format!("Upstream returned HTTP {}", status.as_u16()),
+    )
+}
+
+fn stream_failure(message: &str) -> RequestFailure {
+    let (stage, category, safe_message) = if message.contains("8 MiB") {
+        (
+            "protocol_conversion",
+            "frame_too_large",
+            "Upstream stream exceeded the conversion limit",
+        )
+    } else if message.contains("valid JSON") || message.contains("convert") {
+        (
+            "protocol_conversion",
+            "invalid_response",
+            "Could not convert the upstream stream",
+        )
+    } else if message.contains("terminal event") {
+        (
+            "upstream_stream",
+            "truncated",
+            "Upstream stream ended before completion",
+        )
+    } else {
+        (
+            "upstream_stream",
+            "failed",
+            "Upstream stream reported a failure",
+        )
+    };
+    RequestFailure::new(stage, category, safe_message)
+}
+
+fn io_failure_detail(err: &(dyn StdError + 'static)) -> Option<&'static str> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => Some("connection refused"),
+                std::io::ErrorKind::ConnectionReset => Some("connection reset"),
+                std::io::ErrorKind::ConnectionAborted => Some("connection aborted"),
+                std::io::ErrorKind::NotConnected => Some("not connected"),
+                std::io::ErrorKind::AddrNotAvailable => Some("address unavailable"),
+                std::io::ErrorKind::TimedOut => Some("connection timed out"),
+                std::io::ErrorKind::UnexpectedEof => Some("connection closed unexpectedly"),
+                _ => None,
+            };
+        }
+        current = error.source();
+    }
+    None
+}
+
 fn to_reqwest_method(method: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::{
-        ApiSurface, ApiType, Protocol, apply_codex_body, copy_response_headers,
-        sanitize_request_headers, strip_transformed_response_headers,
+        ApiSurface, ApiType, Protocol, apply_codex_body, apply_core_upstream_headers,
+        codex_session_id, copy_response_headers, pi_user_agent, sanitize_request_headers,
+        strip_transformed_response_headers, upstream_transport_failure,
     };
     use crate::config::OpenAiSubscription;
 
@@ -944,10 +1304,33 @@ mod tests {
         assert_eq!(value["instructions"], "You are a helpful assistant.");
         assert_eq!(value["input"][0]["role"], "user");
         assert_eq!(value["input"][0]["content"][0]["text"], "hello");
+        assert!(value.get("max_output_tokens").is_none());
         assert_eq!(value["text"]["verbosity"], "low");
         assert_eq!(value["tool_choice"], "auto");
         assert_eq!(value["parallel_tool_calls"], true);
         assert_eq!(value["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn codex_adapter_matches_pi_ai_system_prompt_and_output_limit_shape() {
+        let body = apply_codex_body(
+            br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Pi system prompt"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec(),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instructions"], "Pi system prompt");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["role"], "user");
+        assert!(value.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn codex_session_affinity_matches_pi_ai_and_rejects_invalid_values() {
+        let long = format!("{}tail", "x".repeat(64));
+        let body = serde_json::to_vec(&serde_json::json!({"prompt_cache_key": long})).unwrap();
+        assert_eq!(codex_session_id(&body).unwrap(), "x".repeat(64));
+        assert!(codex_session_id(br#"{"prompt_cache_key":""}"#).is_none());
+        assert!(codex_session_id(br#"{"prompt_cache_key":"bad\nheader"}"#).is_none());
+        assert!(codex_session_id(br#"{}"#).is_none());
     }
 
     #[test]
@@ -974,10 +1357,6 @@ mod tests {
             request_headers,
             ApiType::OpenaiCompatible,
             (Protocol::OpenAiChat, Protocol::OpenAiChat),
-            None,
-            None,
-            &HashMap::new(),
-            &HashMap::new(),
         );
         assert!(!sanitized.contains_key("cookie"));
 
@@ -1021,24 +1400,42 @@ mod tests {
             "anthropic-version",
             HeaderValue::from_static("caller-version"),
         );
-        let endpoint_headers =
-            HashMap::from([("anthropic-beta".to_owned(), "endpoint-beta".to_owned())]);
-
-        let sanitized = sanitize_request_headers(
+        let mut sanitized = sanitize_request_headers(
             headers,
+            ApiType::Anthropic,
+            (Protocol::OpenAiChat, Protocol::AnthropicMessages),
+        );
+        apply_core_upstream_headers(
+            &mut sanitized,
             ApiType::Anthropic,
             (Protocol::OpenAiChat, Protocol::AnthropicMessages),
             None,
             None,
-            &HashMap::new(),
-            &endpoint_headers,
         );
 
         assert_eq!(sanitized["accept-encoding"], "identity");
         assert!(!sanitized.contains_key("openai-organization"));
         assert!(!sanitized.contains_key("openai-project"));
         assert_eq!(sanitized["anthropic-version"], "2023-06-01");
-        assert_eq!(sanitized["anthropic-beta"], "endpoint-beta");
+        assert!(!sanitized.contains_key("anthropic-beta"));
+    }
+
+    #[test]
+    fn upstream_transport_errors_identify_the_configured_proxy_without_exposing_it() {
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:1").unwrap())
+            .build()
+            .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(client.get("https://example.com").send())
+            .unwrap_err();
+        let failure = upstream_transport_failure(&error, true);
+        assert_eq!(failure.stage, "upstream_connect");
+        assert_eq!(failure.category, "proxy_connect_failed");
+        assert!(failure.message.contains("configured SOCKS5 proxy"));
+        assert!(!failure.message.contains("127.0.0.1"));
+        assert!(!failure.message.contains("example.com"));
     }
 
     #[test]
@@ -1050,25 +1447,48 @@ mod tests {
             HeaderValue::from_static("caller-account"),
         );
         headers.insert("content-encoding", HeaderValue::from_static("zstd"));
+        headers.insert("session-id", HeaderValue::from_static("caller-session"));
+        headers.insert(
+            "x-client-request-id",
+            HeaderValue::from_static("caller-request"),
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("pi (test-os; test-arch)"),
+        );
         let credential = OpenAiSubscription {
             access_token: "access-token".to_owned(),
             refresh_token: "refresh-token".to_owned(),
             expires_at: u64::MAX,
             account_id: "account-123".to_owned(),
         };
-        let sanitized = sanitize_request_headers(
+        let mut sanitized = sanitize_request_headers(
             headers,
+            ApiType::OpenaiCodex,
+            (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
+        );
+        apply_core_upstream_headers(
+            &mut sanitized,
             ApiType::OpenaiCodex,
             (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
             None,
             Some(&credential),
-            &HashMap::new(),
-            &HashMap::new(),
         );
         assert_eq!(sanitized["authorization"], "Bearer access-token");
         assert_eq!(sanitized["chatgpt-account-id"], "account-123");
-        assert_eq!(sanitized["originator"], "yabane");
+        assert_eq!(sanitized["originator"], "pi");
+        assert_eq!(sanitized["user-agent"], pi_user_agent());
+        assert_ne!(sanitized["user-agent"], "pi (test-os; test-arch)");
+        assert!(
+            sanitized["user-agent"]
+                .to_str()
+                .unwrap()
+                .starts_with("pi (")
+        );
         assert_eq!(sanitized["openai-beta"], "responses=experimental");
+        assert_eq!(sanitized["accept-encoding"], "identity");
         assert!(!sanitized.contains_key("content-encoding"));
+        assert!(!sanitized.contains_key("session-id"));
+        assert!(!sanitized.contains_key("x-client-request-id"));
     }
 }

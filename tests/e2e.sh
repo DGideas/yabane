@@ -4,8 +4,12 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 binary=${1:-target/debug/yabane}
 binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
 work=$(mktemp -d)
-port=${YABANE_E2E_PORT:-18097}
-upstream_port=$((port + 1))
+available_port() {
+  python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()'
+}
+port=${YABANE_E2E_PORT:-$(available_port)}
+upstream_port=$(available_port)
+while [[ $upstream_port == "$port" ]]; do upstream_port=$(available_port); done
 pid=
 upstream_pid=
 cleanup() { [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; [[ -n "$upstream_pid" ]] && kill "$upstream_pid" 2>/dev/null || true; rm -rf "$work"; }
@@ -14,12 +18,19 @@ cd "$work"
 version_output=$("$binary" --version)
 [[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
 [[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
+[[ $("$binary" --help) == *"--no-extensions"* ]]
 if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-retention.log 2>&1; then
   echo "invalid activity retention unexpectedly started" >&2; exit 1
 fi
 grep -q 'YABANE_ACTIVITY_RETENTION_DAYS must be between 1 and 3650' invalid-retention.log
 TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" "$binary" --addr "127.0.0.1:$port" >server.log 2>&1 & pid=$!
-for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$port/healthz" >/dev/null && break; sleep .1; done
+ready=false
+for _ in $(seq 1 50); do
+  if curl -sf "http://127.0.0.1:$port/healthz" >/dev/null; then ready=true; break; fi
+  if ! kill -0 "$pid" 2>/dev/null; then cat server.log >&2; echo "Yabane exited before becoming ready" >&2; exit 1; fi
+  sleep .1
+done
+if [[ $ready != true ]]; then cat server.log >&2; echo "Yabane did not become ready" >&2; exit 1; fi
 base="http://127.0.0.1:$port"
 cookie="$work/cookie.txt"
 about=$(curl -fsS "$base/about")
@@ -122,6 +133,8 @@ admin() { curl -sS -b "$cookie" "$@"; }
 admin_status() { curl -sS -b "$cookie" -o response.json -w '%{http_code}' "$@"; }
 [[ $(status "$base/v1/models") == 401 ]]
 [[ $(admin_status -X POST "$base/admin/providers/missing/models/refresh") == 404 ]]
+extensions=$(admin -f "$base/admin/extensions")
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, .api_version, (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
 created=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"E2E unrestricted","expires_at":null,"provider_ids":[]}')
 secret=$(printf '%s' "$created" | jq -r .secret)
 id=$(printf '%s' "$created" | jq -r .api_key.id)
@@ -203,7 +216,7 @@ scoped_models=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $model_sco
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"denied/model","messages":[]}') == 403 ]]
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"allowed/model","messages":[]}') == 502 ]]
 connection_failure_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
-[[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null)] | length') == 1 ]]
+[[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null and .failure.stage == "upstream_connect" and .failure.category == "connect_failed")] | length') == 1 ]]
 unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi endpoint","expires_at":null,"provider_ids":[]}')
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
 # Cross-protocol adapters let every caller surface use providers with a different native API.
@@ -233,8 +246,8 @@ stream_converted=$(curl -sfN -X POST "$base/v1/chat/completions" -H "Authorizati
 [[ $stream_converted == *'data: [DONE]'* ]]
 conversion_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.caller_protocol == "openai_chat_completions" and .upstream_protocol == "anthropic_messages")] | length') -ge 2 ]]
-[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502)] | length') == 1 ]]
-[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true)] | length') == 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502 and .failure.stage == "protocol_conversion" and .failure.category == "invalid_response")] | length') == 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true and .failure.stage == "upstream_stream" and .failure.category == "interrupted")] | length') == 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "anthropic-only/claude" and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms != null and .generation_ms != null and .latency_ms >= .first_byte_ms)] | length') == 1 ]]
 preferred_shared=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
 [[ $(printf '%s' "$preferred_shared" | jq -r .endpoint) == two ]]
@@ -247,6 +260,8 @@ admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/js
 admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"name":"Renamed without replacing defaults"}' >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | [.name, .extra_headers["x-provider"], .extra_body.extra, .defaults_endpoint_ids[0]] | join(":")') == Renamed\ without\ replacing\ defaults:yes:provider:one ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"authorization":"unsafe"},"extra_body":{}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"cookie":"unsafe"},"extra_body":{}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"chatgpt-account-id":"unsafe"},"extra_body":{}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"bad header":"unsafe"},"extra_body":{}}') == 400 ]]
 route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":50},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":50}]}'
 [[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
@@ -264,6 +279,18 @@ friendly_two=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: B
 [[ $(printf '%s' "$friendly_one" | jq -r '.headers["x-provider"]') == yes ]]
 [[ $(printf '%s' "$friendly_two" | jq -r .extra) == null ]]
 [[ $(printf '%s' "$friendly_two" | jq -r '.headers["x-provider"]') == null ]]
+# Runtime disabling preserves Request Defaults configuration but bypasses all of its Hooks.
+[[ $(admin_status -X PATCH "$base/admin/extensions/missing" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
+disabled_extension=$(admin -f -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: application/json' -d '{"enabled":false}')
+[[ $(printf '%s' "$disabled_extension" | jq -r '.enabled') == false ]]
+[[ $(jq -r '.enabled["request-defaults"]' data/extensions.json) == false ]]
+without_defaults=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}')
+[[ $(printf '%s' "$without_defaults" | jq -r .extra) == null ]]
+[[ $(printf '%s' "$without_defaults" | jq -r '.headers["x-provider"]') == null ]]
+admin -f -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .extra_body.extra') == provider ]]
+# Request Defaults is an extension-owned policy; Endpoint-level values override Provider defaults inside its own crate.
+# Yabane's E2E only confirms that the compiled extension is wired into the Hook pipeline and scoped routing context.
 # Disabled route targets remain configured and receive no traffic, enabling an instant A/B cutover.
 disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
 admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d "$disabled_route_payload" >/dev/null
@@ -325,6 +352,12 @@ logs=$(admin -f "$base/admin/activity/logs?since=0")
 [[ $(printf '%s' "$logs" | jq 'length') -ge 4 ]]
 filtered_logs=$(admin -f "$base/admin/activity/logs?since=0&provider=multi&limit=1000")
 [[ $(printf '%s' "$filtered_logs" | jq '[.[] | select(.provider != "multi")] | length') == 0 ]]
+log_page=$(admin -f "$base/admin/activity/logs/page?since=0&provider=multi&status=success&query=multi&offset=0&limit=2")
+[[ $(printf '%s' "$log_page" | jq '.data | length') == 2 ]]
+[[ $(printf '%s' "$log_page" | jq -r '.limit') == 2 ]]
+[[ $(printf '%s' "$log_page" | jq -r '.total') -ge 2 ]]
+[[ $(printf '%s' "$log_page" | jq '[.data[] | select(.provider != "multi" or .status >= 400)] | length') == 0 ]]
+[[ $(admin -f "$base/admin/activity/logs/page?since=0&limit=0" | jq -r '.limit') == 1 ]]
 stats=$(admin -f "$base/admin/activity/stats?since=0")
 [[ $(printf '%s' "$stats" | jq -r '.cost > 0') == true ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
@@ -415,4 +448,18 @@ kill -TERM "$pid"
 wait "$pid"
 pid=
 [[ $(wc -l < data/activity.jsonl | tr -d ' ') -eq $((before_shutdown_count + 1)) ]]
+# The process-wide CLI override leaves compiled Extensions visible but prevents every Hook and runtime enablement.
+"$binary" --no-extensions --addr "127.0.0.1:$port" >no-extensions.log 2>&1 & pid=$!
+for _ in $(seq 1 50); do curl -sf "$base/healthz" >/dev/null && break; sleep .1; done
+[[ $(curl -sS -c "$cookie" -o /dev/null -w '%{http_code}' -X POST "$base/admin/login" -H 'content-type: application/json' -d '{"username":"owner","email":null,"password":"password123","turnstile_token":""}') == 204 ]]
+cli_extension=$(admin -f "$base/admin/extensions" | jq -c '.[] | select(.id == "request-defaults")')
+[[ $(printf '%s' "$cli_extension" | jq -r '.enabled') == false ]]
+[[ $(printf '%s' "$cli_extension" | jq -r '.runtime_configurable') == false ]]
+[[ $(admin_status -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: application/json' -d '{"enabled":true}') == 409 ]]
+cli_without_defaults=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}')
+[[ $(printf '%s' "$cli_without_defaults" | jq -r .extra) == null ]]
+[[ $(jq -r '.enabled["request-defaults"]' data/extensions.json) == true ]]
+kill -TERM "$pid"
+wait "$pid"
+pid=
 echo 'Authentication and routing E2E passed'
