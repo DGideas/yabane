@@ -53,6 +53,11 @@ for (const project of projects) {
     if (backdropAnimations.some(name => name !== 'none')) throw new Error(`${project.name}: console background ignores reduced-motion preference`);
     await page.emulateMedia({ reducedMotion: 'no-preference' });
 
+    const accountAvatar = page.locator('#account-menu');
+    const topbar = page.locator('.topbar');
+    const [avatarBox, topbarBox] = await Promise.all([accountAvatar.boundingBox(), topbar.boundingBox()]);
+    if (!avatarBox || !topbarBox || topbarBox.x + topbarBox.width - (avatarBox.x + avatarBox.width) > 21) throw new Error(`${project.name}: administrator avatar is not aligned to the top-right of the console`);
+
     const mobileNavToggle = page.locator('#mobile-nav-toggle');
     if (project.mobile) {
       const toggleBox = await mobileNavToggle.boundingBox();
@@ -111,8 +116,32 @@ for (const project of projects) {
       await homeRefresh;
     }
 
-    await page.locator('#open-help').click();
+    await page.evaluate(() => document.querySelector('[data-view="access"]').click());
+    const editGatewayKey = page.locator('.edit-gateway-key').first();
+    if (await editGatewayKey.isVisible()) {
+      await editGatewayKey.click();
+      await assertDialog(page, '#edit-gateway-key-dialog', project.name);
+      await page.locator('#edit-gateway-key-dialog .close-edit-gateway-key').first().click();
+    }
+    await page.locator('.contextual-help[data-help-context="access"]').click();
     await assertDialog(page, '#help-dialog', project.name);
+    if (await page.locator('[data-help-tab]').count() !== 3) throw new Error(`${project.name}: help guide does not use the compact three-tab layout`);
+    const agentSelect = page.locator('.help-agent-select');
+    if (!(await agentSelect.isVisible())) throw new Error(`${project.name}: Agent selector is missing from Agent setup`);
+    await page.locator('[data-help-tab="generic"]').click();
+    await page.locator('#help-dialog [data-help-panel="generic"]').waitFor({state: 'visible'});
+    if (await agentSelect.isVisible()) throw new Error(`${project.name}: Generic Agent incorrectly shows the Agent selector`);
+    const agentBodyHeight = await page.locator('.help-body').evaluate(element => element.getBoundingClientRect().height);
+    await page.locator('[data-help-tab="curl"]').click();
+    await page.locator('#help-dialog [data-help-panel="curl"]').waitFor({state: 'visible'});
+    if (await agentSelect.isVisible()) throw new Error(`${project.name}: Shell / test request incorrectly shows the Agent selector`);
+    await page.waitForTimeout(120);
+    const transitioningBodyHeight = await page.locator('.help-body').evaluate(element => element.getBoundingClientRect().height);
+    if (!(transitioningBodyHeight < agentBodyHeight - 1)) throw new Error(`${project.name}: Help content height does not animate toward the shorter Shell / test request panel`);
+    await page.locator('[data-help-tab="agent"]').click();
+    if (!(await agentSelect.isVisible())) throw new Error(`${project.name}: returning to Agent setup does not restore the Agent selector`);
+    await page.locator('#help-agent').selectOption('codex');
+    await page.locator('#help-dialog [data-help-panel="codex"]').waitFor({state: 'visible'});
     await page.locator('#help-dialog .close-help').first().click();
     await page.evaluate(() => document.querySelector('.open-about').click());
     await assertDialog(page, '#about-dialog', project.name);
@@ -131,12 +160,33 @@ for (const project of projects) {
     await page.locator('#next-step').click();
     await page.locator('#api-type-choices input[value="openai_codex"]').check();
     await assertDialog(page, '#provider-dialog', project.name);
+    if (await page.locator('#initial-endpoint-id').inputValue() !== 'chatgpt') throw new Error(`${project.name}: first endpoint does not expose the API-type default ID`);
     if (await page.locator('#base-url').isVisible()) throw new Error(`${project.name}: subscription setup exposes Base URL`);
     if (!(await page.locator('#provider-form [name="socks5_proxy"]').isVisible())) throw new Error(`${project.name}: subscription setup hides SOCKS5 proxy`);
     await page.locator('#provider-form [name="socks5_proxy"]').fill('socks5h://127.0.0.1:1080');
     if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: subscription setup exposes API key input`);
     if (await page.locator('#create-provider').textContent() !== 'Connect OpenAI') throw new Error(`${project.name}: subscription setup has the wrong primary action`);
     await page.locator('#provider-dialog .close-dialog').first().click();
+    await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+    const firstProvider = page.locator('#providers .provider-list-item').first();
+    if (await firstProvider.count()) {
+      await firstProvider.click();
+      await page.locator('.edit-provider').click();
+      await assertDialog(page, '#provider-identity-dialog', project.name);
+      if (!(await page.locator('#provider-identity-form [name="id"]').isDisabled())) throw new Error(`${project.name}: Provider ID is editable after creation`);
+      await page.locator('#provider-identity-dialog .close-provider-identity').first().click();
+      await page.locator('.add-endpoint').click();
+      await assertDialog(page, '#endpoint-dialog', project.name);
+      if (!(await page.locator('#endpoint-form [name="id"]').inputValue())) throw new Error(`${project.name}: additional endpoint ID is not suggested`);
+      await page.locator('#endpoint-dialog .close-endpoint').first().click();
+    }
+    await page.evaluate(() => document.querySelector('[data-view="models"]').click());
+    const renderedRoute = page.locator('#routes .route-destination').first();
+    if (await renderedRoute.count()) {
+      if (!(await renderedRoute.locator('.route-upstream').isVisible()) || !(await renderedRoute.locator('.route-status').isVisible()) || !(await renderedRoute.locator('.route-target-state > strong').isVisible())) throw new Error(`${project.name}: route destination does not visually separate its upstream, status, and traffic share`);
+      const routeOverflow = await page.locator('#routes-table').evaluate(element => element.scrollWidth > element.clientWidth + 1);
+      if (routeOverflow) throw new Error(`${project.name}: structured route summary overflows its table viewport`);
+    }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
@@ -155,19 +205,48 @@ for (const project of projects) {
     if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be disabled`);
     await page.locator('#route-dialog .close-route').first().click();
     const initialActivityLoad = testLiveRefresh ? Promise.all([
-      page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=')),
-      page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=')),
+      page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=24') && response.url().includes('until=')),
+      page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
     ]) : null;
     await page.evaluate(() => document.querySelector('[data-view="activity"]').click());
     if (initialActivityLoad) await initialActivityLoad;
     if (testLiveRefresh) {
       const activityRefresh = Promise.all([
-        page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=')),
-        page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=')),
+        page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=24') && response.url().includes('until=')),
+        page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
       ]);
-      await page.clock.fastForward(10000);
+      await page.clock.fastForward(30000);
       await activityRefresh;
     }
+    const timelineColumns = page.locator('#activity-chart .chart-column');
+    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 24);
+    if (await timelineColumns.count() !== 24) throw new Error(`${project.name}: 24-hour Activity timeline does not expose every interval`);
+    const inspectorBefore = await page.locator('#chart-inspector-time').textContent();
+    if (project.mobile) await timelineColumns.first().click(); else await timelineColumns.first().hover();
+    const inspectorAfter = await page.locator('#chart-inspector-time').textContent();
+    const firstColumnClass = await timelineColumns.first().getAttribute('class');
+    if (!inspectorAfter || inspectorAfter === '—' || (inspectorAfter === inspectorBefore && !firstColumnClass.includes('selected'))) throw new Error(`${project.name}: Activity timeline does not respond to interval interaction`);
+    await page.locator('[data-chart-metric="latency"]').click();
+    if (await page.locator('[data-chart-metric="latency"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Activity timeline metric cannot be changed`);
+    if (!(await page.locator('#chart-inspector-values').getByText('Avg latency', {exact: true}).isVisible())) throw new Error(`${project.name}: Activity timeline inspector omits latency`);
+    const metricLayout = await page.locator('.activity-metrics').evaluate(element => ({scrollable: element.scrollWidth > element.clientWidth + 1, display: getComputedStyle(element).display}));
+    if (project.mobile && !metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries are not swipeable on a narrow screen`);
+    if (!project.mobile && project.width >= 1200 && metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries waste wide-screen space`);
+    const explorerLoad = testLiveRefresh ? page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=1000')) : null;
+    await page.locator('[data-activity-tab="requests"]').click();
+    if (explorerLoad) await explorerLoad;
+    const explorerPanel = page.locator('.request-explorer-panel');
+    if (!(await explorerPanel.isVisible())) throw new Error(`${project.name}: Request explorer is not visible`);
+    if (!project.mobile) {
+      const explorerBox = await explorerPanel.boundingBox();
+      const viewport = page.viewportSize();
+      if (!explorerBox || !viewport || explorerBox.height < Math.max(440, viewport.height - 290)) throw new Error(`${project.name}: Request explorer does not adapt to available viewport height`);
+    }
+    const explorerRow = page.locator('#activity-logs .activity-request-row').first();
+    if (await explorerRow.count()) {
+      if (!(await explorerRow.locator('.activity-model').isVisible()) || !(await explorerRow.locator('.route-cell').isVisible()) || !(await explorerRow.locator('.activity-output').isVisible())) throw new Error(`${project.name}: Request explorer does not emphasize model, route, and output usage`);
+    }
+    await page.locator('[data-activity-tab="overview"]').click();
     const activityRow = page.locator('#recent-activity-logs .activity-request-row').first();
     if (await activityRow.count()) {
       await activityRow.click();

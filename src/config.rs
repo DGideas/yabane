@@ -200,10 +200,43 @@ pub async fn load_providers() -> Result<HashMap<String, Provider>, String> {
     };
     let providers: Vec<Provider> = serde_json::from_slice(&contents)
         .map_err(|err| format!("parse {PROVIDERS_FILE}: {err}"))?;
+    validate_provider_identities(&providers)?;
     Ok(providers
         .into_iter()
         .map(|provider| (provider.id.clone(), provider))
         .collect())
+}
+
+fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
+    let mut provider_ids = std::collections::HashSet::new();
+    for provider in providers {
+        if provider.id.is_empty() || !provider_ids.insert(provider.id.as_str()) {
+            return Err(format!(
+                "parse {PROVIDERS_FILE}: Provider IDs must be non-empty and unique"
+            ));
+        }
+        let mut endpoint_ids = std::collections::HashSet::new();
+        for endpoint in &provider.endpoints {
+            if endpoint.id.is_empty() || !endpoint_ids.insert(endpoint.id.as_str()) {
+                return Err(format!(
+                    "parse {PROVIDERS_FILE}: Endpoint IDs within Provider '{}' must be non-empty and unique",
+                    provider.id
+                ));
+            }
+            let mut key_ids = std::collections::HashSet::new();
+            if endpoint
+                .api_keys
+                .iter()
+                .any(|key| key.id.is_empty() || !key_ids.insert(key.id.as_str()))
+            {
+                return Err(format!(
+                    "parse {PROVIDERS_FILE}: API key IDs within Endpoint '{}/{}' must be non-empty and unique",
+                    provider.id, endpoint.id
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn save_providers(providers: &HashMap<String, Provider>) -> Result<(), std::io::Error> {
@@ -224,7 +257,7 @@ fn default_proxy_client() -> Arc<OnceLock<Result<reqwest::Client, String>>> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{ApiEndpoint, ApiKey, ApiType};
+    use super::{ApiEndpoint, ApiKey, ApiType, Provider};
 
     fn key(id: &str, weight: u32, enabled: bool) -> ApiKey {
         ApiKey {
@@ -234,6 +267,69 @@ mod tests {
             weight,
             enabled,
         }
+    }
+
+    #[test]
+    fn rejects_ambiguous_persisted_resource_identities() {
+        let endpoint = ApiEndpoint {
+            id: "shared".to_owned(),
+            api_keys: vec![key("duplicate", 50, true), key("duplicate", 50, true)],
+            ..ApiEndpoint::default()
+        };
+        let provider = Provider {
+            id: "provider".to_owned(),
+            name: "Provider".to_owned(),
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            defaults_endpoint_ids: Vec::new(),
+            endpoints: vec![endpoint],
+            discovered_models: Vec::new(),
+            model_endpoints: HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
+            models_discovered_at: None,
+            model_discovery_error: None,
+        };
+        assert!(super::validate_provider_identities(&[provider]).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_provider_and_endpoint_ids() {
+        let provider = |id: &str, endpoints: Vec<ApiEndpoint>| Provider {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            defaults_endpoint_ids: Vec::new(),
+            endpoints,
+            discovered_models: Vec::new(),
+            model_endpoints: HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
+            models_discovered_at: None,
+            model_discovery_error: None,
+        };
+        assert!(
+            super::validate_provider_identities(&[
+                provider("same", Vec::new()),
+                provider("same", Vec::new()),
+            ])
+            .is_err()
+        );
+        assert!(
+            super::validate_provider_identities(&[provider(
+                "provider",
+                vec![
+                    ApiEndpoint {
+                        id: "same".to_owned(),
+                        ..ApiEndpoint::default()
+                    },
+                    ApiEndpoint {
+                        id: "same".to_owned(),
+                        ..ApiEndpoint::default()
+                    },
+                ],
+            )])
+            .is_err()
+        );
     }
 
     #[test]

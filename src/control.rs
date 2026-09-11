@@ -5,7 +5,7 @@ use axum::{
     http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use tracing::error;
@@ -27,7 +27,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(get_auth_settings).patch(update_auth_settings),
         )
         .route("/admin/auth/keys", post(create_gateway_api_key))
-        .route("/admin/auth/keys/{id}", delete(delete_gateway_api_key))
+        .route(
+            "/admin/auth/keys/{id}",
+            patch(update_gateway_api_key).delete(delete_gateway_api_key),
+        )
         .route(
             "/admin/providers",
             get(list_providers).post(create_provider),
@@ -174,6 +177,21 @@ struct CreateGatewayApiKey {
     provider_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct UpdateGatewayApiKey {
+    note: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_expiry")]
+    expires_at: Option<Option<u64>>,
+    provider_ids: Option<Vec<String>>,
+}
+
+fn deserialize_optional_expiry<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u64>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Serialize)]
 struct AuthSettingsView {
     enabled: bool,
@@ -302,6 +320,55 @@ async fn create_gateway_api_key(
         .into_response()
 }
 
+async fn update_gateway_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Json(input): axum::Json<UpdateGatewayApiKey>,
+) -> Response {
+    if input
+        .expires_at
+        .flatten()
+        .is_some_and(|expiry| expiry <= now())
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "API key expiry must be in the future",
+        );
+    }
+    if let Some(provider_ids) = &input.provider_ids {
+        let providers = state.providers.read().await;
+        if let Some(provider_id) = provider_ids
+            .iter()
+            .find(|provider_id| !providers.contains_key(*provider_id))
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Unknown provider '{provider_id}'"),
+            );
+        }
+    }
+
+    let mut auth = state.auth.write().await;
+    let mut updated = auth.clone();
+    let Some(key) = updated.api_keys.iter_mut().find(|key| key.id == id) else {
+        return api_error(StatusCode::NOT_FOUND, "API key not found");
+    };
+    if let Some(note) = input.note {
+        key.note = note.trim().to_owned();
+    }
+    if let Some(expires_at) = input.expires_at {
+        key.expires_at = expires_at;
+    }
+    if let Some(provider_ids) = input.provider_ids {
+        key.provider_ids = provider_ids;
+    }
+    let response = persist_auth_or_error(&updated).await;
+    if response.status().is_success() {
+        *auth = updated;
+    }
+    response
+}
+
 async fn delete_gateway_api_key(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let mut auth = state.auth.write().await;
     let mut updated = auth.clone();
@@ -352,9 +419,14 @@ async fn save_global_route(
     original_pattern: Option<String>,
     input: CreateGlobalRoute,
 ) -> Response {
+    let enabled_weight_total: u64 = input
+        .targets
+        .iter()
+        .filter(|target| target.enabled)
+        .map(|target| u64::from(target.weight))
+        .sum();
     if !valid_model_pattern(input.pattern.trim())
         || input.targets.is_empty()
-        || !input.targets.iter().any(|target| target.enabled)
         || input
             .targets
             .iter()
@@ -363,6 +435,12 @@ async fn save_global_route(
         return api_error(
             StatusCode::BAD_REQUEST,
             "A valid pattern, at least one enabled target, and positive target weights are required",
+        );
+    }
+    if enabled_weight_total != 100 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Enabled route target traffic percentages must total 100",
         );
     }
     let providers = state.providers.read().await;
@@ -507,6 +585,9 @@ async fn persist_routes_or_error(routes: &[routes::ModelRoute]) -> Response {
 struct ActivityQuery {
     since: Option<u64>,
     limit: Option<usize>,
+    provider: Option<String>,
+    buckets: Option<usize>,
+    until: Option<u64>,
 }
 async fn activity_logs(
     State(state): State<AppState>,
@@ -515,7 +596,11 @@ async fn activity_logs(
     axum::Json(
         state
             .activity
-            .logs(query.since.unwrap_or(0), query.limit.unwrap_or(100))
+            .logs(
+                query.since.unwrap_or(0),
+                query.provider.as_deref(),
+                query.limit.unwrap_or(100),
+            )
             .await,
     )
 }
@@ -523,7 +608,17 @@ async fn activity_stats(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
 ) -> impl IntoResponse {
-    axum::Json(state.activity.stats(query.since.unwrap_or(0)).await)
+    axum::Json(
+        state
+            .activity
+            .stats(
+                query.since.unwrap_or(0),
+                query.provider.as_deref(),
+                query.buckets.unwrap_or(24),
+                query.until.unwrap_or_else(now),
+            )
+            .await,
+    )
 }
 
 async fn preview_activity_export(
@@ -697,12 +792,11 @@ struct UpdateModelEndpointPreferences {
 
 #[derive(Deserialize)]
 struct ProviderOptions {
-    #[serde(default)]
-    extra_headers: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    extra_body: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    defaults_endpoint_ids: Vec<String>,
+    id: Option<String>,
+    name: Option<String>,
+    extra_headers: Option<std::collections::HashMap<String, String>>,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    defaults_endpoint_ids: Option<Vec<String>>,
 }
 
 async fn update_model_endpoint_preferences(
@@ -753,7 +847,12 @@ async fn update_provider_options(
     Path(id): Path<String>,
     axum::Json(input): axum::Json<ProviderOptions>,
 ) -> Response {
-    if let Err(message) = validate_extra_headers(&input.extra_headers) {
+    if input.id.as_deref().is_some_and(|new_id| new_id != id) {
+        return api_error(StatusCode::BAD_REQUEST, "Provider ID cannot be changed");
+    }
+    if let Some(headers) = &input.extra_headers
+        && let Err(message) = validate_extra_headers(headers)
+    {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     let mut providers = state.providers.write().await;
@@ -761,24 +860,36 @@ async fn update_provider_options(
     let Some(provider) = updated.get_mut(&id) else {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
     };
-    let mut endpoint_ids = input.defaults_endpoint_ids;
-    endpoint_ids.sort();
-    endpoint_ids.dedup();
-    if endpoint_ids
-        .iter()
-        .any(|id| !provider.endpoints.iter().any(|endpoint| &endpoint.id == id))
-    {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "Request defaults contain an unknown endpoint",
-        );
+    if let Some(name) = input.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return api_error(StatusCode::BAD_REQUEST, "Provider display name is required");
+        }
+        provider.name = name.to_owned();
     }
-    if endpoint_ids.len() == provider.endpoints.len() {
-        endpoint_ids.clear();
+    if let Some(mut endpoint_ids) = input.defaults_endpoint_ids {
+        endpoint_ids.sort();
+        endpoint_ids.dedup();
+        if endpoint_ids
+            .iter()
+            .any(|id| !provider.endpoints.iter().any(|endpoint| &endpoint.id == id))
+        {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "Request defaults contain an unknown endpoint",
+            );
+        }
+        if endpoint_ids.len() == provider.endpoints.len() {
+            endpoint_ids.clear();
+        }
+        provider.defaults_endpoint_ids = endpoint_ids;
     }
-    provider.extra_headers = input.extra_headers;
-    provider.extra_body = input.extra_body;
-    provider.defaults_endpoint_ids = endpoint_ids;
+    if let Some(headers) = input.extra_headers {
+        provider.extra_headers = headers;
+    }
+    if let Some(body) = input.extra_body {
+        provider.extra_body = body;
+    }
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
         *providers = updated;

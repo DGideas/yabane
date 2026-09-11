@@ -6,14 +6,17 @@ const $$ = selector => [...document.querySelectorAll(selector)];
 const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
 const providerDialog = $('#provider-dialog');
 const providerForm = $('#provider-form');
+const providerIdentityDialog = $('#provider-identity-dialog');
 let providerStep = 1;
 let providerIdEdited = false;
 let selectedProviderId = null;
 let adminSession = null;
 let turnstileWidgetId = null;
 let aboutInfo = null;
-const LIVE_REFRESH_INTERVAL_MS = 10000;
+const LIVE_REFRESH_INTERVAL_MS = 30000;
+const ACTIVITY_RENDER_LIMIT = 100;
 let activityLoadPromise = null;
+let activityLogsLimit = 0;
 let dashboardLoadPromise = null;
 
 async function renderTurnstile(action) {
@@ -154,6 +157,7 @@ function openProviderDialog() {
   delete $('#base-url').dataset.previousValue;
   providerIdEdited = false;
   $('#provider-error').textContent = '';
+  $('#initial-endpoint-id').dataset.edited = '';
   setApiType('openai_compatible');
   toggleKeyRequirement();
   setProviderStep(1);
@@ -180,6 +184,8 @@ function setApiType(type) {
   $$('#api-type-choices .choice').forEach(choice => choice.classList.toggle('selected', choice.contains(input)));
   const subscription = type === 'openai_codex';
   const base = $('#base-url');
+  const endpointId = $('#initial-endpoint-id');
+  if (!endpointId.dataset.edited) endpointId.value = defaultEndpointId(type);
   [base.closest('.field'), $('#requires-key').closest('.checkbox-row')].forEach(field => field.hidden = subscription);
   if (subscription) { base.dataset.previousValue = base.value; base.value = 'https://chatgpt.com/backend-api'; }
   else if (base.value === 'https://chatgpt.com/backend-api') base.value = base.dataset.previousValue || '';
@@ -189,6 +195,21 @@ function setApiType(type) {
   $('#create-provider').textContent = subscription ? 'Connect OpenAI' : 'Add provider';
 }
 $$('input[name="api_type"]').forEach(input => input.addEventListener('change', () => setApiType(input.value)));
+$('#initial-endpoint-id').addEventListener('input', event => {
+  event.target.value = slugify(event.target.value);
+  event.target.dataset.edited = 'true';
+});
+function defaultEndpointId(type) {
+  return {openai_compatible: 'openai', openai_chat_completions: 'openai-chat', openai_responses: 'openai-responses', openai_codex: 'chatgpt', anthropic: 'anthropic'}[type] || 'endpoint';
+}
+function availableEndpointId(provider, type) {
+  const base = defaultEndpointId(type);
+  const used = new Set(provider?.endpoints.map(endpoint => endpoint.id) || []);
+  if (!used.has(base)) return base;
+  let suffix = 2;
+  while (used.has(`${base}-${suffix}`)) suffix++;
+  return `${base}-${suffix}`;
+}
 function operationPathNotice(input) {
   const notice = input.closest('.field').querySelector('.base-url-notice');
   if (!notice) return;
@@ -230,6 +251,7 @@ providerForm.addEventListener('submit', async event => {
     id: data.get('id'),
     name: data.get('name'),
     endpoint: {
+      id: data.get('endpoint_id'),
       api_type: data.get('api_type'),
       base_url: data.get('base_url'),
       socks5_proxy: data.get('socks5_proxy') || null,
@@ -240,7 +262,7 @@ providerForm.addEventListener('submit', async event => {
     }
   };
   if (payload.endpoint.api_type === 'openai_codex') {
-    return beginOpenAiSubscription({provider_id: payload.id, provider_name: payload.name, endpoint_id: 'chatgpt', socks5_proxy: payload.endpoint.socks5_proxy}, $('#provider-error'), providerDialog);
+    return beginOpenAiSubscription({provider_id: payload.id, provider_name: payload.name, endpoint_id: payload.endpoint.id, socks5_proxy: payload.endpoint.socks5_proxy}, $('#provider-error'), providerDialog);
   }
   const response = await fetch('/admin/providers', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#provider-error'));
@@ -372,7 +394,7 @@ function renderProviderPage() {
   const bodyCount = Object.keys(provider.extra_body || {}).length;
   const defaultsScope = provider.defaults_endpoint_ids?.length ? `${provider.defaults_endpoint_ids.length} selected endpoint${provider.defaults_endpoint_ids.length === 1 ? '' : 's'}` : 'All endpoints';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="search" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card"><div class="card-head"><div><span class="section-kicker">Applies to ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>Choose all endpoints or a specific group; Endpoint values still override matching defaults.</p></div><button class="button secondary edit-provider-options">Configure</button></div><div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Applied provider-wide' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -464,6 +486,7 @@ function trafficShares(keys) {
 }
 
 function bindProviderActions() {
+  $$('.edit-provider').forEach(button => button.addEventListener('click', () => openProviderIdentityDialog(button.dataset.provider)));
   $$('.delete-provider').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     if (confirm(`Delete ${provider.name}?`)) { await fetch(`/admin/providers/${provider.id}`, {method: 'DELETE'}); selectedProviderId = null; await loadProviders(); }
@@ -494,6 +517,28 @@ function bindProviderActions() {
   $$('.add-endpoint').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider)));
 }
 
+function openProviderIdentityDialog(providerId) {
+  const provider = providers.find(item => item.id === providerId);
+  const form = $('#provider-identity-form');
+  form.reset();
+  form.elements.current_id.value = provider.id;
+  form.elements.name.value = provider.name;
+  form.elements.id.value = provider.id;
+  $('#provider-identity-error').textContent = '';
+  providerIdentityDialog.showModal();
+  form.elements.name.focus();
+}
+$$('.close-provider-identity').forEach(button => button.addEventListener('click', () => providerIdentityDialog.close()));
+$('#provider-identity-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.target;
+  const provider = providers.find(item => item.id === form.elements.current_id.value);
+  const response = await fetch(`/admin/providers/${provider.id}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({id: provider.id, name: form.elements.name.value})});
+  if (!response.ok) return showApiError(response, $('#provider-identity-error'));
+  providerIdentityDialog.close();
+  await loadProviders();
+});
+
 async function patchKey(providerId, endpointId, keyId, update) {
   const response = await fetch(`/admin/providers/${providerId}/endpoints/${endpointId}/keys/${keyId}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify(update)});
   if (!response.ok) return showApiError(response, null);
@@ -502,8 +547,10 @@ async function patchKey(providerId, endpointId, keyId, update) {
 
 const endpointDialog = $('#endpoint-dialog');
 function openEndpointDialog(providerId, endpointId = null) {
-  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
-  const endpoint = endpointId ? providers.find(item => item.id === providerId)?.endpoints.find(item => item.id === endpointId) : null;
+  const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; form.elements.id.dataset.edited = ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
+  const provider = providers.find(item => item.id === providerId);
+  const endpoint = endpointId ? provider?.endpoints.find(item => item.id === endpointId) : null;
+  if (!endpoint) form.elements.id.value = availableEndpointId(provider, form.elements.api_type.value);
   form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint && endpoint.api_type !== 'openai_codex');
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
   $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
@@ -529,7 +576,15 @@ function toggleEndpointMode() {
   $('#endpoint-dialog button[type="submit"]').textContent = editing ? 'Save changes' : subscription ? 'Connect OpenAI' : 'Add endpoint';
 }
 $('#endpoint-form [name="requires_api_key"]').addEventListener('change', toggleEndpointMode);
-$('#endpoint-form [name="api_type"]').addEventListener('change', toggleEndpointMode);
+$('#endpoint-form [name="id"]').addEventListener('input', event => { event.target.value = slugify(event.target.value); event.target.dataset.edited = 'true'; });
+$('#endpoint-form [name="api_type"]').addEventListener('change', event => {
+  const form = $('#endpoint-form');
+  if (!form.dataset.endpointId && !form.elements.id.dataset.edited) {
+    const provider = providers.find(item => item.id === form.elements.provider_id.value);
+    form.elements.id.value = availableEndpointId(provider, event.target.value);
+  }
+  toggleEndpointMode();
+});
 $$('.close-endpoint').forEach(button => button.addEventListener('click', () => endpointDialog.close()));
 $('#endpoint-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const data = new FormData(form); const providerId = data.get('provider_id'); const endpointId = form.dataset.endpointId;
@@ -839,9 +894,34 @@ $('#refresh-all-models').addEventListener('click', async event => {
   if (failures) alert(`${failures} provider${failures === 1 ? '' : 's'} could not refresh models. See the status below.`);
 });
 
+function routeTargetSummary(target, activeWeightTotal) {
+  const provider = providers.find(item => item.id === target.provider_id);
+  const endpoint = provider?.endpoints.find(item => item.id === target.endpoint_id);
+  const credential = endpoint?.api_type === 'openai_codex'
+    ? 'ChatGPT subscription'
+    : endpoint?.api_keys.find(key => key.id === target.api_key_id)?.name || target.api_key_id;
+  const enabled = target.enabled !== false;
+  const share = enabled && activeWeightTotal > 0 ? Math.round(Number(target.weight) / activeWeightTotal * 100) : 0;
+  return `<article class="route-destination${enabled ? '' : ' is-disabled'}">
+    <div class="route-destination-mark" aria-hidden="true">${icon('arrow-right')}</div>
+    <div class="route-destination-main">
+      <div class="route-upstream"><span>${escapeHtml(target.provider_id)}</span><b>/</b><code>${escapeHtml(target.upstream_model)}</code></div>
+      <div class="route-destination-meta"><span title="Endpoint">Endpoint <code>${escapeHtml(target.endpoint_id)}</code></span><span title="Credential">Credential <strong>${escapeHtml(credential || 'Default')}</strong></span></div>
+    </div>
+    <div class="route-target-state"><span class="route-status ${enabled ? 'active' : 'disabled'}"><i></i>${enabled ? 'Active' : 'Disabled'}</span><strong>${share}%</strong><small>traffic</small></div>
+  </article>`;
+}
+
 function renderRoutes() {
   $('#routes-empty').hidden = modelRoutes.length > 0; $('#routes-table').hidden = modelRoutes.length === 0;
-  $('#routes').replaceChildren(...modelRoutes.map((route, index) => { const row = document.createElement('tr'); const targets = route.targets.map(target => `${escapeHtml(target.provider_id)}/${escapeHtml(target.upstream_model)} · ${escapeHtml(target.endpoint_id)} · ${target.enabled === false ? 'disabled' : `weight ${target.weight}`}`).join('<br>'); row.innerHTML = `<td><code>${escapeHtml(route.pattern)}</code></td><td>${targets}</td><td><div class="route-row-actions"><button class="edit-route text-link" data-index="${index}">Edit</button><button class="delete-route text-link danger-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></div></td>`; return row; }));
+  $('#routes').replaceChildren(...modelRoutes.map((route, index) => {
+    const row = document.createElement('tr');
+    const activeWeightTotal = route.targets.filter(target => target.enabled !== false).reduce((total, target) => total + Number(target.weight || 0), 0);
+    const destinations = route.targets.map(target => routeTargetSummary(target, activeWeightTotal)).join('');
+    const matchKind = route.pattern.endsWith('*') ? 'Prefix match' : 'Exact match';
+    row.innerHTML = `<td class="route-model-cell"><span class="route-match-kind">${matchKind}</span><code>${escapeHtml(route.pattern)}</code><small>${route.targets.filter(target => target.enabled !== false).length} active destination${route.targets.filter(target => target.enabled !== false).length === 1 ? '' : 's'}</small></td><td><div class="route-destinations">${destinations}</div></td><td><div class="route-row-actions"><button class="edit-route text-link" data-index="${index}">Edit</button><button class="delete-route text-link danger-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></div></td>`;
+    return row;
+  }));
   $$('.edit-route').forEach(button => button.addEventListener('click', () => openRouteDialog(modelRoutes[Number(button.dataset.index)])));
   $$('.delete-route').forEach(button => button.addEventListener('click', async () => { if (confirm('Delete this model route?')) { await fetch(`/admin/routes/${button.dataset.pattern}`, {method: 'DELETE'}); await loadRoutes(); } }));
   renderModelReference();
@@ -878,6 +958,13 @@ $$('.open-about').forEach(button => button.addEventListener('click', async () =>
 $$('.close-about').forEach(button => button.addEventListener('click', () => aboutDialog.close()));
 
 const helpDialog = $('#help-dialog');
+function openHelp(context = 'general', providerId = null) {
+  helpDialog.dataset.context = context;
+  selectHelpTab('agent');
+  helpDialog.dataset.provider = providerId || '';
+  updateHelpGuide();
+  helpDialog.showModal();
+}
 function helpModels() {
   const discovered = providers.flatMap(provider => provider.discovered_models.map(model => `${provider.id}/${model}`));
   return [...new Set([...modelRoutes.map(route => route.pattern).filter(pattern => !pattern.endsWith('*')), ...discovered])].sort();
@@ -893,6 +980,10 @@ function updateHelpGuide() {
   if (!authSettings.api_keys.length) keySelect.append(new Option('Generate a Gateway API key first', ''));
   if ([...keySelect.options].some(option => option.value === previousKey)) keySelect.value = previousKey;
   const baseUrl = `${location.origin}/v1`; const model = modelSelect.value || 'provider/model-id'; const key = keySelect.value || 'sk-your-yabane-key';
+  const context = helpDialog.dataset.context || 'general';
+  const provider = providers.find(item => item.id === helpDialog.dataset.provider);
+  const title = context === 'provider' && provider ? `Connect clients to ${provider.name}` : context === 'access' ? 'Connect clients to Yabane' : 'Connect your Agent to Yabane';
+  helpDialog.querySelector('h2').textContent = title;
   $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an Endpoint and upstream credential'}</small></span>`;
   $('#help-key-check').innerHTML = `<b>${authSettings.api_keys.length ? icon('check') : '2'}</b><span><strong>Generate a Gateway key</strong><small>${authSettings.api_keys.length ? `${authSettings.api_keys.length} available` : 'Required while authentication is enabled'}</small></span>`;
   $('#help-model-check').innerHTML = `<b>${models.length ? icon('check') : '3'}</b><span><strong>Select a model</strong><small>${models.length ? `${models.length} available` : 'Refresh Provider model discovery'}</small></span>`;
@@ -906,17 +997,53 @@ function updateHelpGuide() {
   $('#help-codex-env').textContent = `export YABANE_API_KEY='${key}'`;
   $('#help-base-url').textContent = baseUrl; $('#help-api-key').textContent = key; $('#help-model-id').textContent = model;
   $('#help-curl-code').textContent = `curl '${baseUrl}/chat/completions' \\\n  -H 'Authorization: Bearer ${key}' \\\n  -H 'content-type: application/json' \\\n  -d '${JSON.stringify({model, messages: [{role: 'user', content: 'Hello'}]})}'`;
+  selectHelpTab($('.help-tabs [data-help-tab].active')?.dataset.helpTab || 'agent');
 }
-$('#open-help').addEventListener('click', () => { updateHelpGuide(); helpDialog.showModal(); });
+document.addEventListener('click', event => { const button = event.target.closest('.contextual-help'); if (button) openHelp(button.dataset.helpContext, button.dataset.provider); });
 $$('.close-help').forEach(button => button.addEventListener('click', () => helpDialog.close()));
 $('#help-model').addEventListener('change', updateHelpGuide); $('#help-key').addEventListener('change', updateHelpGuide);
-$$('[data-help-tab]').forEach(button => button.addEventListener('click', () => { $$('[data-help-tab]').forEach(tab => { const active = tab === button; tab.classList.toggle('active', active); tab.setAttribute('aria-selected', String(active)); }); $$('[data-help-panel]').forEach(panel => { panel.hidden = panel.dataset.helpPanel !== button.dataset.helpTab; }); }));
+let helpHeightTransitionEnd;
+function selectHelpTab(tab) {
+  const body = $('.help-body');
+  const startHeight = body.getBoundingClientRect().height;
+  const animateHeight = helpDialog.open && startHeight > 0;
+  if (helpHeightTransitionEnd) body.removeEventListener('transitionend', helpHeightTransitionEnd);
+  body.style.transition = 'none';
+  body.style.height = '';
+  $$('.help-tabs [data-help-tab]').forEach(item => { const active = item.dataset.helpTab === tab; item.classList.toggle('active', active); item.setAttribute('aria-selected', String(active)); });
+  const agent = $('#help-agent')?.value || 'pi';
+  $('.help-agent-select').hidden = tab !== 'agent';
+  $$('[data-help-panel]').forEach(panel => {
+    const visible = tab === 'agent' ? panel.dataset.helpAgent === 'true' && panel.dataset.helpPanel === agent : panel.dataset.helpPanel === tab;
+    panel.hidden = !visible;
+  });
+  const endHeight = body.getBoundingClientRect().height;
+  if (!animateHeight) {
+    body.style.transition = '';
+    return;
+  }
+  body.style.height = `${startHeight}px`;
+  body.getBoundingClientRect();
+  body.style.transition = '';
+  requestAnimationFrame(() => {
+    body.style.height = `${endHeight}px`;
+    helpHeightTransitionEnd = event => {
+      if (event.propertyName !== 'height') return;
+      body.removeEventListener('transitionend', helpHeightTransitionEnd);
+      helpHeightTransitionEnd = null;
+      body.style.height = '';
+    };
+    body.addEventListener('transitionend', helpHeightTransitionEnd);
+  });
+}
+$$('[data-help-tab]').forEach(button => button.addEventListener('click', () => selectHelpTab(button.dataset.helpTab)));
+$('#help-agent').addEventListener('change', () => { if ($('.help-tabs [data-help-tab].active')?.dataset.helpTab === 'agent') selectHelpTab('agent'); });
 $$('.copy-help-code').forEach(button => button.addEventListener('click', async () => { await navigator.clipboard.writeText($(`#${button.dataset.copy}`).textContent); const original = button.textContent; button.textContent = 'Copied'; setTimeout(() => { button.textContent = original; }, 1200); }));
 
 const gatewayKeyDialog = $('#gateway-key-dialog');
 $('#open-gateway-key').addEventListener('click', () => {
   $('#gateway-key-form').reset(); $('#gateway-key-error').textContent = '';
-  $('#gateway-key-providers').replaceChildren(...providers.map(provider => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" name="provider_ids" value="${escapeHtml(provider.id)}"><span class="custom-check">${icon('check')}</span><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.id)}</small></span>`; return label; }));
+  gatewayProviderChecks($('#gateway-key-providers'));
   gatewayKeyDialog.showModal();
 });
 $('#empty-gateway-key').addEventListener('click', () => $('#open-gateway-key').click());
@@ -931,7 +1058,7 @@ $('#gateway-key-form').addEventListener('submit', async event => {
   const payload = {note: data.get('note'), expires_at: expiry ? Math.floor(new Date(expiry).getTime() / 1000) : null, provider_ids: data.getAll('provider_ids')};
   const response = await fetch('/admin/auth/keys', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#gateway-key-error'));
-  const created = await response.json(); gatewayKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-dialog').showModal(); await loadAuth();
+  const created = await response.json(); gatewayKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now or retrieve it later from the API key list.'; $('#generated-key-dialog').showModal(); await loadAuth();
 });
 $('#copy-generated-key').addEventListener('click', async () => {
   const button = $('#copy-generated-key');
@@ -945,15 +1072,39 @@ $('#copy-generated-key').addEventListener('click', async () => {
 });
 $('#close-generated-key').addEventListener('click', () => {
   $('#generated-key').value = ''; $('#copy-generated-key').classList.remove('copied'); $('.copy-key-label').textContent = 'Copy API key';
-  $('#copy-key-status').textContent = 'Store it somewhere secure before closing this window.'; $('#generated-key-dialog').close();
+  $('#copy-key-status').textContent = 'Store it securely and do not share it.'; $('#generated-key-dialog').close();
 });
 
+function gatewayProviderChecks(container, selectedProviderIds = []) {
+  container.replaceChildren(...providers.map(provider => { const label = document.createElement('label'); label.className = 'provider-check'; label.innerHTML = `<input type="checkbox" name="provider_ids" value="${escapeHtml(provider.id)}"${selectedProviderIds.includes(provider.id) ? ' checked' : ''}><span class="custom-check">${icon('check')}</span><span><strong>${escapeHtml(provider.name)}</strong><small>${escapeHtml(provider.id)}</small></span>`; return label; }));
+}
+function localDateTimeValue(timestamp) {
+  if (!timestamp) return '';
+  const date = new Date(timestamp * 1000); const offset = date.getTimezoneOffset() * 60000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+const editGatewayKeyDialog = $('#edit-gateway-key-dialog');
+function openEditGatewayKey(key) {
+  const form = $('#edit-gateway-key-form'); form.reset(); $('#edit-gateway-key-error').textContent = '';
+  form.elements.id.value = key.id; form.elements.note.value = key.note || ''; form.elements.expires_at.value = localDateTimeValue(key.expires_at);
+  gatewayProviderChecks($('#edit-gateway-key-providers'), key.provider_ids);
+  editGatewayKeyDialog.showModal();
+}
+$$('.close-edit-gateway-key').forEach(button => button.addEventListener('click', () => editGatewayKeyDialog.close()));
+$('#edit-gateway-key-form').addEventListener('submit', async event => {
+  event.preventDefault(); const data = new FormData(event.target); const expiry = data.get('expires_at');
+  const payload = {note: data.get('note'), expires_at: expiry ? Math.floor(new Date(expiry).getTime() / 1000) : null, provider_ids: data.getAll('provider_ids')};
+  const response = await fetch(`/admin/auth/keys/${encodeURIComponent(data.get('id'))}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
+  if (!response.ok) return showApiError(response, $('#edit-gateway-key-error'));
+  editGatewayKeyDialog.close(); await loadAuth();
+});
 function renderAuth() {
   $('#auth-enabled').checked = authSettings.enabled;
   $('.switch-status').textContent = authSettings.enabled ? 'Enabled' : 'Disabled';
   $('#gateway-keys-empty').hidden = authSettings.api_keys.length > 0; $('#gateway-keys-table').hidden = authSettings.api_keys.length === 0;
-  $('#gateway-keys').replaceChildren(...authSettings.api_keys.map(key => { const row = document.createElement('tr'); const expiry = key.expires_at ? new Date(key.expires_at * 1000).toLocaleString() : 'Never'; const access = key.provider_ids.length ? key.provider_ids.join(', ') : 'All providers'; row.innerHTML = `<td><div class="listed-key"><code>${escapeHtml(key.secret || key.prefix)}</code>${key.secret ? `<button class="icon-copy-key" data-secret="${escapeHtml(key.secret)}" title="Copy API key" aria-label="Copy API key">${copyIcon()}</button>` : ''}</div></td><td>${escapeHtml(key.note || '—')}</td><td>${escapeHtml(access)}</td><td>${escapeHtml(expiry)}</td><td><button class="delete-gateway-key text-link" data-key="${key.id}">Delete</button></td>`; return row; }));
+  $('#gateway-keys').replaceChildren(...authSettings.api_keys.map(key => { const row = document.createElement('tr'); const expired = key.expires_at && key.expires_at * 1000 <= Date.now(); const expiry = key.expires_at ? new Date(key.expires_at * 1000).toLocaleString() : 'Never'; const access = key.provider_ids.length ? key.provider_ids.join(', ') : 'All providers'; row.innerHTML = `<td><div class="listed-key"><code>${escapeHtml(key.secret || key.prefix)}</code>${key.secret ? `<button class="icon-copy-key" data-secret="${escapeHtml(key.secret)}" title="Copy API key" aria-label="Copy API key">${copyIcon()}</button>` : ''}</div></td><td>${escapeHtml(key.note || '—')}</td><td>${escapeHtml(access)}</td><td><span class="key-expiry${expired ? ' expired' : ''}">${expired ? 'Expired · ' : ''}${escapeHtml(expiry)}</span></td><td><div class="gateway-key-actions"><button class="edit-gateway-key text-link" data-key="${key.id}">Edit</button><button class="delete-gateway-key text-link danger-link" data-key="${key.id}">Delete</button></div></td>`; return row; }));
   $$('.icon-copy-key').forEach(button => button.addEventListener('click', async () => { await navigator.clipboard.writeText(button.dataset.secret); button.classList.add('copied'); setTimeout(() => button.classList.remove('copied'), 1200); }));
+  $$('.edit-gateway-key').forEach(button => button.addEventListener('click', () => openEditGatewayKey(authSettings.api_keys.find(key => key.id === button.dataset.key))));
   $$('.delete-gateway-key').forEach(button => button.addEventListener('click', async () => { if (confirm('Delete this API key?')) { await fetch(`/admin/auth/keys/${button.dataset.key}`, {method: 'DELETE'}); await loadAuth(); } }));
 }
 async function loadAuth() { const response = await fetch('/admin/auth'); authSettings = await response.json(); renderAuth(); }
@@ -966,7 +1117,7 @@ $('#management-key-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.target); const expiry = data.get('expires_at');
   const response = await fetch('/admin/management-keys', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({name: data.get('name'), expires_at: expiry ? Math.floor(new Date(expiry).getTime() / 1000) : null})});
   if (!response.ok) return showApiError(response, $('#management-key-error'));
-  const created = await response.json(); managementKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-dialog').showModal(); await loadManagementKeys();
+  const created = await response.json(); managementKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now. Management API key secrets are shown only once.'; $('#generated-key-dialog').showModal(); await loadManagementKeys();
 });
 function renderManagementKeys(keys) {
   $('#management-keys-empty').hidden = keys.length > 0; $('#management-keys-table').hidden = keys.length === 0;
@@ -985,7 +1136,7 @@ const searchItems = [
   {label: 'Activity', description: 'Requests, tokens, latency, upstream cost, and routing logs', view: 'activity'},
   {label: 'Management API', description: 'Programmatic control keys and live docs', view: 'management'},
   {label: 'Create Management API key', description: 'Create a control-plane credential', view: 'management', action: () => $('#open-management-key').click()},
-  {label: 'Getting started', description: 'Connect an Agent to Yabane', view: 'home', action: () => $('#open-help').click()},
+  {label: 'Getting started', description: 'Connect an Agent to Yabane', view: 'home', action: () => openHelp()},
   {label: 'Live API docs', description: 'Interactive OpenAPI documentation', view: 'management', action: () => location.assign('/docs')}
 ];
 let selectedSearchIndex = -1;
@@ -1022,20 +1173,43 @@ function compactNumber(value) { return Intl.NumberFormat('en', {notation: 'compa
 function formatCost(value) { return value == null ? '—' : `$${new Intl.NumberFormat('en', {minimumFractionDigits: 2, maximumFractionDigits: 6}).format(value)}`; }
 let activityLogs = [];
 const activityColors = ['#0b57d0', '#7c4dff', '#00a67e', '#ff8f00', '#d93025', '#00897b'];
-function activityBuckets(logs, seconds) {
+function activityBuckets(logs, seconds, end = Math.floor(Date.now() / 1000)) {
   const count = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30;
-  const end = Math.floor(Date.now() / 1000); const start = end - seconds; const width = seconds / count;
-  return Array.from({length: count}, (_, index) => ({start: start + index * width, requests: 0, tokens: 0, cached: 0, cost: 0, latency: 0, samples: 0})).map((bucket, index, buckets) => {
-    logs.filter(log => log.timestamp >= bucket.start && (index === buckets.length - 1 || log.timestamp < bucket.start + width)).forEach(log => { bucket.requests++; bucket.tokens += log.input_tokens + log.output_tokens; bucket.cached += log.cached_tokens; bucket.cost += log.cost || 0; bucket.latency += log.latency_ms; bucket.samples++; }); return bucket;
+  const start = end - seconds; const width = seconds / count;
+  return Array.from({length: count}, (_, index) => ({start: start + index * width, requests: 0, tokens: 0, cached: 0, cost: 0, latency: 0, samples: 0, successful: 0, errors: 0})).map((bucket, index, buckets) => {
+    logs.filter(log => log.timestamp >= bucket.start && (index === buckets.length - 1 || log.timestamp < bucket.start + width)).forEach(log => { bucket.requests++; bucket.tokens += log.input_tokens + log.output_tokens; bucket.cached += log.cached_tokens; bucket.cost += log.cost || 0; bucket.latency += log.latency_ms; bucket.samples++; bucket.successful += Number(log.status < 400); bucket.errors += Number(log.status >= 400); }); return bucket;
   });
 }
 function sparkline(values, color) {
   const max = Math.max(...values, 1); const points = values.map((value, index) => `${index * 100 / Math.max(values.length - 1, 1)},${30 - value * 26 / max}`).join(' ');
   return `<svg viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>`;
 }
-function renderActivityChart(buckets, seconds) {
-  const maxRequests = Math.max(...buckets.map(bucket => bucket.requests), 1); const maxTokens = Math.max(...buckets.map(bucket => bucket.tokens), 1);
-  $('#activity-chart').innerHTML = `<div class="chart-grid"><span></span><span></span><span></span><span></span></div><div class="chart-bars">${buckets.map((bucket, index) => { const date = new Date(bucket.start * 1000); const label = seconds <= 86400 ? date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : date.toLocaleDateString([], {month: 'short', day: 'numeric'}); return `<div class="chart-column" title="${bucket.requests} requests · ${compactNumber(bucket.tokens)} tokens · ${formatCost(bucket.cost)}"><div class="chart-bars-pair"><i style="height:${Math.max(bucket.requests * 100 / maxRequests, bucket.requests ? 4 : 0)}%"></i><b style="height:${Math.max(bucket.tokens * 100 / maxTokens, bucket.tokens ? 4 : 0)}%"></b></div><small>${index % Math.ceil(buckets.length / 7) === 0 ? label : ''}</small></div>`; }).join('')}</div>`;
+let activityChartMetric = 'requests';
+let activityChartBuckets = [];
+let activityChartSeconds = 86400;
+function activityBucketLabel(bucket, seconds, full = false) {
+  const start = new Date(bucket.start * 1000); const end = new Date((bucket.start + seconds / activityChartBuckets.length) * 1000);
+  if (!full) return seconds <= 86400 ? start.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : start.toLocaleDateString([], {month: 'short', day: 'numeric'});
+  const startLabel = seconds <= 86400 ? start.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : start.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  const endLabel = seconds <= 86400 ? end.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : end.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  return `${startLabel} – ${endLabel}`;
+}
+function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'latency' ? (bucket.samples ? bucket.latency / bucket.samples : 0) : bucket.requests; }
+function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'latency' ? formatDuration(Math.round(value)) : value.toLocaleString(); }
+function inspectActivityBucket(index) {
+  const bucket = activityChartBuckets[index]; if (!bucket) return;
+  $$('.chart-column').forEach((column, columnIndex) => column.classList.toggle('selected', columnIndex === index));
+  $('#chart-inspector-time').textContent = activityBucketLabel(bucket, activityChartSeconds, true);
+  const averageLatency = bucket.samples ? Math.round(bucket.latency / bucket.samples) : null;
+  const successRate = bucket.requests ? (bucket.successful * 100 / bucket.requests).toFixed(1) + '%' : '—';
+  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Tokens', compactNumber(bucket.tokens)], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached', compactNumber(bucket.cached)], ['Cost', formatCost(bucket.cost || null)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+}
+function renderActivityChart(buckets = activityChartBuckets, seconds = activityChartSeconds) {
+  activityChartBuckets = buckets; activityChartSeconds = seconds;
+  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const max = Math.max(...values, 1);
+  const nonEmpty = buckets.reduce((last, bucket, index) => bucket.requests ? index : last, -1); const selected = nonEmpty >= 0 ? nonEmpty : buckets.length - 1;
+  $('#activity-chart').innerHTML = `<div class="chart-grid"><span><b>${activityMetricLabel(max, activityChartMetric)}</b></span><span></span><span><b>0</b></span></div><div class="chart-bars">${buckets.map((bucket, index) => { const value = values[index]; const label = activityBucketLabel(bucket, seconds); const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatCost(bucket.cost || null)}`; return `<button class="chart-column" type="button" data-chart-index="${index}" aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${activityMetricLabel(value, activityChartMetric)}</span><span class="chart-bar" style="height:${Math.max(value * 100 / max, value ? 3 : 0)}%"></span><small>${index % Math.ceil(buckets.length / 6) === 0 || index === buckets.length - 1 ? label : ''}</small></button>`; }).join('')}</div>`;
+  inspectActivityBucket(selected);
 }
 function aggregateActivity(logs, key) {
   const map = new Map(); logs.forEach(log => { const name = log[key]; const item = map.get(name) || {name, requests: 0, tokens: 0, errors: 0, latency: 0}; item.requests++; item.tokens += log.input_tokens + log.output_tokens; item.errors += Number(log.status >= 400); item.latency += log.latency_ms; map.set(name, item); }); return [...map.values()].sort((a, b) => b.requests - a.requests);
@@ -1048,7 +1222,7 @@ function compactPath(path) { return path.replace('/v1/', '').replace('chat/compl
 function activityRow(log, detailed = false, index = -1) {
   const tokens = log.input_tokens + log.output_tokens; const time = new Date(log.timestamp * 1000);
   const conversion = log.caller_protocol && log.upstream_protocol && log.caller_protocol !== log.upstream_protocol ? ` · ${log.caller_protocol.replace('openai_', '').replace('_completions', '')} → ${log.upstream_protocol.replace('openai_', '').replace('_completions', '')}` : '';
-  const row = detailed ? `<td>${time.toLocaleString()}</td><td><code>${escapeHtml(log.request_id)}</code></td><td><code>${escapeHtml(log.model)}</code></td><td>${escapeHtml(log.provider)}</td><td>${escapeHtml(log.endpoint)}</td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td>${compactNumber(log.input_tokens)}</td><td>${compactNumber(log.output_tokens)}</td><td>${compactNumber(log.cached_tokens)}</td><td>${formatCost(log.cost)}</td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
+  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td><span class="activity-model"><code>${escapeHtml(log.model)}</code><small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small></span></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td>${statusBadge(log.status)}</td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${formatCost(log.cost)}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td><code>${escapeHtml(log.model)}</code></td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
   return `<tr class="activity-request-row" data-activity-index="${index}" tabindex="0" aria-label="Open details for ${escapeHtml(log.model)} request">${row}</tr>`;
 }
 function formatDuration(milliseconds) { return milliseconds == null ? 'Not available' : milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 1 : 2)} s` : `${milliseconds.toLocaleString()} ms`; }
@@ -1066,37 +1240,62 @@ function openActivityDetail(log) {
 $$('.close-activity-detail').forEach(button => button.addEventListener('click', () => $('#activity-detail-dialog').close()));
 $('#activity-detail-dialog').addEventListener('click', event => { if (event.target === event.currentTarget) event.currentTarget.close(); });
 function renderActivityLogs() {
+  if ($('#activity-requests-panel').hidden) return;
   const query = $('#activity-search').value.trim().toLowerCase(); const status = $('#activity-status-filter').value;
-  const filtered = activityLogs.filter(log => (!query || `${log.request_id} ${log.model} ${log.provider} ${log.endpoint}`.toLowerCase().includes(query)) && (!status || (status === 'success' ? log.status < 400 : log.status >= 400)));
-  $('#activity-logs').innerHTML = filtered.length ? filtered.map(log => activityRow(log, true, activityLogs.indexOf(log))).join('') : '<tr><td colspan="12"><div class="activity-empty">No requests match these filters.</div></td></tr>';
+  const matches = [];
+  for (let index = 0; index < activityLogs.length; index++) {
+    const log = activityLogs[index];
+    if ((!query || `${log.request_id} ${log.model} ${log.provider} ${log.endpoint}`.toLowerCase().includes(query)) && (!status || (status === 'success' ? log.status < 400 : log.status >= 400))) matches.push({log, index});
+  }
+  const visible = matches.slice(0, ACTIVITY_RENDER_LIMIT);
+  $('#activity-result-count').textContent = matches.length > visible.length ? `${matches.length.toLocaleString()} matching · showing ${visible.length}` : `${matches.length.toLocaleString()} request${matches.length === 1 ? '' : 's'}`;
+  $('#activity-logs').innerHTML = visible.length ? visible.map(({log, index}) => activityRow(log, true, index)).join('') : '<tr><td colspan="10"><div class="activity-empty">No requests match these filters.</div></td></tr>';
 }
-async function loadActivity() {
-  if (activityLoadPromise) return activityLoadPromise;
+async function loadActivity(requestedLogLimit) {
+  const explorerVisible = !$('#activity-requests-panel').hidden;
+  const logLimit = requestedLogLimit || (explorerVisible ? 1000 : 100);
+  if (activityLoadPromise) {
+    await activityLoadPromise;
+    if (logLimit <= activityLogsLimit) return;
+  }
   activityLoadPromise = (async () => {
-    const seconds = Number($('#activity-range').value); const since = Math.floor(Date.now() / 1000) - seconds;
-    const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=1000`).then(response => response.json())]);
-    const providerFilter = $('#activity-provider-filter').value; activityLogs = providerFilter ? logs.filter(log => log.provider === providerFilter) : logs;
-    const totals = activityLogs.reduce((total, log) => { total.input += log.input_tokens; total.output += log.output_tokens; total.cached += log.cached_tokens; total.cost += log.cost || 0; total.latency += log.latency_ms; total.success += Number(log.status < 400); total.streaming += Number(log.streaming); return total; }, {input: 0, output: 0, cached: 0, cost: 0, latency: 0, success: 0, streaming: 0});
-    const buckets = activityBuckets(activityLogs, seconds); const requests = activityLogs.length; const totalTokens = totals.input + totals.output;
-    $('#stat-requests').textContent = compactNumber(requests); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
-    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}% successful`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = `${requests ? Math.round(totals.latency / requests).toLocaleString() : 0} ms avg · ${totals.streaming} streaming`;
-    $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00a67e'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
-    renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), aggregateActivity(activityLogs, 'provider')); renderRankings($('#model-stats'), aggregateActivity(activityLogs, 'model'));
+    const seconds = Number($('#activity-range').value); const until = Math.floor(Date.now() / 1000); const since = until - seconds; const bucketCount = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30; const providerFilter = $('#activity-provider-filter').value;
+    const providerQuery = providerFilter ? `&provider=${encodeURIComponent(providerFilter)}` : '';
+    const statsUrl = `/admin/activity/stats?since=${since}&until=${until}&buckets=${bucketCount}${providerQuery}`;
+    const [stats, logs] = await Promise.all([fetch(statsUrl).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=${logLimit}${providerQuery}`).then(response => response.json())]);
+    activityLogs = logs; activityLogsLimit = logLimit;
+    const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
+    const buckets = stats.buckets; const requests = stats.requests; const totalTokens = totals.input + totals.output;
+    $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
+    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
+    $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
+    renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), stats.by_provider.map(item => ({...item, tokens: item.input_tokens + item.output_tokens}))); renderRankings($('#model-stats'), stats.by_model.map(item => ({...item, tokens: item.input_tokens + item.output_tokens})));
     $('#recent-activity-logs').innerHTML = activityLogs.length ? activityLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>'; renderActivityLogs();
-    const filter = $('#activity-provider-filter'); const previous = filter.value; filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.provider, provider.provider))); filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
+    const filter = $('#activity-provider-filter'); const previous = filter.value;
+    if (!providerFilter) filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.name, provider.name)));
+    filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
   })().finally(() => { activityLoadPromise = null; });
   return activityLoadPromise;
 }
-function showActivityTab(tab) { $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); }); $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests'; }
+function showActivityTab(tab) {
+  $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
+  $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests';
+  if (tab === 'requests') { renderActivityLogs(); if (activityLogsLimit < 1000) loadActivity(1000); }
+}
 $('#activity-view').addEventListener('click', event => {
   const tab = event.target.closest('[data-activity-tab]');
   if (tab) { showActivityTab(tab.dataset.activityTab); return; }
   if (event.target.closest('.show-request-explorer')) showActivityTab('requests');
 });
 $('#activity-search').addEventListener('input', renderActivityLogs); $('#activity-status-filter').addEventListener('change', renderActivityLogs);
+$('.chart-metric-picker').addEventListener('click', event => { const button = event.target.closest('[data-chart-metric]'); if (!button) return; activityChartMetric = button.dataset.chartMetric; $$('.chart-metric-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); renderActivityChart(); });
+$('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
+$('#activity-chart').addEventListener('focusin', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
+$('#activity-chart').addEventListener('click', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
 $('#activity-view').addEventListener('click', event => { const row = event.target.closest('.activity-request-row'); if (row) openActivityDetail(activityLogs[Number(row.dataset.activityIndex)]); });
 $('#activity-view').addEventListener('keydown', event => { const row = event.target.closest('.activity-request-row'); if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openActivityDetail(activityLogs[Number(row.dataset.activityIndex)]); } });
-$('#activity-range').addEventListener('change', loadActivity); $('#activity-provider-filter').addEventListener('change', loadActivity); $('#refresh-activity').addEventListener('click', loadActivity);
+function resetAndLoadActivity() { activityLogsLimit = 0; loadActivity(); }
+$('#activity-range').addEventListener('change', resetAndLoadActivity); $('#activity-provider-filter').addEventListener('change', resetAndLoadActivity); $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
 const activityDataDialog = $('#activity-data-dialog');
 let activityImportBytes = null;
 function formatBytes(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB']; let value = bytes / 1024; let unit = units.shift(); while (value >= 1024 && units.length) { value /= 1024; unit = units.shift(); } return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`; }
@@ -1159,10 +1358,9 @@ $('#save-activity-retention').addEventListener('click', async () => {
   if (!response.ok) await showApiError(response, $('#activity-retention-error')); else { await loadActivityStorage(); await loadActivity(); }
   button.disabled = false; button.textContent = 'Save retention';
 });
-function renderHomeTraffic(logs) {
-  const buckets = activityBuckets(logs, 86400);
-  const max = Math.max(...buckets.map(bucket => bucket.requests), 1);
-  $('#home-traffic-chart').innerHTML = `<div class="home-chart-grid"><i></i><i></i><i></i></div><div class="home-chart-bars">${buckets.map((bucket, index) => { const hour = new Date(bucket.start * 1000); const label = index % 6 === 0 || index === buckets.length - 1 ? hour.toLocaleTimeString([], {hour: '2-digit'}) : ''; return `<div class="home-chart-column" title="${bucket.requests} request${bucket.requests === 1 ? '' : 's'}"><span style="height:${bucket.requests * 100 / max}%;animation-delay:${index * 16}ms"></span><small>${label}</small></div>`; }).join('')}</div>${logs.length ? '' : '<p class="home-chart-empty">No requests in the last 24 hours</p>'}`;
+function renderHomeTraffic(buckets) {
+  const max = Math.max(...buckets.map(bucket => bucket.requests), 1); const requests = buckets.reduce((total, bucket) => total + bucket.requests, 0);
+  $('#home-traffic-chart').innerHTML = `<div class="home-chart-grid"><i></i><i></i><i></i></div><div class="home-chart-bars">${buckets.map((bucket, index) => { const hour = new Date(bucket.start * 1000); const label = index % 6 === 0 || index === buckets.length - 1 ? hour.toLocaleTimeString([], {hour: '2-digit'}) : ''; return `<div class="home-chart-column" title="${bucket.requests} request${bucket.requests === 1 ? '' : 's'}"><span style="height:${bucket.requests * 100 / max}%;animation-delay:${index * 16}ms"></span><small>${label}</small></div>`; }).join('')}</div>${requests ? '' : '<p class="home-chart-empty">No requests in the last 24 hours</p>'}`;
 }
 function openHomeView(name) { showView(name); }
 $('#home-open-activity').addEventListener('click', () => openHomeView('activity'));
@@ -1173,11 +1371,11 @@ async function loadDashboard() {
   if (dashboardLoadPromise) return dashboardLoadPromise;
   dashboardLoadPromise = (async () => {
     const since = Math.floor(Date.now() / 1000) - 86400;
-    const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?since=${since}`).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=1000`).then(response => response.json())]);
+    const stats = await fetch(`/admin/activity/stats?since=${since}&buckets=24`).then(response => response.json());
     $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens);
     $('#home-updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
     $('#home-provider-summary').textContent = `${providers.length} provider${providers.length === 1 ? '' : 's'} · ${providers.reduce((sum, provider) => sum + provider.discovered_models.length, 0).toLocaleString()} discovered models`;
-    renderHomeTraffic(logs);
+    renderHomeTraffic(stats.buckets);
     const providerItems = providers.map(provider => {
       const item = document.createElement('button'); item.className = 'home-provider';
       const credentials = credentialCount(provider); const status = provider.model_discovery_error ? 'Discovery issue' : provider.models_discovered_at ? 'Catalog ready' : 'Discovering…';

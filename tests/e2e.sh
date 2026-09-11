@@ -32,8 +32,13 @@ about=$(curl -fsS "$base/about")
 turnstile_config=$(curl -fsS "$base/admin/turnstile-config")
 [[ $(printf '%s' "$turnstile_config" | jq -r .enabled) == true ]]
 [[ $(printf '%s' "$turnstile_config" | jq -r .site_key) == 1x00000000000000000000AA ]]
-setup_status=$(curl -sS -c "$cookie" -o response.json -w '%{http_code}' -X POST "$base/admin/setup" -H 'content-type: application/json' -d '{"username":"admin","email":"admin@example.com","password":"password123"}')
-[[ $setup_status == 204 ]]
+setup_payload='{"username":"admin","email":"admin@example.com","password":"password123"}'
+curl -sS -c "$work/cookie-one.txt" -o "$work/setup-one.json" -w '%{http_code}' -X POST "$base/admin/setup" -H 'content-type: application/json' -d "$setup_payload" >"$work/setup-one.status" & setup_one_pid=$!
+curl -sS -c "$work/cookie-two.txt" -o "$work/setup-two.json" -w '%{http_code}' -X POST "$base/admin/setup" -H 'content-type: application/json' -d "$setup_payload" >"$work/setup-two.status" & setup_two_pid=$!
+wait "$setup_one_pid" "$setup_two_pid"
+[[ $(sort "$work/setup-one.status" "$work/setup-two.status" | paste -sd, -) == 204,409 ]]
+if [[ $(<"$work/setup-one.status") == 204 ]]; then cp "$work/cookie-one.txt" "$cookie"; else cp "$work/cookie-two.txt" "$cookie"; fi
+[[ $(curl -sS -o /dev/null -w '%{http_code}' -X POST "$base/admin/setup" -H 'content-type: application/json' -d '{"username":"other","email":"other@example.com","password":"password456"}') == 409 ]]
 cat >upstream.py <<'PY'
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -126,10 +131,32 @@ grep -Fq "$secret" data/auth.json
 [[ $(status "$base/v1/models" -H 'Authorization: Basic nope') == 401 ]]
 [[ $(status "$base/v1/models" -H 'Authorization: Bearer sk-invalid') == 401 ]]
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 200 ]]
+future_expiry=$(($(date +%s) + 3600))
+admin -f -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d "{\"note\":\"Edited note\",\"expires_at\":$future_expiry,\"provider_ids\":[]}" >/dev/null
+edited_key=$(admin -f "$base/admin/auth" | jq -c ".api_keys[] | select(.id == \"$id\")")
+[[ $(printf '%s' "$edited_key" | jq -r .note) == "Edited note" ]]
+[[ $(printf '%s' "$edited_key" | jq -r .expires_at) == "$future_expiry" ]]
+[[ $(printf '%s' "$edited_key" | jq -r .secret) == "$secret" ]]
+# PATCH updates only supplied fields; editing a note must not silently clear expiry or scope.
+admin -f -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"Note only"}' >/dev/null
+[[ $(admin -f "$base/admin/auth" | jq -r ".api_keys[] | select(.id == \"$id\") | .expires_at") == "$future_expiry" ]]
+[[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 200 ]]
+[[ $(admin_status -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
 admin -f -X DELETE "$base/admin/auth/keys/$id" >/dev/null
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 401 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
+short_expiry=$(($(date +%s) + 1))
+expiring=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d "{\"note\":\"Short lived\",\"expires_at\":$short_expiry,\"provider_ids\":[]}")
+expiring_secret=$(printf '%s' "$expiring" | jq -r .secret)
+expiring_id=$(printf '%s' "$expiring" | jq -r .api_key.id)
+sleep 2
+[[ $(status "$base/v1/models" -H "Authorization: Bearer $expiring_secret") == 401 ]]
+[[ $(jq -r '.error.message' response.json) == "API key has expired" ]]
+# Editing an expired key to remove expiry reactivates the same secret.
+admin -f -X PATCH "$base/admin/auth/keys/$expiring_id" -H 'content-type: application/json' -d '{"note":"Reactivated","expires_at":null,"provider_ids":[]}' >/dev/null
+[[ $(status "$base/v1/models" -H "Authorization: Bearer $expiring_secret") == 200 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_api_key":false,"api_key":null}}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"bad-subscription-proxy","provider_name":"Bad subscription proxy","endpoint_id":"chatgpt","socks5_proxy":"http://127.0.0.1:1080"}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_api_key":false,"api_key":null}}') == 400 ]]
@@ -143,6 +170,10 @@ for provider in allowed denied; do
 done
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}}" >/dev/null
 admin -f -X POST "$base/admin/providers/multi/endpoints" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"two\"}" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"id":"multi","name":"Renamed provider"}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | [.id, .name] | join(":")') == multi:Renamed\ provider ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"id":"renamed"}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"name":"  "}') == 400 ]]
 admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1/\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .base_url') == "http://127.0.0.1:$upstream_port/v1" ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"renamed\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 400 ]]
@@ -164,6 +195,11 @@ providers_json=$(admin -f "$base/admin/providers")
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/model-endpoint-preferences" -H 'content-type: application/json' -d '{"preferences":[{"model":"model-a","api_type":"openai_compatible","endpoint_id":"two"}]}') == 400 ]]
 scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped","expires_at":null,"provider_ids":["allowed"]}')
 scoped_secret=$(printf '%s' "$scoped" | jq -r .secret)
+# Provider scope is carried from the authorization middleware to model listing and inference.
+model_scoped_secret=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped model listing","expires_at":null,"provider_ids":["multi"]}' | jq -r .secret)
+scoped_models=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $model_scoped_secret")
+[[ $(printf '%s' "$scoped_models" | jq '.data | length') -gt 0 ]]
+[[ $(printf '%s' "$scoped_models" | jq '[.data[] | select(.id | startswith("multi/") | not)] | length') == 0 ]]
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"denied/model","messages":[]}') == 403 ]]
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"allowed/model","messages":[]}') == 502 ]]
 connection_failure_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
@@ -208,13 +244,15 @@ model_b=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer
 [[ $(printf '%s' "$model_b" | jq -r .endpoint) == two ]]
 [[ $(printf '%s' "$model_a" | jq -r .model) == model-a ]]
 admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"x-provider":"yes"},"extra_body":{"extra":"provider"},"defaults_endpoint_ids":["one"]}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"name":"Renamed without replacing defaults"}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | [.name, .extra_headers["x-provider"], .extra_body.extra, .defaults_endpoint_ids[0]] | join(":")') == Renamed\ without\ replacing\ defaults:yes:provider:one ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"authorization":"unsafe"},"extra_body":{}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"bad header":"unsafe"},"extra_body":{}}') == 400 ]]
-route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":1},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":1}]}'
+route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":50},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":50}]}'
 [[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$route_payload" >/dev/null
 # Existing routes can be edited, including renaming the public pattern and replacing destinations.
-admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model-edited","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"custom-model-not-discovered","weight":1}]}' >/dev/null
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model-edited","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"custom-model-not-discovered","weight":100}]}' >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model-edited") | .targets[0].upstream_model') == custom-model-not-discovered ]]
 [[ $(admin_status -X PATCH "$base/admin/routes/missing-route" -H 'content-type: application/json' -d "$route_payload") == 404 ]]
 admin -f -X PATCH "$base/admin/routes/friendly-model-edited" -H 'content-type: application/json' -d "$route_payload" >/dev/null
@@ -235,6 +273,7 @@ for _ in $(seq 1 4); do
   [[ $(printf '%s' "$switched" | jq -r .endpoint) == two ]]
 done
 [[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":false}]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":60,"enabled":true},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":30,"enabled":true}]}') == 400 ]]
 # Endpoint identity is part of an upstream-key mutation, because key IDs are only endpoint-local.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Temporary","secret":"temporary","weight":10}' >/dev/null
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/temporary" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
@@ -246,19 +285,19 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/temporary" >/
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/keys/default" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
 # Deleting a key also removes global-route destinations that refer to that exact endpoint key.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Routed temporary","secret":"routed-temporary","weight":10}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":1}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":100}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/routed-temporary" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "temporary-route")] | length') == 0 ]]
 # Deleting an endpoint removes its keys, discovery availability, and exact route destinations.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":1}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two")] | length') == 0 ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | has("model_endpoints") and (.model_endpoints | has("model-b") | not)') == true ]]
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "endpoint-deletion-route")] | length') == 0 ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/missing") == 404 ]]
 # Deleting a Provider removes every route destination that refers to it.
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":1}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/denied" >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "provider-deletion-route")] | length') == 0 ]]
@@ -273,11 +312,19 @@ for _ in $(seq 1 10); do
   [[ $after_batch_count -gt $before_batch_count ]] && break
 done
 [[ $((after_batch_count - before_batch_count)) -eq 10 ]]
-stats=$(admin -f "$base/admin/activity/stats?since=0")
+stats=$(admin -f "$base/admin/activity/stats?since=0&buckets=24")
 [[ $(printf '%s' "$stats" | jq -r .requests) -ge 10 ]]
 [[ $(printf '%s' "$stats" | jq -r .input_tokens) -ge 4800 ]]
+[[ $(printf '%s' "$stats" | jq -r '.buckets | length') == 24 ]]
+[[ $(printf '%s' "$stats" | jq -r '[.buckets[].requests] | add') == $(printf '%s' "$stats" | jq -r .requests) ]]
+[[ $(printf '%s' "$stats" | jq -r '.by_model | length > 0') == true ]]
+filtered_stats=$(admin -f "$base/admin/activity/stats?since=0&provider=multi&buckets=12")
+[[ $(printf '%s' "$filtered_stats" | jq -r '.buckets | length') == 12 ]]
+[[ $(printf '%s' "$filtered_stats" | jq '[.by_provider[] | select(.name != "multi")] | length') == 0 ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
 [[ $(printf '%s' "$logs" | jq 'length') -ge 4 ]]
+filtered_logs=$(admin -f "$base/admin/activity/logs?since=0&provider=multi&limit=1000")
+[[ $(printf '%s' "$filtered_logs" | jq '[.[] | select(.provider != "multi")] | length') == 0 ]]
 stats=$(admin -f "$base/admin/activity/stats?since=0")
 [[ $(printf '%s' "$stats" | jq -r '.cost > 0') == true ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
