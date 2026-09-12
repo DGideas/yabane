@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/yabane-extension-api",
     "extensions/request-defaults",
+    "extensions/traffic-capture",
 ]
 resolver = "2"
 
@@ -14,8 +15,9 @@ description = "A clear, reliable gateway to every LLM."
 license = "MIT"
 
 [features]
-default = ["extension-request-defaults"]
+default = ["extension-request-defaults", "extension-traffic-capture"]
 extension-request-defaults = ["dep:yabane-extension-request-defaults"]
+extension-traffic-capture = ["dep:yabane-extension-traffic-capture"]
 
 [dependencies]
 argon2 = "0.5"
@@ -30,12 +32,13 @@ sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "socks", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "time", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 yabane-extension-api = { path = "crates/yabane-extension-api" }
 yabane-extension-request-defaults = { path = "extensions/request-defaults", optional = true }
+yabane-extension-traffic-capture = { path = "extensions/traffic-capture", optional = true }
 
 [profile.release]
 lto = "thin"

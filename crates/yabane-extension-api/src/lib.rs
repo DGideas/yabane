@@ -14,6 +14,7 @@ pub enum Protocol {
 pub enum HookStage {
     UpstreamRequest,
     UpstreamHeaders,
+    UpstreamExchange,
 }
 
 impl HookStage {
@@ -21,6 +22,7 @@ impl HookStage {
         match self {
             Self::UpstreamRequest => "upstream_request",
             Self::UpstreamHeaders => "upstream_headers",
+            Self::UpstreamExchange => "upstream_exchange",
         }
     }
 }
@@ -105,6 +107,55 @@ pub trait UpstreamHeadersHook: ExtensionHook {
         context: &RequestContext<'_>,
         headers: &mut HeaderMap,
     ) -> Result<HookOutcome<()>, ExtensionError>;
+}
+
+/// A credential-safe snapshot of an HTTP header. Core replaces sensitive values
+/// before an observer is invoked; observers can apply stricter redaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedHeader {
+    pub name: String,
+    pub value: String,
+}
+
+pub struct ObservedUpstreamRequest<'a> {
+    pub headers: &'a [ObservedHeader],
+    pub body: &'a [u8],
+}
+
+pub struct ObservedUpstreamResponseHead<'a> {
+    pub status: StatusCode,
+    pub headers: &'a [ObservedHeader],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExchangeOutcome {
+    Complete,
+    TransportError,
+    ResponseReadError,
+    Interrupted,
+}
+
+/// A per-request, read-only observer. Calls are synchronous and must remain
+/// non-blocking; implementations should use bounded in-memory work and enqueue
+/// persistence. Observer failures never alter the proxied response.
+pub trait UpstreamExchangeObserver: Send {
+    fn on_response_head(&mut self, response: ObservedUpstreamResponseHead<'_>);
+    fn on_response_chunk(&mut self, chunk: &Bytes);
+    fn on_complete(&mut self, outcome: ExchangeOutcome);
+}
+
+pub trait UpstreamExchangeHook: ExtensionHook {
+    /// Cheap preflight used before Core constructs credential-safe Header snapshots.
+    /// Return false when this request cannot produce an observer.
+    fn is_interested(&self, _context: &RequestContext<'_>) -> bool {
+        true
+    }
+
+    fn begin(
+        &self,
+        context: &RequestContext<'_>,
+        request: ObservedUpstreamRequest<'_>,
+    ) -> Option<Box<dyn UpstreamExchangeObserver>>;
 }
 
 #[derive(Clone, Copy, Debug)]

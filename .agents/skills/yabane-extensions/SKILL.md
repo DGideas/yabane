@@ -18,12 +18,15 @@ description: 指导 Agent 在 Yabane 中创建、接入、配置和测试原生 
 
 Yabane Extension 是独立 Rust crate，通过 Cargo feature 编译并静态链接进二进制。新增或移除 Extension 需要重新构建和部署；当前没有动态安装、热加载、WASM、异步 Hook 或安全沙箱。
 
-当前 API v1 提供两个同步 Hook：
+当前 API v2 提供两个同步改写 Hook 和一个只读观察 Hook：
 
 | Hook | 输入 | 确切位置 |
 |---|---|---|
 | `UpstreamRequestHook` | 上游协议的 JSON body，类型为 `Bytes` | 完成认证、路由、Provider 前缀移除和显式协议转换之后；发送及 Core 的 Provider 特殊适配之前 |
 | `UpstreamHeadersHook` | 独立的空 Header overlay | 清理调用方 Header 之后；Core 注入上游凭据、协议默认 Header 和订阅身份之前 |
+| `UpstreamExchangeHook` | 最终上游请求及原始上游响应的只读增量视图 | Core 完成请求改写和认证之后开始；响应头、每个原始响应 chunk 和最终 outcome 分别通知 observer |
+
+`UpstreamExchangeHook` 只能观察，不能改写或拒绝流量。其 `is_interested` preflight 必须便宜且不分配，并与 `begin` 使用可在同步 Hook 路径安全读取的短临界区状态；Core 只在至少一个 observer 对该请求感兴趣时构造 Header 快照，并只对通过 preflight 的同一组 Hook 调用一次 `begin`（不能在两者之间再次用易变状态筛选）。Core 在调用前必须永久遮蔽 Authorization、API key、Cookie、订阅身份、代理认证和请求亲和标识；observer 应保持同步、非阻塞、有界，并把持久化排入队列。observer 的 panic 或内部失败不能改变代理响应。
 
 `RequestContext` 提供 request ID、公开 model、精确 upstream model、Provider/Endpoint ID、调用方协议、上游协议和原始 streaming 意图。它不提供调用方或上游凭据。
 
@@ -205,7 +208,7 @@ yabane-extension-example = {
 
 ### 6. 构造配置实例并加入请求快照
 
-当前 v1 没有通用的运行时配置 loader。参照 `request-defaults`：在路由资源已经确定后，从同一个权威配置源构造 Extension 实例，并按持久化顺序把 trait reference 放进 `RequestHooks`：
+当前 v2 没有通用的运行时配置 loader。参照 `request-defaults`：在路由资源已经确定后，从同一个权威配置源构造 Extension 实例，并按持久化顺序把 trait reference 放进 `RequestHooks`：
 
 ```rust
 let hooks = RequestHooks {
@@ -288,8 +291,8 @@ cargo check --no-default-features
 以下需求不是当前 Hook 的既有能力，不能硬塞进 `UpstreamRequestHook` 或 `UpstreamHeadersHook`：
 
 - 修改协议转换前的 caller payload。
-- 读取或修改 response。
-- 异步网络或存储调用。
+- 修改 response（v2 exchange observer 只能只读观察 response）。
+- 在 Hook 或 observer 回调内执行异步网络或阻塞存储调用；observer 应使用有界队列转交后台任务。
 - 每实例 timeout 或可选 fail-open。
 - 动态安装、卸载、热加载或沙箱。
 - 通用运行时实例配置和排序。

@@ -1772,6 +1772,7 @@ dependencies = [
  "tracing-subscriber",
  "yabane-extension-api",
  "yabane-extension-request-defaults",
+ "yabane-extension-traffic-capture",
 ]
 
 [[package]]
@@ -1789,6 +1790,18 @@ dependencies = [
  "bytes",
  "http",
  "serde_json",
+ "yabane-extension-api",
+]
+
+[[package]]
+name = "yabane-extension-traffic-capture"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "serde",
+ "serde_json",
+ "tokio",
  "yabane-extension-api",
 ]
 

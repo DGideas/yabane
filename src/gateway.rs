@@ -233,7 +233,7 @@ async fn resolve_provider(
         status: StatusCode::BAD_REQUEST,
         message: format!("Provider '{provider_id}' has no endpoint for model '{upstream_model}'"),
     })?;
-    let api_key = if endpoint.api_type == ApiType::OpenaiCodex {
+    let api_key = if endpoint.api_type == ApiType::OpenaiCodex || !endpoint.requires_api_key {
         None
     } else if let Some(target) = &route_target {
         let key = endpoint
@@ -441,17 +441,25 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         },
         &endpoint.extra_body,
     );
+    #[cfg_attr(
+        not(any(
+            feature = "extension-request-defaults",
+            feature = "extension-traffic-capture"
+        )),
+        allow(unused_mut)
+    )]
+    let mut extension_hooks = crate::extensions::RequestHooks::default();
     #[cfg(feature = "extension-request-defaults")]
-    let extension_hooks = if !request_defaults_enabled || request_defaults.is_empty() {
-        crate::extensions::RequestHooks::default()
-    } else {
-        crate::extensions::RequestHooks {
-            upstream_request: vec![&request_defaults],
-            upstream_headers: vec![&request_defaults],
-        }
-    };
-    #[cfg(not(feature = "extension-request-defaults"))]
-    let extension_hooks = crate::extensions::RequestHooks::default();
+    if request_defaults_enabled && !request_defaults.is_empty() {
+        extension_hooks.upstream_request.push(&request_defaults);
+        extension_hooks.upstream_headers.push(&request_defaults);
+    }
+    #[cfg(feature = "extension-traffic-capture")]
+    if state.extensions.is_enabled("traffic-capture") {
+        extension_hooks
+            .upstream_exchange
+            .push(state.traffic_capture.as_ref());
+    }
     let mut request_headers = sanitize_request_headers(
         parts.headers,
         endpoint.api_type,
@@ -521,9 +529,30 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         request_headers.insert(HeaderName::from_static("x-client-request-id"), session_id);
     }
 
+    let interested_exchange_hooks = state
+        .extensions
+        .interested_upstream_exchange(&extension_context, &extension_hooks.upstream_exchange);
+    let observed_request_headers = if interested_exchange_hooks.is_empty() {
+        Vec::new()
+    } else {
+        observed_headers(&request_headers)
+    };
+    let mut exchange_observers = state.extensions.begin_upstream_exchange(
+        &extension_context,
+        yabane_extension_api::ObservedUpstreamRequest {
+            headers: &observed_request_headers,
+            body: &body,
+        },
+        &interested_exchange_hooks,
+    );
+
     let client = match endpoint.client(&state.client) {
         Ok(client) => client,
         Err(err) => {
+            complete_exchange_observers(
+                &mut exchange_observers,
+                yabane_extension_api::ExchangeOutcome::TransportError,
+            );
             error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not configure endpoint client");
             return api_error(StatusCode::BAD_GATEWAY, err);
         }
@@ -535,6 +564,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let upstream_response = match upstream.send().await {
         Ok(response) => response,
         Err(err) => {
+            complete_exchange_observers(
+                &mut exchange_observers,
+                yabane_extension_api::ExchangeOutcome::TransportError,
+            );
             let using_socks5_proxy = endpoint.socks5_proxy.is_some();
             let failure = upstream_transport_failure(&err, using_socks5_proxy);
             error!(
@@ -582,6 +615,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let status = upstream_response.status();
     let api_type = endpoint.api_type;
     let response_headers = upstream_response.headers().clone();
+    if !exchange_observers.is_empty() {
+        let observed_response_headers = observed_headers(&response_headers);
+        observe_response_head(&mut exchange_observers, status, &observed_response_headers);
+    }
     let content_type = response_headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -626,6 +663,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     break;
                 }
             };
+            observe_response_chunk(&mut exchange_observers, &chunk);
             usage.observe(&chunk);
             if let Err(err) = converter.push(&chunk) {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not convert upstream stream");
@@ -665,8 +703,16 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     Some(stream_failure(&err)),
                 )
                 .await;
+            complete_exchange_observers(
+                &mut exchange_observers,
+                yabane_extension_api::ExchangeOutcome::Interrupted,
+            );
             return api_error(StatusCode::BAD_GATEWAY, err);
         }
+        complete_exchange_observers(
+            &mut exchange_observers,
+            yabane_extension_api::ExchangeOutcome::Complete,
+        );
         activity
             .record_at(status, usage, true, first_byte_ms, completion_ms)
             .await;
@@ -700,9 +746,14 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                         ),
                     )
                     .await;
+                complete_exchange_observers(
+                    &mut exchange_observers,
+                    yabane_extension_api::ExchangeOutcome::ResponseReadError,
+                );
                 return api_error(StatusCode::BAD_GATEWAY, "Could not read upstream response");
             }
         };
+        observe_response_chunk(&mut exchange_observers, &bytes);
         let mut usage = UsageTracker::new(api_type, false);
         usage.observe(&bytes);
         let converted = protocol::convert_response(&bytes, upstream_protocol, caller_protocol);
@@ -724,6 +775,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                         ),
                     )
                     .await;
+                complete_exchange_observers(
+                    &mut exchange_observers,
+                    yabane_extension_api::ExchangeOutcome::Complete,
+                );
                 return api_error(StatusCode::BAD_GATEWAY, err);
             }
         };
@@ -745,6 +800,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 .record(status, usage, requested_streaming, None)
                 .await;
         }
+        complete_exchange_observers(
+            &mut exchange_observers,
+            yabane_extension_api::ExchangeOutcome::Complete,
+        );
         let mut response = Response::new(Body::from(converted));
         *response.status_mut() = status;
         copy_response_headers(response.headers_mut(), &response_headers);
@@ -758,6 +817,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     }
 
     let stream = async_stream::stream! {
+        let mut exchange_observers = exchange_observers;
         let mut upstream = upstream_response.bytes_stream();
         let mut usage = UsageTracker::new(api_type, event_stream);
         let mut converter = converting.then(|| StreamConverter::new(upstream_protocol, caller_protocol));
@@ -767,6 +827,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             match chunk {
                 Ok(chunk) => {
                     first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                    observe_response_chunk(&mut exchange_observers, &chunk);
                     usage.observe(&chunk);
                     if let Some(converter) = &mut converter {
                         match converter.push(&chunk) {
@@ -811,6 +872,12 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 }
             }
         }
+        let exchange_outcome = if conversion_failed {
+            yabane_extension_api::ExchangeOutcome::Interrupted
+        } else {
+            yabane_extension_api::ExchangeOutcome::Complete
+        };
+        complete_exchange_observers(&mut exchange_observers, exchange_outcome);
         let (usage, protocol_failed) = usage.finish();
         let recorded_status = if conversion_failed || protocol_failed { StatusCode::BAD_GATEWAY } else { status };
         if conversion_failed {
@@ -867,6 +934,74 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
     }
     response
+}
+
+fn observed_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<yabane_extension_api::ObservedHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| yabane_extension_api::ObservedHeader {
+            name: name.as_str().to_owned(),
+            value: if sensitive_observed_header(name.as_str()) {
+                "[REDACTED]".to_owned()
+            } else {
+                value.to_str().unwrap_or("[NON-UTF8]").to_owned()
+            },
+        })
+        .collect()
+}
+
+fn sensitive_observed_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "x-api-key"
+            | "cookie"
+            | "set-cookie"
+            | "chatgpt-account-id"
+            | "session-id"
+            | "x-client-request-id"
+    )
+}
+
+fn observe_response_head(
+    observers: &mut [Box<dyn yabane_extension_api::UpstreamExchangeObserver>],
+    status: StatusCode,
+    headers: &[yabane_extension_api::ObservedHeader],
+) {
+    for observer in observers {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.on_response_head(yabane_extension_api::ObservedUpstreamResponseHead {
+                status,
+                headers,
+            });
+        }));
+    }
+}
+
+fn observe_response_chunk(
+    observers: &mut [Box<dyn yabane_extension_api::UpstreamExchangeObserver>],
+    chunk: &bytes::Bytes,
+) {
+    for observer in observers {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.on_response_chunk(chunk);
+        }));
+    }
+}
+
+fn complete_exchange_observers(
+    observers: &mut Vec<Box<dyn yabane_extension_api::UpstreamExchangeObserver>>,
+    outcome: yabane_extension_api::ExchangeOutcome,
+) {
+    for mut observer in observers.drain(..) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer.on_complete(outcome);
+        }));
+    }
 }
 
 pub(crate) fn join_upstream_url(base_url: &str, path_and_query: &str) -> String {

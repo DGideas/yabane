@@ -57,12 +57,12 @@
       "gatewayKey": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Gateway API key (sk-\u2026) for inference endpoints. Provider scopes apply."
+        "description": "Gateway API key (sk-…) for inference endpoints. Provider scopes apply."
       },
       "managementKey": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Management API key (yab_mgmt_\u2026) for control endpoints."
+        "description": "Management API key (yab_mgmt_…) for control endpoints."
       },
       "adminSession": {
         "type": "apiKey",
@@ -148,31 +148,94 @@
         "type": "object",
         "description": "An upstream connection. OAuth tokens and account IDs are never included.",
         "properties": {
-          "id": {"type": "string"},
-          "api_type": {"type": "string", "enum": ["openai_compatible", "openai_chat_completions", "openai_responses", "openai_codex", "anthropic"]},
-          "base_url": {"type": "string"},
-          "socks5_proxy": {"type": "string", "nullable": true},
-          "extra_headers": {"type": "object", "additionalProperties": {"type": "string"}},
-          "extra_body": {"type": "object"},
-          "requires_api_key": {"type": "boolean"},
-          "api_keys": {"type": "array", "items": {"type": "object"}},
-          "subscription_connected": {"type": "boolean"},
-          "subscription_expires_at": {"type": "integer", "nullable": true}
+          "id": {
+            "type": "string"
+          },
+          "api_type": {
+            "type": "string",
+            "enum": [
+              "openai_compatible",
+              "openai_chat_completions",
+              "openai_responses",
+              "openai_codex",
+              "anthropic"
+            ]
+          },
+          "base_url": {
+            "type": "string"
+          },
+          "socks5_proxy": {
+            "type": "string",
+            "nullable": true
+          },
+          "extra_headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "extra_body": {
+            "type": "object"
+          },
+          "requires_api_key": {
+            "type": "boolean"
+          },
+          "api_keys": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "subscription_connected": {
+            "type": "boolean"
+          },
+          "subscription_expires_at": {
+            "type": "integer",
+            "nullable": true
+          }
         }
       },
       "ExtensionView": {
         "type": "object",
         "properties": {
-          "id": {"type": "string"},
-          "name": {"type": "string"},
-          "version": {"type": "string"},
-          "api_version": {"type": "integer"},
-          "description": {"type": "string"},
-          "implementation": {"type": "string", "enum": ["native_rust"]},
-          "included": {"type": "boolean"},
-          "enabled": {"type": "boolean", "description": "Whether this Extension executes Hooks in the current process."},
-          "runtime_configurable": {"type": "boolean", "description": "False when --no-extensions prevents runtime enablement for this process."},
-          "hooks": {"type": "array", "items": {"type": "string"}}
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "api_version": {
+            "type": "integer"
+          },
+          "description": {
+            "type": "string"
+          },
+          "implementation": {
+            "type": "string",
+            "enum": [
+              "native_rust"
+            ]
+          },
+          "included": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this Extension executes Hooks in the current process."
+          },
+          "runtime_configurable": {
+            "type": "boolean",
+            "description": "False when --no-extensions prevents runtime enablement for this process."
+          },
+          "hooks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
       "ProviderView": {
@@ -255,34 +318,143 @@
       },
       "OpenAiDeviceFlow": {
         "type": "object",
-        "required": ["id", "status", "user_code", "verification_uri", "interval_seconds", "expires_at"],
+        "required": [
+          "id",
+          "status",
+          "user_code",
+          "verification_uri",
+          "interval_seconds",
+          "expires_at"
+        ],
         "properties": {
-          "id": {"type": "string"},
-          "status": {"type": "string", "enum": ["pending", "complete", "failed"]},
-          "user_code": {"type": "string"},
-          "verification_uri": {"type": "string", "format": "uri"},
-          "interval_seconds": {"type": "integer"},
-          "expires_at": {"type": "integer"},
-          "error": {"type": "string", "nullable": true}
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "complete",
+              "failed"
+            ]
+          },
+          "user_code": {
+            "type": "string"
+          },
+          "verification_uri": {
+            "type": "string",
+            "format": "uri"
+          },
+          "interval_seconds": {
+            "type": "integer"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
         }
       },
       "RequestFailure": {
         "type": "object",
-        "required":["stage","category","message"],
+        "required": [
+          "stage",
+          "category",
+          "message"
+        ],
         "properties": {
-          "stage":{"type":"string","enum":["upstream_connect","upstream_transport","upstream_response","upstream_stream","protocol_conversion"]},
-          "category":{"type":"string","description":"Stable machine-readable failure category."},
-          "message":{"type":"string","description":"Safe administrator-facing summary."}
+          "stage": {
+            "type": "string",
+            "enum": [
+              "upstream_connect",
+              "upstream_transport",
+              "upstream_response",
+              "upstream_stream",
+              "protocol_conversion"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "Stable machine-readable failure category."
+          },
+          "message": {
+            "type": "string",
+            "description": "Safe administrator-facing summary."
+          }
         }
       },
       "ActivitySettings": {
-        "type":"object","required":["retention_days"],"properties":{"retention_days":{"type":"integer","minimum":1,"maximum":3650}}
+        "type": "object",
+        "required": [
+          "retention_days"
+        ],
+        "properties": {
+          "retention_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3650
+          }
+        }
       },
       "ActivitySummary": {
-        "type":"object","required":["records","estimated_bytes","retention_days"],"properties":{"records":{"type":"integer"},"estimated_bytes":{"type":"integer"},"oldest_at":{"type":"integer","nullable":true},"newest_at":{"type":"integer","nullable":true},"retention_days":{"type":"integer"}}
+        "type": "object",
+        "required": [
+          "records",
+          "estimated_bytes",
+          "retention_days"
+        ],
+        "properties": {
+          "records": {
+            "type": "integer"
+          },
+          "estimated_bytes": {
+            "type": "integer"
+          },
+          "oldest_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "newest_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "retention_days": {
+            "type": "integer"
+          }
+        }
       },
       "ActivityImportResult": {
-        "type":"object","required":["imported","duplicates","expired","total"],"properties":{"imported":{"type":"integer"},"duplicates":{"type":"integer"},"expired":{"type":"integer"},"total":{"type":"integer"},"oldest_at":{"type":"integer","nullable":true},"newest_at":{"type":"integer","nullable":true}}
+        "type": "object",
+        "required": [
+          "imported",
+          "duplicates",
+          "expired",
+          "total"
+        ],
+        "properties": {
+          "imported": {
+            "type": "integer"
+          },
+          "duplicates": {
+            "type": "integer"
+          },
+          "expired": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "oldest_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "newest_at": {
+            "type": "integer",
+            "nullable": true
+          }
+        }
       },
       "RequestLog": {
         "type": "object",
@@ -320,7 +492,11 @@
           "failure": {
             "nullable": true,
             "description": "Structured, safe diagnosis for a failed proxied request. It does not contain credentials, prompt or response content, upstream URLs, proxy addresses, or untrusted upstream error text.",
-            "allOf": [{"$ref": "#/components/schemas/RequestFailure"}]
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RequestFailure"
+              }
+            ]
           },
           "latency_ms": {
             "type": "integer",
@@ -371,28 +547,269 @@
       },
       "Stats": {
         "type": "object",
-        "required": ["requests", "input_tokens", "output_tokens", "cached_tokens", "cost", "successful", "streaming", "latency_ms", "by_provider", "by_model", "buckets"],
+        "required": [
+          "requests",
+          "input_tokens",
+          "output_tokens",
+          "cached_tokens",
+          "cost",
+          "successful",
+          "streaming",
+          "latency_ms",
+          "by_provider",
+          "by_model",
+          "buckets"
+        ],
         "properties": {
-          "requests": {"type": "integer"},
-          "input_tokens": {"type": "integer"},
-          "output_tokens": {"type": "integer"},
-          "cached_tokens": {"type": "integer"},
-          "cost": {"type": "number"},
-          "successful": {"type": "integer"},
-          "streaming": {"type": "integer"},
-          "latency_ms": {"type": "integer", "description": "Total latency across all matching requests."},
-          "by_provider": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityDimensionStats"}},
-          "by_model": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityDimensionStats"}},
-          "buckets": {"type": "array", "items": {"$ref": "#/components/schemas/ActivityBucket"}}
+          "requests": {
+            "type": "integer"
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "successful": {
+            "type": "integer"
+          },
+          "streaming": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "description": "Total latency across all matching requests."
+          },
+          "by_provider": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityDimensionStats"
+            }
+          },
+          "by_model": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityDimensionStats"
+            }
+          },
+          "buckets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityBucket"
+            }
+          }
         }
       },
       "ActivityDimensionStats": {
         "type": "object",
-        "properties": {"name":{"type":"string"},"requests":{"type":"integer"},"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"},"cached_tokens":{"type":"integer"},"cost":{"type":"number"},"errors":{"type":"integer"},"latency_ms":{"type":"integer"}}
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "errors": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "integer"
+          }
+        }
       },
       "ActivityBucket": {
         "type": "object",
-        "properties": {"start":{"type":"integer"},"requests":{"type":"integer"},"tokens":{"type":"integer"},"cached":{"type":"integer"},"cost":{"type":"number"},"latency":{"type":"integer"},"samples":{"type":"integer"},"successful":{"type":"integer"},"errors":{"type":"integer"}}
+        "properties": {
+          "start": {
+            "type": "integer"
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "tokens": {
+            "type": "integer"
+          },
+          "cached": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "latency": {
+            "type": "integer"
+          },
+          "samples": {
+            "type": "integer"
+          },
+          "successful": {
+            "type": "integer"
+          },
+          "errors": {
+            "type": "integer"
+          }
+        }
+      },
+      "TrafficCaptureConfig": {
+        "type": "object",
+        "description": "When active, provider_id and endpoint_id are required together and expires_at must be a future Unix timestamp.",
+        "required": [
+          "active",
+          "remaining",
+          "body_limit",
+          "retention_days"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "remaining": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "expires_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "endpoint_id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "body_limit": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 8388608
+          },
+          "retention_days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30
+          },
+          "redacted_headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "TrafficCaptureStatus": {
+        "type": "object",
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/TrafficCaptureConfig"
+          },
+          "retained": {
+            "type": "integer"
+          },
+          "dropped": {
+            "type": "integer",
+            "description": "Captures or configuration updates dropped because the bounded queue was full or persistence failed."
+          }
+        }
+      },
+      "TrafficCaptureSummary": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "public_model": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "endpoint_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "nullable": true
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "outcome": {
+            "type": "string"
+          }
+        }
+      },
+      "TrafficCaptureHeader": {
+        "type": "object",
+        "required": ["name", "value"],
+        "properties": {
+          "name": { "type": "string" },
+          "value": { "type": "string" }
+        }
+      },
+      "TrafficCaptureRecord": {
+        "type": "object",
+        "description": "Credential-redacted upstream request and response headers and bounded body byte arrays.",
+        "required": [
+          "request_id", "timestamp", "expires_at", "public_model", "upstream_model",
+          "provider_id", "endpoint_id", "caller_protocol", "upstream_protocol", "streaming",
+          "request_headers", "request_body", "request_truncated", "response_headers",
+          "response_body", "response_truncated", "outcome"
+        ],
+        "properties": {
+          "request_id": { "type": "string" },
+          "timestamp": { "type": "integer" },
+          "expires_at": { "type": "integer" },
+          "public_model": { "type": "string" },
+          "upstream_model": { "type": "string" },
+          "provider_id": { "type": "string" },
+          "endpoint_id": { "type": "string" },
+          "caller_protocol": { "type": "string" },
+          "upstream_protocol": { "type": "string" },
+          "streaming": { "type": "boolean" },
+          "request_headers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TrafficCaptureHeader" }
+          },
+          "request_body": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+          "request_truncated": { "type": "boolean" },
+          "status": { "type": "integer", "nullable": true },
+          "response_headers": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/TrafficCaptureHeader" }
+          },
+          "response_body": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+          "response_truncated": { "type": "boolean" },
+          "outcome": { "type": "string", "enum": ["complete", "transport_error", "response_read_error", "interrupted"] }
+        }
       }
     },
     "responses": {
@@ -460,13 +877,30 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["name", "commit", "commit_time", "license", "license_text"],
+                  "required": [
+                    "name",
+                    "commit",
+                    "commit_time",
+                    "license",
+                    "license_text"
+                  ],
                   "properties": {
-                    "name": {"type": "string"},
-                    "commit": {"type": "string"},
-                    "commit_time": {"type": "string", "description": "ISO 8601 Git commit time, or unknown when unavailable"},
-                    "license": {"type": "string"},
-                    "license_text": {"type": "string"}
+                    "name": {
+                      "type": "string"
+                    },
+                    "commit": {
+                      "type": "string"
+                    },
+                    "commit_time": {
+                      "type": "string",
+                      "description": "ISO 8601 Git commit time, or unknown when unavailable"
+                    },
+                    "license": {
+                      "type": "string"
+                    },
+                    "license_text": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -779,7 +1213,17 @@
                     "type": "string"
                   },
                   "input": {
-                    "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "object"}}]
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "object"
+                        }
+                      }
+                    ]
                   },
                   "stream": {
                     "type": "boolean"
@@ -1184,24 +1628,72 @@
     },
     "/admin/auth/keys/{id}": {
       "patch": {
-        "tags": ["Gateway access"],
+        "tags": [
+          "Gateway access"
+        ],
         "summary": "Edit a Gateway API key",
         "description": "Updates any supplied note, expiration, or Provider allowlist field without changing the key secret. Omitted fields remain unchanged; expires_at: null removes expiry and provider_ids: [] grants access to every Provider.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "required": true,
-          "content": {"application/json": {"schema": {"type": "object", "properties": {
-            "note": {"type": "string"},
-            "expires_at": {"type": "integer", "nullable": true},
-            "provider_ids": {"type": "array", "items": {"type": "string"}}
-          }}, "example": {"note": "Production application", "expires_at": null, "provider_ids": []}}}
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "note": {
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "provider_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "example": {
+                "note": "Production application",
+                "expires_at": null,
+                "provider_ids": []
+              }
+            }
+          }
         },
         "responses": {
-          "204": {"$ref": "#/components/responses/NoContent"},
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "404": {"$ref": "#/components/responses/NotFound"}
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       },
       "delete": {
@@ -1242,49 +1734,216 @@
     },
     "/admin/openai-subscriptions/device-code": {
       "post": {
-        "tags": ["Providers"],
+        "tags": [
+          "Providers"
+        ],
         "summary": "Start OpenAI subscription device sign-in",
         "description": "Starts OpenAI device-code OAuth for a new Provider or a new Endpoint on an existing Provider. When socks5_proxy is set, device authorization, token exchange, refresh, and inference use that proxy. OAuth tokens are never returned by this API.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["provider_id"], "properties": {"provider_id": {"type": "string"}, "provider_name": {"type": "string", "nullable": true}, "endpoint_id": {"type": "string", "nullable": true}, "socks5_proxy": {"type": "string", "nullable": true, "pattern": "^socks5h?://"}}}}}},
-        "responses": {"201": {"description": "Device sign-in started", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "400": {"$ref": "#/components/responses/BadRequest"}, "401": {"$ref": "#/components/responses/Unauthorized"}, "502": {"description": "OpenAI OAuth service unavailable"}}
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "provider_id"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string"
+                  },
+                  "provider_name": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "endpoint_id": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true,
+                    "pattern": "^socks5h?://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Device sign-in started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiDeviceFlow"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "502": {
+            "description": "OpenAI OAuth service unavailable"
+          }
+        }
       }
     },
     "/admin/openai-subscriptions/device-code/{id}": {
       "get": {
-        "tags": ["Providers"],
+        "tags": [
+          "Providers"
+        ],
         "summary": "Poll OpenAI subscription device sign-in",
         "description": "Returns pending status or completes OAuth and atomically creates the connected subscription Endpoint.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "responses": {"200": {"description": "Current device sign-in state", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}}
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current device sign-in state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiDeviceFlow"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
       }
     },
     "/admin/extensions": {
       "get": {
-        "tags": ["Extensions"],
+        "tags": [
+          "Extensions"
+        ],
         "summary": "List extensions included in this build",
         "description": "Returns trusted native Rust extensions, their current enabled state, Extension API versions, and declared Hook stages. It does not expose a runtime installation endpoint.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
         "responses": {
-          "200": {"description": "Included extensions", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ExtensionView"}}}}},
-          "401": {"$ref": "#/components/responses/Unauthorized"}
+          "200": {
+            "description": "Included extensions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ExtensionView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       }
     },
     "/admin/extensions/{id}": {
       "patch": {
-        "tags": ["Extensions"],
+        "tags": [
+          "Extensions"
+        ],
         "summary": "Enable or disable a compiled extension",
         "description": "Persists the Extension enabled state without changing its own configuration. Returns 409 when this process was started with --no-extensions.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}}}}}},
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
-          "200": {"description": "Updated extension", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ExtensionView"}}}},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "404": {"$ref": "#/components/responses/NotFound"},
-          "409": {"description": "All extensions are disabled by the startup option"}
+          "200": {
+            "description": "Updated extension",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "All extensions are disabled by the startup option"
+          }
         }
       }
     },
@@ -1403,7 +2062,7 @@
                   "base_url": "https://api.example.com/v1",
                   "socks5_proxy": null,
                   "requires_api_key": true,
-                  "api_key": "sk-\u2026"
+                  "api_key": "sk-…"
                 }
               }
             }
@@ -1614,7 +2273,7 @@
                 "base_url": "https://api.example.com/v1",
                 "socks5_proxy": null,
                 "requires_api_key": true,
-                "api_key": "sk-\u2026"
+                "api_key": "sk-…"
               }
             }
           }
@@ -1687,7 +2346,7 @@
               "example": {
                 "endpoint_id": "openai",
                 "name": "Production key",
-                "secret": "sk-\u2026",
+                "secret": "sk-…",
                 "weight": 100
               }
             }
@@ -1813,19 +2472,21 @@
                         },
                         "api_key_id": {
                           "type": "string",
-                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."
+                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint or an Endpoint configured without authentication."
                         },
                         "upstream_model": {
                           "type": "string"
                         },
                         "weight": {
                           "type": "integer",
-                          "minimum": 1
+                          "minimum": 0,
+                          "maximum": 100,
+                          "description": "Exact traffic percentage. A 0% share disables the target; all shares must total 100."
                         },
                         "enabled": {
                           "type": "boolean",
                           "default": true,
-                          "description": "Disabled targets remain configured but receive no traffic. Enabled target percentages must total 100."
+                          "description": "Optional compatibility field. False sets the target's effective share to 0; a 0% weight is always inactive."
                         }
                       }
                     }
@@ -1892,7 +2553,10 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["pattern", "targets"],
+                "required": [
+                  "pattern",
+                  "targets"
+                ],
                 "properties": {
                   "pattern": {
                     "type": "string",
@@ -1902,14 +2566,37 @@
                     "type": "array",
                     "items": {
                       "type": "object",
-                      "required": ["provider_id", "endpoint_id", "upstream_model", "weight"],
+                      "required": [
+                        "provider_id",
+                        "endpoint_id",
+                        "upstream_model",
+                        "weight"
+                      ],
                       "properties": {
-                        "provider_id": {"type": "string"},
-                        "endpoint_id": {"type": "string"},
-                        "api_key_id": {"type": "string", "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint."},
-                        "upstream_model": {"type": "string"},
-                        "weight": {"type": "integer", "minimum": 1},
-                        "enabled": {"type": "boolean", "default": true, "description": "Disabled targets remain configured but receive no traffic. Enabled target percentages must total 100."}
+                        "provider_id": {
+                          "type": "string"
+                        },
+                        "endpoint_id": {
+                          "type": "string"
+                        },
+                        "api_key_id": {
+                          "type": "string",
+                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint or an Endpoint configured without authentication."
+                        },
+                        "upstream_model": {
+                          "type": "string"
+                        },
+                        "weight": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 100,
+                          "description": "Exact traffic percentage. A 0% share disables the target; all shares must total 100."
+                        },
+                        "enabled": {
+                          "type": "boolean",
+                          "default": true,
+                          "description": "Optional compatibility field. False sets the target's effective share to 0; a 0% weight is always inactive."
+                        }
                       }
                     }
                   }
@@ -1919,10 +2606,18 @@
           }
         },
         "responses": {
-          "204": {"$ref": "#/components/responses/NoContent"},
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "404": {"$ref": "#/components/responses/NotFound"}
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       },
       "delete": {
@@ -2025,34 +2720,118 @@
     },
     "/admin/activity/logs/page": {
       "get": {
-        "tags": ["Activity"],
+        "tags": [
+          "Activity"
+        ],
         "summary": "Paginated request logs",
         "description": "Returns newest-first request logs with server-side filtering. At most 100 records are returned per page.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
         "parameters": [
-          {"name": "since", "in": "query", "schema": {"type": "integer", "default": 0}, "description": "Unix seconds lower bound."},
-          {"name": "until", "in": "query", "schema": {"type": "integer"}, "description": "Unix seconds inclusive upper bound used to keep pagination stable."},
-          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 100}},
-          {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}},
-          {"name": "provider", "in": "query", "schema": {"type": "string"}},
-          {"name": "query", "in": "query", "schema": {"type": "string"}, "description": "Case-insensitive request ID, model, Provider, or Endpoint search."},
-          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["success", "error"]}}
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Unix seconds lower bound."
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Unix seconds inclusive upper bound used to keep pagination stable."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 100,
+              "maximum": 100
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "name": "provider",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Case-insensitive request ID, model, Provider, or Endpoint search."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "success",
+                "error"
+              ]
+            }
+          }
         ],
         "responses": {
           "200": {
             "description": "A page of newest-first request logs and the total filtered count.",
-            "content": {"application/json": {"schema": {
-              "type": "object",
-              "required": ["data", "total", "offset", "limit"],
-              "properties": {
-                "data": {"type": "array", "items": {"$ref": "#/components/schemas/RequestLog"}},
-                "total": {"type": "integer"},
-                "offset": {"type": "integer"},
-                "limit": {"type": "integer"}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data",
+                    "total",
+                    "offset",
+                    "limit"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RequestLog"
+                      }
+                    },
+                    "total": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    }
+                  }
+                }
               }
-            }}}
+            }
           },
-          "401": {"$ref": "#/components/responses/Unauthorized"}
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       }
     },
@@ -2082,19 +2861,28 @@
           {
             "name": "until",
             "in": "query",
-            "schema": {"type": "integer"},
+            "schema": {
+              "type": "integer"
+            },
             "description": "Unix seconds upper bound; defaults to now."
           },
           {
             "name": "provider",
             "in": "query",
-            "schema": {"type": "string"},
+            "schema": {
+              "type": "string"
+            },
             "description": "Optional exact Provider ID filter."
           },
           {
             "name": "buckets",
             "in": "query",
-            "schema": {"type": "integer", "default": 24, "minimum": 1, "maximum": 120}
+            "schema": {
+              "type": "integer",
+              "default": 24,
+              "minimum": 1,
+              "maximum": 120
+            }
           }
         ],
         "responses": {
@@ -2166,7 +2954,8 @@
                     "minimum": 1
                   },
                   "enabled": {
-                    "type": "boolean"
+                    "type": "boolean",
+                    "description": "A key referenced by a retained model-route target cannot be disabled until that target is updated or deleted."
                   }
                 }
               },
@@ -2186,6 +2975,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           }
         }
       },
@@ -2290,7 +3082,7 @@
           "Providers"
         ],
         "summary": "Update an API endpoint",
-        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed. OpenAI subscription Endpoints accept only SOCKS5 proxy changes; their API type, base URL, and credential requirement remain fixed.",
+        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed. Disabling required authentication atomically clears credential references from model-route targets. Enabling it is rejected while keyless route targets still refer to the Endpoint. OpenAI subscription Endpoints accept only SOCKS5 proxy changes; their API type, base URL, and credential requirement remain fixed.",
         "security": [
           {
             "managementKey": []
@@ -2378,6 +3170,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
           }
         }
       }
@@ -2580,7 +3375,16 @@
         ],
         "summary": "Export retained activity records",
         "description": "Downloads a versioned portable JSON snapshot containing routing metadata and usage, never prompt or response content.",
-        "parameters": [{"name":"since","in":"query","schema":{"type":"integer"},"description":"Include records at or after this Unix timestamp; omit for all retained records."}],
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Include records at or after this Unix timestamp; omit for all retained records."
+          }
+        ],
         "security": [
           {
             "managementKey": []
@@ -2641,20 +3445,128 @@
     },
     "/admin/activity/export/preview": {
       "get": {
-        "tags": ["Activity"], "summary": "Preview an activity export",
-        "parameters": [{"name":"since","in":"query","schema":{"type":"integer"}}],
-        "responses": {"200":{"description":"Export record count, approximate size, time bounds, and retention","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySummary"}}}},"401":{"$ref":"#/components/responses/Unauthorized"}}
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Preview an activity export",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Export record count, approximate size, time bounds, and retention",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivitySummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
       }
     },
     "/admin/activity/settings": {
-      "get": {"tags":["Activity"],"summary":"Get activity retention","responses":{"200":{"description":"Retention settings","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"401":{"$ref":"#/components/responses/Unauthorized"}}},
-      "patch": {"tags":["Activity"],"summary":"Update and immediately enforce activity retention","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"responses":{"200":{"description":"Saved retention settings","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivitySettings"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"}}}
+      "get": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Get activity retention",
+        "responses": {
+          "200": {
+            "description": "Retention settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivitySettings"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Update and immediately enforce activity retention",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivitySettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved retention settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivitySettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
     },
     "/admin/activity/import/preview": {
       "post": {
-        "tags":["Activity"],"summary":"Validate and classify an activity import without writing data","description":"Returns the same idempotency and retention classification used by import.",
-        "requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object"}}}},
-        "responses":{"200":{"description":"Prospective import counts","content":{"application/json":{"schema":{"$ref":"#/components/schemas/ActivityImportResult"}}}},"400":{"$ref":"#/components/responses/BadRequest"},"401":{"$ref":"#/components/responses/Unauthorized"}}
+        "tags": [
+          "Activity"
+        ],
+        "summary": "Validate and classify an activity import without writing data",
+        "description": "Returns the same idempotency and retention classification used by import.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Prospective import counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityImportResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
       }
     },
     "/admin/activity/import": {
@@ -2732,6 +3644,200 @@
             "$ref": "#/components/responses/Unauthorized"
           }
         }
+      }
+    },
+    "/admin/extensions/traffic-capture/status": {
+      "get": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Get Traffic Capture status",
+        "responses": {
+          "200": {
+            "description": "Capture status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficCaptureStatus"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Start or configure a bounded capture session",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrafficCaptureConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated capture status"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      }
+    },
+    "/admin/extensions/traffic-capture/stop": {
+      "post": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Stop Traffic Capture",
+        "responses": {
+          "200": {
+            "description": "Stopped capture status"
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      }
+    },
+    "/admin/extensions/traffic-capture/captures": {
+      "get": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "List retained traffic captures",
+        "responses": {
+          "200": {
+            "description": "Capture summaries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrafficCaptureSummary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Delete all retained traffic captures",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      }
+    },
+    "/admin/extensions/traffic-capture/captures/{request_id}": {
+      "parameters": [
+        {
+          "name": "request_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Get one retained traffic capture",
+        "responses": {
+          "200": {
+            "description": "Captured exchange",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficCaptureRecord"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Extensions"
+        ],
+        "summary": "Delete one retained traffic capture",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ]
       }
     }
   }

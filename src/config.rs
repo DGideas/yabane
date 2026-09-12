@@ -25,6 +25,8 @@ pub struct AppState {
     pub activity: ActivityStore,
     pub routes: RouteStore,
     pub extensions: Arc<crate::extensions::ExtensionRegistry>,
+    #[cfg(feature = "extension-traffic-capture")]
+    pub traffic_capture: Arc<yabane_extension_traffic_capture::TrafficCapture>,
     pub openai_oauth: crate::openai_subscription::OAuthState,
 }
 

@@ -42,14 +42,14 @@ impl ModelRoute {
         let total: u64 = self
             .targets
             .iter()
-            .filter(|target| target.enabled)
+            .filter(|target| target.enabled && target.weight > 0)
             .map(|target| u64::from(target.weight) / divisor)
             .sum();
         let position = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
         let mut cumulative = 0;
         self.targets
             .iter()
-            .filter(|target| target.enabled)
+            .filter(|target| target.enabled && target.weight > 0)
             .find(|target| {
                 cumulative += u64::from(target.weight) / divisor;
                 position < cumulative
@@ -195,6 +195,29 @@ mod tests {
             .map(|_| route.select_target().unwrap().upstream_model.as_str())
             .collect();
         assert_eq!(selected, ["one", "two", "two", "one", "two", "two"]);
+    }
+
+    #[test]
+    fn zero_weight_targets_are_inactive_even_if_legacy_data_marks_them_enabled() {
+        let route = ModelRoute {
+            pattern: "model".to_owned(),
+            targets: vec![
+                RouteTarget {
+                    provider_id: "provider".to_owned(),
+                    endpoint_id: "zero".to_owned(),
+                    api_key_id: "key".to_owned(),
+                    upstream_model: "zero".to_owned(),
+                    weight: 0,
+                    enabled: true,
+                },
+                route("active", "active", 100).targets.remove(0),
+            ],
+            cursor: Default::default(),
+        };
+
+        for _ in 0..4 {
+            assert_eq!(route.select_target().unwrap().upstream_model, "active");
+        }
     }
 
     #[test]
