@@ -40,6 +40,10 @@
       "description": "Providers, endpoints, upstream keys, request defaults, and model discovery."
     },
     {
+      "name": "Extensions",
+      "description": "Trusted native extensions compiled into this Yabane build."
+    },
+    {
       "name": "Model routes",
       "description": "Public model aliases with weighted destinations."
     },
@@ -156,6 +160,21 @@
           "subscription_expires_at": {"type": "integer", "nullable": true}
         }
       },
+      "ExtensionView": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "name": {"type": "string"},
+          "version": {"type": "string"},
+          "api_version": {"type": "integer"},
+          "description": {"type": "string"},
+          "implementation": {"type": "string", "enum": ["native_rust"]},
+          "included": {"type": "boolean"},
+          "enabled": {"type": "boolean", "description": "Whether this Extension executes Hooks in the current process."},
+          "runtime_configurable": {"type": "boolean", "description": "False when --no-extensions prevents runtime enablement for this process."},
+          "hooks": {"type": "array", "items": {"type": "string"}}
+        }
+      },
       "ProviderView": {
         "type": "object",
         "properties": {
@@ -247,6 +266,15 @@
           "error": {"type": "string", "nullable": true}
         }
       },
+      "RequestFailure": {
+        "type": "object",
+        "required":["stage","category","message"],
+        "properties": {
+          "stage":{"type":"string","enum":["upstream_connect","upstream_transport","upstream_response","upstream_stream","protocol_conversion"]},
+          "category":{"type":"string","description":"Stable machine-readable failure category."},
+          "message":{"type":"string","description":"Safe administrator-facing summary."}
+        }
+      },
       "ActivitySettings": {
         "type":"object","required":["retention_days"],"properties":{"retention_days":{"type":"integer","minimum":1,"maximum":3650}}
       },
@@ -288,6 +316,11 @@
           "status": {
             "type": "integer",
             "description": "Final proxy outcome. Streaming protocol-conversion failures are recorded as 502 even when HTTP response headers were sent before the failure was detected."
+          },
+          "failure": {
+            "nullable": true,
+            "description": "Structured, safe diagnosis for a failed proxied request. It does not contain credentials, prompt or response content, upstream URLs, proxy addresses, or untrusted upstream error text.",
+            "allOf": [{"$ref": "#/components/schemas/RequestFailure"}]
           },
           "latency_ms": {
             "type": "integer",
@@ -1227,6 +1260,34 @@
         "responses": {"200": {"description": "Current device sign-in state", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/OpenAiDeviceFlow"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "404": {"$ref": "#/components/responses/NotFound"}}
       }
     },
+    "/admin/extensions": {
+      "get": {
+        "tags": ["Extensions"],
+        "summary": "List extensions included in this build",
+        "description": "Returns trusted native Rust extensions, their current enabled state, Extension API versions, and declared Hook stages. It does not expose a runtime installation endpoint.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "responses": {
+          "200": {"description": "Included extensions", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ExtensionView"}}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/admin/extensions/{id}": {
+      "patch": {
+        "tags": ["Extensions"],
+        "summary": "Enable or disable a compiled extension",
+        "description": "Persists the Extension enabled state without changing its own configuration. Returns 409 when this process was started with --no-extensions.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}}}}}},
+        "responses": {
+          "200": {"description": "Updated extension", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ExtensionView"}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {"description": "All extensions are disabled by the startup option"}
+        }
+      }
+    },
     "/admin/providers": {
       "get": {
         "tags": [
@@ -1959,6 +2020,39 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           }
+        }
+      }
+    },
+    "/admin/activity/logs/page": {
+      "get": {
+        "tags": ["Activity"],
+        "summary": "Paginated request logs",
+        "description": "Returns newest-first request logs with server-side filtering. At most 100 records are returned per page.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [
+          {"name": "since", "in": "query", "schema": {"type": "integer", "default": 0}, "description": "Unix seconds lower bound."},
+          {"name": "until", "in": "query", "schema": {"type": "integer"}, "description": "Unix seconds inclusive upper bound used to keep pagination stable."},
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 100}},
+          {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}},
+          {"name": "provider", "in": "query", "schema": {"type": "string"}},
+          {"name": "query", "in": "query", "schema": {"type": "string"}, "description": "Case-insensitive request ID, model, Provider, or Endpoint search."},
+          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["success", "error"]}}
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of newest-first request logs and the total filtered count.",
+            "content": {"application/json": {"schema": {
+              "type": "object",
+              "required": ["data", "total", "offset", "limit"],
+              "properties": {
+                "data": {"type": "array", "items": {"$ref": "#/components/schemas/RequestLog"}},
+                "total": {"type": "integer"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"}
+              }
+            }}}
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"}
         }
       }
     },

@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/admin/openai-subscriptions/device-code/{id}",
             get(poll_openai_subscription),
         )
+        .route("/admin/extensions", get(list_extensions))
+        .route("/admin/extensions/{id}", patch(update_extension))
         .route(
             "/admin/routes",
             get(list_global_routes).post(create_global_route),
@@ -52,6 +54,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             patch(update_global_route).delete(delete_global_route),
         )
         .route("/admin/activity/logs", get(activity_logs))
+        .route("/admin/activity/logs/page", get(activity_log_page))
         .route("/admin/activity/stats", get(activity_stats))
         .route("/admin/activity/export", get(export_activity))
         .route(
@@ -585,9 +588,19 @@ async fn persist_routes_or_error(routes: &[routes::ModelRoute]) -> Response {
 struct ActivityQuery {
     since: Option<u64>,
     limit: Option<usize>,
+    offset: Option<usize>,
+    query: Option<String>,
+    status: Option<String>,
     provider: Option<String>,
     buckets: Option<usize>,
     until: Option<u64>,
+}
+#[derive(Serialize)]
+struct ActivityLogPage {
+    data: Vec<crate::activity::RequestLog>,
+    total: usize,
+    offset: usize,
+    limit: usize,
 }
 async fn activity_logs(
     State(state): State<AppState>,
@@ -603,6 +616,31 @@ async fn activity_logs(
             )
             .await,
     )
+}
+async fn activity_log_page(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
+) -> impl IntoResponse {
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    let (data, total) = state
+        .activity
+        .query_logs(crate::activity::ActivityLogQuery {
+            since: query.since.unwrap_or(0),
+            until: query.until.unwrap_or_else(now),
+            provider: query.provider.as_deref(),
+            text: query.query.as_deref(),
+            status: query.status.as_deref(),
+            offset,
+            limit,
+        })
+        .await;
+    axum::Json(ActivityLogPage {
+        data,
+        total,
+        offset,
+        limit,
+    })
 }
 async fn activity_stats(
     State(state): State<AppState>,
@@ -732,6 +770,39 @@ async fn import_activity(State(state): State<AppState>, body: Bytes) -> Response
     match state.activity.import(import).await {
         Ok(result) => axum::Json(result).into_response(),
         Err(message) => api_error(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+async fn list_extensions(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.extensions.views())
+}
+
+#[derive(Deserialize)]
+struct ExtensionUpdate {
+    enabled: bool,
+}
+
+async fn update_extension(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Json(input): axum::Json<ExtensionUpdate>,
+) -> Response {
+    match state.extensions.set_enabled(&id, input.enabled).await {
+        Ok(extension) => axum::Json(extension).into_response(),
+        Err(crate::extensions::UpdateError::NotFound) => {
+            api_error(StatusCode::NOT_FOUND, "Extension not found")
+        }
+        Err(crate::extensions::UpdateError::DisabledByCli) => api_error(
+            StatusCode::CONFLICT,
+            "Extensions are disabled for this process by --no-extensions",
+        ),
+        Err(crate::extensions::UpdateError::Persist(error)) => {
+            error!(%error, extension = %id, "persist extension settings");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not persist extension settings",
+            )
+        }
     }
 }
 
@@ -1465,6 +1536,10 @@ fn validate_extra_headers(
             "host"
                 | "authorization"
                 | "x-api-key"
+                | "cookie"
+                | "set-cookie"
+                | "chatgpt-account-id"
+                | "originator"
                 | "content-length"
                 | "connection"
                 | "keep-alive"

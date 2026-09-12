@@ -17,12 +17,20 @@ struct ApiErrorBody {
 }
 
 pub fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
+    api_error_with_type(status, message, "yabane_error")
+}
+
+pub fn api_error_with_type(
+    status: StatusCode,
+    message: impl Into<String>,
+    kind: &'static str,
+) -> Response {
     (
         status,
         axum::Json(ApiError {
             error: ApiErrorBody {
                 message: message.into(),
-                kind: "yabane_error",
+                kind,
             },
         }),
     )

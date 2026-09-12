@@ -1,9 +1,21 @@
+[workspace]
+members = [
+    ".",
+    "crates/yabane-extension-api",
+    "extensions/request-defaults",
+]
+resolver = "2"
+
 [package]
 name = "yabane"
 version = "0.1.0"
 edition = "2024"
 description = "A clear, reliable gateway to every LLM."
 license = "MIT"
+
+[features]
+default = ["extension-request-defaults"]
+extension-request-defaults = ["dep:yabane-extension-request-defaults"]
 
 [dependencies]
 argon2 = "0.5"
@@ -22,6 +34,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
+yabane-extension-api = { path = "crates/yabane-extension-api" }
+yabane-extension-request-defaults = { path = "extensions/request-defaults", optional = true }
 
 [profile.release]
 lto = "thin"

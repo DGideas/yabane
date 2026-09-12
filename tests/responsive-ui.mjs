@@ -21,6 +21,23 @@ for (const project of projects) {
       await context.addCookies([{ name: 'yabane_session', value: sessionCookie, url: base, httpOnly: true, sameSite: 'Strict' }]);
     }
     const page = await context.newPage();
+    await page.route('**/admin/providers', async route => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const response = await route.fetch();
+      if (!response.ok()) return route.fulfill({response});
+      const body = await response.json();
+      body.push({
+        id: 'ui-subscription', name: 'UI subscription fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+        endpoints: [{
+          id: 'chatgpt', api_type: 'openai_codex', base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_api_key: false, api_keys: [], subscription_connected: true,
+          subscription_expires_at: 1,
+        }],
+        discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
+        models_discovered_at: 1, model_discovery_error: null,
+      });
+      await route.fulfill({response, json: body});
+    });
     const testLiveRefresh = project.name === 'desktop-chrome';
     if (testLiveRefresh) await page.clock.install();
     await page.goto(base, { waitUntil: 'domcontentloaded' });
@@ -73,7 +90,25 @@ for (const project of projects) {
       await page.keyboard.press('Escape');
       if (await mobileNavToggle.getAttribute('aria-expanded') !== 'false') throw new Error(`${project.name}: Escape does not close mobile navigation`);
       await page.evaluate(() => document.querySelector('[data-view="home"]').click());
-    } else if (await mobileNavToggle.isVisible()) throw new Error(`${project.name}: mobile navigation trigger is visible on a wide layout`);
+    } else {
+      if (await mobileNavToggle.isVisible()) throw new Error(`${project.name}: mobile navigation trigger is visible on a wide layout`);
+      const aboutFooter = page.locator('#console-sidebar .about-link');
+      const beforeScroll = await aboutFooter.boundingBox();
+      await page.evaluate(() => {
+        const spacer = document.createElement('div');
+        spacer.id = 'sidebar-scroll-test-spacer';
+        spacer.style.height = '150vh';
+        document.querySelector('main').append(spacer);
+        window.scrollTo(0, document.documentElement.scrollHeight);
+      });
+      await page.waitForFunction(() => window.scrollY > 0);
+      const afterScroll = await aboutFooter.boundingBox();
+      if (!beforeScroll || !afterScroll || Math.abs(afterScroll.y - beforeScroll.y) > 1) throw new Error(`${project.name}: About Yabane footer moves with page content`);
+      await page.evaluate(() => {
+        window.scrollTo(0, 0);
+        document.querySelector('#sidebar-scroll-test-spacer')?.remove();
+      });
+    }
 
     for (const emptyState of [
       {view: 'access', container: '#gateway-keys-empty', action: '#empty-gateway-key', dialog: '#gateway-key-dialog'},
@@ -91,6 +126,23 @@ for (const project of projects) {
         await page.keyboard.press('Escape');
       }
     }
+    await page.evaluate(() => document.querySelector('[data-view="extensions"]').click());
+    if (await page.locator('.extension-build-commands code').allTextContents().then(values => !values.includes('cargo build --release') || !values.includes('cargo build --release --no-default-features'))) throw new Error(`${project.name}: Extensions page omits build instructions`);
+    const developmentLink = page.locator('.extension-development-link');
+    if (!(await developmentLink.isVisible()) || await developmentLink.getAttribute('href') !== 'https://github.com/DGideas/yabane/blob/master/.agents/skills/yabane-extensions/SKILL.md') throw new Error(`${project.name}: Extensions page omits the development guide link`);
+    const requestDefaultsExtension = page.locator('.extension-card').filter({hasText: 'request-defaults'});
+    if (!(await requestDefaultsExtension.isVisible())) throw new Error(`${project.name}: Request Defaults is missing from Extensions`);
+    if (!(await requestDefaultsExtension.getByText('Native Rust', {exact: true}).isVisible())) throw new Error(`${project.name}: extension implementation type is not visible`);
+    if (!(await requestDefaultsExtension.getByText('v1', {exact: true}).isVisible())) throw new Error(`${project.name}: Extension API version is not visible`);
+    const extensionToggle = requestDefaultsExtension.locator('[data-extension-toggle="request-defaults"]');
+    if (!(await extensionToggle.isChecked()) || !(await extensionToggle.isEnabled())) throw new Error(`${project.name}: Request Defaults does not expose its enabled runtime setting`);
+    if (project.name === 'desktop-chrome') {
+      await extensionToggle.evaluate(input => input.click());
+      await requestDefaultsExtension.getByText('Disabled', {exact: true}).waitFor();
+      await requestDefaultsExtension.locator('[data-extension-toggle="request-defaults"]').evaluate(input => input.click());
+      await requestDefaultsExtension.getByText('Enabled', {exact: true}).waitFor();
+    }
+    await assertNoPageOverflow(page, project.name, 'Extensions page');
     await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
     const stretchedProviderLabels = await page.locator('.provider-list-main code').evaluateAll(labels => labels.filter(label => {
       const range = document.createRange();
@@ -119,6 +171,11 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('[data-view="access"]').click());
     const editGatewayKey = page.locator('.edit-gateway-key').first();
     if (await editGatewayKey.isVisible()) {
+      const firstKey = await page.evaluate(async () => (await (await fetch('/admin/auth')).json()).api_keys[0]);
+      const listedKey = page.locator('#gateway-keys .listed-key').first();
+      if (await listedKey.locator('code').textContent() !== firstKey.prefix) throw new Error(`${project.name}: API key list does not use the masked key prefix`);
+      if ((await listedKey.evaluate(element => element.outerHTML)).includes(firstKey.secret)) throw new Error(`${project.name}: API key list embeds the full secret in its markup`);
+      if (!(await listedKey.locator('.icon-copy-key[aria-label="Copy API key"]').isVisible())) throw new Error(`${project.name}: masked API key cannot be copied`);
       await editGatewayKey.click();
       await assertDialog(page, '#edit-gateway-key-dialog', project.name);
       await page.locator('#edit-gateway-key-dialog .close-edit-gateway-key').first().click();
@@ -145,7 +202,10 @@ for (const project of projects) {
     await page.locator('#help-dialog .close-help').first().click();
     await page.evaluate(() => document.querySelector('.open-about').click());
     await assertDialog(page, '#about-dialog', project.name);
-    if (await page.getByText('Reproducible from Git').count()) throw new Error(`${project.name}: About dialog still shows redundant build text`);
+    if (await page.getByText('Built from source').count()) throw new Error(`${project.name}: About dialog still shows implementation-focused build text`);
+    if (await page.getByText('Open source LLM gateway').count() !== 1) throw new Error(`${project.name}: About dialog is missing its product descriptor`);
+    const aboutBodyPadding = await page.locator('#about-dialog .about-body').evaluate(element => parseFloat(getComputedStyle(element).paddingTop));
+    if (aboutBodyPadding < 36) throw new Error(`${project.name}: About build identity is too close to the hero`);
     const githubLink = page.locator('#about-dialog a[href="https://github.com/DGideas/yabane"]');
     if (await githubLink.count() !== 1 || await githubLink.getAttribute('target') !== '_blank') throw new Error(`${project.name}: About dialog is missing the project GitHub link`);
     const logoAnimation = await page.locator('#about-dialog .about-logo').evaluate(element => getComputedStyle(element).animationName);
@@ -168,13 +228,61 @@ for (const project of projects) {
     if (await page.locator('#create-provider').textContent() !== 'Connect OpenAI') throw new Error(`${project.name}: subscription setup has the wrong primary action`);
     await page.locator('#provider-dialog .close-dialog').first().click();
     await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+    const subscriptionProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-subscription/model-id'})});
+    await subscriptionProvider.click();
+    const credential = page.locator('.subscription-credential');
+    await credential.waitFor({state: 'visible'});
+    if (await credential.getByText('Automatic renewal enabled', {exact: true}).count() !== 1) throw new Error(`${project.name}: connected OpenAI subscription does not present automatic renewal as its primary state`);
+    if (await credential.getByText(/^Token expires /).count()) throw new Error(`${project.name}: OpenAI subscription still presents access-token expiry as its primary state`);
+    const details = credential.locator('.credential-details');
+    if (await details.count() !== 1 || await details.getAttribute('open') !== null) throw new Error(`${project.name}: OpenAI access-token details are missing or expanded by default`);
+    await details.locator('summary').click();
+    const detailText = await details.locator('p').textContent();
+    if (!detailText.includes('current access token') || !detailText.includes('next request')) throw new Error(`${project.name}: elapsed OpenAI access-token detail does not explain lazy renewal`);
+    await page.locator('#back-to-providers').click();
+    await page.locator('#provider-list-page').waitFor({state: 'visible'});
     const firstProvider = page.locator('#providers .provider-list-item').first();
     if (await firstProvider.count()) {
       await firstProvider.click();
+      const defaultsCard = page.locator('.defaults-card');
+      const defaultsIncluded = await defaultsCard.getByText(/^Extension (enabled|disabled)/).count();
+      if (defaultsIncluded) {
+        if (!(await defaultsCard.getByRole('button', {name: 'Configure'}).isVisible())) throw new Error(`${project.name}: included Request Defaults cannot be configured`);
+        if (await defaultsCard.getByRole('button', {name: 'View extension'}).count()) throw new Error(`${project.name}: included Request Defaults retains a redundant View extension action`);
+      } else {
+        if (!(await defaultsCard.getByRole('button', {name: 'How to include'}).isVisible())) throw new Error(`${project.name}: unavailable Request Defaults does not explain how to include it`);
+      }
       await page.locator('.edit-provider').click();
       await assertDialog(page, '#provider-identity-dialog', project.name);
-      if (!(await page.locator('#provider-identity-form [name="id"]').isDisabled())) throw new Error(`${project.name}: Provider ID is editable after creation`);
+      const immutableProviderId = page.locator('#provider-identity-form [name="id"]');
+      if (!(await immutableProviderId.isDisabled())) throw new Error(`${project.name}: Provider ID is editable after creation`);
+      if (await page.locator('#provider-identity-form .immutable-badge').textContent() !== 'Permanent') throw new Error(`${project.name}: Provider ID lacks an explicit permanent marker`);
+      const immutableStyles = await immutableProviderId.evaluate(element => { const style = getComputedStyle(element); return {backgroundColor: style.backgroundColor, cursor: style.cursor}; });
+      if (immutableStyles.backgroundColor === 'rgb(255, 255, 255)' || immutableStyles.cursor !== 'not-allowed') throw new Error(`${project.name}: Provider ID does not look visibly immutable`);
+      if (await page.locator('#provider-id-immutable-help strong').textContent() !== 'Cannot be changed after creation.') throw new Error(`${project.name}: Provider ID immutability is not stated directly`);
       await page.locator('#provider-identity-dialog .close-provider-identity').first().click();
+      const coverageBox = await page.locator('.endpoint-coverage').boundingBox();
+      const insightsBox = await page.locator('.model-insights').boundingBox();
+      if (!coverageBox || !insightsBox || coverageBox.x > insightsBox.x + 2 || coverageBox.width < insightsBox.width - 4) throw new Error(`${project.name}: Endpoint coverage remains squeezed against the right edge of the model summary`);
+      const browseCatalog = page.locator('.browse-provider-models');
+      if (!(await browseCatalog.isDisabled())) {
+        await browseCatalog.click();
+        const [catalogBox, overviewBox, defaultsBox] = await Promise.all([
+          page.locator('.model-summary-card').boundingBox(),
+          page.locator('.provider-overview').boundingBox(),
+          page.locator('.defaults-card').boundingBox(),
+        ]);
+        if (!catalogBox || !overviewBox || catalogBox.width < overviewBox.width - 4) throw new Error(`${project.name}: expanded model catalog does not use the full overview width`);
+        if (!defaultsBox || defaultsBox.y < catalogBox.y + catalogBox.height - 2) throw new Error(`${project.name}: Request defaults remains beside the expanded model catalog`);
+        if (await page.locator('.model-table').evaluate(element => element.scrollWidth > element.clientWidth + 1)) throw new Error(`${project.name}: model catalog requires horizontal scrolling`);
+        const modelSearch = page.locator('.model-browser-toolbar [role="searchbox"]');
+        await modelSearch.fill('gpt');
+        if (!(await page.locator('.model-search-clear').isVisible())) throw new Error(`${project.name}: model catalog does not expose its clear-search action`);
+        if (await modelSearch.getAttribute('type') === 'search') throw new Error(`${project.name}: model catalog renders both native and custom clear-search actions`);
+        await page.locator('.model-search-clear').click();
+        if (await modelSearch.inputValue()) throw new Error(`${project.name}: model catalog clear-search action does not clear the query`);
+        await browseCatalog.click();
+      }
       await page.locator('.add-endpoint').click();
       await assertDialog(page, '#endpoint-dialog', project.name);
       if (!(await page.locator('#endpoint-form [name="id"]').inputValue())) throw new Error(`${project.name}: additional endpoint ID is not suggested`);
@@ -232,7 +340,7 @@ for (const project of projects) {
     const metricLayout = await page.locator('.activity-metrics').evaluate(element => ({scrollable: element.scrollWidth > element.clientWidth + 1, display: getComputedStyle(element).display}));
     if (project.mobile && !metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries are not swipeable on a narrow screen`);
     if (!project.mobile && project.width >= 1200 && metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries waste wide-screen space`);
-    const explorerLoad = testLiveRefresh ? page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=1000')) : null;
+    const explorerLoad = testLiveRefresh ? page.waitForResponse(response => response.url().includes('/admin/activity/logs/page?') && response.url().includes('limit=100')) : null;
     await page.locator('[data-activity-tab="requests"]').click();
     if (explorerLoad) await explorerLoad;
     const explorerPanel = page.locator('.request-explorer-panel');
@@ -242,6 +350,8 @@ for (const project of projects) {
       const viewport = page.viewportSize();
       if (!explorerBox || !viewport || explorerBox.height < Math.max(440, viewport.height - 290)) throw new Error(`${project.name}: Request explorer does not adapt to available viewport height`);
     }
+    if (!(await page.locator('#activity-page-previous').isDisabled())) throw new Error(`${project.name}: Request explorer enables Previous on the first page`);
+    if (!(await page.locator('#activity-page-status').textContent()).includes('Page 1')) throw new Error(`${project.name}: Request explorer does not expose page status`);
     const explorerRow = page.locator('#activity-logs .activity-request-row').first();
     if (await explorerRow.count()) {
       if (!(await explorerRow.locator('.activity-model').isVisible()) || !(await explorerRow.locator('.route-cell').isVisible()) || !(await explorerRow.locator('.activity-output').isVisible())) throw new Error(`${project.name}: Request explorer does not emphasize model, route, and output usage`);
@@ -253,6 +363,7 @@ for (const project of projects) {
       await assertDialog(page, '#activity-detail-dialog', project.name);
       if (!(await page.locator('#activity-detail-request').getByText('Request ID', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits request metadata`);
       if (!(await page.locator('#activity-detail-timing').getByText('Total', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits timing`);
+      if (!(await page.locator('#activity-detail-failure').count())) throw new Error(`${project.name}: request detail dialog omits the failure diagnosis region`);
       if (!(await page.locator('#activity-detail-dialog').getByText('Prompt and response content are not retained.').isVisible())) throw new Error(`${project.name}: request detail dialog omits the content-retention notice`);
       await page.locator('#activity-detail-dialog .close-activity-detail').first().click();
     }

@@ -32,6 +32,8 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_protocol: Option<String>,
     pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<RequestFailure>,
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_ms: Option<u64>,
@@ -47,6 +49,33 @@ pub struct RequestLog {
     #[serde(default)]
     pub cost: Option<f64>,
     pub streaming: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RequestFailure {
+    pub stage: String,
+    pub category: String,
+    pub message: String,
+}
+
+impl RequestFailure {
+    pub fn new(stage: &str, category: &str, message: impl Into<String>) -> Self {
+        Self {
+            stage: stage.to_owned(),
+            category: category.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
+pub struct ActivityLogQuery<'a> {
+    pub since: u64,
+    pub until: u64,
+    pub provider: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub offset: usize,
+    pub limit: usize,
 }
 
 #[derive(Clone)]
@@ -200,6 +229,50 @@ impl ActivityStore {
             .take(limit.min(1000))
             .cloned()
             .collect()
+    }
+
+    pub async fn query_logs(&self, query: ActivityLogQuery<'_>) -> (Vec<RequestLog>, usize) {
+        let since = query.since.max(retention_cutoff(self.retention_days()));
+        let text = query
+            .text
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_lowercase);
+        let data = self.inner.lock().await;
+        let matches = |log: &&RequestLog| {
+            log.timestamp >= since
+                && log.timestamp <= query.until
+                && query
+                    .provider
+                    .is_none_or(|provider| log.provider == provider)
+                && query.status.is_none_or(|status| match status {
+                    "success" => log.status < 400,
+                    "error" => log.status >= 400,
+                    _ => true,
+                })
+                && text.as_ref().is_none_or(|text| {
+                    [&log.request_id, &log.model, &log.provider, &log.endpoint]
+                        .iter()
+                        .any(|value| value.to_lowercase().contains(text))
+                })
+        };
+        let total = data
+            .persisted
+            .iter()
+            .chain(&data.pending)
+            .filter(matches)
+            .count();
+        let logs = data
+            .persisted
+            .iter()
+            .chain(&data.pending)
+            .rev()
+            .filter(matches)
+            .skip(query.offset)
+            .take(query.limit.min(100))
+            .cloned()
+            .collect();
+        (logs, total)
     }
 
     pub fn instance_id(&self) -> &str {
@@ -610,4 +683,111 @@ async fn load_retention_days() -> Result<u64, String> {
 
 fn retention_cutoff(days: u64) -> u64 {
     crate::auth::now().saturating_sub(days.saturating_mul(86_400))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(timestamp: u64, id: &str, provider: &str, status: u16) -> RequestLog {
+        RequestLog {
+            timestamp,
+            request_id: id.to_owned(),
+            source_instance_id: None,
+            path: "/v1/responses".to_owned(),
+            model: format!("{provider}/model-{id}"),
+            provider: provider.to_owned(),
+            endpoint: format!("endpoint-{provider}"),
+            caller_protocol: None,
+            upstream_protocol: None,
+            status,
+            failure: None,
+            latency_ms: 1,
+            gateway_ms: None,
+            upstream_response_ms: None,
+            first_byte_ms: None,
+            generation_ms: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cost: None,
+            streaming: false,
+        }
+    }
+
+    #[test]
+    fn structured_failure_round_trips_without_losing_categories() {
+        let mut log = request(1, "structured", "provider", 429);
+        log.failure = Some(RequestFailure::new(
+            "upstream_response",
+            "rate_limited",
+            "Upstream returned HTTP 429",
+        ));
+        let encoded = serde_json::to_vec(&log).unwrap();
+        let decoded: RequestLog = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.failure, log.failure);
+    }
+
+    fn store(logs: Vec<RequestLog>) -> ActivityStore {
+        ActivityStore {
+            inner: Arc::new(Mutex::new(ActivityData {
+                persisted: logs,
+                pending: Vec::new(),
+            })),
+            flush_lock: Arc::new(Mutex::new(())),
+            instance_id: Arc::new("test-instance".to_owned()),
+            retention_days: Arc::new(AtomicU64::new(DEFAULT_RETENTION_DAYS)),
+        }
+    }
+
+    #[tokio::test]
+    async fn paginated_logs_filter_before_counting_and_slicing() {
+        let now = crate::auth::now();
+        let store = store(vec![
+            request(now - 4, "old-success", "alpha", 200),
+            request(now - 3, "alpha-error", "alpha", 500),
+            request(now - 2, "beta-success", "beta", 200),
+            request(now - 1, "new-success", "alpha", 201),
+        ]);
+
+        let (logs, total) = store
+            .query_logs(ActivityLogQuery {
+                since: now - 10,
+                until: now,
+                provider: Some("alpha"),
+                text: Some("success"),
+                status: Some("success"),
+                offset: 1,
+                limit: 1,
+            })
+            .await;
+
+        assert_eq!(total, 2);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].request_id, "old-success");
+    }
+
+    #[tokio::test]
+    async fn paginated_logs_respect_snapshot_upper_bound() {
+        let now = crate::auth::now();
+        let store = store(vec![
+            request(now - 2, "snapshot", "alpha", 200),
+            request(now + 1, "newer", "alpha", 200),
+        ]);
+
+        let (logs, total) = store
+            .query_logs(ActivityLogQuery {
+                since: now - 10,
+                until: now,
+                provider: None,
+                text: None,
+                status: None,
+                offset: 0,
+                limit: 100,
+            })
+            .await;
+
+        assert_eq!(total, 1);
+        assert_eq!(logs[0].request_id, "snapshot");
+    }
 }

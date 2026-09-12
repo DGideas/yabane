@@ -1770,6 +1770,26 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "yabane-extension-api",
+ "yabane-extension-request-defaults",
+]
+
+[[package]]
+name = "yabane-extension-api"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+]
+
+[[package]]
+name = "yabane-extension-request-defaults"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "serde_json",
+ "yabane-extension-api",
 ]
 
 [[package]]

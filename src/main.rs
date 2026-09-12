@@ -14,6 +14,7 @@ mod auth;
 mod config;
 mod control;
 mod error;
+mod extensions;
 mod gateway;
 mod models;
 mod openai_subscription;
@@ -34,6 +35,7 @@ Usage: yabane [OPTIONS]
 Options:
   --addr <ADDRESS>  Listen address [default: 127.0.0.1:8080]
   --log <FILTER>    Tracing filter [env: YABANE_LOG] [default: info]
+  --no-extensions   Disable all compiled Extensions for this run
   -h, --help        Print help
   -V, --version     Print commit information
 
@@ -48,6 +50,7 @@ Persistent configuration is stored in data/.
 
 Examples:
   yabane --addr 127.0.0.1:9090
+  yabane --no-extensions
   yabane --addr 0.0.0.0:8080 --log debug
   YABANE_ACTIVITY_RETENTION_DAYS=90 yabane
 ";
@@ -56,6 +59,7 @@ Examples:
 struct Cli {
     address: Option<String>,
     log_filter: Option<String>,
+    no_extensions: bool,
 }
 
 impl Cli {
@@ -78,6 +82,7 @@ impl Cli {
                 }
                 "--addr" => cli.address = Some(required_value(&mut args, "--addr")),
                 "--log" => cli.log_filter = Some(required_value(&mut args, "--log")),
+                "--no-extensions" => cli.no_extensions = true,
                 _ if arg.starts_with("--addr=") => {
                     cli.address = Some(arg["--addr=".len()..].to_owned())
                 }
@@ -118,6 +123,9 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
     let providers = load_providers().await.expect("load provider configuration");
+    let extensions = extensions::ExtensionRegistry::built_in(cli.no_extensions)
+        .await
+        .expect("load extensions");
     let activity = activity::ActivityStore::load()
         .await
         .expect("load activity");
@@ -137,6 +145,7 @@ async fn main() {
         auth: Arc::new(RwLock::new(auth)),
         activity,
         routes,
+        extensions: Arc::new(extensions),
         openai_oauth: openai_subscription::OAuthState::default(),
         admin: admin_user::AdminState {
             user: Arc::new(RwLock::new(admin)),
@@ -178,6 +187,7 @@ async fn main() {
         .route("/providers", get(web::index))
         .route("/providers/{id}", get(web::index))
         .route("/model-routing", get(web::index))
+        .route("/extensions", get(web::index))
         .route("/api-access", get(web::index))
         .route("/activity", get(web::index))
         .route("/management-api", get(web::index))

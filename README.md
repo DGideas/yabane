@@ -20,6 +20,7 @@ Yabane is a small, performance-oriented LLM gateway written in Rust. Its first r
 - Gateway API-key authentication with expiration and provider scopes
 - Separate one-time-secret Management API keys for control-plane automation
 - Activity analytics with tokens, latency, routing metadata, and upstream-reported cost
+- Versioned native Rust request-extension Hooks, with trusted extensions selected at build time
 - Embedded interactive OpenAPI reference at `/docs` (`/openapi.json`)
 
 ## Run
@@ -52,6 +53,24 @@ End-to-end behavior requirements are maintained in [`GATEWAY_BEHAVIORS.md`](GATE
 cargo build && tests/e2e.sh target/debug/yabane
 ```
 
+## Extensions
+
+Yabane request extensions are trusted Rust crates statically linked through Cargo features. The default build includes the `request-defaults` extension, which owns explicitly configured Extra Header and Extra JSON Body behavior. Its configuration remains in each Provider's resource context, while the Extensions console page identifies the implementation, API version, Hook stages, and enabled state.
+
+An administrator can enable or disable each compiled Extension on the Extensions page. The state is persisted in `data/extensions.json`; disabling Request Defaults keeps its Provider and Endpoint configuration but stops applying it. To disable every compiled Extension for one process without changing persisted settings, run:
+
+```bash
+yabane --no-extensions
+```
+
+Build the transparent Core without bundled Extensions with:
+
+```bash
+cargo build --release --no-default-features
+```
+
+See the [Yabane Extensions development guide](.agents/skills/yabane-extensions/SKILL.md) for the Hook lifecycle, crate setup, registration, security rules, and test checklist. The versioned API lives in `crates/yabane-extension-api`; concrete extensions and their policy tests live under `extensions/`. Yabane Core owns ordered Hook dispatch, structured rejection, Header credential isolation, and zero-Hook behavior. Native extensions are trusted process code, not sandboxed runtime packages.
+
 ## Design
 
-Yabane starts as a transparent gateway. It reads the request model to select a configured provider, removes that provider prefix, and leaves every other request field unchanged on a native protocol path. Upstream responses remain streamed. Cross-protocol routing uses an explicit adapter. The OpenAI subscription Endpoint always connects to ChatGPT's streaming Codex Responses backend, applies that backend's required OAuth headers and body constraints, and adapts responses back to the caller's selected API surface.
+Yabane starts as a transparent gateway. It reads the request model to select a configured provider, removes that provider prefix, and leaves every other request field unchanged on a native protocol path unless an explicitly configured extension modifies it. Upstream responses remain streamed. Cross-protocol routing uses an explicit adapter. The OpenAI subscription Endpoint always connects to ChatGPT's streaming Codex Responses backend, applies that backend's required OAuth headers and body constraints, and adapts responses back to the caller's selected API surface.
