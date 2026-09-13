@@ -126,6 +126,10 @@ async fn main() {
     let extensions = extensions::ExtensionRegistry::built_in(cli.no_extensions)
         .await
         .expect("load extensions");
+    #[cfg(feature = "extension-traffic-capture")]
+    let traffic_capture = yabane_extension_traffic_capture::TrafficCapture::load()
+        .await
+        .expect("load Traffic Capture extension");
     let activity = activity::ActivityStore::load()
         .await
         .expect("load activity");
@@ -146,6 +150,8 @@ async fn main() {
         activity,
         routes,
         extensions: Arc::new(extensions),
+        #[cfg(feature = "extension-traffic-capture")]
+        traffic_capture: Arc::new(traffic_capture),
         openai_oauth: openai_subscription::OAuthState::default(),
         admin: admin_user::AdminState {
             user: Arc::new(RwLock::new(admin)),
@@ -188,6 +194,7 @@ async fn main() {
         .route("/providers/{id}", get(web::index))
         .route("/model-routing", get(web::index))
         .route("/extensions", get(web::index))
+        .route("/extensions/traffic-capture", get(web::index))
         .route("/api-access", get(web::index))
         .route("/activity", get(web::index))
         .route("/management-api", get(web::index))
@@ -234,6 +241,10 @@ async fn main() {
         .await
         .expect("serve Yabane");
     state.activity.flush().await;
+    #[cfg(feature = "extension-traffic-capture")]
+    if let Err(error) = state.traffic_capture.flush().await {
+        tracing::error!(%error, "could not flush Traffic Capture during shutdown");
+    }
 }
 
 async fn shutdown_signal() {

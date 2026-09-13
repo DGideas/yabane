@@ -134,7 +134,9 @@ admin_status() { curl -sS -b "$cookie" -o response.json -w '%{http_code}' "$@"; 
 [[ $(status "$base/v1/models") == 401 ]]
 [[ $(admin_status -X POST "$base/admin/providers/missing/models/refresh") == 404 ]]
 extensions=$(admin -f "$base/admin/extensions")
-[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, .api_version, (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, (.api_version | tostring), (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "traffic-capture") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:upstream_exchange:true ]]
+[[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.active, .config.remaining, .retained] | join(":")') == false:0:0 ]]
 created=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"E2E unrestricted","expires_at":null,"provider_ids":[]}')
 secret=$(printf '%s' "$created" | jq -r .secret)
 id=$(printf '%s' "$created" | jq -r .api_key.id)
@@ -263,6 +265,23 @@ admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/js
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"cookie":"unsafe"},"extra_body":{}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"chatgpt-account-id":"unsafe"},"extra_body":{}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"bad header":"unsafe"},"extra_body":{}}') == 400 ]]
+# Routes can explicitly target an Endpoint that is configured not to require authentication.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"keyless\",\"name\":\"Keyless local\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":false,\"api_key\":null}}" >/dev/null
+keyless_route_payload='{"pattern":"local-alias","targets":[{"provider_id":"keyless","endpoint_id":"local","api_key_id":"","upstream_model":"local-model","weight":100}]}'
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$keyless_route_payload" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "local-alias") | .targets[0].api_key_id') == "" ]]
+keyless_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"local-alias","messages":[]}')
+[[ $(printf '%s' "$keyless_response" | jq -r .endpoint) == unknown ]]
+[[ $(printf '%s' "$keyless_response" | jq -r .model) == local-model ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-keyless-route","targets":[{"provider_id":"keyless","endpoint_id":"local","api_key_id":"invented","upstream_model":"local-model","weight":100}]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/keyless/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true}") == 409 ]]
+# Removing an Endpoint's authentication requirement atomically clears route credential references.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"auth-switch\",\"name\":\"Authentication switch\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"switch-secret\"}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"auth-switch-alias","targets":[{"provider_id":"auth-switch","endpoint_id":"local","api_key_id":"default","upstream_model":"switch-model","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/auth-switch/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":false}" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "auth-switch-alias") | .targets[0].api_key_id') == "" ]]
+auth_switch_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"auth-switch-alias","messages":[]}')
+[[ $(printf '%s' "$auth_switch_response" | jq -r .model) == switch-model ]]
 route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":50},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":50}]}'
 [[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$route_payload" >/dev/null
@@ -289,18 +308,55 @@ without_defaults=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorizatio
 [[ $(printf '%s' "$without_defaults" | jq -r '.headers["x-provider"]') == null ]]
 admin -f -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .extra_body.extra') == provider ]]
+# Traffic Capture is explicitly scoped and stopped by default. It observes final upstream
+# bytes, redacts both Core-managed and configured headers, and stays outside Activity.
+capture_expiry=$(($(date +%s) + 600))
+admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$capture_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"model\":\"multi/model-a\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[\"x-provider\"]}" >/dev/null
+capture_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[{"role":"user","content":"traffic-capture-secret-marker"}]}')
+[[ $(printf '%s' "$capture_response" | jq -r .endpoint) == one ]]
+capture_id=
+for _ in $(seq 1 50); do
+  capture_id=$(admin -f "$base/admin/extensions/traffic-capture/captures" | jq -r '.[0].request_id // empty')
+  [[ -n "$capture_id" ]] && break
+  sleep .02
+done
+[[ -n "$capture_id" ]]
+capture=$(admin -f "$base/admin/extensions/traffic-capture/captures/$capture_id")
+[[ $(printf '%s' "$capture" | jq -r '[.status, .outcome, .request_truncated, .response_truncated] | join(":")') == 200:complete:false:false ]]
+[[ $(printf '%s' "$capture" | jq -r '.request_body | implode | fromjson | [.model, .extra, .messages[0].content] | join(":")') == model-a:provider:traffic-capture-secret-marker ]]
+[[ $(printf '%s' "$capture" | jq -r '.response_body | implode | fromjson | [.endpoint, .model] | join(":")') == one:model-a ]]
+[[ $(printf '%s' "$capture" | jq -r '.request_headers[] | select(.name == "authorization") | .value') == '[REDACTED]' ]]
+[[ $(printf '%s' "$capture" | jq -r '.request_headers[] | select(.name == "x-provider") | .value') == '[REDACTED]' ]]
+[[ $(printf '%s' "$capture" | jq -r '.response_headers[] | select(.name == "set-cookie") | .value') == '[REDACTED]' ]]
+[[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.active, .config.remaining, .retained] | join(":")') == false:0:1 ]]
+! admin -f "$base/admin/activity/export?since=0" | grep -q 'traffic-capture-secret-marker'
+admin -f -X DELETE "$base/admin/extensions/traffic-capture/captures/$capture_id" >/dev/null
+[[ $(admin -f "$base/admin/extensions/traffic-capture/captures" | jq length) == 0 ]]
+admin -f -X PATCH "$base/admin/extensions/traffic-capture" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$capture_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"model\":\"\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[]}") == 409 ]]
+admin -f -X PATCH "$base/admin/extensions/traffic-capture" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
+# Active capture must not silently become inert or orphaned.
+admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$capture_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"model\":\"\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[]}" >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/extensions/traffic-capture" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
+[[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/one") == 409 ]]
+[[ $(admin_status -X DELETE "$base/admin/providers/multi") == 409 ]]
+admin -f -X POST "$base/admin/extensions/traffic-capture/stop" >/dev/null
 # Request Defaults is an extension-owned policy; Endpoint-level values override Provider defaults inside its own crate.
 # Yabane's E2E only confirms that the compiled extension is wired into the Hook pipeline and scoped routing context.
 # Disabled route targets remain configured and receive no traffic, enabling an instant A/B cutover.
-disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
+disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
 admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d "$disabled_route_payload" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model") | [.targets[].enabled] | join(",")') == false,true ]]
 for _ in $(seq 1 4); do
   switched=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"friendly-model","messages":[]}')
   [[ $(printf '%s' "$switched" | jq -r .endpoint) == two ]]
 done
-[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":false}]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":0,"enabled":false}]}') == 400 ]]
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":true},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}' >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model") | [.targets[0].weight, .targets[0].enabled] | join(",")') == 0,false ]]
 [[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":60,"enabled":true},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":30,"enabled":true}]}') == 400 ]]
+# A key referenced by any retained route target cannot be disabled, including a disabled target kept for cutover.
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/default" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
 # Endpoint identity is part of an upstream-key mutation, because key IDs are only endpoint-local.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Temporary","secret":"temporary","weight":10}' >/dev/null
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/temporary" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]

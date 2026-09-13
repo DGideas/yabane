@@ -21,7 +21,7 @@ use crate::{
 };
 
 pub fn router(state: AppState) -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
         .route(
             "/admin/auth",
             get(get_auth_settings).patch(update_auth_settings),
@@ -44,7 +44,26 @@ pub fn router(state: AppState) -> Router<AppState> {
             get(poll_openai_subscription),
         )
         .route("/admin/extensions", get(list_extensions))
-        .route("/admin/extensions/{id}", patch(update_extension))
+        .route("/admin/extensions/{id}", patch(update_extension));
+    #[cfg(feature = "extension-traffic-capture")]
+    let router = router
+        .route(
+            "/admin/extensions/traffic-capture/status",
+            get(traffic_capture_status).patch(configure_traffic_capture),
+        )
+        .route(
+            "/admin/extensions/traffic-capture/stop",
+            post(stop_traffic_capture),
+        )
+        .route(
+            "/admin/extensions/traffic-capture/captures",
+            get(list_traffic_captures).delete(delete_all_traffic_captures),
+        )
+        .route(
+            "/admin/extensions/traffic-capture/captures/{request_id}",
+            get(get_traffic_capture).delete(delete_traffic_capture),
+        );
+    router
         .route(
             "/admin/routes",
             get(list_global_routes).post(create_global_route),
@@ -420,12 +439,17 @@ async fn update_global_route(
 async fn save_global_route(
     state: AppState,
     original_pattern: Option<String>,
-    input: CreateGlobalRoute,
+    mut input: CreateGlobalRoute,
 ) -> Response {
-    let enabled_weight_total: u64 = input
+    for target in &mut input.targets {
+        if !target.enabled || target.weight == 0 {
+            target.enabled = false;
+            target.weight = 0;
+        }
+    }
+    let traffic_total: u64 = input
         .targets
         .iter()
-        .filter(|target| target.enabled)
         .map(|target| u64::from(target.weight))
         .sum();
     if !valid_model_pattern(input.pattern.trim())
@@ -433,14 +457,14 @@ async fn save_global_route(
         || input
             .targets
             .iter()
-            .any(|target| target.weight == 0 || target.upstream_model.trim().is_empty())
+            .any(|target| target.upstream_model.trim().is_empty() || target.weight > 100)
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "A valid pattern, at least one enabled target, and positive target weights are required",
+            "A valid pattern and traffic shares from 0 to 100 are required; 0 disables a target",
         );
     }
-    if enabled_weight_total != 100 {
+    if traffic_total != 100 {
         return api_error(
             StatusCode::BAD_REQUEST,
             "Enabled route target traffic percentages must total 100",
@@ -475,6 +499,14 @@ async fn save_global_route(
                 return api_error(
                     StatusCode::BAD_REQUEST,
                     "Route target OpenAI subscription is not connected",
+                );
+            }
+            None
+        } else if !endpoint.requires_api_key {
+            if !target.api_key_id.is_empty() {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Route targets for Endpoints without authentication must not specify an API key",
                 );
             }
             None
@@ -787,6 +819,16 @@ async fn update_extension(
     Path(id): Path<String>,
     axum::Json(input): axum::Json<ExtensionUpdate>,
 ) -> Response {
+    #[cfg(feature = "extension-traffic-capture")]
+    if id == yabane_extension_traffic_capture::ID && !input.enabled {
+        let capture = state.traffic_capture.status().await.config;
+        if capture.active {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Stop Traffic Capture before disabling the extension",
+            );
+        }
+    }
     match state.extensions.set_enabled(&id, input.enabled).await {
         Ok(extension) => axum::Json(extension).into_response(),
         Err(crate::extensions::UpdateError::NotFound) => {
@@ -803,6 +845,91 @@ async fn update_extension(
                 "Could not persist extension settings",
             )
         }
+    }
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn traffic_capture_status(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.traffic_capture.status().await)
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn configure_traffic_capture(
+    State(state): State<AppState>,
+    axum::Json(config): axum::Json<yabane_extension_traffic_capture::CaptureConfig>,
+) -> Response {
+    if config.active && !state.extensions.is_enabled("traffic-capture") {
+        return api_error(
+            StatusCode::CONFLICT,
+            "Enable the Traffic Capture extension before starting capture",
+        );
+    }
+    if config.provider_id.is_empty() != config.endpoint_id.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Capture Provider and Endpoint must be specified together",
+        );
+    }
+    if !config.provider_id.is_empty() {
+        let providers = state.providers.read().await;
+        let Some(provider) = providers.get(&config.provider_id) else {
+            return api_error(StatusCode::BAD_REQUEST, "Capture Provider was not found");
+        };
+        if !provider
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.id == config.endpoint_id)
+        {
+            return api_error(StatusCode::BAD_REQUEST, "Capture Endpoint was not found");
+        }
+    }
+    match state.traffic_capture.configure(config).await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(message) => api_error(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn stop_traffic_capture(State(state): State<AppState>) -> Response {
+    match state.traffic_capture.stop().await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(message) => api_error(StatusCode::INTERNAL_SERVER_ERROR, message),
+    }
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn list_traffic_captures(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.traffic_capture.list().await)
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn get_traffic_capture(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Response {
+    match state.traffic_capture.get(&request_id).await {
+        Some(capture) => axum::Json(capture).into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "Traffic capture not found"),
+    }
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn delete_traffic_capture(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> Response {
+    match state.traffic_capture.delete(&request_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "Traffic capture not found"),
+        Err(message) => api_error(StatusCode::INTERNAL_SERVER_ERROR, message),
+    }
+}
+
+#[cfg(feature = "extension-traffic-capture")]
+async fn delete_all_traffic_captures(State(state): State<AppState>) -> Response {
+    match state.traffic_capture.delete_all().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(message) => api_error(StatusCode::INTERNAL_SERVER_ERROR, message),
     }
 }
 
@@ -1094,6 +1221,16 @@ async fn create_provider(
 }
 
 async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    #[cfg(feature = "extension-traffic-capture")]
+    {
+        let capture = state.traffic_capture.status().await.config;
+        if capture.active && capture.provider_id == id {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Stop Traffic Capture before deleting its scoped Provider",
+            );
+        }
+    }
     let mut providers = state.providers.write().await;
     let mut updated_providers = providers.clone();
     if updated_providers.remove(&id).is_none() {
@@ -1242,6 +1379,22 @@ async fn update_endpoint(
             "Connect a new OpenAI subscription instead of converting an existing Endpoint",
         );
     }
+    let stopped_requiring_api_key = endpoint.requires_api_key && !input.requires_api_key;
+    let started_requiring_api_key = !endpoint.requires_api_key && input.requires_api_key;
+    if started_requiring_api_key {
+        let routes = state.routes.0.read().await;
+        if routes.iter().any(|route| {
+            route.targets.iter().any(|target| {
+                target.provider_id == provider_id && target.endpoint_id == endpoint_id
+            })
+        }) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Update or delete model routes targeting this Endpoint before requiring an API key",
+            );
+        }
+    }
+
     endpoint.api_type = input.api_type;
     endpoint.base_url = input.base_url.trim().trim_end_matches('/').to_owned();
     endpoint.socks5_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
@@ -1250,10 +1403,38 @@ async fn update_endpoint(
     if !subscription_endpoint {
         remove_endpoint_discovery(provider, &endpoint_id);
     }
-    let response = persist_or_error(&updated).await;
-    if response.status().is_success() {
-        *providers = updated;
-    }
+
+    let response = if stopped_requiring_api_key {
+        let mut routes = state.routes.0.write().await;
+        let mut updated_routes = routes.clone();
+        for route in &mut updated_routes {
+            for target in &mut route.targets {
+                if target.provider_id == provider_id && target.endpoint_id == endpoint_id {
+                    target.api_key_id.clear();
+                }
+            }
+        }
+        match save_provider_and_routes(&updated, &updated_routes, &providers).await {
+            Ok(()) => {
+                *providers = updated;
+                *routes = updated_routes;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(err) => {
+                error!(%err, "failed to persist Endpoint update");
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not update API endpoint",
+                )
+            }
+        }
+    } else {
+        let response = persist_or_error(&updated).await;
+        if response.status().is_success() {
+            *providers = updated;
+        }
+        response
+    };
     drop(providers);
     if response.status().is_success() && !subscription_endpoint {
         spawn_provider_refresh(state, provider_id);
@@ -1265,6 +1446,19 @@ async fn delete_endpoint(
     State(state): State<AppState>,
     Path((provider_id, endpoint_id)): Path<(String, String)>,
 ) -> Response {
+    #[cfg(feature = "extension-traffic-capture")]
+    {
+        let capture = state.traffic_capture.status().await.config;
+        if capture.active
+            && capture.provider_id == provider_id
+            && capture.endpoint_id == endpoint_id
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Stop Traffic Capture before deleting its scoped Endpoint",
+            );
+        }
+    }
     let mut providers = state.providers.write().await;
     let mut updated_providers = providers.clone();
     let Some(provider) = updated_providers.get_mut(&provider_id) else {
@@ -1444,6 +1638,21 @@ async fn update_api_key(
     let Some(key) = endpoint.api_keys.iter_mut().find(|key| key.id == key_id) else {
         return api_error(StatusCode::NOT_FOUND, "API key not found");
     };
+    if key.enabled && input.enabled == Some(false) {
+        let routes = state.routes.0.read().await;
+        if routes.iter().any(|route| {
+            route.targets.iter().any(|target| {
+                target.provider_id == provider_id
+                    && target.endpoint_id == endpoint_id
+                    && target.api_key_id == key_id
+            })
+        }) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Update or delete model routes targeting this API key before disabling it",
+            );
+        }
+    }
     if let Some(weight) = input.weight {
         key.weight = weight;
     }

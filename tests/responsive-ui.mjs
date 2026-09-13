@@ -35,6 +35,15 @@ for (const project of projects) {
         }],
         discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
+      }, {
+        id: 'ui-keyless', name: 'UI keyless fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+        endpoints: [{
+          id: 'local', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_api_key: false, api_keys: [], subscription_connected: false,
+          subscription_expires_at: null,
+        }],
+        discovered_models: ['local-model'], model_endpoints: {'local-model': ['local']}, model_endpoint_preferences: [],
+        models_discovered_at: 1, model_discovery_error: null,
       });
       await route.fulfill({response, json: body});
     });
@@ -132,13 +141,28 @@ for (const project of projects) {
     if (!(await developmentLink.isVisible()) || await developmentLink.getAttribute('href') !== 'https://github.com/DGideas/yabane/blob/master/.agents/skills/yabane-extensions/SKILL.md') throw new Error(`${project.name}: Extensions page omits the development guide link`);
     const requestDefaultsExtension = page.locator('.extension-card').filter({hasText: 'request-defaults'});
     if (!(await requestDefaultsExtension.isVisible())) throw new Error(`${project.name}: Request Defaults is missing from Extensions`);
+    const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
+    if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
+    await trafficCaptureExtension.getByRole('button', {name: 'Configure capture'}).click();
+    await page.locator('#traffic-capture-view').waitFor({state: 'visible'});
+    if (!(await page.getByText('Captured bodies may contain prompts, files, tool calls, and model output.', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not warn about captured content`);
+    if (!(await page.locator('#capture-form [name="provider_id"]').evaluate(element => element.required))) throw new Error(`${project.name}: Traffic Capture lacks a required Provider scope selector`);
+    await assertNoPageOverflow(page, project.name, 'Traffic Capture page');
+    await page.locator('#back-to-extensions').click();
     if (!(await requestDefaultsExtension.getByText('Native Rust', {exact: true}).isVisible())) throw new Error(`${project.name}: extension implementation type is not visible`);
-    if (!(await requestDefaultsExtension.getByText('v1', {exact: true}).isVisible())) throw new Error(`${project.name}: Extension API version is not visible`);
+    if (!(await requestDefaultsExtension.getByText(/^v\d+$/, {exact: true}).isVisible())) throw new Error(`${project.name}: Extension API version is not visible`);
     const extensionToggle = requestDefaultsExtension.locator('[data-extension-toggle="request-defaults"]');
     if (!(await extensionToggle.isChecked()) || !(await extensionToggle.isEnabled())) throw new Error(`${project.name}: Request Defaults does not expose its enabled runtime setting`);
     if (project.name === 'desktop-chrome') {
       await extensionToggle.evaluate(input => input.click());
       await requestDefaultsExtension.getByText('Disabled', {exact: true}).waitFor();
+      await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+      await page.locator('#providers .provider-list-item').first().click();
+      const disabledDefaultsCard = page.locator('.defaults-card.defaults-disabled').first();
+      await disabledDefaultsCard.waitFor({state: 'visible'});
+      if (!(await disabledDefaultsCard.getByText('Request defaults are off', {exact: true}).isVisible())) throw new Error(`${project.name}: disabled Request Defaults lacks a prominent warning`);
+      if (!(await disabledDefaultsCard.getByText(/No saved headers or body fields will be added.*Enable it from Extensions/).isVisible())) throw new Error(`${project.name}: disabled Request Defaults does not explain its traffic impact or how to enable it`);
+      await page.evaluate(() => document.querySelector('[data-view="extensions"]').click());
       await requestDefaultsExtension.locator('[data-extension-toggle="request-defaults"]').evaluate(input => input.click());
       await requestDefaultsExtension.getByText('Enabled', {exact: true}).waitFor();
     }
@@ -210,6 +234,11 @@ for (const project of projects) {
     if (await githubLink.count() !== 1 || await githubLink.getAttribute('target') !== '_blank') throw new Error(`${project.name}: About dialog is missing the project GitHub link`);
     const logoAnimation = await page.locator('#about-dialog .about-logo').evaluate(element => getComputedStyle(element).animationName);
     if (logoAnimation !== 'none') throw new Error(`${project.name}: About icon still animates (${logoAnimation})`);
+    const heroPalette = await page.locator('#about-dialog').evaluate(dialog => {
+      const colors = selector => [...dialog.querySelectorAll(selector)].map(element => getComputedStyle(element).fill);
+      return { background: getComputedStyle(dialog.querySelector('.about-hero')).backgroundColor, facets: colors('.about-facets path'), frontArrow: colors('.about-arrows-front path')[0] };
+    });
+    if (new Set(heroPalette.facets).size < 4 || !heroPalette.facets.includes('rgb(0, 213, 232)') || heroPalette.frontArrow !== 'rgb(112, 242, 255)') throw new Error(`${project.name}: About hero is missing its saturated blue-and-cyan contrast palette`);
     const logoPaths = await page.locator('#about-dialog .about-logo path').evaluateAll(paths => paths.map(path => path.getAttribute('d')));
     if (logoPaths.join('|') !== 'M14 4h32l14 14v32c0 5.5-4.5 10-10 10H14C8.5 60 4 55.5 4 50V14C4 8.5 8.5 4 14 4Z|m13 18 13 14-13 14h8l13-14-13-14Z|m31 18 13 14-13 14h8l13-14-13-14Z') throw new Error(`${project.name}: About dialog does not use the Yabane mark`);
     const brandLoaded = await page.locator('.topbar .brand-mark').evaluate(image => image.complete && image.naturalWidth > 0);
@@ -283,20 +312,45 @@ for (const project of projects) {
         if (await modelSearch.inputValue()) throw new Error(`${project.name}: model catalog clear-search action does not clear the query`);
         await browseCatalog.click();
       }
+      const editableEndpoint = page.locator('.endpoint-card:not(.subscription-endpoint) .endpoint-edit').first();
+      if (await editableEndpoint.count()) {
+        await editableEndpoint.click();
+        await assertDialog(page, '#endpoint-dialog', project.name);
+        const immutableEndpointId = page.locator('#endpoint-form [name="id"]');
+        if (!(await immutableEndpointId.isDisabled())) throw new Error(`${project.name}: Endpoint ID is editable after creation`);
+        if (await page.locator('#endpoint-form .endpoint-id-permanent').textContent() !== 'Permanent') throw new Error(`${project.name}: Endpoint ID lacks an explicit permanent marker`);
+        const immutableEndpointStyles = await immutableEndpointId.evaluate(element => { const style = getComputedStyle(element); return {backgroundColor: style.backgroundColor, cursor: style.cursor}; });
+        if (immutableEndpointStyles.backgroundColor === 'rgb(255, 255, 255)' || immutableEndpointStyles.cursor !== 'not-allowed') throw new Error(`${project.name}: Endpoint ID does not look visibly immutable`);
+        if (await page.locator('#endpoint-id-help strong').textContent() !== 'Cannot be changed after creation.') throw new Error(`${project.name}: Endpoint ID immutability is not stated directly`);
+        await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      }
       await page.locator('.add-endpoint').click();
       await assertDialog(page, '#endpoint-dialog', project.name);
       if (!(await page.locator('#endpoint-form [name="id"]').inputValue())) throw new Error(`${project.name}: additional endpoint ID is not suggested`);
+      if (await page.locator('#endpoint-form .endpoint-id-permanent').isVisible()) throw new Error(`${project.name}: new Endpoint ID is incorrectly marked permanent before creation`);
+      if (!(await page.locator('#endpoint-form .endpoint-id-required').isVisible())) throw new Error(`${project.name}: new Endpoint ID does not remain visibly required`);
       await page.locator('#endpoint-dialog .close-endpoint').first().click();
     }
     await page.evaluate(() => document.querySelector('[data-view="models"]').click());
     const renderedRoute = page.locator('#routes .route-destination').first();
     if (await renderedRoute.count()) {
       if (!(await renderedRoute.locator('.route-upstream').isVisible()) || !(await renderedRoute.locator('.route-status').isVisible()) || !(await renderedRoute.locator('.route-target-state > strong').isVisible())) throw new Error(`${project.name}: route destination does not visually separate its upstream, status, and traffic share`);
+      const routeModelCell = page.locator('#routes .route-model-cell').first();
+      const [modelCellBox, modelHeadingBox, matchKind] = await Promise.all([
+        routeModelCell.boundingBox(),
+        routeModelCell.locator('.route-model-heading').boundingBox(),
+        routeModelCell.locator('.route-match-kind').textContent(),
+      ]);
+      if (!modelCellBox || !modelHeadingBox || modelHeadingBox.height > 42) throw new Error(`${project.name}: route match identity becomes tall when a rule has multiple destinations`);
+      if (!['Exact', 'Prefix'].includes(matchKind?.trim())) throw new Error(`${project.name}: route match type is not rendered as a compact label`);
+      if (!(await routeModelCell.locator('small').textContent()).includes('destination')) throw new Error(`${project.name}: route destination count is missing from the public model summary`);
       const routeOverflow = await page.locator('#routes-table').evaluate(element => element.scrollWidth > element.clientWidth + 1);
       if (routeOverflow) throw new Error(`${project.name}: structured route summary overflows its table viewport`);
     }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
+    const keylessDestination = page.locator('#route-targets .route-target option', {hasText: 'UI keyless fixture · local · No API key'});
+    if (await keylessDestination.count() !== 1) throw new Error(`${project.name}: route editor omits an Endpoint configured without an API key`);
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
     await page.locator('#add-route-target').click();
     await page.locator('#route-split-head').waitFor({ state: 'visible' });
@@ -306,11 +360,17 @@ for (const project of projects) {
     if (!(await page.locator('#save-route').isDisabled())) throw new Error(`${project.name}: invalid traffic total does not disable saving`);
     if (await page.locator('#route-split-total').textContent() !== '110%') throw new Error(`${project.name}: invalid traffic total is not explained`);
     await page.locator('#route-targets [name="target_enabled"]').first().uncheck();
-    const switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => ({value: input.value, disabled: input.disabled})));
-    if (!switchedShares[0].disabled || switchedShares[1].value !== '100') throw new Error(`${project.name}: disabling a route target does not move all traffic to the active target`);
-    if (await page.locator('#save-route').isDisabled()) throw new Error(`${project.name}: one active 100% target cannot be saved`);
+    let switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => ({value: input.value, disabled: input.disabled})));
+    if (switchedShares[0].value !== '0' || switchedShares[0].disabled || switchedShares[1].value !== '100') throw new Error(`${project.name}: turning off a route target does not produce a visible 0/100 split`);
+    if (await page.locator('#save-route').isDisabled()) throw new Error(`${project.name}: one 100% target cannot be saved`);
+    await page.locator('#route-targets [name="target_enabled"]').first().check();
+    switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => input.value));
+    if (switchedShares.join(',') !== '50,50') throw new Error(`${project.name}: turning a destination back on does not restore an even 50/50 split (${switchedShares.join(',')})`);
+    await page.locator('#route-targets [name="target_weight"]').first().fill('0');
+    switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => input.value));
+    if (switchedShares.join(',') !== '0,100' || await page.locator('#route-targets [name="target_enabled"]').first().isChecked()) throw new Error(`${project.name}: a 0% share does not turn off and redistribute the destination`);
     await page.locator('#route-targets [name="target_enabled"]').nth(1).uncheck();
-    if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be disabled`);
+    if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be turned off`);
     await page.locator('#route-dialog .close-route').first().click();
     const initialActivityLoad = testLiveRefresh ? Promise.all([
       page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=24') && response.url().includes('until=')),

@@ -9,10 +9,15 @@ use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-#[cfg(any(feature = "extension-request-defaults", test))]
+#[cfg(any(
+    feature = "extension-request-defaults",
+    feature = "extension-traffic-capture",
+    test
+))]
 use yabane_extension_api::{EXTENSION_API_VERSION, Extension};
 use yabane_extension_api::{
-    ExtensionError, HookOutcome, RequestContext, UpstreamHeadersHook, UpstreamRequestHook,
+    ExtensionError, HookOutcome, ObservedUpstreamRequest, RequestContext, UpstreamExchangeHook,
+    UpstreamExchangeObserver, UpstreamHeadersHook, UpstreamRequestHook,
 };
 
 pub const EXTENSIONS_FILE: &str = "data/extensions.json";
@@ -76,6 +81,7 @@ pub struct HookRejection {
 pub struct RequestHooks<'a> {
     pub upstream_request: Vec<&'a dyn UpstreamRequestHook>,
     pub upstream_headers: Vec<&'a dyn UpstreamHeadersHook>,
+    pub upstream_exchange: Vec<&'a dyn UpstreamExchangeHook>,
 }
 
 pub struct ExtensionRegistry {
@@ -90,6 +96,8 @@ impl ExtensionRegistry {
         let infos: Vec<ExtensionInfo> = vec![
             #[cfg(feature = "extension-request-defaults")]
             extension_info(yabane_extension_request_defaults::metadata())?,
+            #[cfg(feature = "extension-traffic-capture")]
+            extension_info(yabane_extension_traffic_capture::metadata())?,
         ];
         let settings = load_settings(EXTENSIONS_FILE).await?;
         Self::new(infos, settings, EXTENSIONS_FILE.into(), disabled_by_cli)
@@ -140,7 +148,13 @@ impl ExtensionRegistry {
             .collect()
     }
 
-    #[cfg_attr(not(feature = "extension-request-defaults"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            feature = "extension-request-defaults",
+            feature = "extension-traffic-capture"
+        )),
+        allow(dead_code)
+    )]
     pub fn is_enabled(&self, id: &str) -> bool {
         !self.disabled_by_cli
             && self
@@ -201,6 +215,61 @@ impl ExtensionRegistry {
         Ok(DispatchOutcome::Continue(body))
     }
 
+    pub fn interested_upstream_exchange<'a>(
+        &self,
+        context: &RequestContext<'_>,
+        hooks: &[&'a dyn UpstreamExchangeHook],
+    ) -> Vec<&'a dyn UpstreamExchangeHook> {
+        hooks
+            .iter()
+            .copied()
+            .filter(|hook| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.is_interested(context)
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::error!(
+                        extension = hook.extension_id(),
+                        instance = hook.instance_id(),
+                        "upstream exchange observer panicked during preflight"
+                    );
+                    false
+                })
+            })
+            .collect()
+    }
+
+    pub fn begin_upstream_exchange(
+        &self,
+        context: &RequestContext<'_>,
+        request: ObservedUpstreamRequest<'_>,
+        hooks: &[&dyn UpstreamExchangeHook],
+    ) -> Vec<Box<dyn UpstreamExchangeObserver>> {
+        hooks
+            .iter()
+            .filter_map(|hook| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hook.begin(
+                        context,
+                        ObservedUpstreamRequest {
+                            headers: request.headers,
+                            body: request.body,
+                        },
+                    )
+                }))
+                .map_err(|_| {
+                    tracing::error!(
+                        extension = hook.extension_id(),
+                        instance = hook.instance_id(),
+                        "upstream exchange observer panicked during initialization"
+                    );
+                })
+                .ok()
+                .flatten()
+            })
+            .collect()
+    }
+
     pub fn run_upstream_headers(
         &self,
         context: &RequestContext<'_>,
@@ -242,7 +311,11 @@ async fn load_settings(path: impl AsRef<Path>) -> Result<ExtensionSettings, Stri
     }
 }
 
-#[cfg(any(feature = "extension-request-defaults", test))]
+#[cfg(any(
+    feature = "extension-request-defaults",
+    feature = "extension-traffic-capture",
+    test
+))]
 fn extension_info(extension: Extension) -> Result<ExtensionInfo, String> {
     if extension.id.is_empty() {
         return Err("extension ID cannot be empty".to_owned());
@@ -373,7 +446,8 @@ mod tests {
     use bytes::Bytes;
     use yabane_extension_api::{
         EXTENSION_API_VERSION, Extension, ExtensionError, ExtensionHook, ExtensionRejection,
-        HookOutcome, HookStage, Protocol, RequestContext, UpstreamHeadersHook, UpstreamRequestHook,
+        HookOutcome, HookStage, ObservedUpstreamRequest, Protocol, RequestContext,
+        UpstreamExchangeHook, UpstreamExchangeObserver, UpstreamHeadersHook, UpstreamRequestHook,
     };
 
     use super::{
@@ -441,6 +515,33 @@ mod tests {
             _body: Bytes,
         ) -> Result<HookOutcome<Bytes>, ExtensionError> {
             panic!("sensitive panic detail")
+        }
+    }
+
+    struct Exchange {
+        interested: bool,
+        begins: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ExtensionHook for Exchange {
+        fn extension_id(&self) -> &'static str {
+            "exchange"
+        }
+    }
+
+    impl UpstreamExchangeHook for Exchange {
+        fn is_interested(&self, _context: &RequestContext<'_>) -> bool {
+            self.interested
+        }
+
+        fn begin(
+            &self,
+            _context: &RequestContext<'_>,
+            _request: ObservedUpstreamRequest<'_>,
+        ) -> Option<Box<dyn UpstreamExchangeObserver>> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
         }
     }
 
@@ -647,9 +748,44 @@ mod tests {
     }
 
     #[test]
+    fn exchange_preflight_selects_the_exact_hooks_initialized() {
+        let interested = Exchange {
+            interested: true,
+            begins: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let uninterested = Exchange {
+            interested: false,
+            begins: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let registry = registry();
+        let selected =
+            registry.interested_upstream_exchange(&context(), &[&interested, &uninterested]);
+        assert_eq!(selected.len(), 1);
+        registry.begin_upstream_exchange(
+            &context(),
+            ObservedUpstreamRequest {
+                headers: &[],
+                body: &[],
+            },
+            &selected,
+        );
+        assert_eq!(
+            interested.begins.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            uninterested
+                .begins
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
     fn zero_hook_snapshot_is_empty() {
         let hooks = RequestHooks::default();
         assert!(hooks.upstream_request.is_empty());
         assert!(hooks.upstream_headers.is_empty());
+        assert!(hooks.upstream_exchange.is_empty());
     }
 }
