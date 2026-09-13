@@ -194,6 +194,22 @@ $('#provider-id').addEventListener('input', event => {
   providerIdEdited = event.target.value !== slugify($('#display-name').value);
 });
 
+function openAiSubscriptionAvailable() {
+  return extensions.some(extension => extension.id === 'openai-subscription' && extension.enabled);
+}
+function updateOpenAiSubscriptionChoices() {
+  const available = openAiSubscriptionAvailable();
+  $$('[name="api_type"][value="openai_codex"]').forEach(input => {
+    input.disabled = !available;
+    const choice = input.closest('.choice');
+    if (choice) {
+      choice.classList.toggle('unavailable', !available);
+      choice.title = available ? '' : 'Enable the OpenAI Subscription Extension to use this Endpoint type';
+    }
+  });
+  const option = $('#endpoint-form [name="api_type"] option[value="openai_codex"]');
+  if (option) option.textContent = available ? 'OpenAI subscription (ChatGPT Plus/Pro)' : 'OpenAI subscription (Extension unavailable)';
+}
 function setApiType(type) {
   const input = $(`input[name="api_type"][value="${type}"]`);
   input.checked = true;
@@ -1523,7 +1539,8 @@ function renderExtensions() {
   list.innerHTML = extensions.map(extension => {
     const configuredProviders = extension.id === 'request-defaults' ? providers.filter(provider => Object.keys(provider.extra_headers || {}).length || Object.keys(provider.extra_body || {}).length || provider.endpoints.some(endpoint => Object.keys(endpoint.extra_headers || {}).length || Object.keys(endpoint.extra_body || {}).length)) : [];
     const status = extension.enabled ? 'Enabled' : extension.runtime_configurable ? 'Disabled' : 'Disabled by CLI';
-    const configured = extension.id === 'request-defaults' ? `${configuredProviders.length} Provider${configuredProviders.length === 1 ? '' : 's'}` : 'On demand';
+    const subscriptionEndpoints = extension.id === 'openai-subscription' ? providers.reduce((count, provider) => count + provider.endpoints.filter(endpoint => endpoint.api_type === 'openai_codex').length, 0) : 0;
+    const configured = extension.id === 'request-defaults' ? `${configuredProviders.length} Provider${configuredProviders.length === 1 ? '' : 's'}` : extension.id === 'openai-subscription' ? `${subscriptionEndpoints} Endpoint${subscriptionEndpoints === 1 ? '' : 's'}` : 'On demand';
     const footer = extension.id === 'request-defaults' ? `<footer><div><strong>Configured in Provider context</strong><p>Header and body defaults remain next to the Provider and Endpoint resources they affect.${extension.enabled ? '' : ' They are retained while this Extension is disabled.'}</p></div>${configuredProviders.length ? `<div class="extension-provider-links">${configuredProviders.map(provider => `<button class="text-link" type="button" data-extension-provider="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</button>`).join('')}</div>` : '<button class="button secondary extension-open-providers" type="button">Choose a Provider</button>'}</footer>` : extension.id === 'traffic-capture' ? `<footer><div><strong>Sensitive diagnostic data</strong><p>Capture is stopped by default. Credentials are always redacted and content remains separate from Activity.</p></div><button class="button secondary open-traffic-capture" type="button" ${extension.enabled ? '' : 'disabled'}>Configure capture</button></footer>` : '';
     return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(hook => hook.replaceAll('_', ' ')).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
   }).join('');
@@ -1533,13 +1550,13 @@ function renderExtensions() {
     if (!response.ok) { toggle.checked = !toggle.checked; toggle.disabled = false; window.alert((await response.json()).error?.message || 'Could not update Extension'); return; }
     const updated = await response.json();
     extensions = extensions.map(extension => extension.id === updated.id ? updated : extension);
-    renderExtensions(); renderProviders();
+    renderExtensions(); updateOpenAiSubscriptionChoices(); renderProviders();
   }));
   $$('.extension-open-providers').forEach(button => button.addEventListener('click', () => showView('providers')));
   $$('.open-traffic-capture').forEach(button => button.addEventListener('click', () => showView('capture')));
   $$('[data-extension-provider]').forEach(button => button.addEventListener('click', () => { selectedProviderId = button.dataset.extensionProvider; showView('providers'); }));
 }
-async function loadExtensions() { const response = await fetch('/admin/extensions'); extensions = response.ok ? await response.json() : []; renderExtensions(); }
+async function loadExtensions() { const response = await fetch('/admin/extensions'); extensions = response.ok ? await response.json() : []; renderExtensions(); updateOpenAiSubscriptionChoices(); }
 
 function renderCaptureSelectors() {
   const form = $('#capture-form'); const providerSelect = form.elements.provider_id; const current = providerSelect.value || trafficCaptureStatus?.config.provider_id;
@@ -1562,6 +1579,11 @@ async function loadTrafficCapture() {
   if (!statusResponse.ok) return showApiError(statusResponse, $('#capture-error'));
   trafficCaptureStatus = await statusResponse.json(); trafficCaptures = capturesResponse.ok ? await capturesResponse.json() : []; renderTrafficCapture();
 }
+$('#refresh-captures').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try { await loadTrafficCapture(); } finally { button.disabled = false; }
+});
 $('#back-to-extensions').addEventListener('click', () => showView('extensions'));
 $('#capture-form').elements.provider_id.addEventListener('change', renderCaptureSelectors);
 $('#capture-form').addEventListener('submit', async event => {

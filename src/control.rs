@@ -819,6 +819,28 @@ async fn update_extension(
     Path(id): Path<String>,
     axum::Json(input): axum::Json<ExtensionUpdate>,
 ) -> Response {
+    #[cfg(feature = "extension-openai-subscription")]
+    if id == yabane_extension_openai_subscription::ID
+        && !input.enabled
+        && state.extensions.contains(&id)
+    {
+        // Keep the Provider lock through the enabled-state commit. OAuth completion
+        // takes the same lock before checking the Extension, so it cannot attach a
+        // subscription Endpoint between this dependency check and disablement.
+        let providers = state.providers.write().await;
+        if providers.values().any(|provider| {
+            provider
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.api_type == ApiType::OpenaiCodex)
+        }) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "Delete OpenAI subscription Endpoints before disabling the extension",
+            );
+        }
+        return set_extension_enabled(&state, &id, false).await;
+    }
     #[cfg(feature = "extension-traffic-capture")]
     if id == yabane_extension_traffic_capture::ID && !input.enabled {
         let capture = state.traffic_capture.status().await.config;
@@ -829,16 +851,26 @@ async fn update_extension(
             );
         }
     }
-    match state.extensions.set_enabled(&id, input.enabled).await {
+    set_extension_enabled(&state, &id, input.enabled).await
+}
+
+async fn set_extension_enabled(state: &AppState, id: &str, enabled: bool) -> Response {
+    match state.extensions.set_enabled(id, enabled).await {
         Ok(extension) => axum::Json(extension).into_response(),
-        Err(crate::extensions::UpdateError::NotFound) => {
+        Err(error) => extension_update_error(id, error),
+    }
+}
+
+fn extension_update_error(id: &str, error: crate::extensions::UpdateError) -> Response {
+    match error {
+        crate::extensions::UpdateError::NotFound => {
             api_error(StatusCode::NOT_FOUND, "Extension not found")
         }
-        Err(crate::extensions::UpdateError::DisabledByCli) => api_error(
+        crate::extensions::UpdateError::DisabledByCli => api_error(
             StatusCode::CONFLICT,
             "Extensions are disabled for this process by --no-extensions",
         ),
-        Err(crate::extensions::UpdateError::Persist(error)) => {
+        crate::extensions::UpdateError::Persist(error) => {
             error!(%error, extension = %id, "persist extension settings");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1099,6 +1131,12 @@ async fn start_openai_subscription(
     State(state): State<AppState>,
     axum::Json(input): axum::Json<openai_subscription::StartSubscription>,
 ) -> Response {
+    if state.extensions.provider_endpoint("openai_codex").is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "OpenAI Subscription Extension is not enabled",
+        );
+    }
     match openai_subscription::start(&state, input).await {
         Ok(flow) => (StatusCode::CREATED, axum::Json(flow)).into_response(),
         Err(openai_subscription::StartError::Invalid(message)) => {
@@ -1114,6 +1152,12 @@ async fn poll_openai_subscription(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    if state.extensions.provider_endpoint("openai_codex").is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "OpenAI Subscription Extension is not enabled",
+        );
+    }
     match openai_subscription::poll(&state, &id).await {
         Ok(flow) => axum::Json(flow).into_response(),
         Err(message) => api_error(StatusCode::NOT_FOUND, message),

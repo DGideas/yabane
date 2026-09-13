@@ -1,27 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use crate::config::{ApiEndpoint, ApiType, AppState, OpenAiSubscription, Provider, save_providers};
-
-// Public client registration used by OpenAI's Codex device authorization flow.
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const AUTH_BASE_URL: &str = "https://auth.openai.com";
-const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const DEVICE_TIMEOUT_SECONDS: u64 = 15 * 60;
-const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-// ChatGPT's Codex backend has no supported /models operation, so keep this catalog explicit.
-pub const MODELS: &[&str] = &[
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-];
 
 #[derive(Clone, Default)]
 pub struct OAuthState {
@@ -37,8 +18,10 @@ struct DeviceFlow {
     endpoint_id: String,
     socks5_proxy: Option<String>,
     client: reqwest::Client,
+    base_url: String,
     device_auth_id: String,
     user_code: String,
+    verification_uri: &'static str,
     interval_seconds: u64,
     next_poll_at: u64,
     poll_lock: Arc<Mutex<()>>,
@@ -76,37 +59,6 @@ pub struct DeviceFlowView {
     pub expires_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceCodeResponse {
-    device_auth_id: String,
-    user_code: String,
-    interval: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct DeviceTokenResponse {
-    authorization_code: String,
-    code_verifier: String,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-    expires_in: u64,
-}
-
-#[derive(Deserialize)]
-struct JwtClaims {
-    #[serde(rename = "https://api.openai.com/auth")]
-    auth: Option<JwtAuthClaims>,
-}
-
-#[derive(Deserialize)]
-struct JwtAuthClaims {
-    chatgpt_account_id: Option<String>,
 }
 
 pub async fn start(
@@ -160,32 +112,23 @@ pub async fn start(
         }
     };
 
-    let response = client
-        .post(format!("{AUTH_BASE_URL}/api/accounts/deviceauth/usercode"))
-        .json(&serde_json::json!({"client_id": CLIENT_ID}))
-        .timeout(OAUTH_REQUEST_TIMEOUT)
-        .send()
+    let implementation = state
+        .extensions
+        .subscription_provider("openai_codex")
+        .ok_or_else(|| {
+            StartError::Invalid("OpenAI Subscription Extension is not enabled".to_owned())
+        })?;
+    let endpoint_type = implementation.endpoint_type();
+    let base_url = endpoint_type
+        .fixed_base_url
+        .ok_or_else(|| {
+            StartError::Invalid("Subscription Extension must declare a fixed base URL".to_owned())
+        })?
+        .to_owned();
+    let device = implementation
+        .start_device_authorization(&client)
         .await
-        .map_err(|err| StartError::Upstream(format!("Could not start OpenAI sign-in: {err}")))?;
-    let status = response.status();
-    let body = response.bytes().await.map_err(|err| {
-        StartError::Upstream(format!("Could not read OpenAI sign-in response: {err}"))
-    })?;
-    if !status.is_success() {
-        return Err(StartError::Upstream(format!(
-            "OpenAI sign-in returned {status}"
-        )));
-    }
-    let device: DeviceCodeResponse = serde_json::from_slice(&body).map_err(|_| {
-        StartError::Upstream("OpenAI returned an invalid device sign-in response".to_owned())
-    })?;
-    let interval_seconds = match device.interval {
-        serde_json::Value::Number(value) => value.as_u64(),
-        serde_json::Value::String(value) => value.parse().ok(),
-        _ => None,
-    }
-    .ok_or_else(|| StartError::Upstream("OpenAI returned an invalid polling interval".to_owned()))?
-    .max(1);
+        .map_err(StartError::Upstream)?;
     let now = crate::auth::now();
     let id = random_id();
     let flow = DeviceFlow {
@@ -195,12 +138,14 @@ pub async fn start(
         endpoint_id,
         socks5_proxy,
         client,
+        base_url,
         device_auth_id: device.device_auth_id,
         user_code: device.user_code,
-        interval_seconds,
+        verification_uri: device.verification_uri,
+        interval_seconds: device.interval_seconds,
         next_poll_at: now,
         poll_lock: Arc::new(Mutex::new(())),
-        expires_at: now + DEVICE_TIMEOUT_SECONDS,
+        expires_at: now.saturating_add(device.expires_in_seconds),
         status: FlowStatus::Pending,
     };
     let view = flow_view(&id, &flow);
@@ -236,10 +181,17 @@ pub async fn poll(state: &AppState, id: &str) -> Result<DeviceFlowView, String> 
             .ok_or_else(|| "OpenAI sign-in flow not found".to_owned());
     };
 
-    match poll_openai(&flow.client, &flow, AUTH_BASE_URL).await {
+    let implementation = state
+        .extensions
+        .subscription_provider("openai_codex")
+        .ok_or_else(|| "OpenAI Subscription Extension is not enabled".to_owned())?;
+    match implementation
+        .poll_device_authorization(&flow.client, &flow.device_auth_id, &flow.user_code)
+        .await
+    {
         Ok(None) => {}
         Ok(Some(credential)) => {
-            if let Err(error) = attach_subscription(state, &flow, credential).await {
+            if let Err(error) = attach_subscription(state, &flow, credential.into()).await {
                 set_flow_status(state, id, FlowStatus::Failed(error)).await;
             } else {
                 set_flow_status(state, id, FlowStatus::Complete).await;
@@ -252,109 +204,6 @@ pub async fn poll(state: &AppState, id: &str) -> Result<DeviceFlowView, String> 
         .get(id)
         .map(|flow| flow_view(id, flow))
         .ok_or_else(|| "OpenAI sign-in flow not found".to_owned())
-}
-
-async fn poll_openai(
-    client: &reqwest::Client,
-    flow: &DeviceFlow,
-    auth_base_url: &str,
-) -> Result<Option<OpenAiSubscription>, String> {
-    let response = client.post(format!("{auth_base_url}/api/accounts/deviceauth/token"))
-        .json(&serde_json::json!({"device_auth_id": flow.device_auth_id, "user_code": flow.user_code}))
-        .timeout(OAUTH_REQUEST_TIMEOUT)
-        .send().await.map_err(|err| format!("OpenAI sign-in polling failed: {err}"))?;
-    if response.status() == reqwest::StatusCode::FORBIDDEN
-        || response.status() == reqwest::StatusCode::NOT_FOUND
-    {
-        return Ok(None);
-    }
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("Could not read OpenAI sign-in status: {err}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI sign-in failed with {status}"));
-    }
-    let code: DeviceTokenResponse = serde_json::from_slice(&body)
-        .map_err(|_| "OpenAI returned an invalid sign-in completion".to_owned())?;
-    exchange_code(
-        client,
-        &code.authorization_code,
-        &code.code_verifier,
-        auth_base_url,
-    )
-    .await
-    .map(Some)
-}
-
-async fn exchange_code(
-    client: &reqwest::Client,
-    code: &str,
-    verifier: &str,
-    auth_base_url: &str,
-) -> Result<OpenAiSubscription, String> {
-    let response = client
-        .post(format!("{auth_base_url}/oauth/token"))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", CLIENT_ID),
-            ("code", code),
-            ("code_verifier", verifier),
-            (
-                "redirect_uri",
-                "https://auth.openai.com/deviceauth/callback",
-            ),
-        ])
-        .timeout(OAUTH_REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|err| format!("OpenAI token exchange failed: {err}"))?;
-    token_response(response, "exchange").await
-}
-
-async fn refresh_token(
-    client: &reqwest::Client,
-    refresh: &str,
-    auth_base_url: &str,
-) -> Result<OpenAiSubscription, String> {
-    let response = client
-        .post(format!("{auth_base_url}/oauth/token"))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-            ("client_id", CLIENT_ID),
-        ])
-        .timeout(OAUTH_REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|err| format!("OpenAI token refresh failed: {err}"))?;
-    token_response(response, "refresh").await
-}
-
-async fn token_response(
-    response: reqwest::Response,
-    operation: &str,
-) -> Result<OpenAiSubscription, String> {
-    let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("Could not read OpenAI token response: {err}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI token {operation} failed with {status}"));
-    }
-    let token: TokenResponse = serde_json::from_slice(&body)
-        .map_err(|_| format!("OpenAI token {operation} returned an invalid response"))?;
-    let account_id = account_id(&token.access_token)?;
-    reqwest::header::HeaderValue::from_str(&account_id)
-        .map_err(|_| "OpenAI access token contains an invalid ChatGPT account ID".to_owned())?;
-    Ok(OpenAiSubscription {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires_at: crate::auth::now().saturating_add(token.expires_in),
-        account_id,
-    })
 }
 
 pub async fn refreshed_endpoint(
@@ -392,7 +241,14 @@ pub async fn refreshed_endpoint(
         return Ok(endpoint);
     }
     let client = endpoint.client(&state.client)?;
-    let refreshed = refresh_token(&client, &credential.refresh_token, AUTH_BASE_URL).await?;
+    let implementation = state
+        .extensions
+        .subscription_provider("openai_codex")
+        .ok_or_else(|| "OpenAI Subscription Extension is not enabled".to_owned())?;
+    let refreshed = implementation
+        .refresh_credential(&client, &credential.refresh_token)
+        .await?;
+    let refreshed = refreshed.into();
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
     let stored = updated
@@ -432,6 +288,12 @@ async fn attach_subscription(
     credential: OpenAiSubscription,
 ) -> Result<(), String> {
     let mut providers = state.providers.write().await;
+    // Checked under the same Provider lock used by Extension disablement, which
+    // prevents a completed OAuth flow from attaching after the dependency check.
+    let implementation = state
+        .extensions
+        .provider_endpoint("openai_codex")
+        .ok_or_else(|| "OpenAI Subscription Extension is not enabled".to_owned())?;
     let mut updated = providers.clone();
     if flow.create_provider && updated.contains_key(&flow.provider_id) {
         return Err("Provider ID already exists".to_owned());
@@ -467,12 +329,13 @@ async fn attach_subscription(
     provider
         .endpoints
         .push(subscription_endpoint(flow, credential));
+    let models = implementation.models();
     provider
         .discovered_models
-        .extend(MODELS.iter().map(|model| (*model).to_owned()));
+        .extend(models.iter().map(|model| (*model).to_owned()));
     provider.discovered_models.sort();
     provider.discovered_models.dedup();
-    for model in MODELS {
+    for model in models {
         provider
             .model_endpoints
             .entry((*model).to_owned())
@@ -492,7 +355,8 @@ fn subscription_endpoint(flow: &DeviceFlow, credential: OpenAiSubscription) -> A
     ApiEndpoint {
         id: flow.endpoint_id.clone(),
         api_type: ApiType::OpenaiCodex,
-        base_url: CHATGPT_BASE_URL.to_owned(),
+        // Persisted for backward compatibility; the Extension owns the target path and wire behavior.
+        base_url: flow.base_url.clone(),
         socks5_proxy: flow.socks5_proxy.clone(),
         extra_headers: HashMap::new(),
         extra_body: serde_json::Map::new(),
@@ -548,28 +412,11 @@ fn flow_view(id: &str, flow: &DeviceFlow) -> DeviceFlowView {
         id: id.to_owned(),
         status,
         user_code: flow.user_code.clone(),
-        verification_uri: "https://auth.openai.com/codex/device",
+        verification_uri: flow.verification_uri,
         interval_seconds: flow.interval_seconds,
         expires_at: flow.expires_at,
         error,
     }
-}
-
-fn account_id(token: &str) -> Result<String, String> {
-    let payload = token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| "OpenAI access token is not a JWT".to_owned())?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| "OpenAI access token has invalid JWT encoding".to_owned())?;
-    let claims: JwtClaims = serde_json::from_slice(&bytes)
-        .map_err(|_| "OpenAI access token has invalid JWT claims".to_owned())?;
-    claims
-        .auth
-        .and_then(|auth| auth.chatgpt_account_id)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| "OpenAI access token does not contain a ChatGPT account ID".to_owned())
 }
 
 fn random_id() -> String {
@@ -593,24 +440,9 @@ fn valid_id(value: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use tokio::sync::Mutex;
 
     use crate::config::OpenAiSubscription;
-
-    #[test]
-    fn extracts_chatgpt_account_id_from_access_token() {
-        let payload = URL_SAFE_NO_PAD
-            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-123"}}"#);
-        let token = format!("header.{payload}.signature");
-        assert_eq!(super::account_id(&token).unwrap(), "account-123");
-    }
-
-    #[test]
-    fn rejects_access_token_without_account_id() {
-        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"user"}"#);
-        assert!(super::account_id(&format!("header.{payload}.signature")).is_err());
-    }
 
     #[test]
     fn stale_refresh_cannot_overwrite_a_reconnected_endpoint() {
@@ -675,8 +507,10 @@ mod tests {
             endpoint_id: "chatgpt".to_owned(),
             socks5_proxy: Some("socks5h://127.0.0.1:1080".to_owned()),
             client: reqwest::Client::new(),
+            base_url: "https://chatgpt.com/backend-api".to_owned(),
             device_auth_id: "device".to_owned(),
             user_code: "CODE".to_owned(),
+            verification_uri: "https://auth.openai.com/codex/device",
             interval_seconds: 1,
             next_poll_at: 0,
             poll_lock: Arc::new(Mutex::new(())),
@@ -690,83 +524,5 @@ mod tests {
             Some("socks5h://127.0.0.1:1080"),
         );
         assert_eq!(endpoint.api_type, crate::config::ApiType::OpenaiCodex);
-    }
-
-    #[tokio::test]
-    async fn refreshes_subscription_credential() {
-        use std::collections::HashMap;
-
-        use axum::{Form, Json, Router, routing::post};
-
-        let payload = URL_SAFE_NO_PAD.encode(
-            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-refreshed"}}"#,
-        );
-        let access_token = format!("header.{payload}.signature");
-        let app = Router::new().route(
-            "/oauth/token",
-            post(move |Form(form): Form<HashMap<String, String>>| {
-                let access_token = access_token.clone();
-                async move {
-                    assert_eq!(form.get("grant_type").map(String::as_str), Some("refresh_token"));
-                    assert_eq!(form.get("refresh_token").map(String::as_str), Some("old-refresh"));
-                    Json(serde_json::json!({"access_token":access_token, "refresh_token":"new-refresh", "expires_in":3600}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let credential = super::refresh_token(
-            &reqwest::Client::new(),
-            "old-refresh",
-            &format!("http://{address}"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(credential.account_id, "account-refreshed");
-        assert_eq!(credential.refresh_token, "new-refresh");
-    }
-
-    #[tokio::test]
-    async fn device_completion_exchanges_code_for_subscription_credential() {
-        use axum::{Json, Router, routing::post};
-
-        let payload = URL_SAFE_NO_PAD
-            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-456"}}"#);
-        let access_token = format!("header.{payload}.signature");
-        let app = Router::new()
-            .route("/api/accounts/deviceauth/token", post(|| async {
-                Json(serde_json::json!({"authorization_code":"code", "code_verifier":"verifier"}))
-            }))
-            .route("/oauth/token", post(move || { let access_token = access_token.clone(); async move {
-                Json(serde_json::json!({"access_token":access_token, "refresh_token":"refresh", "expires_in":3600}))
-            }}));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let flow = super::DeviceFlow {
-            provider_id: "openai".to_owned(),
-            provider_name: None,
-            create_provider: false,
-            endpoint_id: "chatgpt".to_owned(),
-            socks5_proxy: None,
-            client: reqwest::Client::new(),
-            device_auth_id: "device".to_owned(),
-            user_code: "CODE".to_owned(),
-            interval_seconds: 1,
-            next_poll_at: 0,
-            poll_lock: Arc::new(Mutex::new(())),
-            expires_at: u64::MAX,
-            status: super::FlowStatus::Pending,
-        };
-
-        let credential = super::poll_openai(&flow.client, &flow, &format!("http://{address}"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(credential.account_id, "account-456");
-        assert_eq!(credential.refresh_token, "refresh");
-        assert!(credential.expires_at > crate::auth::now());
     }
 }

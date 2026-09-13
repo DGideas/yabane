@@ -15,6 +15,7 @@ pub enum HookStage {
     UpstreamRequest,
     UpstreamHeaders,
     UpstreamExchange,
+    ProviderEndpoint,
 }
 
 impl HookStage {
@@ -23,6 +24,7 @@ impl HookStage {
             Self::UpstreamRequest => "upstream_request",
             Self::UpstreamHeaders => "upstream_headers",
             Self::UpstreamExchange => "upstream_exchange",
+            Self::ProviderEndpoint => "provider_endpoint",
         }
     }
 }
@@ -156,6 +158,91 @@ pub trait UpstreamExchangeHook: ExtensionHook {
         context: &RequestContext<'_>,
         request: ObservedUpstreamRequest<'_>,
     ) -> Option<Box<dyn UpstreamExchangeObserver>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderEndpointKind {
+    Subscription,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderEndpointType {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub default_endpoint_id: &'static str,
+    pub fixed_base_url: Option<&'static str>,
+    pub kind: ProviderEndpointKind,
+    pub upstream_protocol: Protocol,
+    pub always_event_stream: bool,
+}
+
+pub struct ProviderEndpointCredential<'a> {
+    pub access_token: &'a str,
+    pub account_id: &'a str,
+}
+
+pub struct ProviderEndpointRequest<'a> {
+    pub headers: &'a mut HeaderMap,
+    pub body: &'a mut Vec<u8>,
+    pub target_path: &'a mut String,
+    /// Core-owned, short-lived credential fields. Implementations must not retain them.
+    pub credential: Option<ProviderEndpointCredential<'a>>,
+}
+
+/// A compiled provider-specific Endpoint implementation. Core retains routing,
+/// persistence, and credential ownership; the Extension owns its wire behavior.
+pub trait ProviderEndpoint: Send + Sync {
+    fn extension_id(&self) -> &'static str;
+    fn endpoint_type(&self) -> ProviderEndpointType;
+    fn models(&self) -> &'static [&'static str];
+    fn prepare_request(&self, request: ProviderEndpointRequest<'_>) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct SubscriptionCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64,
+    pub account_id: String,
+}
+
+/// OAuth and credential lifecycle owned by a subscription Endpoint Extension.
+/// The host supplies persistence and resource validation around these operations.
+pub trait SubscriptionProvider: ProviderEndpoint {
+    fn start_device_authorization<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<DeviceAuthorization, String>> + Send + 'a>,
+    >;
+    fn poll_device_authorization<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        device_auth_id: &'a str,
+        user_code: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<SubscriptionCredential>, String>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn refresh_credential<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        refresh_token: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
+    >;
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceAuthorization {
+    pub device_auth_id: String,
+    pub user_code: String,
+    pub verification_uri: &'static str,
+    pub interval_seconds: u64,
+    pub expires_in_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug)]

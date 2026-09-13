@@ -18,10 +18,11 @@ description: 指导 Agent 在 Yabane 中创建、接入、配置和测试原生 
 
 Yabane Extension 是独立 Rust crate，通过 Cargo feature 编译并静态链接进二进制。新增或移除 Extension 需要重新构建和部署；当前没有动态安装、热加载、WASM、异步 Hook 或安全沙箱。
 
-当前 API v2 提供两个同步改写 Hook 和一个只读观察 Hook：
+当前 API v1 提供 Provider Endpoint integration、两个同步改写 Hook 和一个只读观察 Hook：
 
 | Hook | 输入 | 确切位置 |
 |---|---|---|
+| `ProviderEndpoint` / `SubscriptionProvider` | Endpoint metadata、model catalog、OAuth lifecycle 和最终 wire request | Core 保持 Provider/Endpoint 资源、路由、持久化和凭据所有权；实现负责 Provider-specific 行为 |
 | `UpstreamRequestHook` | 上游协议的 JSON body，类型为 `Bytes` | 完成认证、路由、Provider 前缀移除和显式协议转换之后；发送及 Core 的 Provider 特殊适配之前 |
 | `UpstreamHeadersHook` | 独立的空 Header overlay | 清理调用方 Header 之后；Core 注入上游凭据、协议默认 Header 和订阅身份之前 |
 | `UpstreamExchangeHook` | 最终上游请求及原始上游响应的只读增量视图 | Core 完成请求改写和认证之后开始；响应头、每个原始响应 chunk 和最终 outcome 分别通知 observer |
@@ -208,7 +209,7 @@ yabane-extension-example = {
 
 ### 6. 构造配置实例并加入请求快照
 
-当前 v2 没有通用的运行时配置 loader。参照 `request-defaults`：在路由资源已经确定后，从同一个权威配置源构造 Extension 实例，并按持久化顺序把 trait reference 放进 `RequestHooks`：
+当前 v1 没有通用的运行时配置 loader。参照 `request-defaults`：在路由资源已经确定后，从同一个权威配置源构造 Extension 实例，并按持久化顺序把 trait reference 放进 `RequestHooks`：
 
 ```rust
 let hooks = RequestHooks {
@@ -239,11 +240,12 @@ Header Hook 不能设置以下 Core-managed Header：
 
 Runner 会在每个 Header Hook 后验证整个 overlay，并把违规归因给当前实例。管理 API 若允许配置 Header，也必须在保存时执行同等限制，不能等到流量路径才失败。
 
-Extension 不得读取、记录、返回或持久化 Gateway API key、上游 API key、OAuth token、Cookie 或订阅账号身份。原生 Extension 是部署方审核的可信进程内代码，不是安全沙箱。
+普通请求 Hook 不得读取 Gateway API key、上游 API key、OAuth token、Cookie 或订阅账号身份。实现 `SubscriptionProvider` 的可信 Provider Endpoint Extension 可以接收完成当前 OAuth 或 wire preparation 所需的短生命周期订阅凭据，但不得记录、返回、另行持久化或保留这些值。原生 Extension 是部署方审核的可信进程内代码，不是安全沙箱。
 
 ## 配置和管理页面
 
 - 配置必须只有一个权威来源；Extension 页面和 Provider/Endpoint 页面不能各保存一份。
+- `ProviderEndpointType::fixed_base_url` 非空时是实际请求目标的权威来源；Core 不能继续使用旧配置中持久化的 base URL，否则被篡改或历史数据会绕过 Extension 声明的固定上游。
 - 与 Provider/Endpoint 强关联的设置保留在资源页面，Extensions 页面展示实现、版本、Hook、启用状态，以及从同一配置派生的摘要与链接。
 - 所有编译进二进制的 Extension 默认启用；`ExtensionRegistry` 将实现级启停状态持久化到 `data/extensions.json`。禁用只停止 Hook 执行，不删除 Extension 自身的 Provider/Endpoint 配置。
 - `--no-extensions` 是进程级总开关，不修改持久化状态；Extension 接入必须服从 Registry 的有效启用状态。

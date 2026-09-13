@@ -55,7 +55,7 @@ cargo build && tests/e2e.sh target/debug/yabane
 
 ## Extensions
 
-Yabane request extensions are trusted Rust crates statically linked through Cargo features. The default build includes the `request-defaults` extension, which owns explicitly configured Extra Header and Extra JSON Body behavior. Its configuration remains in each Provider's resource context, while the Extensions console page identifies the implementation, API version, Hook stages, and enabled state.
+Yabane request extensions are trusted Rust crates statically linked through Cargo features. The default build includes `request-defaults`, `traffic-capture`, and `openai-subscription`. OpenAI Subscription owns ChatGPT device authorization, credential refresh, the pi-ai-aligned model catalog, and Codex wire adaptation while its Provider and Endpoint setup remains in the normal console resource hierarchy. Request Defaults owns explicitly configured Extra Header and Extra JSON Body behavior. Its configuration remains in each Provider's resource context, while the Extensions console page identifies the implementation, API version, Hook stages, and enabled state.
 
 An administrator can enable or disable each compiled Extension on the Extensions page. The state is persisted in `data/extensions.json`; disabling Request Defaults keeps its Provider and Endpoint configuration but stops applying it. To disable every compiled Extension for one process without changing persisted settings, run:
 

@@ -69,6 +69,17 @@ pub struct OpenAiSubscription {
     pub account_id: String,
 }
 
+impl From<yabane_extension_api::SubscriptionCredential> for OpenAiSubscription {
+    fn from(credential: yabane_extension_api::SubscriptionCredential) -> Self {
+        Self {
+            access_token: credential.access_token,
+            refresh_token: credential.refresh_token,
+            expires_at: credential.expires_at,
+            account_id: credential.account_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApiEndpoint {
     pub id: String,

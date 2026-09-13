@@ -133,9 +133,24 @@ pub async fn load_admin() -> Result<Option<AdminUser>, String> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("read {ADMIN_FILE}: {err}")),
     };
-    serde_json::from_slice(&contents)
-        .map(Some)
-        .map_err(|err| format!("parse {ADMIN_FILE}: {err}"))
+    let user: AdminUser =
+        serde_json::from_slice(&contents).map_err(|err| format!("parse {ADMIN_FILE}: {err}"))?;
+    validate_management_key_identities(&user)?;
+    Ok(Some(user))
+}
+
+fn validate_management_key_identities(user: &AdminUser) -> Result<(), String> {
+    let mut ids = std::collections::HashSet::new();
+    if user
+        .management_api_keys
+        .iter()
+        .any(|key| key.id.is_empty() || !ids.insert(key.id.as_str()))
+    {
+        return Err(format!(
+            "parse {ADMIN_FILE}: Management API key IDs must be non-empty and unique"
+        ));
+    }
+    Ok(())
 }
 
 pub async fn turnstile_config() -> axum::Json<TurnstileConfig> {
@@ -601,3 +616,29 @@ fn expired_cookie() -> &'static str {
 }
 
 use axum::response::IntoResponse;
+
+#[cfg(test)]
+mod tests {
+    use super::{AdminUser, ManagementApiKey};
+
+    #[test]
+    fn rejects_ambiguous_management_api_key_identities() {
+        let key = |id: &str| ManagementApiKey {
+            id: id.to_owned(),
+            name: "key".to_owned(),
+            secret_hash: "hash".to_owned(),
+            prefix: "yab_mgmt_…test".to_owned(),
+            created_at: 0,
+            expires_at: None,
+            last_used_at: None,
+        };
+        let user = AdminUser {
+            username: "admin".to_owned(),
+            email: "admin@example.com".to_owned(),
+            password_hash: "hash".to_owned(),
+            management_api_keys: vec![key("duplicate"), key("duplicate")],
+        };
+
+        assert!(super::validate_management_key_identities(&user).is_err());
+    }
+}

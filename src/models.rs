@@ -82,7 +82,7 @@ pub async fn list_models(State(state): State<AppState>, request: Request) -> Res
         .filter(|provider| allowed.is_none_or(|ids| ids.is_empty() || ids.contains(&provider.id)))
         .cloned()
         .collect();
-    let results = discover_providers(&state.client, providers).await;
+    let results = discover_providers(&state, providers).await;
     update_discoveries(&state, &results).await;
 
     let mut data = Vec::new();
@@ -127,7 +127,7 @@ pub async fn refresh_provider(
             );
         }
     };
-    let results = discover_providers(&state.client, vec![provider]).await;
+    let results = discover_providers(&state, vec![provider]).await;
     update_discoveries(&state, &results).await;
     match &results[0].1 {
         Ok(discovery) => axum::Json(serde_json::json!({"models": discovery.models.iter().map(|model| &model.id).collect::<Vec<_>>() })).into_response(),
@@ -136,15 +136,12 @@ pub async fn refresh_provider(
 }
 
 async fn discover_providers(
-    client: &reqwest::Client,
+    state: &AppState,
     providers: Vec<Provider>,
 ) -> Vec<(Provider, Result<ProviderDiscovery, String>)> {
-    join_all(providers.into_iter().map(|provider| {
-        let client = client.clone();
-        async move {
-            let models = discover_provider_models(&client, &provider).await;
-            (provider, models)
-        }
+    join_all(providers.into_iter().map(|provider| async move {
+        let models = discover_provider_models(state, &provider).await;
+        (provider, models)
     }))
     .await
 }
@@ -225,13 +222,13 @@ fn discovery_keys_match(current: &[ApiKey], snapshot: &[ApiKey]) -> bool {
 }
 
 async fn discover_provider_models(
-    client: &reqwest::Client,
+    state: &AppState,
     provider: &Provider,
 ) -> Result<ProviderDiscovery, String> {
     let results = join_all(provider.endpoints.iter().map(|endpoint| async move {
         (
             endpoint.id.clone(),
-            list_endpoint_models(client, provider, endpoint).await,
+            list_endpoint_models(state, provider, endpoint).await,
         )
     }))
     .await;
@@ -264,7 +261,7 @@ async fn discover_provider_models(
 }
 
 async fn list_endpoint_models(
-    client: &reqwest::Client,
+    state: &AppState,
     provider: &Provider,
     endpoint: &ApiEndpoint,
 ) -> Result<Vec<Model>, String> {
@@ -275,7 +272,12 @@ async fn list_endpoint_models(
                 endpoint.id
             ));
         }
-        return Ok(crate::openai_subscription::MODELS
+        let implementation = state
+            .extensions
+            .provider_endpoint("openai_codex")
+            .ok_or_else(|| "OpenAI Subscription Extension is not enabled".to_owned())?;
+        return Ok(implementation
+            .models()
             .iter()
             .map(|id| Model {
                 id: (*id).to_owned(),
@@ -286,6 +288,7 @@ async fn list_endpoint_models(
             })
             .collect());
     }
+    let client = &state.client;
     let keys: Vec<Option<ApiKey>> = if endpoint.requires_api_key {
         endpoint
             .api_keys

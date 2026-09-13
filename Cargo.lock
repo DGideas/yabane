@@ -1771,6 +1771,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yabane-extension-api",
+ "yabane-extension-openai-subscription",
  "yabane-extension-request-defaults",
  "yabane-extension-traffic-capture",
 ]
@@ -1781,6 +1782,19 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
+ "reqwest",
+]
+
+[[package]]
+name = "yabane-extension-openai-subscription"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "yabane-extension-api",
 ]
 
 [[package]]

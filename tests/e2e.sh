@@ -23,6 +23,10 @@ if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-
   echo "invalid activity retention unexpectedly started" >&2; exit 1
 fi
 grep -q 'YABANE_ACTIVITY_RETENTION_DAYS must be between 1 and 3650' invalid-retention.log
+mkdir -p data
+cat >data/providers.json <<'JSON'
+[{"id":"subscription-fixture","name":"Subscription fixture","extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[],"endpoints":[{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","socks5_proxy":null,"extra_headers":{},"extra_body":{},"requires_api_key":false,"api_keys":[],"openai_subscription":{"access_token":"fixture","refresh_token":"fixture","expires_at":4102444800,"account_id":"fixture"}}],"discovered_models":[],"model_endpoints":{},"model_endpoint_preferences":[],"models_discovered_at":null,"model_discovery_error":null}]
+JSON
 TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" "$binary" --addr "127.0.0.1:$port" >server.log 2>&1 & pid=$!
 ready=false
 for _ in $(seq 1 50); do
@@ -136,6 +140,15 @@ admin_status() { curl -sS -b "$cookie" -o response.json -w '%{http_code}' "$@"; 
 extensions=$(admin -f "$base/admin/extensions")
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, (.api_version | tostring), (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "traffic-capture") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:upstream_exchange:true ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
+# A Provider Endpoint implementation cannot be disabled while configured Endpoints depend on it.
+[[ $(admin_status -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Delete OpenAI subscription Endpoints before disabling the extension" ]]
+admin -f -X DELETE "$base/admin/providers/subscription-fixture" >/dev/null
+[[ $(admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":false}' | jq -r .enabled) == false ]]
+[[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI Subscription Extension is not enabled" ]]
+admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
 [[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.active, .config.remaining, .retained] | join(":")') == false:0:0 ]]
 created=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"E2E unrestricted","expires_at":null,"provider_ids":[]}')
 secret=$(printf '%s' "$created" | jq -r .secret)
