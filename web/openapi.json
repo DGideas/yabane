@@ -224,7 +224,7 @@
           },
           "enabled": {
             "type": "boolean",
-            "description": "Whether this Extension executes Hooks in the current process."
+            "description": "Whether this Extension executes Hooks or provides its Endpoint implementation in the current process."
           },
           "runtime_configurable": {
             "type": "boolean",
@@ -1852,7 +1852,7 @@
           "Extensions"
         ],
         "summary": "List extensions included in this build",
-        "description": "Returns trusted native Rust extensions, their current enabled state, Extension API versions, and declared Hook stages. It does not expose a runtime installation endpoint.",
+        "description": "Returns trusted native Rust extensions, their current enabled state, Extension API versions, and declared Hook or Provider Endpoint stages. It does not expose a runtime installation endpoint.",
         "security": [
           {
             "managementKey": []
@@ -1887,7 +1887,7 @@
           "Extensions"
         ],
         "summary": "Enable or disable a compiled extension",
-        "description": "Persists the Extension enabled state without changing its own configuration. Returns 409 when this process was started with --no-extensions.",
+        "description": "Persists the Extension enabled state without changing its own configuration. Returns 409 when this process was started with --no-extensions or configured resources still depend on the Extension.",
         "security": [
           {
             "managementKey": []
@@ -1942,7 +1942,7 @@
             "$ref": "#/components/responses/NotFound"
           },
           "409": {
-            "description": "All extensions are disabled by the startup option"
+            "description": "Extensions are disabled by the startup option, or configured resources still depend on this Extension"
           }
         }
       }

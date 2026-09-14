@@ -141,12 +141,23 @@ for (const project of projects) {
     if (!(await developmentLink.isVisible()) || await developmentLink.getAttribute('href') !== 'https://github.com/DGideas/yabane/blob/master/.agents/skills/yabane-extensions/SKILL.md') throw new Error(`${project.name}: Extensions page omits the development guide link`);
     const requestDefaultsExtension = page.locator('.extension-card').filter({hasText: 'request-defaults'});
     if (!(await requestDefaultsExtension.isVisible())) throw new Error(`${project.name}: Request Defaults is missing from Extensions`);
+    const openAiSubscriptionExtension = page.locator('.extension-card').filter({hasText: 'openai-subscription'});
+    if (!(await openAiSubscriptionExtension.isVisible()) || !(await openAiSubscriptionExtension.getByText('1 Endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension is missing or not linked to its Endpoint resources`);
+    if (!(await openAiSubscriptionExtension.getByText('provider endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension does not declare its Endpoint stage`);
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
     await trafficCaptureExtension.getByRole('button', {name: 'Configure capture'}).click();
     await page.locator('#traffic-capture-view').waitFor({state: 'visible'});
     if (!(await page.getByText('Captured bodies may contain prompts, files, tool calls, and model output.', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not warn about captured content`);
     if (!(await page.locator('#capture-form [name="provider_id"]').evaluate(element => element.required))) throw new Error(`${project.name}: Traffic Capture lacks a required Provider scope selector`);
+    const refreshCaptures = page.getByRole('button', {name: 'Refresh captures'});
+    if (!(await refreshCaptures.isVisible())) throw new Error(`${project.name}: Traffic Capture lacks a manual refresh action`);
+    await Promise.all([
+      page.waitForResponse(response => response.request().method() === 'GET' && response.url().endsWith('/admin/extensions/traffic-capture/status')),
+      page.waitForResponse(response => response.request().method() === 'GET' && response.url().endsWith('/admin/extensions/traffic-capture/captures')),
+      refreshCaptures.click(),
+    ]);
+    await page.waitForFunction(() => !document.querySelector('#refresh-captures').disabled);
     await assertNoPageOverflow(page, project.name, 'Traffic Capture page');
     await page.locator('#back-to-extensions').click();
     if (!(await requestDefaultsExtension.getByText('Native Rust', {exact: true}).isVisible())) throw new Error(`${project.name}: extension implementation type is not visible`);
@@ -238,7 +249,10 @@ for (const project of projects) {
       const colors = selector => [...dialog.querySelectorAll(selector)].map(element => getComputedStyle(element).fill);
       return { background: getComputedStyle(dialog.querySelector('.about-hero')).backgroundColor, facets: colors('.about-facets path'), frontArrow: colors('.about-arrows-front path')[0] };
     });
-    if (new Set(heroPalette.facets).size < 4 || !heroPalette.facets.includes('rgb(0, 213, 232)') || heroPalette.frontArrow !== 'rgb(112, 242, 255)') throw new Error(`${project.name}: About hero is missing its saturated blue-and-cyan contrast palette`);
+    const channels = color => (color.match(/\d+/g) || []).slice(0, 3).map(Number);
+    const cyan = channels(heroPalette.facets[2]);
+    const arrow = channels(heroPalette.frontArrow);
+    if (new Set(heroPalette.facets).size < 4 || cyan.length !== 3 || Math.max(...cyan) > 185 || Math.max(...cyan) - Math.min(...cyan) > 100 || arrow.length !== 3 || Math.max(...arrow) > 230) throw new Error(`${project.name}: About hero does not use its restrained ink-blue and muted-cyan palette`);
     const logoPaths = await page.locator('#about-dialog .about-logo path').evaluateAll(paths => paths.map(path => path.getAttribute('d')));
     if (logoPaths.join('|') !== 'M14 4h32l14 14v32c0 5.5-4.5 10-10 10H14C8.5 60 4 55.5 4 50V14C4 8.5 8.5 4 14 4Z|m13 18 13 14-13 14h8l13-14-13-14Z|m31 18 13 14-13 14h8l13-14-13-14Z') throw new Error(`${project.name}: About dialog does not use the Yabane mark`);
     const brandLoaded = await page.locator('.topbar .brand-mark').evaluate(image => image.complete && image.naturalWidth > 0);

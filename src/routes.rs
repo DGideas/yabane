@@ -67,8 +67,9 @@ impl RouteStore {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(format!("read {ROUTES_FILE}: {err}")),
         };
-        let routes = serde_json::from_slice(&contents)
+        let routes: Vec<ModelRoute> = serde_json::from_slice(&contents)
             .map_err(|err| format!("parse {ROUTES_FILE}: {err}"))?;
+        validate_route_identities(&routes)?;
         Ok(Self(Arc::new(RwLock::new(routes))))
     }
 
@@ -94,6 +95,19 @@ impl RouteStore {
             .and_then(ModelRoute::select_target)
             .cloned()
     }
+}
+
+fn validate_route_identities(routes: &[ModelRoute]) -> Result<(), String> {
+    let mut patterns = std::collections::HashSet::new();
+    if routes
+        .iter()
+        .any(|route| route.pattern.is_empty() || !patterns.insert(route.pattern.as_str()))
+    {
+        return Err(format!(
+            "parse {ROUTES_FILE}: model route patterns must be non-empty and unique"
+        ));
+    }
+    Ok(())
 }
 
 fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
@@ -128,6 +142,17 @@ mod tests {
             }],
             cursor: Default::default(),
         }
+    }
+
+    #[test]
+    fn rejects_ambiguous_persisted_route_patterns() {
+        assert!(
+            super::validate_route_identities(&[
+                route("duplicate", "one", 100),
+                route("duplicate", "two", 100),
+            ])
+            .is_err()
+        );
     }
 
     #[tokio::test]

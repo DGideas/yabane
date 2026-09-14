@@ -85,7 +85,24 @@ pub async fn load_auth() -> Result<AuthConfig, String> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(AuthConfig::default()),
         Err(err) => return Err(format!("read {AUTH_FILE}: {err}")),
     };
-    serde_json::from_slice(&contents).map_err(|err| format!("parse {AUTH_FILE}: {err}"))
+    let auth: AuthConfig =
+        serde_json::from_slice(&contents).map_err(|err| format!("parse {AUTH_FILE}: {err}"))?;
+    validate_auth_identities(&auth)?;
+    Ok(auth)
+}
+
+fn validate_auth_identities(auth: &AuthConfig) -> Result<(), String> {
+    let mut ids = std::collections::HashSet::new();
+    if auth
+        .api_keys
+        .iter()
+        .any(|key| key.id.is_empty() || !ids.insert(key.id.as_str()))
+    {
+        return Err(format!(
+            "parse {AUTH_FILE}: Gateway API key IDs must be non-empty and unique"
+        ));
+    }
+    Ok(())
 }
 
 pub async fn save_auth(auth: &AuthConfig) -> Result<(), std::io::Error> {
@@ -192,8 +209,8 @@ mod tests {
     use axum::body::Body;
 
     use super::{
-        AuthorizedProviders, authorized_provider_ids, constant_time_eq, generate_secret,
-        hash_secret,
+        AuthConfig, AuthorizedProviders, GatewayApiKey, authorized_provider_ids, constant_time_eq,
+        generate_secret, hash_secret,
     };
 
     #[test]
@@ -210,6 +227,26 @@ mod tests {
         assert!(constant_time_eq("same-length", "same-length"));
         assert!(!constant_time_eq("same-length", "different!!"));
         assert!(!constant_time_eq("short", "longer"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_gateway_api_key_identities() {
+        let key = |id: &str| GatewayApiKey {
+            id: id.to_owned(),
+            note: String::new(),
+            secret_hash: "hash".to_owned(),
+            secret: String::new(),
+            prefix: "sk-…test".to_owned(),
+            created_at: 0,
+            expires_at: None,
+            provider_ids: Vec::new(),
+        };
+        let auth = AuthConfig {
+            enabled: true,
+            api_keys: vec![key("duplicate"), key("duplicate")],
+        };
+
+        assert!(super::validate_auth_identities(&auth).is_err());
     }
 
     #[test]

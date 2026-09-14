@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, sync::OnceLock, time::Instant};
+use std::{error::Error as StdError, time::Instant};
 
 use axum::{
     body::Body,
@@ -102,7 +102,21 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
             Err(err) => return api_error(err.status, err.message),
         };
 
-    let upstream_protocol = surface.upstream_protocol(endpoint.api_type);
+    let upstream_protocol = if endpoint.api_type == ApiType::OpenaiCodex {
+        match state.extensions.provider_endpoint("openai_codex") {
+            Some(implementation) => {
+                protocol_from_extension(implementation.endpoint_type().upstream_protocol)
+            }
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "OpenAI Subscription Extension is not enabled",
+                );
+            }
+        }
+    } else {
+        surface.upstream_protocol(endpoint.api_type)
+    };
     let body = match protocol::convert_request(&body, surface.protocol(), upstream_protocol) {
         Ok(body) => body,
         Err(err) => return api_error(StatusCode::BAD_REQUEST, err),
@@ -483,7 +497,6 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         endpoint.api_type,
         (caller_protocol, upstream_protocol),
         api_key.as_ref(),
-        endpoint.openai_subscription.as_ref(),
     );
     let path_and_query = parts
         .uri
@@ -495,12 +508,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         Protocol::OpenAiResponses => "/v1/responses",
         Protocol::AnthropicMessages => "/v1/messages",
     };
-    let target = if endpoint.api_type == ApiType::OpenaiCodex {
-        join_upstream_url(&endpoint.base_url, "/codex/responses")
-    } else if caller_protocol == upstream_protocol {
-        join_upstream_url(&endpoint.base_url, path_and_query)
+    let mut target_path = if caller_protocol == upstream_protocol {
+        path_and_query.to_owned()
     } else {
-        join_upstream_url(&endpoint.base_url, target_path)
+        target_path.to_owned()
     };
     let body = if extension_hooks.upstream_request.is_empty() {
         body
@@ -517,17 +528,48 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Err(failure) => return crate::extensions::execution_error(failure),
         }
     };
-    let body = if endpoint.api_type == ApiType::OpenaiCodex {
-        apply_codex_body(body)
-    } else {
-        body
-    };
-    if endpoint.api_type == ApiType::OpenaiCodex
-        && let Some(session_id) = codex_session_id(&body)
-    {
-        request_headers.insert(HeaderName::from_static("session-id"), session_id.clone());
-        request_headers.insert(HeaderName::from_static("x-client-request-id"), session_id);
+    let mut body = body;
+    if endpoint.api_type == ApiType::OpenaiCodex {
+        let implementation = match state.extensions.provider_endpoint("openai_codex") {
+            Some(implementation) => implementation,
+            None => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "OpenAI Subscription Extension is not enabled",
+                );
+            }
+        };
+        let subscription = endpoint
+            .openai_subscription
+            .as_ref()
+            .expect("refreshed subscription");
+        if let Err(error) =
+            implementation.prepare_request(yabane_extension_api::ProviderEndpointRequest {
+                headers: &mut request_headers,
+                body: &mut body,
+                target_path: &mut target_path,
+                credential: Some(yabane_extension_api::ProviderEndpointCredential {
+                    access_token: &subscription.access_token,
+                    account_id: &subscription.account_id,
+                }),
+            })
+        {
+            error!(provider = %provider.id, endpoint = %endpoint.id, %error, "OpenAI subscription request preparation failed");
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "OpenAI Subscription Extension failed",
+            );
+        }
     }
+    let endpoint_implementation = if endpoint.api_type == ApiType::OpenaiCodex {
+        state.extensions.provider_endpoint("openai_codex")
+    } else {
+        None
+    };
+    let target = join_upstream_url(
+        provider_endpoint_base_url(&endpoint.base_url, endpoint_implementation),
+        &target_path,
+    );
 
     let interested_exchange_hooks = state
         .extensions
@@ -625,7 +667,11 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .unwrap_or_default();
     // The ChatGPT Codex endpoint is always SSE, but currently omits Content-Type
     // on successful responses. pi-ai parses it as SSE by protocol, not by header.
-    let event_stream = api_type == ApiType::OpenaiCodex
+    let event_stream = (api_type == ApiType::OpenaiCodex
+        && state
+            .extensions
+            .provider_endpoint("openai_codex")
+            .is_some_and(|implementation| implementation.endpoint_type().always_event_stream))
         || content_type
             .split(';')
             .next()
@@ -645,7 +691,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     };
     let converting = status.is_success() && caller_protocol != upstream_protocol;
 
-    if converting && event_stream && !requested_streaming {
+    // Some upstreams, including ChatGPT Codex subscriptions, require SSE even
+    // when a native Responses caller requested one non-streaming response.
+    if event_stream && !requested_streaming && (converting || api_type == ApiType::OpenaiCodex) {
         let mut upstream = upstream_response.bytes_stream();
         let mut usage = UsageTracker::new(api_type, true);
         let mut converter = StreamConverter::new_aggregating(upstream_protocol, caller_protocol);
@@ -724,7 +772,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
-        set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
+        if converting {
+            set_conversion_header(response.headers_mut(), upstream_protocol, caller_protocol);
+        }
         return response;
     }
 
@@ -1070,7 +1120,6 @@ fn apply_core_upstream_headers(
     api_type: ApiType,
     protocol_route: (Protocol, Protocol),
     api_key: Option<&ApiKey>,
-    subscription: Option<&crate::config::OpenAiSubscription>,
 ) {
     if protocol_route.0 != protocol_route.1 {
         headers.insert(
@@ -1099,154 +1148,23 @@ fn apply_core_upstream_headers(
             .entry(HeaderName::from_static("anthropic-version"))
             .or_insert(HeaderValue::from_static("2023-06-01"));
     }
-    if let Some(subscription) = subscription {
-        // pi-ai's fetch transport transparently decodes compressed responses before
-        // parsing usage. Request identity encoding so Yabane can observe the same
-        // response bytes it forwards and record subscription usage accurately.
-        headers.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", subscription.access_token))
-                .expect("validated OpenAI access token header value"),
-        );
-        headers.insert(
-            HeaderName::from_static("chatgpt-account-id"),
-            HeaderValue::from_str(&subscription.account_id)
-                .expect("validated ChatGPT account ID header value"),
-        );
-        headers.insert(
-            HeaderName::from_static("originator"),
-            HeaderValue::from_static("pi"),
-        );
-        headers.insert(header::USER_AGENT, pi_user_agent().clone());
-        headers.insert(
-            HeaderName::from_static("openai-beta"),
-            HeaderValue::from_static("responses=experimental"),
-        );
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-    }
 }
 
-fn pi_user_agent() -> &'static HeaderValue {
-    static USER_AGENT: OnceLock<HeaderValue> = OnceLock::new();
-    USER_AGENT.get_or_init(|| {
-        let platform = match std::env::consts::OS {
-            "macos" => "darwin",
-            platform => platform,
-        };
-        let architecture = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "x64",
-            architecture => architecture,
-        };
-        let release = std::process::Command::new("uname")
-            .arg("-r")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|release| release.trim().to_owned())
-            .filter(|release| !release.is_empty());
-        let value = match release {
-            Some(release) => format!("pi ({platform} {release}; {architecture})"),
-            None => format!("pi ({platform}; {architecture})"),
-        };
-        HeaderValue::from_str(&value).expect("pi user agent is a valid header value")
-    })
+fn provider_endpoint_base_url<'a>(
+    configured: &'a str,
+    implementation: Option<&dyn yabane_extension_api::ProviderEndpoint>,
+) -> &'a str {
+    implementation
+        .and_then(|implementation| implementation.endpoint_type().fixed_base_url)
+        .unwrap_or(configured)
 }
 
-fn apply_codex_body(body: Vec<u8>) -> Vec<u8> {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.insert("store".to_owned(), serde_json::Value::Bool(false));
-        object.insert("stream".to_owned(), serde_json::Value::Bool(true));
-        let leading_instructions = object
-            .get_mut("input")
-            .and_then(serde_json::Value::as_array_mut)
-            .and_then(|input| {
-                let first = input.first()?.as_object()?;
-                let role = first.get("role")?.as_str()?;
-                if !matches!(role, "developer" | "system") {
-                    return None;
-                }
-                let instructions = first.get("content")?.as_str()?.to_owned();
-                input.remove(0);
-                Some(instructions)
-            });
-        if object
-            .get("instructions")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            object.insert(
-                "instructions".to_owned(),
-                serde_json::Value::String(
-                    leading_instructions
-                        .unwrap_or_else(|| "You are a helpful assistant.".to_owned()),
-                ),
-            );
-        }
-        if let Some(input) = object
-            .get("input")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-        {
-            object.insert(
-                "input".to_owned(),
-                serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": input}]}]),
-            );
-        }
-        // pi-ai's Codex request shape intentionally omits the public Responses
-        // output cap because the ChatGPT Codex backend rejects that parameter.
-        object.remove("max_output_tokens");
-        object
-            .entry("text")
-            .or_insert_with(|| serde_json::json!({"verbosity": "low"}));
-        object
-            .entry("tool_choice")
-            .or_insert_with(|| serde_json::Value::String("auto".to_owned()));
-        object
-            .entry("parallel_tool_calls")
-            .or_insert(serde_json::Value::Bool(true));
-        let include = object
-            .entry("include")
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        if !include.is_array() {
-            *include = serde_json::Value::Array(Vec::new());
-        }
-        let items = include.as_array_mut().expect("normalized include array");
-        if !items
-            .iter()
-            .any(|item| item.as_str() == Some("reasoning.encrypted_content"))
-        {
-            items.push(serde_json::Value::String(
-                "reasoning.encrypted_content".to_owned(),
-            ));
-        }
+fn protocol_from_extension(protocol: yabane_extension_api::Protocol) -> Protocol {
+    match protocol {
+        yabane_extension_api::Protocol::OpenAiChatCompletions => Protocol::OpenAiChat,
+        yabane_extension_api::Protocol::OpenAiResponses => Protocol::OpenAiResponses,
+        yabane_extension_api::Protocol::AnthropicMessages => Protocol::AnthropicMessages,
     }
-    serde_json::to_vec(&value).expect("serialize OpenAI subscription request")
-}
-
-fn codex_session_id(body: &[u8]) -> Option<HeaderValue> {
-    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    let key = value.get("prompt_cache_key")?.as_str()?;
-    if key.is_empty() {
-        return None;
-    }
-    let clamped: String = key.chars().take(64).collect();
-    HeaderValue::from_str(&clamped).ok()
 }
 
 fn extension_protocol(protocol: Protocol) -> yabane_extension_api::Protocol {
@@ -1422,17 +1340,31 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
     use super::{
-        ApiSurface, ApiType, Protocol, apply_codex_body, apply_core_upstream_headers,
-        codex_session_id, copy_response_headers, pi_user_agent, sanitize_request_headers,
-        strip_transformed_response_headers, upstream_transport_failure,
+        ApiSurface, ApiType, Protocol, apply_core_upstream_headers, copy_response_headers,
+        provider_endpoint_base_url, sanitize_request_headers, strip_transformed_response_headers,
+        upstream_transport_failure,
     };
-    use crate::config::OpenAiSubscription;
+
+    #[test]
+    fn provider_endpoint_fixed_base_url_overrides_persisted_configuration() {
+        assert_eq!(
+            provider_endpoint_base_url(
+                "https://attacker.invalid/backend-api",
+                Some(&yabane_extension_openai_subscription::ENDPOINT),
+            ),
+            "https://chatgpt.com/backend-api"
+        );
+        assert_eq!(
+            provider_endpoint_base_url("https://configured.example/v1", None),
+            "https://configured.example/v1"
+        );
+    }
 
     #[test]
     fn codex_adapter_applies_required_response_fields() {
-        let body = apply_codex_body(
-            br#"{"model":"gpt-5.4","input":"hello","stream":true,"store":true}"#.to_vec(),
-        );
+        let mut body =
+            br#"{"model":"gpt-5.4","input":"hello","stream":true,"store":true}"#.to_vec();
+        yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["stream"], true);
         assert_eq!(value["store"], false);
@@ -1448,9 +1380,8 @@ mod tests {
 
     #[test]
     fn codex_adapter_matches_pi_ai_system_prompt_and_output_limit_shape() {
-        let body = apply_codex_body(
-            br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Pi system prompt"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec(),
-        );
+        let mut body = br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Pi system prompt"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec();
+        yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["instructions"], "Pi system prompt");
         assert_eq!(value["input"].as_array().unwrap().len(), 1);
@@ -1462,10 +1393,21 @@ mod tests {
     fn codex_session_affinity_matches_pi_ai_and_rejects_invalid_values() {
         let long = format!("{}tail", "x".repeat(64));
         let body = serde_json::to_vec(&serde_json::json!({"prompt_cache_key": long})).unwrap();
-        assert_eq!(codex_session_id(&body).unwrap(), "x".repeat(64));
-        assert!(codex_session_id(br#"{"prompt_cache_key":""}"#).is_none());
-        assert!(codex_session_id(br#"{"prompt_cache_key":"bad\nheader"}"#).is_none());
-        assert!(codex_session_id(br#"{}"#).is_none());
+        assert_eq!(
+            yabane_extension_openai_subscription::session_id(&body).unwrap(),
+            "x".repeat(64)
+        );
+        assert!(
+            yabane_extension_openai_subscription::session_id(br#"{"prompt_cache_key":""}"#)
+                .is_none()
+        );
+        assert!(
+            yabane_extension_openai_subscription::session_id(
+                br#"{"prompt_cache_key":"bad\nheader"}"#
+            )
+            .is_none()
+        );
+        assert!(yabane_extension_openai_subscription::session_id(br#"{}"#).is_none());
     }
 
     #[test]
@@ -1545,7 +1487,6 @@ mod tests {
             ApiType::Anthropic,
             (Protocol::OpenAiChat, Protocol::AnthropicMessages),
             None,
-            None,
         );
 
         assert_eq!(sanitized["accept-encoding"], "identity");
@@ -1591,12 +1532,6 @@ mod tests {
             "user-agent",
             HeaderValue::from_static("pi (test-os; test-arch)"),
         );
-        let credential = OpenAiSubscription {
-            access_token: "access-token".to_owned(),
-            refresh_token: "refresh-token".to_owned(),
-            expires_at: u64::MAX,
-            account_id: "account-123".to_owned(),
-        };
         let mut sanitized = sanitize_request_headers(
             headers,
             ApiType::OpenaiCodex,
@@ -1607,12 +1542,29 @@ mod tests {
             ApiType::OpenaiCodex,
             (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
             None,
-            Some(&credential),
         );
+        let mut body = br#"{"model":"gpt-5.4","input":"hello"}"#.to_vec();
+        let mut target_path = "/v1/responses".to_owned();
+        yabane_extension_api::ProviderEndpoint::prepare_request(
+            &yabane_extension_openai_subscription::ENDPOINT,
+            yabane_extension_api::ProviderEndpointRequest {
+                headers: &mut sanitized,
+                body: &mut body,
+                target_path: &mut target_path,
+                credential: Some(yabane_extension_api::ProviderEndpointCredential {
+                    access_token: "access-token",
+                    account_id: "account-123",
+                }),
+            },
+        )
+        .unwrap();
         assert_eq!(sanitized["authorization"], "Bearer access-token");
         assert_eq!(sanitized["chatgpt-account-id"], "account-123");
         assert_eq!(sanitized["originator"], "pi");
-        assert_eq!(sanitized["user-agent"], pi_user_agent());
+        assert_eq!(
+            sanitized["user-agent"],
+            yabane_extension_openai_subscription::pi_user_agent()
+        );
         assert_ne!(sanitized["user-agent"], "pi (test-os; test-arch)");
         assert!(
             sanitized["user-agent"]

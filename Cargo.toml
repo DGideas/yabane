@@ -4,6 +4,7 @@ members = [
     "crates/yabane-extension-api",
     "extensions/request-defaults",
     "extensions/traffic-capture",
+    "extensions/openai-subscription",
 ]
 resolver = "2"
 
@@ -15,9 +16,10 @@ description = "A clear, reliable gateway to every LLM."
 license = "MIT"
 
 [features]
-default = ["extension-request-defaults", "extension-traffic-capture"]
+default = ["extension-request-defaults", "extension-traffic-capture", "extension-openai-subscription"]
 extension-request-defaults = ["dep:yabane-extension-request-defaults"]
 extension-traffic-capture = ["dep:yabane-extension-traffic-capture"]
+extension-openai-subscription = ["dep:yabane-extension-openai-subscription"]
 
 [dependencies]
 argon2 = "0.5"
@@ -39,6 +41,7 @@ dotenvy = "0.15"
 yabane-extension-api = { path = "crates/yabane-extension-api" }
 yabane-extension-request-defaults = { path = "extensions/request-defaults", optional = true }
 yabane-extension-traffic-capture = { path = "extensions/traffic-capture", optional = true }
+yabane-extension-openai-subscription = { path = "extensions/openai-subscription", optional = true }
 
 [profile.release]
 lto = "thin"

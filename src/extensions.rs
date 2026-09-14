@@ -12,12 +12,13 @@ use tokio::sync::Mutex;
 #[cfg(any(
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
+    feature = "extension-openai-subscription",
     test
 ))]
 use yabane_extension_api::{EXTENSION_API_VERSION, Extension};
 use yabane_extension_api::{
-    ExtensionError, HookOutcome, ObservedUpstreamRequest, RequestContext, UpstreamExchangeHook,
-    UpstreamExchangeObserver, UpstreamHeadersHook, UpstreamRequestHook,
+    ExtensionError, HookOutcome, ObservedUpstreamRequest, ProviderEndpoint, RequestContext,
+    UpstreamExchangeHook, UpstreamExchangeObserver, UpstreamHeadersHook, UpstreamRequestHook,
 };
 
 pub const EXTENSIONS_FILE: &str = "data/extensions.json";
@@ -86,6 +87,8 @@ pub struct RequestHooks<'a> {
 
 pub struct ExtensionRegistry {
     extensions: Vec<ExtensionEntry>,
+    provider_endpoints: Vec<&'static dyn ProviderEndpoint>,
+    subscription_providers: Vec<&'static dyn yabane_extension_api::SubscriptionProvider>,
     settings: Mutex<ExtensionSettings>,
     settings_path: PathBuf,
     disabled_by_cli: bool,
@@ -98,9 +101,22 @@ impl ExtensionRegistry {
             extension_info(yabane_extension_request_defaults::metadata())?,
             #[cfg(feature = "extension-traffic-capture")]
             extension_info(yabane_extension_traffic_capture::metadata())?,
+            #[cfg(feature = "extension-openai-subscription")]
+            extension_info(yabane_extension_openai_subscription::metadata())?,
         ];
         let settings = load_settings(EXTENSIONS_FILE).await?;
-        Self::new(infos, settings, EXTENSIONS_FILE.into(), disabled_by_cli)
+        #[allow(unused_mut)]
+        let mut registry = Self::new(infos, settings, EXTENSIONS_FILE.into(), disabled_by_cli)?;
+        #[cfg(feature = "extension-openai-subscription")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_openai_subscription::ENDPOINT);
+            registry
+                .subscription_providers
+                .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        Ok(registry)
     }
 
     fn new(
@@ -124,10 +140,19 @@ impl ExtensionRegistry {
             .collect();
         Ok(Self {
             extensions,
+            provider_endpoints: Vec::new(),
+            subscription_providers: Vec::new(),
             settings: Mutex::new(settings),
             settings_path,
             disabled_by_cli,
         })
+    }
+
+    #[cfg_attr(not(feature = "extension-openai-subscription"), allow(dead_code))]
+    pub fn contains(&self, id: &str) -> bool {
+        self.extensions
+            .iter()
+            .any(|extension| extension.info.id == id)
     }
 
     pub fn views(&self) -> Vec<ExtensionView> {
@@ -151,7 +176,8 @@ impl ExtensionRegistry {
     #[cfg_attr(
         not(any(
             feature = "extension-request-defaults",
-            feature = "extension-traffic-capture"
+            feature = "extension-traffic-capture",
+            feature = "extension-openai-subscription"
         )),
         allow(dead_code)
     )]
@@ -162,6 +188,29 @@ impl ExtensionRegistry {
                 .iter()
                 .find(|extension| extension.info.id == id)
                 .is_some_and(|extension| extension.enabled.load(Ordering::Acquire))
+    }
+
+    pub fn provider_endpoint(&self, endpoint_type: &str) -> Option<&'static dyn ProviderEndpoint> {
+        self.provider_endpoints
+            .iter()
+            .copied()
+            .find(|implementation| {
+                implementation.endpoint_type().id == endpoint_type
+                    && self.is_enabled(implementation.extension_id())
+            })
+    }
+
+    pub fn subscription_provider(
+        &self,
+        endpoint_type: &str,
+    ) -> Option<&'static dyn yabane_extension_api::SubscriptionProvider> {
+        self.subscription_providers
+            .iter()
+            .copied()
+            .find(|implementation| {
+                implementation.endpoint_type().id == endpoint_type
+                    && self.is_enabled(implementation.extension_id())
+            })
     }
 
     pub async fn set_enabled(&self, id: &str, enabled: bool) -> Result<ExtensionView, UpdateError> {
@@ -314,6 +363,7 @@ async fn load_settings(path: impl AsRef<Path>) -> Result<ExtensionSettings, Stri
 #[cfg(any(
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
+    feature = "extension-openai-subscription",
     test
 ))]
 fn extension_info(extension: Extension) -> Result<ExtensionInfo, String> {
