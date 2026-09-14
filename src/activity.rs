@@ -24,7 +24,12 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_instance_id: Option<String>,
     pub path: String,
+    /// The model string exactly as supplied by the caller.
     pub model: String,
+    /// The model ID selected by routing and placed in the upstream request.
+    /// Older imported or retained records may not contain this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
     pub provider: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +259,10 @@ impl ActivityStore {
                     [&log.request_id, &log.model, &log.provider, &log.endpoint]
                         .iter()
                         .any(|value| value.to_lowercase().contains(text))
+                        || log
+                            .upstream_model
+                            .as_ref()
+                            .is_some_and(|model| model.to_lowercase().contains(text))
                 })
         };
         let total = data
@@ -696,6 +705,7 @@ mod tests {
             source_instance_id: None,
             path: "/v1/responses".to_owned(),
             model: format!("{provider}/model-{id}"),
+            upstream_model: Some(format!("model-{id}")),
             provider: provider.to_owned(),
             endpoint: format!("endpoint-{provider}"),
             caller_protocol: None,
@@ -713,6 +723,14 @@ mod tests {
             cost: None,
             streaming: false,
         }
+    }
+
+    #[test]
+    fn legacy_record_without_upstream_model_remains_readable() {
+        let encoded = r#"{"timestamp":1,"request_id":"legacy","path":"/v1/responses","model":"alias","provider":"provider","endpoint":"endpoint","status":200,"latency_ms":1,"input_tokens":0,"output_tokens":0,"cached_tokens":0,"streaming":false}"#;
+        let decoded: RequestLog = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded.model, "alias");
+        assert_eq!(decoded.upstream_model, None);
     }
 
     #[test]
@@ -765,6 +783,30 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].request_id, "old-success");
+    }
+
+    #[tokio::test]
+    async fn paginated_logs_search_the_upstream_model() {
+        let now = crate::auth::now();
+        let mut routed = request(now, "routed", "provider", 200);
+        routed.model = "public-alias".to_owned();
+        routed.upstream_model = Some("actual-model".to_owned());
+        let store = store(vec![routed]);
+
+        let (logs, total) = store
+            .query_logs(ActivityLogQuery {
+                since: now - 1,
+                until: now,
+                provider: None,
+                text: Some("actual-model"),
+                status: None,
+                offset: 0,
+                limit: 10,
+            })
+            .await;
+
+        assert_eq!(total, 1);
+        assert_eq!(logs[0].model, "public-alias");
     }
 
     #[tokio::test]

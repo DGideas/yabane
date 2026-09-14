@@ -299,6 +299,7 @@ struct ProxyActivity {
     request_id: String,
     path: String,
     model: String,
+    upstream_model: Option<String>,
     provider: String,
     endpoint: String,
     caller_protocol: Protocol,
@@ -369,6 +370,7 @@ impl ProxyActivity {
                 source_instance_id: None,
                 path: self.path.clone(),
                 model: self.model.clone(),
+                upstream_model: self.upstream_model.clone(),
                 provider: self.provider.clone(),
                 endpoint: self.endpoint.clone(),
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
@@ -561,6 +563,12 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             );
         }
     }
+    // Request extensions and Endpoint implementations may explicitly rewrite or
+    // remove the routed model. Activity must describe the final wire request, not
+    // merely the route target selected before those transformations ran.
+    let sent_upstream_model = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("model")?.as_str().map(str::to_owned));
     let endpoint_implementation = if endpoint.api_type == ApiType::OpenaiCodex {
         state.extensions.provider_endpoint("openai_codex")
     } else {
@@ -631,6 +639,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     source_instance_id: None,
                     path,
                     model,
+                    upstream_model: sent_upstream_model,
                     provider: provider.id.clone(),
                     endpoint: endpoint.id.clone(),
                     caller_protocol: Some(caller_protocol.name().to_owned()),
@@ -681,6 +690,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         request_id,
         path,
         model,
+        upstream_model: sent_upstream_model,
         provider: provider.id.clone(),
         endpoint: endpoint.id.clone(),
         caller_protocol,

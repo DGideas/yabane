@@ -469,7 +469,13 @@
             "type": "string"
           },
           "model": {
-            "type": "string"
+            "type": "string",
+            "description": "Model string exactly as supplied by the caller."
+          },
+          "upstream_model": {
+            "type": "string",
+            "nullable": true,
+            "description": "Exact model ID selected by routing and placed in the upstream request. Null for records created before this metadata was introduced."
           },
           "provider": {
             "type": "string"
