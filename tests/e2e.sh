@@ -311,6 +311,11 @@ friendly_two=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: B
 [[ $(printf '%s' "$friendly_one" | jq -r '.headers["x-provider"]') == yes ]]
 [[ $(printf '%s' "$friendly_two" | jq -r .extra) == null ]]
 [[ $(printf '%s' "$friendly_two" | jq -r '.headers["x-provider"]') == null ]]
+# Activity preserves both the caller's alias and the exact destination model selected by weighted routing.
+friendly_activity=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$friendly_activity" | jq '[.[] | select(.model == "friendly-model" and .provider == "multi" and .endpoint == "one" and .upstream_model == "model-a")] | length') -ge 1 ]]
+[[ $(printf '%s' "$friendly_activity" | jq '[.[] | select(.model == "friendly-model" and .provider == "multi" and .endpoint == "two" and .upstream_model == "model-b")] | length') -ge 1 ]]
+[[ $(admin -f "$base/admin/activity/logs/page?since=0&query=model-b&limit=100" | jq '[.data[] | select(.model == "friendly-model" and .upstream_model == "model-b")] | length') -ge 1 ]]
 # Runtime disabling preserves Request Defaults configuration but bypasses all of its Hooks.
 [[ $(admin_status -X PATCH "$base/admin/extensions/missing" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
 disabled_extension=$(admin -f -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: application/json' -d '{"enabled":false}')
@@ -440,6 +445,7 @@ summary=$(admin -f "$base/admin/activity/export/preview?since=0")
 [[ $(admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":45}' | jq -r .retention_days) == 45 ]]
 [[ $(jq -r .retention_days "$work/data/activity-settings.json") == 45 ]]
 old_retained_at=$(( $(date +%s) - 2 * 86400 ))
+# Legacy records without upstream_model remain importable for backward compatibility.
 old_retained_payload="{\"format\":\"yabane-activity\",\"version\":1,\"instance_id\":\"retention-test\",\"records\":[{\"timestamp\":$old_retained_at,\"request_id\":\"req-retention-old\",\"path\":\"/v1/responses\",\"model\":\"old/model\",\"provider\":\"old\",\"endpoint\":\"old\",\"status\":200,\"latency_ms\":1,\"input_tokens\":0,\"output_tokens\":0,\"cached_tokens\":0,\"cost\":null,\"streaming\":false}]}"
 [[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$old_retained_payload" | jq -r .imported) == 1 ]]
 admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":1}' >/dev/null

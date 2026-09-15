@@ -428,7 +428,7 @@ for (const project of projects) {
     if (!(await page.locator('#activity-page-status').textContent()).includes('Page 1')) throw new Error(`${project.name}: Request explorer does not expose page status`);
     const explorerRow = page.locator('#activity-logs .activity-request-row').first();
     if (await explorerRow.count()) {
-      if (!(await explorerRow.locator('.activity-model').isVisible()) || !(await explorerRow.locator('.route-cell').isVisible()) || !(await explorerRow.locator('.activity-output').isVisible())) throw new Error(`${project.name}: Request explorer does not emphasize model, route, and output usage`);
+      if (!(await explorerRow.locator('.activity-model').isVisible()) || !(await explorerRow.locator('.activity-upstream-model').isVisible()) || !(await explorerRow.locator('.route-cell').isVisible()) || !(await explorerRow.locator('.activity-output').isVisible())) throw new Error(`${project.name}: Request explorer does not emphasize requested/upstream models, route, and output usage`);
     }
     await page.locator('[data-activity-tab="overview"]').click();
     const activityRow = page.locator('#recent-activity-logs .activity-request-row').first();
@@ -436,6 +436,7 @@ for (const project of projects) {
       await activityRow.click();
       await assertDialog(page, '#activity-detail-dialog', project.name);
       if (!(await page.locator('#activity-detail-request').getByText('Request ID', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits request metadata`);
+      if (!(await page.locator('#activity-detail-request').getByText('Requested model', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-request').getByText('Upstream model', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog does not distinguish requested and upstream models`);
       if (!(await page.locator('#activity-detail-timing').getByText('Total', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits timing`);
       if (!(await page.locator('#activity-detail-failure').count())) throw new Error(`${project.name}: request detail dialog omits the failure diagnosis region`);
       if (!(await page.locator('#activity-detail-dialog').getByText('Prompt and response content are not retained.').isVisible())) throw new Error(`${project.name}: request detail dialog omits the content-retention notice`);
