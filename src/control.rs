@@ -43,6 +43,14 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/admin/openai-subscriptions/device-code/{id}",
             get(poll_openai_subscription),
         )
+        .route(
+            "/admin/openai-subscriptions/oauth",
+            post(start_openai_subscription_oauth),
+        )
+        .route(
+            "/admin/openai-subscriptions/oauth/{id}/complete",
+            post(complete_openai_subscription_oauth),
+        )
         .route("/admin/extensions", get(list_extensions))
         .route("/admin/extensions/{id}", patch(update_extension));
     #[cfg(feature = "extension-traffic-capture")]
@@ -1144,6 +1152,52 @@ async fn start_openai_subscription(
         }
         Err(openai_subscription::StartError::Upstream(message)) => {
             api_error(StatusCode::BAD_GATEWAY, message)
+        }
+    }
+}
+
+async fn start_openai_subscription_oauth(
+    State(state): State<AppState>,
+    axum::Json(input): axum::Json<openai_subscription::StartSubscription>,
+) -> Response {
+    if state.extensions.provider_endpoint("openai_codex").is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "OpenAI Subscription Extension is not enabled",
+        );
+    }
+    match openai_subscription::start_browser(&state, input).await {
+        Ok(flow) => (StatusCode::CREATED, axum::Json(flow)).into_response(),
+        Err(openai_subscription::StartError::Invalid(message)) => {
+            api_error(StatusCode::BAD_REQUEST, message)
+        }
+        Err(openai_subscription::StartError::Upstream(message)) => {
+            api_error(StatusCode::BAD_GATEWAY, message)
+        }
+    }
+}
+
+async fn complete_openai_subscription_oauth(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::Json(input): axum::Json<openai_subscription::CompleteBrowserAuthorization>,
+) -> Response {
+    if state.extensions.provider_endpoint("openai_codex").is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "OpenAI Subscription Extension is not enabled",
+        );
+    }
+    match openai_subscription::complete_browser(&state, &id, input).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(openai_subscription::CompleteError::Invalid(message)) => {
+            api_error(StatusCode::BAD_REQUEST, message)
+        }
+        Err(openai_subscription::CompleteError::Upstream(message)) => {
+            api_error(StatusCode::BAD_GATEWAY, message)
+        }
+        Err(openai_subscription::CompleteError::Internal(message)) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
         }
     }
 }

@@ -209,6 +209,15 @@ pub struct SubscriptionCredential {
 /// OAuth and credential lifecycle owned by a subscription Endpoint Extension.
 /// The host supplies persistence and resource validation around these operations.
 pub trait SubscriptionProvider: ProviderEndpoint {
+    fn start_browser_authorization(&self) -> Result<BrowserAuthorization, String>;
+    fn exchange_browser_authorization<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        code: &'a str,
+        code_verifier: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
+    >;
     fn start_device_authorization<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -234,6 +243,14 @@ pub trait SubscriptionProvider: ProviderEndpoint {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
     >;
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowserAuthorization {
+    pub authorization_url: String,
+    pub state: String,
+    pub code_verifier: String,
+    pub expires_in_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
