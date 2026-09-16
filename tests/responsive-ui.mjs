@@ -21,6 +21,22 @@ for (const project of projects) {
       await context.addCookies([{ name: 'yabane_session', value: sessionCookie, url: base, httpOnly: true, sameSite: 'Strict' }]);
     }
     const page = await context.newPage();
+    await page.route('**/admin/openai-subscriptions/device-code', async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'device-flow', status: 'pending', user_code: 'ABCD-EFGH', verification_uri: 'https://auth.openai.com/codex/device', interval_seconds: 60, expires_at: 4102444800})});
+    });
+    await page.route('**/admin/openai-subscriptions/device-code/device-flow', async route => {
+      await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({id: 'device-flow', status: 'pending', user_code: 'ABCD-EFGH', verification_uri: 'https://auth.openai.com/codex/device', interval_seconds: 60, expires_at: 4102444800})});
+    });
+    await page.route('**/admin/openai-subscriptions/oauth', async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'browser-flow', authorization_url: 'https://auth.openai.com/oauth/authorize?state=browser-state', expires_at: 4102444800})});
+    });
+    await page.route('**/admin/openai-subscriptions/oauth/browser-flow/complete', async route => {
+      const body = route.request().postDataJSON();
+      if (body.redirect_url !== 'http://localhost:1455/auth/callback?code=oauth-code&state=browser-state') throw new Error(`${project.name}: browser OAuth did not submit the complete callback URL`);
+      await route.fulfill({status: 204});
+    });
     await page.route('**/admin/providers', async route => {
       if (route.request().method() !== 'GET') return route.continue();
       const response = await route.fetch();
@@ -269,7 +285,24 @@ for (const project of projects) {
     await page.locator('#provider-form [name="socks5_proxy"]').fill('socks5h://127.0.0.1:1080');
     if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: subscription setup exposes API key input`);
     if (await page.locator('#create-provider').textContent() !== 'Connect OpenAI') throw new Error(`${project.name}: subscription setup has the wrong primary action`);
-    await page.locator('#provider-dialog .close-dialog').first().click();
+    await page.locator('#create-provider').click();
+    await page.locator('#openai-subscription-dialog').waitFor({state: 'visible'});
+    if (!(await page.locator('#openai-device-signin').isVisible()) || await page.locator('#openai-oauth-signin').isVisible()) throw new Error(`${project.name}: OpenAI subscription does not default to device-code sign-in`);
+    if (await page.locator('#openai-subscription-code').textContent() !== 'ABCD-EFGH') throw new Error(`${project.name}: device-code sign-in does not show its one-time code`);
+    await page.locator('#openai-use-oauth').click();
+    await page.locator('#openai-oauth-signin').waitFor({state: 'visible'});
+    if (await page.locator('#openai-device-signin').isVisible()) throw new Error(`${project.name}: browser OAuth did not replace the device-code instructions`);
+    const oauthWarning = page.locator('#openai-oauth-signin .oauth-expected-warning');
+    if (!(await oauthWarning.isVisible()) || !(await oauthWarning.getByText('A localhost error page is expected', {exact: true}).isVisible())) throw new Error(`${project.name}: browser OAuth does not prominently prepare users for the localhost error page`);
+    const warningText = await oauthWarning.textContent();
+    if (!warningText.includes('This does not mean OAuth failed') || !warningText.includes('localhost:1455')) throw new Error(`${project.name}: browser OAuth warning does not explain that the localhost failure is intentional`);
+    const oauthSteps = await page.locator('#openai-oauth-signin .oauth-steps li strong').allTextContents();
+    if (oauthSteps.join('|') !== 'Sign in with OpenAI|Expect the localhost error|Return and paste once') throw new Error(`${project.name}: browser OAuth steps do not describe the expected failure before launch`);
+    if (await page.locator('#openai-oauth-link').textContent() !== 'I understand — open OpenAI sign-in') throw new Error(`${project.name}: browser OAuth launch does not require an explicit acknowledgement`);
+    if (await page.locator('#openai-oauth-link').getAttribute('href') !== 'https://auth.openai.com/oauth/authorize?state=browser-state') throw new Error(`${project.name}: browser OAuth does not expose the Extension authorization URL`);
+    await page.locator('#openai-oauth-callback').fill('http://localhost:1455/auth/callback?code=oauth-code&state=browser-state');
+    await page.locator('#openai-oauth-signin [type="submit"]').click();
+    await page.locator('#openai-subscription-dialog').waitFor({state: 'hidden'});
     await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
     const subscriptionProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-subscription/model-id'})});
     await subscriptionProvider.click();

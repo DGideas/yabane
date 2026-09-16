@@ -305,8 +305,24 @@ providerForm.addEventListener('submit', async event => {
 
 const openAiSubscriptionDialog = $('#openai-subscription-dialog');
 let openAiSubscriptionFlowId = null;
+let openAiSubscriptionTarget = null;
 let openAiSubscriptionStartController = null;
 let openAiSubscriptionPollController = null;
+function showOpenAiDeviceDialog(target, flow = null) {
+  openAiSubscriptionTarget = target;
+  $('#openai-device-signin').hidden = false;
+  $('#openai-oauth-signin').hidden = true;
+  $('#openai-subscription-code').hidden = !flow;
+  $('#openai-subscription-link').hidden = !flow;
+  if (flow) {
+    $('#openai-subscription-code').textContent = flow.user_code;
+    $('#openai-subscription-link').href = flow.verification_uri;
+    $('#openai-subscription-status').textContent = 'Waiting for OpenAI sign-in…';
+  } else {
+    $('#openai-subscription-status').textContent = 'Device-code sign-in could not start. You can use browser OAuth instead.';
+  }
+  openAiSubscriptionDialog.showModal();
+}
 async function beginOpenAiSubscription(target, errorElement, parentDialog) {
   openAiSubscriptionFlowId = null;
   openAiSubscriptionPollController?.abort();
@@ -325,21 +341,27 @@ async function beginOpenAiSubscription(target, errorElement, parentDialog) {
     if (current) { openAiSubscriptionStartController = null; submit.disabled = false; }
     if (error.name === 'AbortError' || !current) return;
     errorElement.textContent = 'Could not start OpenAI sign-in.';
+    openAiSubscriptionTarget = target;
+    parentDialog.close();
+    $('#openai-subscription-error').textContent = 'Could not start device-code sign-in.';
+    showOpenAiDeviceDialog(target);
     return;
   }
   if (openAiSubscriptionStartController !== controller) return;
   openAiSubscriptionStartController = null;
   submit.disabled = false;
-  if (!response.ok) return showApiError(response, errorElement);
+  if (!response.ok) {
+    await showApiError(response, $('#openai-subscription-error'));
+    parentDialog.close();
+    showOpenAiDeviceDialog(target);
+    return;
+  }
   const flow = await response.json();
   parentDialog.close();
-  $('#openai-subscription-code').textContent = flow.user_code;
-  $('#openai-subscription-link').href = flow.verification_uri;
-  $('#openai-subscription-status').textContent = 'Waiting for OpenAI sign-in…';
   $('#openai-subscription-error').textContent = '';
   openAiSubscriptionPollController?.abort();
   openAiSubscriptionFlowId = flow.id;
-  openAiSubscriptionDialog.showModal();
+  showOpenAiDeviceDialog(target, flow);
   const poll = async () => {
     if (openAiSubscriptionFlowId !== flow.id) return;
     const controller = new AbortController();
@@ -375,6 +397,48 @@ function stopOpenAiSubscriptionPolling() {
   openAiSubscriptionPollController?.abort();
   openAiSubscriptionPollController = null;
 }
+$('#openai-use-oauth').addEventListener('click', async () => {
+  stopOpenAiSubscriptionPolling();
+  $('#openai-subscription-error').textContent = '';
+  $('#openai-use-oauth').disabled = true;
+  let response;
+  try {
+    response = await fetch('/admin/openai-subscriptions/oauth', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(openAiSubscriptionTarget)});
+  } catch {
+    $('#openai-use-oauth').disabled = false;
+    $('#openai-subscription-error').textContent = 'Could not start browser OAuth.';
+    return;
+  }
+  $('#openai-use-oauth').disabled = false;
+  if (!response.ok) return showApiError(response, $('#openai-subscription-error'));
+  const flow = await response.json();
+  openAiSubscriptionFlowId = flow.id;
+  $('#openai-oauth-link').href = flow.authorization_url;
+  $('#openai-oauth-callback').value = '';
+  $('#openai-oauth-error').textContent = '';
+  $('#openai-device-signin').hidden = true;
+  $('#openai-oauth-signin').hidden = false;
+});
+$('#openai-oauth-signin').addEventListener('submit', async event => {
+  event.preventDefault();
+  const submit = event.currentTarget.querySelector('[type="submit"]');
+  submit.disabled = true;
+  let response;
+  try {
+    response = await fetch(`/admin/openai-subscriptions/oauth/${encodeURIComponent(openAiSubscriptionFlowId)}/complete`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({redirect_url: $('#openai-oauth-callback').value})});
+  } catch {
+    submit.disabled = false;
+    $('#openai-oauth-error').textContent = 'Could not complete browser OAuth.';
+    return;
+  }
+  submit.disabled = false;
+  if (!response.ok) return showApiError(response, $('#openai-oauth-error'));
+  const target = openAiSubscriptionTarget;
+  openAiSubscriptionFlowId = null;
+  await Promise.all([loadProviders(), loadRoutes()]);
+  openAiSubscriptionDialog.close();
+  if (target?.provider_name) { selectedProviderId = target.provider_id; history.pushState({}, '', `/providers/${encodeURIComponent(target.provider_id)}`); renderProviderPage(); }
+});
 $$('.close-openai-subscription').forEach(button => button.addEventListener('click', () => { stopOpenAiSubscriptionPolling(); openAiSubscriptionDialog.close(); }));
 openAiSubscriptionDialog.addEventListener('close', stopOpenAiSubscriptionPolling);
 $('#openai-subscription-code').addEventListener('click', async () => {

@@ -12,6 +12,7 @@ pub struct OAuthState {
 
 #[derive(Clone)]
 struct DeviceFlow {
+    kind: FlowKind,
     provider_id: String,
     provider_name: Option<String>,
     create_provider: bool,
@@ -27,6 +28,14 @@ struct DeviceFlow {
     poll_lock: Arc<Mutex<()>>,
     expires_at: u64,
     status: FlowStatus,
+    browser_state: Option<String>,
+    code_verifier: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FlowKind {
+    Device,
+    Browser,
 }
 
 #[derive(Clone)]
@@ -39,6 +48,12 @@ enum FlowStatus {
 pub enum StartError {
     Invalid(String),
     Upstream(String),
+}
+
+pub enum CompleteError {
+    Invalid(String),
+    Upstream(String),
+    Internal(String),
 }
 
 #[derive(Deserialize)]
@@ -59,6 +74,18 @@ pub struct DeviceFlowView {
     pub expires_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BrowserFlowView {
+    pub id: String,
+    pub authorization_url: String,
+    pub expires_at: u64,
+}
+
+#[derive(Deserialize)]
+pub struct CompleteBrowserAuthorization {
+    pub redirect_url: String,
 }
 
 pub async fn start(
@@ -132,6 +159,7 @@ pub async fn start(
     let now = crate::auth::now();
     let id = random_id();
     let flow = DeviceFlow {
+        kind: FlowKind::Device,
         provider_id: input.provider_id,
         provider_name: input.provider_name.map(|name| name.trim().to_owned()),
         create_provider,
@@ -147,12 +175,166 @@ pub async fn start(
         poll_lock: Arc::new(Mutex::new(())),
         expires_at: now.saturating_add(device.expires_in_seconds),
         status: FlowStatus::Pending,
+        browser_state: None,
+        code_verifier: None,
     };
     let view = flow_view(&id, &flow);
     let mut flows = state.openai_oauth.flows.lock().await;
     flows.retain(|_, existing| existing.expires_at > now);
     flows.insert(id, flow);
     Ok(view)
+}
+
+pub async fn start_browser(
+    state: &AppState,
+    input: StartSubscription,
+) -> Result<BrowserFlowView, StartError> {
+    if !valid_id(&input.provider_id) {
+        return Err(StartError::Invalid(
+            "Provider ID must be a URL slug".to_owned(),
+        ));
+    }
+    let endpoint_id = input.endpoint_id.unwrap_or_else(|| "chatgpt".to_owned());
+    if !valid_id(&endpoint_id) {
+        return Err(StartError::Invalid(
+            "Endpoint ID must be a URL slug".to_owned(),
+        ));
+    }
+    let socks5_proxy =
+        normalized_socks5_proxy(input.socks5_proxy.as_deref()).map_err(StartError::Invalid)?;
+    let client = ApiEndpoint {
+        id: endpoint_id.clone(),
+        socks5_proxy: socks5_proxy.clone(),
+        ..ApiEndpoint::default()
+    }
+    .client(&state.client)
+    .map_err(StartError::Invalid)?;
+    let create_provider = {
+        let providers = state.providers.read().await;
+        match providers.get(&input.provider_id) {
+            Some(provider) => {
+                if provider
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.id == endpoint_id)
+                {
+                    return Err(StartError::Invalid("Endpoint ID already exists".to_owned()));
+                }
+                false
+            }
+            None if input
+                .provider_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty()) =>
+            {
+                return Err(StartError::Invalid(
+                    "Provider name is required when creating a Provider".to_owned(),
+                ));
+            }
+            None => true,
+        }
+    };
+    let implementation = state
+        .extensions
+        .subscription_provider("openai_codex")
+        .ok_or_else(|| {
+            StartError::Invalid("OpenAI Subscription Extension is not enabled".to_owned())
+        })?;
+    let base_url = implementation
+        .endpoint_type()
+        .fixed_base_url
+        .ok_or_else(|| {
+            StartError::Invalid("Subscription Extension must declare a fixed base URL".to_owned())
+        })?
+        .to_owned();
+    let browser = implementation
+        .start_browser_authorization()
+        .map_err(StartError::Upstream)?;
+    let now = crate::auth::now();
+    let id = random_id();
+    let flow = DeviceFlow {
+        kind: FlowKind::Browser,
+        provider_id: input.provider_id,
+        provider_name: input.provider_name.map(|name| name.trim().to_owned()),
+        create_provider,
+        endpoint_id,
+        socks5_proxy,
+        client,
+        base_url,
+        device_auth_id: String::new(),
+        user_code: String::new(),
+        verification_uri: "",
+        interval_seconds: 0,
+        next_poll_at: 0,
+        poll_lock: Arc::new(Mutex::new(())),
+        expires_at: now.saturating_add(browser.expires_in_seconds),
+        status: FlowStatus::Pending,
+        browser_state: Some(browser.state),
+        code_verifier: Some(browser.code_verifier),
+    };
+    let view = BrowserFlowView {
+        id: id.clone(),
+        authorization_url: browser.authorization_url,
+        expires_at: flow.expires_at,
+    };
+    let mut flows = state.openai_oauth.flows.lock().await;
+    flows.retain(|_, existing| existing.expires_at > now);
+    flows.insert(id, flow);
+    Ok(view)
+}
+
+pub async fn complete_browser(
+    state: &AppState,
+    id: &str,
+    input: CompleteBrowserAuthorization,
+) -> Result<(), CompleteError> {
+    let flow = {
+        let flows = state.openai_oauth.flows.lock().await;
+        let flow = flows.get(id).ok_or_else(|| {
+            CompleteError::Invalid("OpenAI browser sign-in flow not found".to_owned())
+        })?;
+        if flow.kind != FlowKind::Browser || !matches!(flow.status, FlowStatus::Pending) {
+            return Err(CompleteError::Invalid(
+                "OpenAI browser sign-in flow is no longer pending".to_owned(),
+            ));
+        }
+        if flow.expires_at <= crate::auth::now() {
+            return Err(CompleteError::Invalid(
+                "OpenAI browser sign-in expired".to_owned(),
+            ));
+        }
+        flow.clone()
+    };
+    let _guard = flow.poll_lock.clone().try_lock_owned().map_err(|_| {
+        CompleteError::Invalid("OpenAI browser sign-in is already being completed".to_owned())
+    })?;
+    let (code, callback_state) =
+        parse_browser_callback(&input.redirect_url).map_err(CompleteError::Invalid)?;
+    let expected_state = flow.browser_state.as_deref().unwrap_or_default();
+    if !crate::auth::constant_time_eq(&callback_state, expected_state) {
+        return Err(CompleteError::Invalid(
+            "OpenAI callback state does not match this sign-in".to_owned(),
+        ));
+    }
+    let implementation = state
+        .extensions
+        .subscription_provider("openai_codex")
+        .ok_or_else(|| {
+            CompleteError::Invalid("OpenAI Subscription Extension is not enabled".to_owned())
+        })?;
+    let credential = implementation
+        .exchange_browser_authorization(
+            &flow.client,
+            &code,
+            flow.code_verifier.as_deref().unwrap_or_default(),
+        )
+        .await
+        .map_err(CompleteError::Upstream)?;
+    attach_subscription(state, &flow, credential.into())
+        .await
+        .map_err(CompleteError::Internal)?;
+    state.openai_oauth.flows.lock().await.remove(id);
+    Ok(())
 }
 
 pub async fn poll(state: &AppState, id: &str) -> Result<DeviceFlowView, String> {
@@ -162,6 +344,9 @@ pub async fn poll(state: &AppState, id: &str) -> Result<DeviceFlowView, String> 
         let flow = flows
             .get_mut(id)
             .ok_or_else(|| "OpenAI sign-in flow not found".to_owned())?;
+        if flow.kind != FlowKind::Device {
+            return Err("OpenAI device sign-in flow not found".to_owned());
+        }
         match &flow.status {
             FlowStatus::Pending if flow.expires_at <= now => {
                 flow.status = FlowStatus::Failed("OpenAI sign-in expired".to_owned());
@@ -367,6 +552,35 @@ fn subscription_endpoint(flow: &DeviceFlow, credential: OpenAiSubscription) -> A
     }
 }
 
+fn parse_browser_callback(value: &str) -> Result<(String, String), String> {
+    let redirect = reqwest::Url::parse(value.trim())
+        .map_err(|_| "Paste the complete OpenAI localhost callback URL".to_owned())?;
+    if redirect.scheme() != "http"
+        || redirect.host_str() != Some("localhost")
+        || redirect.port() != Some(1455)
+        || redirect.path() != "/auth/callback"
+        || !redirect.username().is_empty()
+        || redirect.password().is_some()
+        || redirect.fragment().is_some()
+    {
+        return Err("Callback URL must start with http://localhost:1455/auth/callback".to_owned());
+    }
+    let codes: Vec<_> = redirect
+        .query_pairs()
+        .filter(|(name, _)| name == "code")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    let states: Vec<_> = redirect
+        .query_pairs()
+        .filter(|(name, _)| name == "state")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    if codes.len() != 1 || states.len() != 1 || codes[0].is_empty() || states[0].is_empty() {
+        return Err("Callback URL must contain exactly one non-empty code and state".to_owned());
+    }
+    Ok((codes[0].clone(), states[0].clone()))
+}
+
 fn normalized_socks5_proxy(value: Option<&str>) -> Result<Option<String>, String> {
     let value = value.map(str::trim).filter(|value| !value.is_empty());
     if value
@@ -483,6 +697,28 @@ mod tests {
     }
 
     #[test]
+    fn browser_callback_accepts_only_the_registered_complete_url() {
+        assert_eq!(
+            super::parse_browser_callback(
+                "http://localhost:1455/auth/callback?code=code%20123&state=state-456"
+            )
+            .unwrap(),
+            ("code 123".to_owned(), "state-456".to_owned()),
+        );
+        for invalid in [
+            "http://127.0.0.1:1455/auth/callback?code=x&state=y",
+            "http://localhost:1456/auth/callback?code=x&state=y",
+            "http://localhost:1455/other?code=x&state=y",
+            "http://attacker@localhost:1455/auth/callback?code=x&state=y",
+            "http://localhost:1455/auth/callback?code=x&code=z&state=y",
+            "http://localhost:1455/auth/callback?code=&state=y",
+            "http://localhost:1455/auth/callback?code=x&state=",
+        ] {
+            assert!(super::parse_browser_callback(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn validates_and_normalizes_subscription_proxy() {
         assert_eq!(
             super::normalized_socks5_proxy(Some(" socks5h://127.0.0.1:1080 ")).unwrap(),
@@ -501,6 +737,7 @@ mod tests {
             account_id: "account".to_owned(),
         };
         let flow = super::DeviceFlow {
+            kind: super::FlowKind::Device,
             provider_id: "openai".to_owned(),
             provider_name: None,
             create_provider: true,
@@ -516,6 +753,8 @@ mod tests {
             poll_lock: Arc::new(Mutex::new(())),
             expires_at: u64::MAX,
             status: super::FlowStatus::Pending,
+            browser_state: None,
+            code_verifier: None,
         };
 
         let endpoint = super::subscription_endpoint(&flow, credential);

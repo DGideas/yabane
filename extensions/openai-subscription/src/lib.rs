@@ -2,11 +2,13 @@ use std::{sync::OnceLock, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::{HeaderName, HeaderValue, header};
+use rand::RngCore as _;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use yabane_extension_api::{
-    DeviceAuthorization, EXTENSION_API_VERSION, Extension, HookStage, Protocol, ProviderEndpoint,
-    ProviderEndpointKind, ProviderEndpointRequest, ProviderEndpointType, SubscriptionCredential,
-    SubscriptionProvider,
+    BrowserAuthorization, DeviceAuthorization, EXTENSION_API_VERSION, Extension, HookStage,
+    Protocol, ProviderEndpoint, ProviderEndpointKind, ProviderEndpointRequest,
+    ProviderEndpointType, SubscriptionCredential, SubscriptionProvider,
 };
 
 pub const ID: &str = "openai-subscription";
@@ -14,6 +16,9 @@ pub const ENDPOINT_TYPE: &str = "openai_codex";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL: &str = "https://auth.openai.com";
 const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const BROWSER_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const BROWSER_SCOPE: &str = "openid profile email offline_access";
+const BROWSER_TIMEOUT_SECONDS: u64 = 15 * 60;
 const DEVICE_TIMEOUT_SECONDS: u64 = 15 * 60;
 const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
@@ -151,6 +156,64 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
 }
 
 impl SubscriptionProvider for OpenAiSubscriptionEndpoint {
+    fn start_browser_authorization(&self) -> Result<BrowserAuthorization, String> {
+        let mut verifier_bytes = [0_u8; 32];
+        rand::rng().fill_bytes(&mut verifier_bytes);
+        let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+        let mut state_bytes = [0_u8; 16];
+        rand::rng().fill_bytes(&mut state_bytes);
+        let state = state_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let query = serde_urlencoded::to_string([
+            ("response_type", "code"),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", BROWSER_REDIRECT_URI),
+            ("scope", BROWSER_SCOPE),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", state.as_str()),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", "pi"),
+        ])
+        .map_err(|_| "Could not construct OpenAI authorization URL".to_owned())?;
+        Ok(BrowserAuthorization {
+            authorization_url: format!("{AUTH_BASE_URL}/oauth/authorize?{query}"),
+            state,
+            code_verifier,
+            expires_in_seconds: BROWSER_TIMEOUT_SECONDS,
+        })
+    }
+
+    fn exchange_browser_authorization<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        code: &'a str,
+        code_verifier: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let response = client
+                .post(format!("{AUTH_BASE_URL}/oauth/token"))
+                .form(&[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", CLIENT_ID),
+                    ("code", code),
+                    ("code_verifier", code_verifier),
+                    ("redirect_uri", BROWSER_REDIRECT_URI),
+                ])
+                .timeout(OAUTH_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| format!("OpenAI token exchange failed: {error}"))?;
+            token_response(response, "exchange").await
+        })
+    }
+
     fn start_device_authorization<'a>(
         &'a self,
         client: &'a reqwest::Client,
@@ -452,6 +515,25 @@ mod tests {
             .is_err()
         );
         assert!(account_id("not-a-jwt").is_err());
+    }
+
+    #[test]
+    fn browser_authorization_matches_pi_ai_callback_and_pkce_shape() {
+        let flow = ENDPOINT.start_browser_authorization().unwrap();
+        let url = reqwest::Url::parse(&flow.authorization_url).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            "https://auth.openai.com/oauth/authorize"
+        );
+        assert_eq!(query.get("client_id").unwrap(), CLIENT_ID);
+        assert_eq!(query.get("redirect_uri").unwrap(), BROWSER_REDIRECT_URI);
+        assert_eq!(query.get("scope").unwrap(), BROWSER_SCOPE);
+        assert_eq!(query.get("state").unwrap(), &flow.state);
+        assert_eq!(query.get("code_challenge_method").unwrap(), "S256");
+        assert_eq!(query.get("originator").unwrap(), "pi");
+        assert_eq!(flow.code_verifier.len(), 43);
+        assert_eq!(flow.expires_in_seconds, 900);
     }
 
     #[test]

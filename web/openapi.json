@@ -316,6 +316,26 @@
           }
         }
       },
+      "OpenAiBrowserFlow": {
+        "type": "object",
+        "required": [
+          "id",
+          "authorization_url",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "authorization_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "expires_at": {
+            "type": "integer"
+          }
+        }
+      },
       "OpenAiDeviceFlow": {
         "type": "object",
         "required": [
@@ -1848,6 +1868,142 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/openai-subscriptions/oauth": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Start OpenAI subscription browser OAuth",
+        "description": "Starts pi-ai-compatible Authorization Code with PKCE as an explicit alternative when an organization disables device sign-in. The registered callback is http://localhost:1455/auth/callback; Yabane does not listen there and the administrator pastes the resulting complete callback URL into the completion operation.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "provider_id"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string"
+                  },
+                  "provider_name": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "endpoint_id": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true,
+                    "pattern": "^socks5h?://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Browser OAuth started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAiBrowserFlow"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "OpenAI Subscription Extension unavailable"
+          }
+        }
+      }
+    },
+    "/admin/openai-subscriptions/oauth/{id}/complete": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Complete OpenAI subscription browser OAuth",
+        "description": "Validates the complete pasted localhost callback URL and its state, exchanges its one-time authorization code with the server-held PKCE verifier, and atomically creates the connected subscription Endpoint. Callback URLs, authorization codes, verifier, and OAuth tokens are not returned or persisted as flow history.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "redirect_url"
+                ],
+                "properties": {
+                  "redirect_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Complete http://localhost:1455/auth/callback URL returned by OpenAI."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "OpenAI Subscription Extension unavailable"
+          },
+          "500": {
+            "description": "Connected credential could not be persisted"
+          },
+          "502": {
+            "description": "OpenAI token exchange failed"
           }
         }
       }

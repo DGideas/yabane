@@ -676,15 +676,15 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .unwrap_or_default();
     // The ChatGPT Codex endpoint is always SSE, but currently omits Content-Type
     // on successful responses. pi-ai parses it as SSE by protocol, not by header.
-    let event_stream = (api_type == ApiType::OpenaiCodex
-        && state
+    let event_stream = response_is_event_stream(
+        status,
+        api_type,
+        state
             .extensions
             .provider_endpoint("openai_codex")
-            .is_some_and(|implementation| implementation.endpoint_type().always_event_stream))
-        || content_type
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+            .is_some_and(|implementation| implementation.endpoint_type().always_event_stream),
+        content_type,
+    );
     let activity = ProxyActivity {
         store: state.activity.clone(),
         request_id,
@@ -1341,6 +1341,19 @@ fn io_failure_detail(err: &(dyn StdError + 'static)) -> Option<&'static str> {
     None
 }
 
+fn response_is_event_stream(
+    status: StatusCode,
+    api_type: ApiType,
+    endpoint_always_streams: bool,
+    content_type: &str,
+) -> bool {
+    (status.is_success() && api_type == ApiType::OpenaiCodex && endpoint_always_streams)
+        || content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
 fn to_reqwest_method(method: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST)
 }
@@ -1351,9 +1364,31 @@ mod tests {
 
     use super::{
         ApiSurface, ApiType, Protocol, apply_core_upstream_headers, copy_response_headers,
-        provider_endpoint_base_url, sanitize_request_headers, strip_transformed_response_headers,
-        upstream_transport_failure,
+        provider_endpoint_base_url, response_is_event_stream, sanitize_request_headers,
+        strip_transformed_response_headers, upstream_transport_failure,
     };
+
+    #[test]
+    fn codex_http_errors_are_not_misclassified_as_event_streams() {
+        assert!(!response_is_event_stream(
+            axum::http::StatusCode::BAD_REQUEST,
+            ApiType::OpenaiCodex,
+            true,
+            "application/json",
+        ));
+        assert!(response_is_event_stream(
+            axum::http::StatusCode::OK,
+            ApiType::OpenaiCodex,
+            true,
+            "",
+        ));
+        assert!(response_is_event_stream(
+            axum::http::StatusCode::BAD_GATEWAY,
+            ApiType::OpenaiCodex,
+            true,
+            "text/event-stream; charset=utf-8",
+        ));
+    }
 
     #[test]
     fn provider_endpoint_fixed_base_url_overrides_persisted_configuration() {

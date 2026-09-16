@@ -187,6 +187,18 @@ admin -f -X PATCH "$base/admin/auth/keys/$expiring_id" -H 'content-type: applica
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $expiring_secret") == 200 ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_api_key":false,"api_key":null}}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"bad-subscription-proxy","provider_name":"Bad subscription proxy","endpoint_id":"chatgpt","socks5_proxy":"http://127.0.0.1:1080"}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth" -H 'content-type: application/json' -d '{"provider_id":"bad-oauth-proxy","provider_name":"Bad OAuth proxy","endpoint_id":"chatgpt","socks5_proxy":"https://127.0.0.1:1080"}') == 400 ]]
+browser_oauth=$(admin -f -X POST "$base/admin/openai-subscriptions/oauth" -H 'content-type: application/json' -d '{"provider_id":"browser-oauth","provider_name":"Browser OAuth","endpoint_id":"chatgpt"}')
+browser_oauth_id=$(printf '%s' "$browser_oauth" | jq -r .id)
+browser_oauth_url=$(printf '%s' "$browser_oauth" | jq -r .authorization_url)
+[[ -n $browser_oauth_id && $browser_oauth_url == https://auth.openai.com/oauth/authorize\?* ]]
+[[ $browser_oauth_url == *client_id=app_EMoamEEZ73f0CkXaXp7hrann* ]]
+[[ $browser_oauth_url == *redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback* ]]
+[[ $browser_oauth_url == *code_challenge_method=S256* ]]
+[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://127.0.0.1:1455/auth/callback?code=code&state=state"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Callback URL must start with http://localhost:1455/auth/callback" ]]
+[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=wrong"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI callback state does not match this sign-in" ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_api_key":false,"api_key":null}}') == 400 ]]
 # Nested OpenAI-compatible roots, including OpenCode Go's /zen/go/v1 shape, append /models at that shared root.
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"nested-root\",\"name\":\"Nested root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/nested/v1\",\"requires_api_key\":true,\"api_key\":\"nested\"}}") == 204 ]]

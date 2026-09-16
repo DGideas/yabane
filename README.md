@@ -13,7 +13,7 @@ Yabane is a small, performance-oriented LLM gateway written in Rust. Its first r
 - Streaming upstream responses without buffering
 - Providers composed from one or more API endpoints
 - Multiple weighted, independently enabled API keys per endpoint
-- OpenAI device-code sign-in with automatic OAuth token refresh and no password handling
+- OpenAI device-code sign-in by default, with browser OAuth fallback for organizations that disable device sign-in, automatic token refresh, and no password handling
 - Optional per-Endpoint `socks5://` or `socks5h://` proxying
 - Provider routing through `provider/model` IDs
 - Optional exact-name and trailing-wildcard model routes to specific upstream credentials
@@ -41,7 +41,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"chutes/qwen3.8-27b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-To use a ChatGPT Plus or Pro subscription, choose **OpenAI subscription** while adding a Provider or Endpoint, optionally enter a `socks5://` or `socks5h://` proxy, open the displayed OpenAI device sign-in page, and enter the one-time code. The proxy is used for Yabane's device authorization, token exchange and refresh, and inference requests. Subscription models can be called through OpenAI Responses, OpenAI Chat Completions, or Anthropic Messages; Yabane explicitly adapts each caller surface to the streaming Responses connection required by the ChatGPT Codex backend.
+To use a ChatGPT Plus, Pro, or Business subscription, choose **OpenAI subscription** while adding a Provider or Endpoint and optionally enter a `socks5://` or `socks5h://` proxy. Device-code sign-in is the default. If an organization disables device sign-in, choose browser OAuth, complete authorization, and paste the complete `http://localhost:1455/auth/callback?...` URL from the browser address bar back into Yabane once. The proxy is used for authorization, token exchange and refresh, and inference requests. Subscription models can be called through OpenAI Responses, OpenAI Chat Completions, or Anthropic Messages; Yabane explicitly adapts each caller surface to the streaming Responses connection required by the ChatGPT Codex backend.
 
 Provider credentials—including OpenAI subscription OAuth tokens—are stored locally in the private `data/providers.json` file and are never returned by the management API; gateway access configuration is stored in `data/auth.json`; the administrator and hashed Management API keys are stored in `data/admin.json`. Gateway API-key authentication is enabled by default, so generate a key in **API access** before calling `/v1/*`. Use a separately generated Management API key for control endpoints, or use the browser session. Management-key creation and revocation remain browser-session-only.
 

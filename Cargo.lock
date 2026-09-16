@@ -1787,13 +1787,16 @@ dependencies = [
 
 [[package]]
 name = "yabane-extension-openai-subscription"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "http",
+ "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha2",
  "yabane-extension-api",
 ]
 
