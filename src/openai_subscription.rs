@@ -473,8 +473,8 @@ async fn attach_subscription(
     credential: OpenAiSubscription,
 ) -> Result<(), String> {
     let mut providers = state.providers.write().await;
-    // Checked under the same Provider lock used by Extension disablement, which
-    // prevents a completed OAuth flow from attaching after the dependency check.
+    // Recheck after obtaining the Provider lock so a flow that completed its
+    // upstream exchange before disablement cannot attach a new Endpoint afterward.
     let implementation = state
         .extensions
         .provider_endpoint("openai_codex")

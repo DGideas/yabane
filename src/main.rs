@@ -26,7 +26,7 @@ mod usage;
 mod web;
 
 use auth::load_auth;
-use config::{AppState, load_providers};
+use config::{AppState, load_providers, validate_configuration_references};
 
 const HELP: &str = "Yabane — a clear, reliable gateway to every LLM
 
@@ -139,6 +139,11 @@ async fn main() {
     let auth = load_auth()
         .await
         .expect("load authentication configuration");
+    {
+        let loaded_routes = routes.0.read().await;
+        validate_configuration_references(&providers, &auth, &loaded_routes)
+            .expect("validate configuration references");
+    }
     let state = AppState {
         client: reqwest::Client::builder()
             .pool_max_idle_per_host(64)

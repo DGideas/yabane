@@ -141,14 +141,25 @@ extensions=$(admin -f "$base/admin/extensions")
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, (.api_version | tostring), (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "traffic-capture") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:upstream_exchange:true ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
-# A Provider Endpoint implementation cannot be disabled while configured Endpoints depend on it.
-[[ $(admin_status -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
-[[ $(jq -r '.error.message' response.json) == "Delete OpenAI subscription Endpoints before disabling the extension" ]]
-admin -f -X DELETE "$base/admin/providers/subscription-fixture" >/dev/null
+# Provider Endpoint Extensions remain independently switchable. Their configured
+# resources are retained but unavailable until the implementation is enabled again.
 [[ $(admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":false}' | jq -r .enabled) == false ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | .endpoints[0].id') == chatgpt ]]
 [[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 409 ]]
 [[ $(jq -r '.error.message' response.json) == "OpenAI Subscription Extension is not enabled" ]]
+admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
+[[ $(status -X POST "$base/v1/responses" -H 'content-type: application/json' -d '{"model":"subscription-fixture/gpt-5.2","input":"test"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI Subscription Extension is not enabled" ]]
+# Automatic routing can bypass the unavailable Extension-owned Endpoint when
+# another configured Endpoint remains eligible for a model.
+admin -f -X POST "$base/admin/providers/subscription-fixture/endpoints" -H 'content-type: application/json' -d "{\"id\":\"fallback\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}" >/dev/null
+fallback_response=$(curl -sf -X POST "$base/v1/responses" -H 'content-type: application/json' -d '{"model":"subscription-fixture/custom-model","input":"test"}')
+[[ $(printf '%s' "$fallback_response" | jq -r .endpoint) == one ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"disabled-subscription","targets":[{"provider_id":"subscription-fixture","endpoint_id":"chatgpt","api_key_id":"","upstream_model":"gpt-5.2","weight":100,"enabled":true}]}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Enable the OpenAI Subscription Extension before routing to this Endpoint" ]]
+admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
+admin -f -X DELETE "$base/admin/providers/subscription-fixture" >/dev/null
 [[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.active, .config.remaining, .retained] | join(":")') == false:0:0 ]]
 created=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"E2E unrestricted","expires_at":null,"provider_ids":[]}')
 secret=$(printf '%s' "$created" | jq -r .secret)
@@ -216,7 +227,8 @@ admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/js
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"name":"  "}') == 400 ]]
 admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1/\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .base_url') == "http://127.0.0.1:$upstream_port/v1" ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"renamed\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 409 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"Bad ID\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 400 ]]
 # The mock identifies endpoints from their bearer credentials.
 # Discovery and inference must map unique models to the endpoint that reported them.
 admin -f -X POST "$base/admin/providers/multi/models/refresh" >/dev/null
@@ -233,10 +245,32 @@ admin -f -X PATCH "$base/admin/providers/multi/model-endpoint-preferences" -H 'c
 providers_json=$(admin -f "$base/admin/providers")
 [[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .model_endpoint_preferences[0].endpoint_id') == two ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi/model-endpoint-preferences" -H 'content-type: application/json' -d '{"preferences":[{"model":"model-a","api_type":"openai_compatible","endpoint_id":"two"}]}') == 400 ]]
+# Renaming an Endpoint keeps credentials attached and atomically rewrites every current
+# reference without invalidating model discovery when connection settings are unchanged.
+admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"x-provider":"yes"},"extra_body":{"extra":"provider"},"defaults_endpoint_ids":["two"]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"rename-fixture","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"regional\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
+providers_json=$(admin -f "$base/admin/providers")
+[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "regional") | .api_keys[0].id') == default ]]
+[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | [.model_endpoints["model-b"][0], .model_endpoint_preferences[0].endpoint_id, .defaults_endpoint_ids[0]] | join(":")') == regional:regional:regional ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "rename-fixture") | .targets[0].endpoint_id') == regional ]]
+[[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r .config.endpoint_id) == regional ]]
+active_rename_expiry=$(($(date +%s) + 600))
+admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$active_rename_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"regional\",\"model\":\"\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[]}" >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"blocked-while-capturing\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 409 ]]
+admin -f -X POST "$base/admin/extensions/traffic-capture/stop" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
+admin -f -X DELETE "$base/admin/routes/rename-fixture" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[]}' >/dev/null
 scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped","expires_at":null,"provider_ids":["allowed"]}')
 scoped_secret=$(printf '%s' "$scoped" | jq -r .secret)
 # Provider scope is carried from the authorization middleware to model listing and inference.
-model_scoped_secret=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped model listing","expires_at":null,"provider_ids":["multi"]}' | jq -r .secret)
+model_scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped model listing","expires_at":null,"provider_ids":["multi"]}')
+model_scoped_id=$(printf '%s' "$model_scoped" | jq -r .api_key.id)
+model_scoped_secret=$(printf '%s' "$model_scoped" | jq -r .secret)
+multi_provider_scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi-provider scope","expires_at":null,"provider_ids":["multi","allowed"]}')
+multi_provider_scoped_id=$(printf '%s' "$multi_provider_scoped" | jq -r .api_key.id)
 scoped_models=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $model_scoped_secret")
 [[ $(printf '%s' "$scoped_models" | jq '.data | length') -gt 0 ]]
 [[ $(printf '%s' "$scoped_models" | jq '[.data[] | select(.id | startswith("multi/") | not)] | length') == 0 ]]
@@ -404,16 +438,24 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/routed-tempor
 # Deleting an endpoint removes its keys, discovery availability, and exact route destinations.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two")] | length') == 0 ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | has("model_endpoints") and (.model_endpoints | has("model-b") | not)') == true ]]
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "endpoint-deletion-route")] | length') == 0 ]]
+[[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.provider_id, .config.endpoint_id] | join(":")') == : ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/missing") == 404 ]]
 # Deleting a Provider removes every route destination that refers to it.
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/denied" >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "provider-deletion-route")] | length') == 0 ]]
+# Deletion cannot turn an exact Provider scope into the empty-list "all Providers" meaning.
+# Keys scoped only to the deleted Provider are revoked, while multi-Provider scopes retain
+# their remaining allowlist entries.
+[[ $(admin -f "$base/admin/auth" | jq --arg id "$model_scoped_id" '[.api_keys[] | select(.id == $id)] | length') == 0 ]]
+[[ $(status "$base/v1/models" -H "Authorization: Bearer $model_scoped_secret") == 401 ]]
+[[ $(admin -f "$base/admin/auth" | jq -r --arg id "$multi_provider_scoped_id" '.api_keys[] | select(.id == $id) | .provider_ids | join(",")') == allowed ]]
 # Recreate the Provider needed by the remaining Activity checks.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}}" >/dev/null
 # A completed batch is appended in groups of ten without depending on earlier Activity totals.
@@ -549,4 +591,30 @@ cli_without_defaults=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authoriz
 kill -TERM "$pid"
 wait "$pid"
 pid=
+# Cross-file reference validation runs on the real startup path instead of allowing
+# a manually corrupted route file to survive until an inference request fails.
+cp data/routes.json data/routes.valid.json
+cat >data/routes.json <<'JSON'
+[{"pattern":"dangling-startup","targets":[{"provider_id":"missing-provider","endpoint_id":"missing-endpoint","api_key_id":"missing-key","upstream_model":"model","weight":100,"enabled":true}]}]
+JSON
+"$binary" --addr "127.0.0.1:$port" >dangling-configuration.log 2>&1 & pid=$!
+for _ in $(seq 1 50); do
+  if ! kill -0 "$pid" 2>/dev/null; then break; fi
+  sleep .02
+done
+if kill -0 "$pid" 2>/dev/null; then
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pid=
+  echo "dangling configuration unexpectedly started" >&2
+  exit 1
+fi
+if wait "$pid"; then
+  pid=
+  echo "dangling configuration unexpectedly exited successfully" >&2
+  exit 1
+fi
+pid=
+grep -q "model route 'dangling-startup' refers to unknown Provider 'missing-provider'" dangling-configuration.log
+mv data/routes.valid.json data/routes.json
 echo 'Authentication and routing E2E passed'

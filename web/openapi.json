@@ -1601,6 +1601,7 @@
           "Gateway access"
         ],
         "summary": "Generate a Gateway API key",
+        "description": "An empty provider_ids array grants access to every Provider. Scoped-key validation and persistence are serialized with Provider deletion so the saved allowlist cannot contain a concurrently removed Provider.",
         "security": [
           {
             "managementKey": []
@@ -1658,7 +1659,7 @@
           "Gateway access"
         ],
         "summary": "Edit a Gateway API key",
-        "description": "Updates any supplied note, expiration, or Provider allowlist field without changing the key secret. Omitted fields remain unchanged; expires_at: null removes expiry and provider_ids: [] grants access to every Provider.",
+        "description": "Updates any supplied note, expiration, or Provider allowlist field without changing the key secret. Omitted fields remain unchanged; expires_at: null removes expiry and provider_ids: [] grants access to every Provider. Scoped-key validation and persistence are serialized with Provider deletion.",
         "security": [
           {
             "managementKey": []
@@ -2049,7 +2050,7 @@
           "Extensions"
         ],
         "summary": "Enable or disable a compiled extension",
-        "description": "Persists the Extension enabled state without changing its own configuration. Returns 409 when this process was started with --no-extensions or configured resources still depend on the Extension.",
+        "description": "Persists the Extension enabled state without changing its own configuration or any configured Provider resources. Returns 409 when this process was started with --no-extensions, or when an Extension-specific active operation such as Traffic Capture must first be stopped.",
         "security": [
           {
             "managementKey": []
@@ -2104,7 +2105,7 @@
             "$ref": "#/components/responses/NotFound"
           },
           "409": {
-            "description": "Extensions are disabled by the startup option, or configured resources still depend on this Extension"
+            "description": "Extensions are disabled by the startup option, or an Extension-specific active operation must first be stopped"
           }
         }
       }
@@ -2334,6 +2335,7 @@
           "Providers"
         ],
         "summary": "Delete a provider",
+        "description": "Deletes the Provider, its Endpoints and upstream credentials, removes model-route targets that refer to it, and removes it from Gateway API-key allowlists. Routes left without targets and Gateway keys scoped only to this Provider are deleted rather than allowing dangling routes or accidentally broadening an empty allowlist to all Providers.",
         "security": [
           {
             "managementKey": []
@@ -2592,6 +2594,7 @@
           "Model routes"
         ],
         "summary": "Create or replace a public model route",
+        "description": "Every target must currently be usable. Validation and persistence are serialized with Provider and Endpoint mutations so a concurrent deletion cannot leave a dangling target. An OpenAI subscription target requires the OpenAI Subscription Extension to be enabled; disabling it later retains the route but makes that target fail visibly until re-enabled.",
         "security": [
           {
             "managementKey": []
@@ -2680,6 +2683,9 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "A target requires an Endpoint implementation Extension that is currently disabled"
           }
         }
       }
@@ -2690,7 +2696,8 @@
           "Model routes"
         ],
         "summary": "Update a public model route",
-        "description": "Replaces the route identified by the current pattern. The request may also change the public pattern.",
+        "description": "Replaces the route identified by the current pattern. The request may also change the public pattern. Every target must currently be usable, including having any Endpoint implementation Extension enabled, and validation is serialized with Provider and Endpoint mutations.",
+        "x-disabled-extension-response": "Returns 409 when a target requires an Endpoint implementation Extension that is currently disabled.",
         "security": [
           {
             "managementKey": []
@@ -2779,6 +2786,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "A target requires an Endpoint implementation Extension that is currently disabled"
           }
         }
       },
@@ -3244,7 +3254,7 @@
           "Providers"
         ],
         "summary": "Update an API endpoint",
-        "description": "Updates endpoint connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Endpoint IDs cannot be changed. Disabling required authentication atomically clears credential references from model-route targets. Enabling it is rejected while keyless route targets still refer to the Endpoint. OpenAI subscription Endpoints accept only SOCKS5 proxy changes; their API type, base URL, and credential requirement remain fixed.",
+        "description": "Updates an Endpoint and its connection settings without exposing or replacing existing API-key secrets or Endpoint request defaults. Changing id atomically updates current discovered-model availability, model Endpoint preferences, model-route destinations, Provider Request Defaults scope, and an inactive Traffic Capture scope; historical Activity and retained captures keep the ID recorded when each request occurred. An active Traffic Capture scoped to the Endpoint must first be stopped. Disabling required authentication atomically clears credential references from model-route targets. Enabling it is rejected while keyless route targets still refer to the Endpoint. OpenAI subscription Endpoints accept ID and SOCKS5 proxy changes only; their API type, base URL, and credential requirement remain fixed.",
         "security": [
           {
             "managementKey": []
@@ -3286,7 +3296,7 @@
                 "properties": {
                   "id": {
                     "type": "string",
-                    "description": "Must equal the existing endpoint ID."
+                    "description": "The desired unique Endpoint ID. Changing it updates current configuration references."
                   },
                   "api_type": {
                     "type": "string",

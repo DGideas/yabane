@@ -99,13 +99,29 @@ impl RouteStore {
 
 fn validate_route_identities(routes: &[ModelRoute]) -> Result<(), String> {
     let mut patterns = std::collections::HashSet::new();
-    if routes
-        .iter()
-        .any(|route| route.pattern.is_empty() || !patterns.insert(route.pattern.as_str()))
-    {
-        return Err(format!(
-            "parse {ROUTES_FILE}: model route patterns must be non-empty and unique"
-        ));
+    for route in routes {
+        if route.pattern.is_empty() || !patterns.insert(route.pattern.as_str()) {
+            return Err(format!(
+                "parse {ROUTES_FILE}: model route patterns must be non-empty and unique"
+            ));
+        }
+        if route.targets.is_empty()
+            || route
+                .targets
+                .iter()
+                .any(|target| target.upstream_model.trim().is_empty() || target.weight > 100)
+            || route
+                .targets
+                .iter()
+                .map(|target| u64::from(target.weight))
+                .sum::<u64>()
+                != 100
+        {
+            return Err(format!(
+                "parse {ROUTES_FILE}: model route '{}' must have non-empty targets, valid upstream models, and traffic totaling 100",
+                route.pattern
+            ));
+        }
     }
     Ok(())
 }
@@ -153,6 +169,19 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_persisted_route_targets_and_traffic() {
+        let mut invalid = route("invalid", "model", 100);
+        invalid.targets.clear();
+        assert!(super::validate_route_identities(&[invalid]).is_err());
+
+        let invalid = route("invalid", "model", 99);
+        assert!(super::validate_route_identities(&[invalid]).is_err());
+
+        let invalid = route("invalid", "", 100);
+        assert!(super::validate_route_identities(&[invalid]).is_err());
     }
 
     #[tokio::test]

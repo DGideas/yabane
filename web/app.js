@@ -488,7 +488,7 @@ function renderProviderPage() {
       const renewal = endpoint.subscription_connected
         ? `<div><h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or OpenAI revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(credentialDetail)} Access and refresh tokens are never shown in the console or API.</p></details></div><span class="renewal-status">Automatic renewal</span>`
         : `<div><h4>Reconnect required</h4><p>${escapeHtml(credentialDetail)}</p></div><span class="renewal-status attention">Not connected</span>`;
-      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit proxy</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
+      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit endpoint</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
     }
     return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
@@ -611,18 +611,42 @@ function bindProviderActions() {
   $$('.edit-provider').forEach(button => button.addEventListener('click', () => openProviderIdentityDialog(button.dataset.provider)));
   $$('.delete-provider').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
-    if (confirm(`Delete ${provider.name}?`)) { await fetch(`/admin/providers/${provider.id}`, {method: 'DELETE'}); selectedProviderId = null; await loadProviders(); }
+    const affectedRoutes = modelRoutes.filter(route => route.targets.some(target => target.provider_id === provider.id));
+    const affectedTargets = affectedRoutes.reduce((count, route) => count + route.targets.filter(target => target.provider_id === provider.id).length, 0);
+    const removedRoutes = affectedRoutes.filter(route => route.targets.every(target => target.provider_id === provider.id)).length;
+    const scopedKeys = authSettings.api_keys.filter(key => key.provider_ids.includes(provider.id));
+    const revokedKeys = scopedKeys.filter(key => key.provider_ids.length === 1).length;
+    const updatedKeys = scopedKeys.length - revokedKeys;
+    const routeImpact = affectedTargets
+      ? `This also removes ${affectedTargets} model-route destination${affectedTargets === 1 ? '' : 's'}${removedRoutes ? ` and deletes ${removedRoutes} route${removedRoutes === 1 ? '' : 's'} left without a destination` : ''}.`
+      : 'No model-route destinations currently use this Provider.';
+    const keyActions = [];
+    if (revokedKeys) keyActions.push(`revokes ${revokedKeys} Gateway API key${revokedKeys === 1 ? '' : 's'} scoped only to this Provider`);
+    if (updatedKeys) keyActions.push(`removes this Provider from ${updatedKeys} other key allowlist${updatedKeys === 1 ? '' : 's'}`);
+    const keyImpact = keyActions.length ? ` It ${keyActions.join(' and ')}.` : '';
+    const message = `Delete provider “${provider.name}”?\n\nThis permanently deletes its ${provider.endpoints.length} Endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}. ${routeImpact}${keyImpact}`;
+    if (!confirm(message)) return;
+    const response = await fetch(`/admin/providers/${provider.id}`, {method: 'DELETE'});
+    if (!response.ok) return showApiError(response, null);
+    selectedProviderId = null;
+    await Promise.all([loadProviders(), loadRoutes(), loadAuth()]);
   }));
   $$('.endpoint-edit').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider, button.dataset.endpoint)));
   $$('.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     const endpoint = provider.endpoints.find(item => item.id === button.dataset.endpoint);
     const credentialImpact = endpoint.api_type === 'openai_codex' ? 'its connected OAuth subscription' : `its ${endpoint.api_keys.length} API key${endpoint.api_keys.length === 1 ? '' : 's'}`;
-    const message = `Delete endpoint “${endpoint.id}”?\n\nThis also deletes ${credentialImpact}, removes its discovered-model availability, and removes destinations that route to it.`;
+    const affectedRoutes = modelRoutes.filter(route => route.targets.some(target => target.provider_id === provider.id && target.endpoint_id === endpoint.id));
+    const affectedTargets = affectedRoutes.reduce((count, route) => count + route.targets.filter(target => target.provider_id === provider.id && target.endpoint_id === endpoint.id).length, 0);
+    const removedRoutes = affectedRoutes.filter(route => route.targets.every(target => target.provider_id === provider.id && target.endpoint_id === endpoint.id)).length;
+    const routeImpact = affectedTargets
+      ? ` It removes ${affectedTargets} model-route destination${affectedTargets === 1 ? '' : 's'}${removedRoutes ? ` and deletes ${removedRoutes} route${removedRoutes === 1 ? '' : 's'} left without a destination` : ''}.`
+      : '';
+    const message = `Delete endpoint “${endpoint.id}”?\n\nThis also deletes ${credentialImpact}, removes its discovered-model availability, and removes destinations that route to it.${routeImpact}`;
     if (!confirm(message)) return;
     const response = await fetch(`/admin/providers/${provider.id}/endpoints/${endpoint.id}`, {method: 'DELETE'});
     if (!response.ok) return showApiError(response, null);
-    await loadProviders();
+    await Promise.all([loadProviders(), loadRoutes()]);
   }));
   $$('.add-key').forEach(button => button.addEventListener('click', () => openKeyDialog(button.dataset.provider, button.dataset.endpoint)));
   $$('.edit-traffic').forEach(button => button.addEventListener('click', () => openTrafficDialog(button.dataset.provider, button.dataset.endpoint)));
@@ -675,19 +699,19 @@ function openEndpointDialog(providerId, endpointId = null) {
   if (!endpoint) form.elements.id.value = availableEndpointId(provider, form.elements.api_type.value);
   form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint && endpoint.api_type !== 'openai_codex');
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
-  $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
+  $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update this Endpoint ID or the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
   $('#endpoint-dialog button[type="submit"]').textContent = endpoint ? 'Save changes' : 'Add endpoint';
   const editing = Boolean(endpoint);
-  form.elements.id.disabled = editing;
-  form.elements.id.closest('.endpoint-id-input').classList.toggle('immutable-input', editing);
-  form.querySelector('.endpoint-id-required').hidden = editing;
-  form.querySelector('.endpoint-id-permanent').hidden = !editing;
-  form.querySelector('.endpoint-id-lock').hidden = !editing;
+  form.elements.id.disabled = false;
+  form.elements.id.closest('.endpoint-id-input').classList.remove('immutable-input');
+  form.querySelector('.endpoint-id-required').hidden = false;
+  form.querySelector('.endpoint-id-permanent').hidden = true;
+  form.querySelector('.endpoint-id-lock').hidden = true;
   const endpointIdHelp = form.querySelector('#endpoint-id-help');
-  endpointIdHelp.classList.toggle('immutable-help', editing);
+  endpointIdHelp.classList.remove('immutable-help');
   endpointIdHelp.innerHTML = editing
-    ? '<strong>Cannot be changed after creation.</strong> It is referenced by model discovery, endpoint preferences, model routes, credentials, and Activity.'
-    : 'Identifies this connection inside the Provider. A unique suggestion is filled in automatically; it cannot be changed after creation.';
+    ? 'Renaming updates model availability, endpoint preferences, model-route destinations, Request Defaults scope, and an inactive Traffic Capture scope. Credentials stay attached; historical Activity and captures keep the ID recorded at request time.'
+    : 'Identifies this connection inside the Provider. A unique suggestion is filled in automatically and can be changed later.';
   if (endpoint) {
     form.elements.id.value = endpoint.id; form.elements.base_url.value = endpoint.base_url; form.elements.api_type.value = endpoint.api_type;
     form.elements.socks5_proxy.value = endpoint.socks5_proxy || ''; form.elements.requires_api_key.checked = endpoint.requires_api_key;
@@ -720,11 +744,13 @@ $('#endpoint-form [name="api_type"]').addEventListener('change', event => {
 $$('.close-endpoint').forEach(button => button.addEventListener('click', () => endpointDialog.close()));
 $('#endpoint-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const data = new FormData(form); const providerId = data.get('provider_id'); const endpointId = form.dataset.endpointId;
-  const payload = endpointId ? {id: endpointId, api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, requires_api_key: data.get('requires_api_key') === 'on'} : {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, extra_headers: {}, extra_body: {}, requires_api_key: data.get('requires_api_key') === 'on', api_key: data.get('requires_api_key') === 'on' ? data.get('api_key') : null};
+  const payload = endpointId ? {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, requires_api_key: data.get('requires_api_key') === 'on'} : {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, extra_headers: {}, extra_body: {}, requires_api_key: data.get('requires_api_key') === 'on', api_key: data.get('requires_api_key') === 'on' ? data.get('api_key') : null};
   if (!endpointId && payload.api_type === 'openai_codex') return beginOpenAiSubscription({provider_id: providerId, endpoint_id: payload.id, socks5_proxy: payload.socks5_proxy}, $('#endpoint-error'), endpointDialog);
   const response = await fetch(endpointId ? `/admin/providers/${providerId}/endpoints/${endpointId}` : `/admin/providers/${providerId}/endpoints`, {method: endpointId ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#endpoint-error'));
-  endpointDialog.close(); await loadProviders();
+  const renamed = Boolean(endpointId && endpointId !== payload.id);
+  endpointDialog.close();
+  await (renamed ? Promise.all([loadProviders(), loadRoutes()]) : loadProviders());
 });
 
 const keyDialog = $('#key-dialog');
@@ -1611,8 +1637,16 @@ function renderExtensions() {
     return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(hook => hook.replaceAll('_', ' ')).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
   }).join('');
   $$('[data-extension-toggle]').forEach(toggle => toggle.addEventListener('change', async () => {
+    const extensionId = toggle.dataset.extensionToggle;
+    if (!toggle.checked && extensionId === 'openai-subscription') {
+      const endpointCount = providers.reduce((count, provider) => count + provider.endpoints.filter(endpoint => endpoint.api_type === 'openai_codex').length, 0);
+      if (endpointCount && !confirm(`Disable OpenAI Subscription?\n\n${endpointCount} configured OpenAI subscription Endpoint${endpointCount === 1 ? '' : 's'} will remain saved, but routing, model discovery, sign-in, token refresh, and inference through ${endpointCount === 1 ? 'it' : 'them'} will stop until this Extension is enabled again.`)) {
+        toggle.checked = true;
+        return;
+      }
+    }
     toggle.disabled = true;
-    const response = await fetch(`/admin/extensions/${encodeURIComponent(toggle.dataset.extensionToggle)}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({enabled: toggle.checked})});
+    const response = await fetch(`/admin/extensions/${encodeURIComponent(extensionId)}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({enabled: toggle.checked})});
     if (!response.ok) { toggle.checked = !toggle.checked; toggle.disabled = false; window.alert((await response.json()).error?.message || 'Could not update Extension'); return; }
     const updated = await response.json();
     extensions = extensions.map(extension => extension.id === updated.id ? updated : extension);
