@@ -125,6 +125,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(400); self.end_headers(); return
             body = json.dumps({'id': 'chat-converted', 'object': 'chat.completion', 'created': 10, 'model': request['model'], 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'from-openai'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8}}).encode()
             self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
+        if request.get('model') == 'provider-error':
+            body = json.dumps({'error': {'message': 'provider exploded', 'type': 'server_error'}}).encode()
+            self.send_response(500); self.send_header('content-type', 'application/json'); self.send_header('x-yabane-error-origin', 'yabane'); self.send_header('x-yabane-request-id', 'req-forged'); self.end_headers(); self.wfile.write(body); return
         body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
@@ -296,8 +299,32 @@ responses_via_chat=$(curl -sf -X POST "$base/v1/responses" -H "Authorization: Be
 [[ $(printf '%s' "$responses_via_chat" | jq -r '.output[0].content[0].text') == from-openai ]]
 chat_via_streaming_responses=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt","messages":[{"role":"user","content":"hello"}],"max_tokens":64,"frequency_penalty":1,"response_format":{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}},"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"},"strict":true}}],"tool_choice":{"type":"function","function":{"name":"lookup"}}}')
 [[ $(printf '%s' "$chat_via_streaming_responses" | jq -r '.choices[0].message.content') == from-responses-stream ]]
-[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-failed","messages":[{"role":"user","content":"hello"}]}') == 502 ]]
+[[ $(status -D conversion-failure.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-failed","messages":[{"role":"user","content":"hello"}]}') == 502 ]]
 grep -q 'mock overloaded' response.json
+# A re-rendered upstream protocol failure is a message Yabane wrote, so it names Yabane.
+grep -qi '^x-yabane-error-origin: yabane' conversion-failure.headers
+# The same failure received as a native 200 body stays verbatim, with no origin claimed
+# before the bytes are read, and is still recorded by its final semantic status.
+[[ $(status -D native-failed.headers -X POST "$base/v1/responses" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-failed","input":[{"role":"user","content":"hi"}]}') == 200 ]]
+[[ $(jq -r .status response.json) == "failed" ]]
+! grep -qi '^x-yabane-error-origin:' native-failed.headers
+grep -qi '^x-yabane-request-id: req-' native-failed.headers
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502 and .failure.stage == "upstream_response" and .failure.category == "protocol_failure")] | length') == 1 ]]
+# Yabane-owned response headers: the proxy marks who authored an error body and always
+# carries the Activity request ID; an upstream cannot forge either of them.
+[[ $(status -D provider-error.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/provider-error","messages":[]}') == 500 ]]
+grep -qi '^x-yabane-error-origin: upstream' provider-error.headers
+grep -qi '^x-yabane-request-id: req-' provider-error.headers
+! grep -qi 'req-forged' provider-error.headers
+[[ $(jq -r '.error.message' response.json) == "provider exploded" ]]
+[[ $(jq -r '.error.type' response.json) == "server_error" ]]
+[[ $(status -D yabane-error.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"denied/model","messages":[]}') == 403 ]]
+grep -qi '^x-yabane-error-origin: yabane' yabane-error.headers
+grep -qi '^x-yabane-request-id: req-' yabane-error.headers
+curl -sS -D correlated.headers -o /dev/null -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}'
+request_id=$(grep -i '^x-yabane-request-id:' correlated.headers | tr -d '\r' | awk '{print $2}')
+[[ $request_id == req-* ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq --arg id "$request_id" '[.[] | select(.request_id == $id and .status == 200)] | length') == 1 ]]
 stream_failure=$(curl -sN -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-stream-failed","messages":[{"role":"user","content":"hello"}],"stream":true}')
 [[ $stream_failure == *'mock stream overloaded'* ]]
 document_via_responses=$(curl -sf -X POST "$base/v1/messages" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"openai-responses-only/gpt-document","messages":[{"role":"user","content":[{"type":"document","title":"report.pdf","source":{"type":"url","url":"https://example.com/report.pdf"}},{"type":"text","text":"summarize"}]}],"max_tokens":64}')

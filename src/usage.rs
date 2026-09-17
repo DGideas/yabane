@@ -163,15 +163,17 @@ fn event_reports_failure(api_type: ApiType, bytes: &[u8]) -> bool {
         | ApiType::OpenaiChatCompletions
         | ApiType::OpenaiResponses
         | ApiType::OpenaiCodex => {
+            // A streaming event carries the response under `response`, while a
+            // non-streaming body is the response object itself, so its terminal
+            // status is a top-level field. Both are the same protocol failure.
+            let response_status = value
+                .pointer("/response/status")
+                .or_else(|| value.get("status"))
+                .and_then(serde_json::Value::as_str);
             matches!(
                 value.get("type").and_then(serde_json::Value::as_str),
                 Some("error" | "response.failed")
-            ) || matches!(
-                value
-                    .pointer("/response/status")
-                    .and_then(serde_json::Value::as_str),
-                Some("failed" | "incomplete")
-            )
+            ) || matches!(response_status, Some("failed" | "incomplete"))
         }
         ApiType::Anthropic => {
             value.get("type").and_then(serde_json::Value::as_str) == Some("error")
@@ -300,6 +302,19 @@ mod tests {
         let mut responses = UsageTracker::new(ApiType::OpenaiResponses, true);
         responses.observe(b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"private upstream detail\"}}}\n\n");
         assert!(responses.finish().1);
+
+        // The same failure delivered as a non-streaming body instead of an event.
+        let mut non_stream = UsageTracker::new(ApiType::OpenaiResponses, false);
+        non_stream.observe(b"{\"id\":\"resp_failed\",\"object\":\"response\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"private upstream detail\"},\"output\":[]}");
+        assert!(non_stream.finish().1);
+
+        // A completed response and a chat completion body are not failures.
+        let mut completed = UsageTracker::new(ApiType::OpenaiResponses, false);
+        completed.observe(b"{\"id\":\"resp_ok\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}");
+        assert!(!completed.finish().1);
+        let mut chat = UsageTracker::new(ApiType::OpenaiChatCompletions, false);
+        chat.observe(b"{\"id\":\"chatcmpl_ok\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}");
+        assert!(!chat.finish().1);
 
         let mut anthropic = UsageTracker::new(ApiType::Anthropic, true);
         anthropic.observe(
