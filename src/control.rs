@@ -304,6 +304,8 @@ async fn create_gateway_api_key(
             "API key expiry must be in the future",
         );
     }
+    // Keep the Provider read lock through the authentication commit so a
+    // concurrently deleted Provider cannot leave a newly created dangling scope.
     let providers = state.providers.read().await;
     if let Some(provider_id) = input
         .provider_ids
@@ -315,7 +317,6 @@ async fn create_gateway_api_key(
             format!("Unknown provider '{provider_id}'"),
         );
     }
-    drop(providers);
     let secret = generate_secret();
     let id = secret[3..15].to_owned();
     let key = GatewayApiKey {
@@ -365,17 +366,19 @@ async fn update_gateway_api_key(
             "API key expiry must be in the future",
         );
     }
-    if let Some(provider_ids) = &input.provider_ids {
-        let providers = state.providers.read().await;
-        if let Some(provider_id) = provider_ids
+    // Provider deletion takes the same locks in Provider → authentication
+    // order. Retain this guard until persistence completes to make validation
+    // and the scoped-key update one serialized operation.
+    let providers = state.providers.read().await;
+    if let Some(provider_ids) = &input.provider_ids
+        && let Some(provider_id) = provider_ids
             .iter()
             .find(|provider_id| !providers.contains_key(*provider_id))
-        {
-            return api_error(
-                StatusCode::BAD_REQUEST,
-                format!("Unknown provider '{provider_id}'"),
-            );
-        }
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Unknown provider '{provider_id}'"),
+        );
     }
 
     let mut auth = state.auth.write().await;
@@ -497,6 +500,12 @@ async fn save_global_route(
             );
         };
         let key = if endpoint.api_type == ApiType::OpenaiCodex {
+            if state.extensions.provider_endpoint("openai_codex").is_none() {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "Enable the OpenAI Subscription Extension before routing to this Endpoint",
+                );
+            }
             if !target.api_key_id.is_empty() {
                 return api_error(
                     StatusCode::BAD_REQUEST,
@@ -558,7 +567,9 @@ async fn save_global_route(
             return api_error(StatusCode::BAD_REQUEST, "Route target API key is disabled");
         }
     }
-    drop(providers);
+    // Keep the Provider snapshot locked until the route is persisted. Provider
+    // and Endpoint mutations use the same Provider → route lock order, so a
+    // target cannot become dangling between validation and commit.
     let mut routes = state.routes.0.write().await;
     let mut updated = routes.clone();
     let pattern = input.pattern.trim().to_owned();
@@ -828,25 +839,11 @@ async fn update_extension(
     axum::Json(input): axum::Json<ExtensionUpdate>,
 ) -> Response {
     #[cfg(feature = "extension-openai-subscription")]
-    if id == yabane_extension_openai_subscription::ID
-        && !input.enabled
-        && state.extensions.contains(&id)
-    {
-        // Keep the Provider lock through the enabled-state commit. OAuth completion
-        // takes the same lock before checking the Extension, so it cannot attach a
-        // subscription Endpoint between this dependency check and disablement.
-        let providers = state.providers.write().await;
-        if providers.values().any(|provider| {
-            provider
-                .endpoints
-                .iter()
-                .any(|endpoint| endpoint.api_type == ApiType::OpenaiCodex)
-        }) {
-            return api_error(
-                StatusCode::CONFLICT,
-                "Delete OpenAI subscription Endpoints before disabling the extension",
-            );
-        }
+    if id == yabane_extension_openai_subscription::ID && !input.enabled {
+        // OAuth completion takes the same lock and rechecks the Extension before
+        // attaching an Endpoint. Holding it through disablement makes the switch
+        // a clean boundary without coupling enabled state to saved resources.
+        let _providers = state.providers.write().await;
         return set_extension_enabled(&state, &id, false).await;
     }
     #[cfg(feature = "extension-traffic-capture")]
@@ -910,8 +907,11 @@ async fn configure_traffic_capture(
             "Capture Provider and Endpoint must be specified together",
         );
     }
+    // Retain this guard through Capture persistence. Provider and Endpoint
+    // deletion lock Providers first and recheck active Capture state, preventing
+    // a validated scope from becoming orphaned before it is activated.
+    let providers = state.providers.read().await;
     if !config.provider_id.is_empty() {
-        let providers = state.providers.read().await;
         let Some(provider) = providers.get(&config.provider_id) else {
             return api_error(StatusCode::BAD_REQUEST, "Capture Provider was not found");
         };
@@ -1319,8 +1319,11 @@ async fn create_provider(
 }
 
 async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let mut providers = state.providers.write().await;
     #[cfg(feature = "extension-traffic-capture")]
-    {
+    let capture_update = {
+        // Capture configuration keeps a Provider read lock through activation,
+        // so checking after taking the write lock closes the validation/delete race.
         let capture = state.traffic_capture.status().await.config;
         if capture.active && capture.provider_id == id {
             return api_error(
@@ -1328,8 +1331,16 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
                 "Stop Traffic Capture before deleting its scoped Provider",
             );
         }
-    }
-    let mut providers = state.providers.write().await;
+        if capture.provider_id == id {
+            let mut cleared = capture.clone();
+            cleared.provider_id.clear();
+            cleared.endpoint_id.clear();
+            cleared.model.clear();
+            Some((capture, cleared))
+        } else {
+            None
+        }
+    };
     let mut updated_providers = providers.clone();
     if updated_providers.remove(&id).is_none() {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
@@ -1341,15 +1352,56 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
         route.targets.retain(|target| target.provider_id != id);
     }
     updated_routes.retain(|route| !route.targets.is_empty());
-    if let Err(err) =
-        save_provider_and_routes(&updated_providers, &updated_routes, &providers).await
+
+    let mut auth = state.auth.write().await;
+    let mut updated_auth = auth.clone();
+    updated_auth.api_keys.retain_mut(|key| {
+        if !key
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == &id)
+        {
+            return true;
+        }
+        key.provider_ids.retain(|provider_id| provider_id != &id);
+        // An empty allowlist means unrestricted access, so revoke a key whose
+        // only scope was the deleted Provider rather than broadening it.
+        !key.provider_ids.is_empty()
+    });
+
+    #[cfg(feature = "extension-traffic-capture")]
+    if let Some((_, config)) = &capture_update
+        && let Err(err) = state.traffic_capture.configure(config.clone()).await
     {
+        error!(%err, "failed to clear Traffic Capture scope for Provider deletion");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not clear Traffic Capture for the Provider deletion",
+        );
+    }
+
+    if let Err(err) = save_auth_provider_and_routes(
+        &updated_auth,
+        &updated_providers,
+        &updated_routes,
+        &auth,
+        &providers,
+    )
+    .await
+    {
+        #[cfg(feature = "extension-traffic-capture")]
+        if let Some((previous, _)) = capture_update
+            && let Err(rollback_err) = state.traffic_capture.configure(previous).await
+        {
+            error!(%rollback_err, "failed to roll back Traffic Capture after Provider deletion failure");
+        }
         error!(%err, "failed to persist provider deletion");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not delete Provider and its model routes",
+            "Could not delete Provider and its dependent configuration",
         );
     }
+    *auth = updated_auth;
     *providers = updated_providers;
     *routes = updated_routes;
     StatusCode::NO_CONTENT.into_response()
@@ -1437,8 +1489,9 @@ async fn update_endpoint(
     if input.base_url.trim().is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "Endpoint base URL is required");
     }
-    if input.id.as_deref().is_some_and(|id| id != endpoint_id) {
-        return api_error(StatusCode::BAD_REQUEST, "Endpoint ID cannot be changed");
+    let new_endpoint_id = input.id.as_deref().unwrap_or(&endpoint_id).to_owned();
+    if !valid_id(&new_endpoint_id) {
+        return api_error(StatusCode::BAD_REQUEST, "Endpoint ID must be a URL slug");
     }
     if let Err(message) = validate_socks5_proxy(input.socks5_proxy.as_deref()) {
         return api_error(StatusCode::BAD_REQUEST, message);
@@ -1452,23 +1505,34 @@ async fn update_endpoint(
     let Some(provider) = updated.get_mut(&provider_id) else {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
     };
-    let Some(endpoint) = provider
+    let Some(endpoint_index) = provider
         .endpoints
-        .iter_mut()
-        .find(|endpoint| endpoint.id == endpoint_id)
+        .iter()
+        .position(|endpoint| endpoint.id == endpoint_id)
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
+    if new_endpoint_id != endpoint_id
+        && provider
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.id == new_endpoint_id)
+    {
+        return api_error(StatusCode::CONFLICT, "Endpoint ID already exists");
+    }
+
+    let endpoint = &provider.endpoints[endpoint_index];
     let subscription_endpoint = endpoint.api_type == ApiType::OpenaiCodex;
+    let normalized_base_url = input.base_url.trim().trim_end_matches('/').to_owned();
+    let normalized_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
     if subscription_endpoint {
-        let base_url = input.base_url.trim().trim_end_matches('/');
         if input.api_type != ApiType::OpenaiCodex
-            || base_url != endpoint.base_url
+            || normalized_base_url != endpoint.base_url
             || input.requires_api_key
         {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "OpenAI subscription Endpoints only allow SOCKS5 proxy changes; delete and reconnect to change other settings",
+                "OpenAI subscription Endpoints allow ID and SOCKS5 proxy changes only; delete and reconnect to change other settings",
             );
         }
     } else if input.api_type == ApiType::OpenaiCodex {
@@ -1479,62 +1543,118 @@ async fn update_endpoint(
     }
     let stopped_requiring_api_key = endpoint.requires_api_key && !input.requires_api_key;
     let started_requiring_api_key = !endpoint.requires_api_key && input.requires_api_key;
-    if started_requiring_api_key {
-        let routes = state.routes.0.read().await;
-        if routes.iter().any(|route| {
+    let connection_changed = endpoint.api_type != input.api_type
+        || endpoint.base_url != normalized_base_url
+        || endpoint.socks5_proxy != normalized_proxy
+        || endpoint.requires_api_key != input.requires_api_key;
+    let renamed = new_endpoint_id != endpoint_id;
+
+    let mut routes = state.routes.0.write().await;
+    if started_requiring_api_key
+        && routes.iter().any(|route| {
             route.targets.iter().any(|target| {
                 target.provider_id == provider_id && target.endpoint_id == endpoint_id
             })
-        }) {
-            return api_error(
-                StatusCode::CONFLICT,
-                "Update or delete model routes targeting this Endpoint before requiring an API key",
-            );
+        })
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "Update or delete model routes targeting this Endpoint before requiring an API key",
+        );
+    }
+
+    #[cfg(feature = "extension-traffic-capture")]
+    let capture_update = if renamed {
+        let status = state.traffic_capture.status().await;
+        if status.config.provider_id == provider_id && status.config.endpoint_id == endpoint_id {
+            if status.config.active {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "Stop Traffic Capture before changing its scoped Endpoint ID",
+                );
+            }
+            let previous = status.config;
+            let mut updated = previous.clone();
+            updated.endpoint_id = new_endpoint_id.clone();
+            Some((previous, updated))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    {
+        let endpoint = &mut provider.endpoints[endpoint_index];
+        endpoint.id = new_endpoint_id.clone();
+        endpoint.api_type = input.api_type;
+        endpoint.base_url = normalized_base_url;
+        endpoint.socks5_proxy = normalized_proxy;
+        endpoint.requires_api_key = input.requires_api_key;
+        endpoint.proxy_client = Default::default();
+    }
+
+    if connection_changed && !subscription_endpoint {
+        remove_endpoint_discovery(provider, &endpoint_id);
+    } else if renamed {
+        rename_endpoint_references(provider, &endpoint_id, &new_endpoint_id);
+    }
+    if renamed {
+        for configured_id in &mut provider.defaults_endpoint_ids {
+            if configured_id == &endpoint_id {
+                *configured_id = new_endpoint_id.clone();
+            }
         }
     }
 
-    endpoint.api_type = input.api_type;
-    endpoint.base_url = input.base_url.trim().trim_end_matches('/').to_owned();
-    endpoint.socks5_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
-    endpoint.requires_api_key = input.requires_api_key;
-    endpoint.proxy_client = Default::default();
-    if !subscription_endpoint {
-        remove_endpoint_discovery(provider, &endpoint_id);
-    }
-
-    let response = if stopped_requiring_api_key {
-        let mut routes = state.routes.0.write().await;
-        let mut updated_routes = routes.clone();
-        for route in &mut updated_routes {
-            for target in &mut route.targets {
-                if target.provider_id == provider_id && target.endpoint_id == endpoint_id {
+    let mut updated_routes = routes.clone();
+    for route in &mut updated_routes {
+        for target in &mut route.targets {
+            if target.provider_id == provider_id && target.endpoint_id == endpoint_id {
+                if renamed {
+                    target.endpoint_id = new_endpoint_id.clone();
+                }
+                if stopped_requiring_api_key {
                     target.api_key_id.clear();
                 }
             }
         }
-        match save_provider_and_routes(&updated, &updated_routes, &providers).await {
-            Ok(()) => {
-                *providers = updated;
-                *routes = updated_routes;
-                StatusCode::NO_CONTENT.into_response()
-            }
-            Err(err) => {
-                error!(%err, "failed to persist Endpoint update");
-                api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Could not update API endpoint",
-                )
-            }
-        }
-    } else {
-        let response = persist_or_error(&updated).await;
-        if response.status().is_success() {
+    }
+
+    #[cfg(feature = "extension-traffic-capture")]
+    if let Some((_, config)) = &capture_update
+        && let Err(err) = state.traffic_capture.configure(config.clone()).await
+    {
+        error!(%err, "failed to update Traffic Capture scope for Endpoint rename");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not update Traffic Capture for the Endpoint ID change",
+        );
+    }
+
+    let response = match save_provider_and_routes(&updated, &updated_routes, &providers).await {
+        Ok(()) => {
             *providers = updated;
+            *routes = updated_routes;
+            StatusCode::NO_CONTENT.into_response()
         }
-        response
+        Err(err) => {
+            #[cfg(feature = "extension-traffic-capture")]
+            if let Some((previous, _)) = capture_update
+                && let Err(rollback_err) = state.traffic_capture.configure(previous).await
+            {
+                error!(%rollback_err, "failed to roll back Traffic Capture after Endpoint update failure");
+            }
+            error!(%err, "failed to persist Endpoint update");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not update API endpoint and its references",
+            )
+        }
     };
+    drop(routes);
     drop(providers);
-    if response.status().is_success() && !subscription_endpoint {
+    if response.status().is_success() && connection_changed && !subscription_endpoint {
         spawn_provider_refresh(state, provider_id);
     }
     response
@@ -1544,20 +1664,29 @@ async fn delete_endpoint(
     State(state): State<AppState>,
     Path((provider_id, endpoint_id)): Path<(String, String)>,
 ) -> Response {
+    let mut providers = state.providers.write().await;
     #[cfg(feature = "extension-traffic-capture")]
-    {
+    let capture_update = {
+        // See configure_traffic_capture: both operations serialize on Providers
+        // before observing or changing Capture scope.
         let capture = state.traffic_capture.status().await.config;
-        if capture.active
-            && capture.provider_id == provider_id
-            && capture.endpoint_id == endpoint_id
-        {
+        let scoped = capture.provider_id == provider_id && capture.endpoint_id == endpoint_id;
+        if capture.active && scoped {
             return api_error(
                 StatusCode::CONFLICT,
                 "Stop Traffic Capture before deleting its scoped Endpoint",
             );
         }
-    }
-    let mut providers = state.providers.write().await;
+        if scoped {
+            let mut cleared = capture.clone();
+            cleared.provider_id.clear();
+            cleared.endpoint_id.clear();
+            cleared.model.clear();
+            Some((capture, cleared))
+        } else {
+            None
+        }
+    };
     let mut updated_providers = providers.clone();
     let Some(provider) = updated_providers.get_mut(&provider_id) else {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
@@ -1589,9 +1718,26 @@ async fn delete_endpoint(
         });
     }
     updated_routes.retain(|route| !route.targets.is_empty());
+    #[cfg(feature = "extension-traffic-capture")]
+    if let Some((_, config)) = &capture_update
+        && let Err(err) = state.traffic_capture.configure(config.clone()).await
+    {
+        error!(%err, "failed to clear Traffic Capture scope for Endpoint deletion");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not clear Traffic Capture for the Endpoint deletion",
+        );
+    }
+
     if let Err(err) =
         save_provider_and_routes(&updated_providers, &updated_routes, &providers).await
     {
+        #[cfg(feature = "extension-traffic-capture")]
+        if let Some((previous, _)) = capture_update
+            && let Err(rollback_err) = state.traffic_capture.configure(previous).await
+        {
+            error!(%rollback_err, "failed to roll back Traffic Capture after Endpoint deletion failure");
+        }
         error!(%err, "failed to persist endpoint deletion");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1820,6 +1966,21 @@ fn remove_endpoint_discovery(provider: &mut Provider, endpoint_id: &str) {
         .retain(|model| provider.model_endpoints.contains_key(model));
 }
 
+fn rename_endpoint_references(provider: &mut Provider, old_id: &str, new_id: &str) {
+    for endpoint_ids in provider.model_endpoints.values_mut() {
+        for endpoint_id in endpoint_ids {
+            if endpoint_id == old_id {
+                *endpoint_id = new_id.to_owned();
+            }
+        }
+    }
+    for preference in &mut provider.model_endpoint_preferences {
+        if preference.endpoint_id == old_id {
+            preference.endpoint_id = new_id.to_owned();
+        }
+    }
+}
+
 fn spawn_provider_refresh(state: AppState, provider_id: String) {
     tokio::spawn(async move {
         let _ = models::refresh_provider(State(state), Path(provider_id)).await;
@@ -1943,6 +2104,27 @@ fn valid_model_pattern(pattern: &str) -> bool {
     !pattern.is_empty()
         && (pattern.matches('*').count() == 0
             || (pattern.ends_with('*') && pattern.matches('*').count() == 1 && pattern.len() > 1))
+}
+
+async fn save_auth_provider_and_routes(
+    auth: &auth::AuthConfig,
+    providers: &std::collections::HashMap<String, Provider>,
+    routes: &[routes::ModelRoute],
+    previous_auth: &auth::AuthConfig,
+    previous_providers: &std::collections::HashMap<String, Provider>,
+) -> Result<(), String> {
+    save_auth(auth)
+        .await
+        .map_err(|err| format!("save authentication: {err}"))?;
+    if let Err(err) = save_provider_and_routes(providers, routes, previous_providers).await {
+        if let Err(rollback_err) = save_auth(previous_auth).await {
+            return Err(format!(
+                "{err}; authentication rollback also failed: {rollback_err}"
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 async fn save_provider_and_routes(

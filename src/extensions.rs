@@ -148,13 +148,6 @@ impl ExtensionRegistry {
         })
     }
 
-    #[cfg_attr(not(feature = "extension-openai-subscription"), allow(dead_code))]
-    pub fn contains(&self, id: &str) -> bool {
-        self.extensions
-            .iter()
-            .any(|extension| extension.info.id == id)
-    }
-
     pub fn views(&self) -> Vec<ExtensionView> {
         self.extensions
             .iter()

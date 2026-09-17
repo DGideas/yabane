@@ -222,26 +222,45 @@ async fn resolve_provider(
             .find(|endpoint| endpoint.id == target.endpoint_id)
     } else {
         let discovered = provider.model_endpoints.get(upstream_model);
-        provider
+        let endpoint_available = |endpoint: &ApiEndpoint| {
+            endpoint.api_type != ApiType::OpenaiCodex
+                || state.extensions.provider_endpoint("openai_codex").is_some()
+        };
+        let endpoint = provider
             .endpoints
             .iter()
             .find(|endpoint| {
-                surface.supports(endpoint.api_type)
+                endpoint_available(endpoint)
+                    && surface.supports(endpoint.api_type)
                     && provider.preferred_endpoint_id(upstream_model, endpoint.api_type)
                         == Some(endpoint.id.as_str())
                     && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
             })
             .or_else(|| {
                 provider.endpoints.iter().find(|endpoint| {
-                    surface.supports(endpoint.api_type)
+                    endpoint_available(endpoint)
+                        && surface.supports(endpoint.api_type)
                         && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
                 })
             })
             .or_else(|| {
                 provider.endpoints.iter().find(|endpoint| {
-                    discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
+                    endpoint_available(endpoint)
+                        && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
                 })
+            });
+        if endpoint.is_none()
+            && provider.endpoints.iter().any(|endpoint| {
+                endpoint.api_type == ApiType::OpenaiCodex
+                    && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
             })
+        {
+            return Err(RoutingError {
+                status: StatusCode::BAD_REQUEST,
+                message: "OpenAI Subscription Extension is not enabled".to_owned(),
+            });
+        }
+        endpoint
     }
     .ok_or_else(|| RoutingError {
         status: StatusCode::BAD_REQUEST,
@@ -1362,10 +1381,12 @@ fn to_reqwest_method(method: &Method) -> reqwest::Method {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
+    #[cfg(feature = "extension-openai-subscription")]
+    use super::provider_endpoint_base_url;
     use super::{
         ApiSurface, ApiType, Protocol, apply_core_upstream_headers, copy_response_headers,
-        provider_endpoint_base_url, response_is_event_stream, sanitize_request_headers,
-        strip_transformed_response_headers, upstream_transport_failure,
+        response_is_event_stream, sanitize_request_headers, strip_transformed_response_headers,
+        upstream_transport_failure,
     };
 
     #[test]
@@ -1390,6 +1411,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn provider_endpoint_fixed_base_url_overrides_persisted_configuration() {
         assert_eq!(
@@ -1405,6 +1427,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn codex_adapter_applies_required_response_fields() {
         let mut body =
@@ -1423,6 +1446,7 @@ mod tests {
         assert_eq!(value["include"][0], "reasoning.encrypted_content");
     }
 
+    #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn codex_adapter_matches_pi_ai_system_prompt_and_output_limit_shape() {
         let mut body = br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Pi system prompt"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec();
@@ -1434,6 +1458,7 @@ mod tests {
         assert!(value.get("max_output_tokens").is_none());
     }
 
+    #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn codex_session_affinity_matches_pi_ai_and_rejects_invalid_values() {
         let long = format!("{}tail", "x".repeat(64));
@@ -1559,6 +1584,7 @@ mod tests {
         assert!(!failure.message.contains("example.com"));
     }
 
+    #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn subscription_headers_replace_caller_credentials() {
         let mut headers = HeaderMap::new();

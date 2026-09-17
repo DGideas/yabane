@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    activity::ActivityStore, admin_user::AdminState, auth::SharedAuth, routes::RouteStore,
+    activity::ActivityStore,
+    admin_user::AdminState,
+    auth::{AuthConfig, SharedAuth},
+    routes::{ModelRoute, RouteStore},
 };
 
 pub const PROVIDERS_FILE: &str = "data/providers.json";
@@ -254,6 +257,121 @@ fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_configuration_references(
+    providers: &HashMap<String, Provider>,
+    auth: &AuthConfig,
+    routes: &[ModelRoute],
+) -> Result<(), String> {
+    for provider in providers.values() {
+        for endpoint_id in &provider.defaults_endpoint_ids {
+            if !provider
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.id == *endpoint_id)
+            {
+                return Err(format!(
+                    "Provider '{}' Request Defaults refer to unknown Endpoint '{}'",
+                    provider.id, endpoint_id
+                ));
+            }
+        }
+        for (model, endpoint_ids) in &provider.model_endpoints {
+            let mut seen = std::collections::HashSet::new();
+            for endpoint_id in endpoint_ids {
+                if !seen.insert(endpoint_id) {
+                    return Err(format!(
+                        "Provider '{}' model '{}' lists Endpoint '{}' more than once",
+                        provider.id, model, endpoint_id
+                    ));
+                }
+                if !provider
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.id == *endpoint_id)
+                {
+                    return Err(format!(
+                        "Provider '{}' model '{}' refers to unknown Endpoint '{}'",
+                        provider.id, model, endpoint_id
+                    ));
+                }
+            }
+        }
+        for preference in &provider.model_endpoint_preferences {
+            let endpoint = provider
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == preference.endpoint_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Provider '{}' model preference refers to unknown Endpoint '{}'",
+                        provider.id, preference.endpoint_id
+                    )
+                })?;
+            if endpoint.api_type != preference.api_type
+                || !provider
+                    .model_endpoints
+                    .get(&preference.model)
+                    .is_some_and(|endpoint_ids| endpoint_ids.contains(&preference.endpoint_id))
+            {
+                return Err(format!(
+                    "Provider '{}' model preference for '{}' is not available through Endpoint '{}' with the configured API type",
+                    provider.id, preference.model, preference.endpoint_id
+                ));
+            }
+        }
+    }
+
+    for key in &auth.api_keys {
+        for provider_id in &key.provider_ids {
+            if !providers.contains_key(provider_id) {
+                return Err(format!(
+                    "Gateway API key '{}' refers to unknown Provider '{}'",
+                    key.id, provider_id
+                ));
+            }
+        }
+    }
+
+    for route in routes {
+        for target in &route.targets {
+            let provider = providers.get(&target.provider_id).ok_or_else(|| {
+                format!(
+                    "model route '{}' refers to unknown Provider '{}'",
+                    route.pattern, target.provider_id
+                )
+            })?;
+            let endpoint = provider
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == target.endpoint_id)
+                .ok_or_else(|| {
+                    format!(
+                        "model route '{}' refers to unknown Endpoint '{}/{}'",
+                        route.pattern, target.provider_id, target.endpoint_id
+                    )
+                })?;
+            if endpoint.requires_api_key && endpoint.api_type != ApiType::OpenaiCodex {
+                if !endpoint
+                    .api_keys
+                    .iter()
+                    .any(|key| key.id == target.api_key_id)
+                {
+                    return Err(format!(
+                        "model route '{}' refers to unknown API key '{}/{}/{}'",
+                        route.pattern, target.provider_id, target.endpoint_id, target.api_key_id
+                    ));
+                }
+            } else if !target.api_key_id.is_empty() {
+                return Err(format!(
+                    "model route '{}' assigns API key '{}' to Endpoint '{}/{}' that does not use API keys",
+                    route.pattern, target.api_key_id, target.provider_id, target.endpoint_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn save_providers(providers: &HashMap<String, Provider>) -> Result<(), std::io::Error> {
     let mut values: Vec<_> = providers.values().cloned().collect();
     values.sort_by(|a, b| a.id.cmp(&b.id));
@@ -273,6 +391,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{ApiEndpoint, ApiKey, ApiType, Provider};
+    use crate::{
+        auth::{AuthConfig, GatewayApiKey},
+        routes::{ModelRoute, RouteTarget},
+    };
 
     fn key(id: &str, weight: u32, enabled: bool) -> ApiKey {
         ApiKey {
@@ -344,6 +466,121 @@ mod tests {
                 ],
             )])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_cross_configuration_references() {
+        let provider = Provider {
+            id: "provider".to_owned(),
+            name: "Provider".to_owned(),
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            defaults_endpoint_ids: Vec::new(),
+            endpoints: vec![ApiEndpoint {
+                id: "endpoint".to_owned(),
+                requires_api_key: true,
+                api_keys: vec![key("key", 100, true)],
+                ..ApiEndpoint::default()
+            }],
+            discovered_models: Vec::new(),
+            model_endpoints: HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
+            models_discovered_at: None,
+            model_discovery_error: None,
+        };
+        let providers = HashMap::from([(provider.id.clone(), provider)]);
+        let gateway_key = |provider_ids| GatewayApiKey {
+            id: "gateway-key".to_owned(),
+            note: String::new(),
+            secret_hash: "hash".to_owned(),
+            secret: String::new(),
+            prefix: "sk-…test".to_owned(),
+            created_at: 0,
+            expires_at: None,
+            provider_ids,
+        };
+        let route = |provider_id: &str, endpoint_id: &str, api_key_id: &str| ModelRoute {
+            pattern: "alias".to_owned(),
+            targets: vec![RouteTarget {
+                provider_id: provider_id.to_owned(),
+                endpoint_id: endpoint_id.to_owned(),
+                api_key_id: api_key_id.to_owned(),
+                upstream_model: "model".to_owned(),
+                weight: 100,
+                enabled: true,
+            }],
+            cursor: Default::default(),
+        };
+
+        assert!(
+            super::validate_configuration_references(
+                &providers,
+                &AuthConfig {
+                    enabled: true,
+                    api_keys: vec![gateway_key(vec!["missing".to_owned()])],
+                },
+                &[],
+            )
+            .is_err()
+        );
+        let mut invalid_provider = providers["provider"].clone();
+        invalid_provider.defaults_endpoint_ids = vec!["missing".to_owned()];
+        assert!(
+            super::validate_configuration_references(
+                &HashMap::from([(invalid_provider.id.clone(), invalid_provider)]),
+                &AuthConfig::default(),
+                &[],
+            )
+            .is_err()
+        );
+        let mut invalid_provider = providers["provider"].clone();
+        invalid_provider
+            .model_endpoints
+            .insert("model".to_owned(), vec!["missing".to_owned()]);
+        assert!(
+            super::validate_configuration_references(
+                &HashMap::from([(invalid_provider.id.clone(), invalid_provider)]),
+                &AuthConfig::default(),
+                &[],
+            )
+            .is_err()
+        );
+        let auth = AuthConfig {
+            enabled: true,
+            api_keys: vec![gateway_key(vec!["provider".to_owned()])],
+        };
+        assert!(
+            super::validate_configuration_references(
+                &providers,
+                &auth,
+                &[route("missing", "endpoint", "key")],
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_configuration_references(
+                &providers,
+                &auth,
+                &[route("provider", "missing", "key")],
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_configuration_references(
+                &providers,
+                &auth,
+                &[route("provider", "endpoint", "missing")],
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_configuration_references(
+                &providers,
+                &auth,
+                &[route("provider", "endpoint", "key")],
+            )
+            .is_ok()
         );
     }
 

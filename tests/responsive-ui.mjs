@@ -69,7 +69,7 @@ for (const project of projects) {
     await page.waitForFunction(() => !document.querySelector('#login-screen')?.hidden || !document.querySelector('#admin-app')?.hidden);
     if (await page.locator('#login-screen').isVisible()) {
       await page.locator('#login-form [name="username"]').waitFor();
-      if (!(await page.locator('#login-form [name="username"]').evaluate(element => element === document.activeElement))) throw new Error(`${project.name}: login does not initially focus the username field`);
+      await page.waitForFunction(() => document.querySelector('#login-form [name="username"]') === document.activeElement);
       const authBackdrop = page.locator('#login-screen > .auth-backdrop');
       if (!(await authBackdrop.isVisible())) throw new Error(`${project.name}: authentication background artwork is not visible`);
       const authBackdropBehavior = await authBackdrop.evaluate(element => ({ pointerEvents: getComputedStyle(element).pointerEvents, ariaHidden: element.getAttribute('aria-hidden') }));
@@ -160,6 +160,13 @@ for (const project of projects) {
     const openAiSubscriptionExtension = page.locator('.extension-card').filter({hasText: 'openai-subscription'});
     if (!(await openAiSubscriptionExtension.isVisible()) || !(await openAiSubscriptionExtension.getByText('1 Endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension is missing or not linked to its Endpoint resources`);
     if (!(await openAiSubscriptionExtension.getByText('provider endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension does not declare its Endpoint stage`);
+    if (project.name === 'desktop-chrome') {
+      let disableWarning = '';
+      page.once('dialog', async dialog => { disableWarning = dialog.message(); await dialog.dismiss(); });
+      await openAiSubscriptionExtension.locator('[data-extension-toggle="openai-subscription"]').evaluate(input => input.click());
+      await page.waitForFunction(() => document.querySelector('[data-extension-toggle="openai-subscription"]').checked);
+      if (!disableWarning.includes('1 configured OpenAI subscription Endpoint') || !disableWarning.includes('routing, model discovery, sign-in, token refresh, and inference')) throw new Error(`${project.name}: disabling OpenAI Subscription does not confirm the impact on configured Endpoints`);
+    }
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
     await trafficCaptureExtension.getByRole('button', {name: 'Configure capture'}).click();
@@ -277,6 +284,8 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('#open-provider').click());
     await page.locator('#display-name').fill('OpenAI subscription');
     await page.locator('#next-step').click();
+    const providerFieldOrder = await page.locator('#provider-form [data-step="2"] > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('input, select')?.name));
+    if (providerFieldOrder.join('|') !== 'endpoint_id|api_type|base_url') throw new Error(`${project.name}: initial Endpoint setup does not ask for API type before Base URL`);
     await page.locator('#api-type-choices input[value="openai_codex"]').check();
     await assertDialog(page, '#provider-dialog', project.name);
     if (await page.locator('#initial-endpoint-id').inputValue() !== 'chatgpt') throw new Error(`${project.name}: first endpoint does not expose the API-type default ID`);
@@ -363,12 +372,11 @@ for (const project of projects) {
       if (await editableEndpoint.count()) {
         await editableEndpoint.click();
         await assertDialog(page, '#endpoint-dialog', project.name);
-        const immutableEndpointId = page.locator('#endpoint-form [name="id"]');
-        if (!(await immutableEndpointId.isDisabled())) throw new Error(`${project.name}: Endpoint ID is editable after creation`);
-        if (await page.locator('#endpoint-form .endpoint-id-permanent').textContent() !== 'Permanent') throw new Error(`${project.name}: Endpoint ID lacks an explicit permanent marker`);
-        const immutableEndpointStyles = await immutableEndpointId.evaluate(element => { const style = getComputedStyle(element); return {backgroundColor: style.backgroundColor, cursor: style.cursor}; });
-        if (immutableEndpointStyles.backgroundColor === 'rgb(255, 255, 255)' || immutableEndpointStyles.cursor !== 'not-allowed') throw new Error(`${project.name}: Endpoint ID does not look visibly immutable`);
-        if (await page.locator('#endpoint-id-help strong').textContent() !== 'Cannot be changed after creation.') throw new Error(`${project.name}: Endpoint ID immutability is not stated directly`);
+        const editableEndpointId = page.locator('#endpoint-form [name="id"]');
+        if (await editableEndpointId.isDisabled()) throw new Error(`${project.name}: Endpoint ID cannot be edited after creation`);
+        if (await page.locator('#endpoint-form .endpoint-id-permanent').isVisible()) throw new Error(`${project.name}: editable Endpoint ID is still marked permanent`);
+        const endpointHelp = await page.locator('#endpoint-id-help').textContent();
+        if (!endpointHelp.includes('model availability') || !endpointHelp.includes('model-route destinations') || !endpointHelp.includes('historical Activity')) throw new Error(`${project.name}: Endpoint rename does not explain linked updates and historical records`);
         await page.locator('#endpoint-dialog .close-endpoint').first().click();
       }
       await page.locator('.add-endpoint').click();
@@ -376,7 +384,45 @@ for (const project of projects) {
       if (!(await page.locator('#endpoint-form [name="id"]').inputValue())) throw new Error(`${project.name}: additional endpoint ID is not suggested`);
       if (await page.locator('#endpoint-form .endpoint-id-permanent').isVisible()) throw new Error(`${project.name}: new Endpoint ID is incorrectly marked permanent before creation`);
       if (!(await page.locator('#endpoint-form .endpoint-id-required').isVisible())) throw new Error(`${project.name}: new Endpoint ID does not remain visibly required`);
+      if (!(await page.locator('#endpoint-id-help').textContent()).includes('can be changed later')) throw new Error(`${project.name}: new Endpoint ID does not explain that it remains editable`);
+      const endpointFieldOrder = await page.locator('#endpoint-form .form-body > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('.field-label')?.childNodes[0]?.textContent.trim()));
+      if (endpointFieldOrder.join('|') !== 'Endpoint ID|API type|Base URL') throw new Error(`${project.name}: additional Endpoint setup does not ask for API type before Base URL`);
+      await page.locator('#endpoint-form [name="api_type"]').selectOption('openai_codex');
+      if (await page.locator('#endpoint-form [name="base_url"]').isVisible()) throw new Error(`${project.name}: additional subscription Endpoint setup exposes Base URL`);
       await page.locator('#endpoint-dialog .close-endpoint').first().click();
+    }
+    if (project.name === 'desktop-chrome') {
+      const providerFixture = {
+        id: 'ui-delete-provider', name: 'UI delete provider', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, requires_api_key: true, api_keys: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true}], subscription_connected: false, subscription_expires_at: null}],
+        discovered_models: [], model_endpoints: {}, model_endpoint_preferences: [], models_discovered_at: null, model_discovery_error: null,
+      };
+      const routeFixture = {pattern: 'ui-delete-route', targets: [{provider_id: providerFixture.id, endpoint_id: 'deletable', api_key_id: 'delete-key', upstream_model: 'upstream-delete-model', weight: 100, enabled: true}]};
+      await page.route('**/admin/providers/ui-delete-provider', async route => {
+        if (route.request().method() !== 'DELETE') return route.continue();
+        await route.fulfill({status: 204});
+      });
+      await page.route('**/admin/routes', async route => {
+        if (route.request().method() !== 'GET') return route.continue();
+        await route.fulfill({status: 200, contentType: 'application/json', body: '[]'});
+      }, {times: 1});
+      await page.route('**/admin/auth', async route => {
+        if (route.request().method() !== 'GET') return route.continue();
+        await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({enabled: true, api_keys: []})});
+      }, {times: 1});
+      await page.evaluate(({providerFixture, routeFixture}) => {
+        providers.push(providerFixture); modelRoutes.push(routeFixture);
+        authSettings.api_keys.push({id: 'ui-delete-scoped-key', note: 'Delete scoped key', prefix: 'sk-ui…test', secret: '', created_at: 1, expires_at: null, provider_ids: [providerFixture.id]});
+        renderProviders(); selectedProviderId = providerFixture.id; renderProviderPage();
+      }, {providerFixture, routeFixture});
+      let confirmation = '';
+      page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+      await Promise.all([
+        page.waitForResponse(response => response.request().method() === 'GET' && response.url().endsWith('/admin/routes')),
+        page.locator('.delete-provider').click(),
+      ]);
+      if (!confirmation.includes('1 Endpoint') || !confirmation.includes('1 upstream credential') || !confirmation.includes('1 model-route destination') || !confirmation.includes('deletes 1 route left without a destination') || !confirmation.includes('revokes 1 Gateway API key scoped only to this Provider')) throw new Error(`${project.name}: Provider deletion does not explain its cascading route, credential, and Gateway key impact`);
+      if (await page.locator('#routes').getByText('ui-delete-route', {exact: true}).count()) throw new Error(`${project.name}: Provider deletion leaves stale model routes rendered in the console`);
     }
     await page.evaluate(() => document.querySelector('[data-view="models"]').click());
     const renderedRoute = page.locator('#routes .route-destination').first();
