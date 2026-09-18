@@ -14,7 +14,7 @@ use crate::{
     activity::{ActivityStore, RequestFailure, RequestLog},
     auth,
     config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
-    error::api_error,
+    error::{self, api_error},
     openai_subscription,
     protocol::{self, Protocol},
     protocol_stream::StreamConverter,
@@ -85,6 +85,23 @@ pub async fn proxy_anthropic(State(state): State<AppState>, request: Request) ->
 }
 
 async fn route_request(state: AppState, request: Request, surface: ApiSurface) -> Response {
+    let request_id = request_id();
+    let mut response = route_proxied(state, request, surface, request_id.clone()).await;
+    error::attach_request_id(&mut response, &request_id);
+    if response.status().is_client_error() || response.status().is_server_error() {
+        // Upstream-authored error passthrough names its own origin; every other
+        // failure at this point is a message Yabane wrote.
+        error::default_error_origin(&mut response, error::ErrorOrigin::Yabane);
+    }
+    response
+}
+
+async fn route_proxied(
+    state: AppState,
+    request: Request,
+    surface: ApiSurface,
+    request_id: String,
+) -> Response {
     let request_started = Instant::now();
     let allowed_providers = auth::authorized_provider_ids(&request).map(<[String]>::to_vec);
     let (parts, body) = request.into_parts();
@@ -137,6 +154,7 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
     forward(
         state,
         ForwardRequest {
+            request_id,
             provider,
             endpoint,
             api_key,
@@ -413,6 +431,7 @@ impl ProxyActivity {
 }
 
 struct ForwardRequest {
+    request_id: String,
     provider: Provider,
     endpoint: ApiEndpoint,
     api_key: Option<ApiKey>,
@@ -428,6 +447,7 @@ struct ForwardRequest {
 
 async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let ForwardRequest {
+        request_id,
         provider,
         endpoint,
         api_key,
@@ -441,7 +461,6 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         upstream_protocol,
     } = request;
     let path = parts.uri.path().to_owned();
-    let request_id = request_id();
     let upstream_model = resolved_upstream_model;
     #[cfg(feature = "extension-request-defaults")]
     let provider_defaults_apply = provider.request_defaults_apply_to(&endpoint.id);
@@ -978,9 +997,17 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 requested_streaming || event_stream,
                 first_byte_ms,
                 RequestFailure::new(
-                    "upstream_stream",
+                    if requested_streaming || event_stream {
+                        "upstream_stream"
+                    } else {
+                        "upstream_response"
+                    },
                     "protocol_failure",
-                    "Upstream stream reported a failure",
+                    if requested_streaming || event_stream {
+                        "Upstream stream reported a failure"
+                    } else {
+                        "Upstream response reported a failure"
+                    },
                 ),
             ).await;
         } else if status.is_client_error() || status.is_server_error() {
@@ -998,6 +1025,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     copy_response_headers(response.headers_mut(), &response_headers);
+    if status.is_client_error() || status.is_server_error() {
+        error::set_error_origin(&mut response, error::ErrorOrigin::Upstream);
+    }
     if api_type == ApiType::OpenaiCodex {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -1219,6 +1249,8 @@ fn copy_response_headers(target: &mut HeaderMap, source: &reqwest::header::Heade
         if is_hop_by_hop_header(name.as_str())
             || name == reqwest::header::CONTENT_LENGTH
             || name == reqwest::header::SET_COOKIE
+            // Yabane owns this namespace; an upstream must never forge into it.
+            || name.as_str().starts_with("x-yabane-")
         {
             continue;
         }
@@ -1524,11 +1556,21 @@ mod tests {
             reqwest::header::ETAG,
             reqwest::header::HeaderValue::from_static("\"upstream-body\""),
         );
+        upstream_headers.insert(
+            reqwest::header::HeaderName::from_static("x-yabane-error-origin"),
+            reqwest::header::HeaderValue::from_static("yabane"),
+        );
+        upstream_headers.insert(
+            reqwest::header::HeaderName::from_static("x-yabane-request-id"),
+            reqwest::header::HeaderValue::from_static("req-forged"),
+        );
         let mut response_headers = HeaderMap::new();
         copy_response_headers(&mut response_headers, &upstream_headers);
         assert!(!response_headers.contains_key("set-cookie"));
         assert_eq!(response_headers["content-type"], "application/json");
         assert_eq!(response_headers["content-encoding"], "gzip");
+        assert!(!response_headers.contains_key("x-yabane-error-origin"));
+        assert!(!response_headers.contains_key("x-yabane-request-id"));
         strip_transformed_response_headers(&mut response_headers);
         assert!(!response_headers.contains_key("content-encoding"));
         assert!(!response_headers.contains_key("etag"));
