@@ -2,6 +2,15 @@ import { chromium, webkit } from 'playwright';
 
 const base = process.env.YABANE_UI_BASE || 'http://127.0.0.1:8080';
 const sessionCookie = process.env.YABANE_SESSION_COOKIE;
+const captureRequestBody = JSON.stringify({model: 'gpt-fixture', input: 'diagnostic request', tools: Array.from({length: 60}, (_, index) => ({type: 'function', name: `tool-${index}`, description: `Diagnostic tool ${index}`}))}, null, 2);
+const captureResponseBody = 'event: response.created\r\ndata: {"type":"response.created","response":{"id":"resp-ui","object":"response","status":"in_progress","model":"gpt-fixture","output":[]}}\r\n\r\nevent: response.output_text.delta\r\nid: 2\r\ndata: {"type":"response.output_text.delta",\r\ndata: "delta":"hello"}\r\n\r\nevent: response.completed\r\ndata: {"type":"response.completed","response":{"id":"resp-ui","object":"response","status":"completed","model":"gpt-fixture","output":[{"id":"msg-ui","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello <script>","annotations":[]}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}\r\n\r\ndata: [DONE]\r\n\r\n';
+const bytes = value => [...new TextEncoder().encode(value)];
+const captureFixture = {
+  request_id: 'ui-capture', timestamp: 1700000000, expires_at: 4102444800, public_model: 'ui-subscription/gpt-fixture', upstream_model: 'gpt-fixture',
+  provider_id: 'ui-subscription', endpoint_id: 'chatgpt', caller_protocol: 'openai_responses', upstream_protocol: 'openai_responses', streaming: true,
+  request_headers: [{name: 'content-type', value: 'application/json'}], request_body: bytes(captureRequestBody), request_truncated: false, status: 200, duration_ms: 17700,
+  response_headers: [{name: 'content-type', value: 'text/event-stream'}], response_body: bytes(captureResponseBody), response_truncated: false, outcome: 'complete',
+};
 const projects = [
   { name: 'desktop-chrome', engine: chromium, launch: { channel: process.env.YABANE_BROWSER_CHANNEL || 'chrome' }, width: 1440, height: 900 },
   { name: 'tablet-chrome', engine: chromium, launch: { channel: process.env.YABANE_BROWSER_CHANNEL || 'chrome' }, width: 768, height: 1024 },
@@ -17,10 +26,19 @@ for (const project of projects) {
       isMobile: project.mobile || false,
       hasTouch: project.mobile || false,
     });
+    if (project.name === 'desktop-chrome') await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: base});
     if (sessionCookie) {
       await context.addCookies([{ name: 'yabane_session', value: sessionCookie, url: base, httpOnly: true, sameSite: 'Strict' }]);
     }
     const page = await context.newPage();
+    await page.route(`${base}/admin/extensions/traffic-capture/captures`, async route => {
+      if (route.request().method() !== 'GET') return route.continue();
+      await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify([{...captureFixture, bytes: captureRequestBody.length + captureResponseBody.length, truncated: false}])});
+    });
+    await page.route(`${base}/admin/extensions/traffic-capture/captures/ui-capture`, async route => {
+      if (route.request().method() !== 'GET') return route.continue();
+      await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(captureFixture)});
+    });
     await page.route('**/admin/openai-subscriptions/device-code', async route => {
       if (route.request().method() !== 'POST') return route.continue();
       await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'device-flow', status: 'pending', user_code: 'ABCD-EFGH', verification_uri: 'https://auth.openai.com/codex/device', interval_seconds: 60, expires_at: 4102444800})});
@@ -169,10 +187,16 @@ for (const project of projects) {
     }
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
+    if (!(await trafficCaptureExtension.getByText('traffic-capture · v0.1.1', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not expose version 0.1.1`);
     await trafficCaptureExtension.getByRole('button', {name: 'Configure capture'}).click();
     await page.locator('#traffic-capture-view').waitFor({state: 'visible'});
     if (!(await page.getByText('Captured bodies may contain prompts, files, tool calls, and model output.', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not warn about captured content`);
     if (!(await page.locator('#capture-form [name="provider_id"]').evaluate(element => element.required))) throw new Error(`${project.name}: Traffic Capture lacks a required Provider scope selector`);
+    if (!(await page.getByText('Capture window', {exact: true}).isVisible()) || await page.getByText('Idle timeout', {exact: true}).count()) throw new Error(`${project.name}: Traffic Capture mislabels its fixed capture window as an idle timeout`);
+    if (!(await page.getByText('Truncating a stream may remove its terminal event and prevent the Assembled view.', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not explain the Body limit impact`);
+    await page.locator('#capture-form [name="provider_id"]').selectOption({index: 1});
+    await page.locator('#capture-form [name="endpoint_id"]').selectOption({index: 1});
+    if (!(await page.locator('#capture-scope-summary').getByText(/Capture the next .* through .* for .* for up to/).isVisible())) throw new Error(`${project.name}: Traffic Capture lacks an exact preflight scope summary`);
     const refreshCaptures = page.getByRole('button', {name: 'Refresh captures'});
     if (!(await refreshCaptures.isVisible())) throw new Error(`${project.name}: Traffic Capture lacks a manual refresh action`);
     await Promise.all([
@@ -181,6 +205,77 @@ for (const project of projects) {
       refreshCaptures.click(),
     ]);
     await page.waitForFunction(() => !document.querySelector('#refresh-captures').disabled);
+    if (!project.mobile) {
+      for (const heading of ['Capture', 'Route', 'Status', 'Upstream time / size']) {
+        if (!(await page.locator('#capture-list-head').getByText(heading, {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture list lacks the ${heading} heading`);
+      }
+    }
+    if (!(await page.locator('[data-capture-id="ui-capture"] .capture-result').getByText('200', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture list lacks a scannable status result`);
+    if (project.name === 'desktop-chrome') {
+      await page.evaluate(() => {
+        const form = document.querySelector('#capture-form');
+        trafficCaptureStatus = {retained: 1, dropped: 0, config: {active: true, remaining: 2, expires_at: Math.floor(Date.now() / 1000) + 600, provider_id: form.elements.provider_id.value, endpoint_id: form.elements.endpoint_id.value, model: '', body_limit: 1048576, retention_days: 1, redacted_headers: []}};
+        renderTrafficCapture();
+      });
+      if (!(await page.locator('#capture-active-summary').isVisible()) || !(await page.locator('#capture-active-title').getByText('Capturing next 2 matching requests', {exact: true}).isVisible())) throw new Error(`${project.name}: active Traffic Capture lacks a clear running-state summary`);
+      if (!(await page.locator('#capture-form [name="provider_id"]').isDisabled()) || !(await page.locator('#capture-form [type="submit"]').isHidden())) throw new Error(`${project.name}: active Traffic Capture allows its scope to be changed before stopping`);
+      await page.evaluate(() => loadTrafficCapture());
+    }
+    await page.locator('[data-capture-id="ui-capture"]').click();
+    await page.locator('#traffic-capture-detail-dialog').waitFor({state: 'visible'});
+    const requestBodyWasScrollable = await page.locator('#traffic-capture-detail-dialog').evaluate(dialog => { const body = dialog.querySelector('#capture-detail-body'); const detail = dialog.querySelector('.capture-detail-body'); body.scrollTop = body.scrollHeight; detail.scrollTop = detail.scrollHeight; return body.scrollTop > 0 || detail.scrollTop > 0; });
+    if (!requestBodyWasScrollable) throw new Error(`${project.name}: Traffic Capture request fixture does not exercise body scrolling`);
+    await page.locator('#traffic-capture-detail-dialog').getByRole('tab', {name: 'Response'}).click();
+    if (await page.locator('#capture-detail-body').evaluate(element => element.scrollTop) !== 0 || await page.locator('.capture-detail-body').evaluate(element => element.scrollTop) !== 0) throw new Error(`${project.name}: Traffic Capture direction change preserves stale scroll position`);
+    await assertDialog(page, '#traffic-capture-detail-dialog', project.name);
+    const captureDialog = page.locator('#traffic-capture-detail-dialog');
+    if (!(await captureDialog.getByRole('button', {name: 'Copy headers'}).isVisible()) || !(await captureDialog.getByRole('button', {name: 'Copy body'}).isVisible())) throw new Error(`${project.name}: Traffic Capture detail lacks copy actions`);
+    if (project.name === 'desktop-chrome') {
+      const dialogBox = await captureDialog.boundingBox();
+      if (!dialogBox || dialogBox.width < project.width * .8 || dialogBox.height < project.height * .8) throw new Error(`${project.name}: Traffic Capture detail is still too small for captured payloads`);
+    }
+    await captureDialog.getByRole('tab', {name: 'Response'}).click();
+    if (!(await captureDialog.getByText(/17.7 s upstream/).isVisible()) || !(await page.locator('[data-capture-id="ui-capture"]').getByText('17.7 s', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not show upstream duration in its list and detail`);
+    const assembledTab = captureDialog.getByRole('tab', {name: 'Assembled'});
+    if (!(await assembledTab.isVisible()) || await assembledTab.getAttribute('aria-selected') !== 'true') throw new Error(`${project.name}: streaming response does not default to its assembled non-streaming structure`);
+    const assembledBody = captureDialog.locator('#capture-detail-body');
+    if (!(await assembledBody.getByText(/"status": "completed"/).isVisible()) || !(await assembledBody.getByText(/"text": "hello <script>"/).isVisible())) throw new Error(`${project.name}: assembled response does not use the terminal response object`);
+    if (await assembledBody.locator('script').count()) throw new Error(`${project.name}: syntax highlighting injects captured markup`);
+    if (!(await assembledBody.locator('.syntax-key').count()) || !(await assembledBody.locator('.syntax-string').count()) || !(await assembledBody.locator('.syntax-number').count())) throw new Error(`${project.name}: assembled JSON lacks syntax highlighting`);
+    await captureDialog.getByRole('tab', {name: 'Raw'}).click();
+    await assembledBody.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    await assembledTab.click();
+    if (await assembledBody.evaluate(element => element.scrollTop) !== 0) throw new Error(`${project.name}: Traffic Capture body mode preserves stale scroll position`);
+    await captureDialog.getByRole('tab', {name: 'Raw'}).click();
+    if (!(await assembledBody.getByText(/event: response.created/).isVisible()) || !(await assembledBody.locator('.syntax-sse').count())) throw new Error(`${project.name}: assembled response cannot return to highlighted raw SSE`);
+    if (project.name === 'desktop-chrome') {
+      await captureDialog.getByRole('button', {name: 'Copy body'}).click();
+      if (await page.evaluate(() => navigator.clipboard.readText()) !== captureResponseBody) throw new Error(`${project.name}: Copy body does not preserve the raw captured bytes`);
+      await assembledTab.click();
+      await captureDialog.getByRole('button', {name: 'Copy body'}).click();
+      if (JSON.parse(await page.evaluate(() => navigator.clipboard.readText())).status !== 'completed') throw new Error(`${project.name}: Copy body does not copy the assembled response in Assembled mode`);
+      const protocolAssemblies = await page.evaluate(() => {
+        const chat = assembleCaptureResponse('openai_chat_completions', {malformed: false, done: true, events: [
+          {id: 'chat-ui', created: 1, model: 'gpt-ui', choices: [{index: 0, delta: {role: 'assistant', content: 'hel'}, finish_reason: null}]},
+          {choices: [{index: 0, delta: {content: 'lo'}, finish_reason: 'stop'}], usage: {prompt_tokens: 2, completion_tokens: 1, total_tokens: 3}},
+        ]});
+        const anthropic = assembleCaptureResponse('anthropic_messages', {malformed: false, done: false, events: [
+          {type: 'message_start', message: {id: 'msg-ui', type: 'message', role: 'assistant', model: 'claude-ui', content: [], usage: {input_tokens: 2, output_tokens: 0}}},
+          {type: 'content_block_start', index: 0, content_block: {type: 'text', text: ''}},
+          {type: 'content_block_delta', index: 0, delta: {type: 'text_delta', text: 'hello'}},
+          {type: 'message_delta', delta: {stop_reason: 'end_turn', stop_sequence: null}, usage: {output_tokens: 1}},
+          {type: 'message_stop'},
+        ]});
+        return {chat, anthropic};
+      });
+      if (protocolAssemblies.chat.choices[0].message.content !== 'hello' || protocolAssemblies.chat.choices[0].finish_reason !== 'stop') throw new Error(`${project.name}: Chat Completions stream does not assemble into a non-streaming choice`);
+      if (protocolAssemblies.anthropic.content[0].text !== 'hello' || protocolAssemblies.anthropic.stop_reason !== 'end_turn') throw new Error(`${project.name}: Anthropic stream does not assemble into a non-streaming message`);
+    }
+    await captureDialog.locator('.close-capture-detail').first().click();
+    await page.locator('[data-capture-id="ui-capture"]').click();
+    await captureDialog.waitFor({state: 'visible'});
+    if (await assembledBody.evaluate(element => element.scrollTop) !== 0 || await captureDialog.locator('.capture-detail-body').evaluate(element => element.scrollTop) !== 0) throw new Error(`${project.name}: opening another Traffic Capture preserves stale scroll position`);
+    await captureDialog.locator('.close-capture-detail').first().click();
     await assertNoPageOverflow(page, project.name, 'Traffic Capture page');
     await page.locator('#back-to-extensions').click();
     if (!(await requestDefaultsExtension.getByText('Native Rust', {exact: true}).isVisible())) throw new Error(`${project.name}: extension implementation type is not visible`);
@@ -211,14 +306,10 @@ for (const project of projects) {
     }).map(label => label.textContent));
     if (stretchedProviderLabels.length) throw new Error(`${project.name}: Provider model labels stretch past their content (${stretchedProviderLabels.join(', ')})`);
     await page.evaluate(() => document.querySelector('[data-view="home"]').click());
-    const homeHero = page.locator('#home-view .home-hero');
-    if (!(await homeHero.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its gateway hero or traffic visualization`);
-    const homeArtwork = await page.locator('.home-hero-motion').evaluate(element => ({pointerEvents: getComputedStyle(element).pointerEvents, ariaHidden: element.getAttribute('aria-hidden')}));
-    if (homeArtwork.pointerEvents !== 'none' || homeArtwork.ariaHidden !== 'true') throw new Error(`${project.name}: Home hero artwork can interfere with interaction or accessibility`);
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-    const homeAnimations = await page.locator('.home-hero-motion g').evaluateAll(groups => groups.map(group => getComputedStyle(group).animationName));
-    if (homeAnimations.some(name => name !== 'none')) throw new Error(`${project.name}: Home hero ignores reduced-motion preference`);
-    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    const homeCommand = page.locator('#home-view .home-command');
+    if (!(await homeCommand.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its operational header or traffic visualization`);
+    if (await page.locator('.home-health-strip > div').count() !== 4) throw new Error(`${project.name}: Home does not summarize runtime, provider, success, and latency health`);
+    if (!(await page.locator('.home-command-actions .button-icon').first().isVisible()) || !(await page.locator('#home-api-keys').isVisible())) throw new Error(`${project.name}: Home omits command icons or Gateway API key traffic`);
 
     if (testLiveRefresh) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
@@ -466,22 +557,45 @@ for (const project of projects) {
     if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be turned off`);
     await page.locator('#route-dialog .close-route').first().click();
     const initialActivityLoad = testLiveRefresh ? Promise.all([
-      page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=24') && response.url().includes('until=')),
+      page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48') && response.url().includes('until=')),
       page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
     ]) : null;
     await page.evaluate(() => document.querySelector('[data-view="activity"]').click());
     if (initialActivityLoad) await initialActivityLoad;
+    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
+    await page.locator('#activity-range-trigger').click();
+    if (!(await page.locator('#activity-range-popover').isVisible())) throw new Error(`${project.name}: advanced Activity time range picker does not open`);
+    await page.locator('#activity-range-search').fill('90 days');
+    if (!(await page.locator('#activity-range-options').getByText('Last 90 days', {exact: true}).isVisible())) throw new Error(`${project.name}: Activity range presets cannot be searched`);
+    await page.keyboard.press('ArrowDown');
+    if (!(await page.locator('#activity-range-options button', {hasText: 'Last 90 days'}).evaluate(element => element === document.activeElement))) throw new Error(`${project.name}: Activity range presets do not support arrow-key focus`);
+    await page.keyboard.press('Escape');
+    if (await page.locator('#activity-range-popover').isVisible()) throw new Error(`${project.name}: Activity range picker does not dismiss with Escape`);
+    const customStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=36'));
+    await page.locator('#activity-range-trigger').click();
+    await page.evaluate(() => {
+      const to = new Date(); const from = new Date(to.getTime() - 6 * 60 * 60 * 1000);
+      const local = date => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+      document.querySelector('#activity-range-from').value = local(from); document.querySelector('#activity-range-to').value = local(to);
+    });
+    await page.locator('#apply-activity-range').click(); await customStats;
+    if (await page.locator('#activity-chart .chart-column').count() !== 36 || !(await page.locator('#activity-range-label').textContent()).includes('–')) throw new Error(`${project.name}: custom six-hour Activity range is not applied at ten-minute resolution`);
+    const presetStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
+    await page.locator('#activity-range').evaluate(select => select.dispatchEvent(new Event('change'))); await presetStats;
     if (testLiveRefresh) {
       const activityRefresh = Promise.all([
-        page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=24') && response.url().includes('until=')),
+        page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48') && response.url().includes('until=')),
         page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
       ]);
       await page.clock.fastForward(30000);
       await activityRefresh;
     }
     const timelineColumns = page.locator('#activity-chart .chart-column');
-    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 24);
-    if (await timelineColumns.count() !== 24) throw new Error(`${project.name}: 24-hour Activity timeline does not expose every interval`);
+    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
+    if (await timelineColumns.count() !== 48) throw new Error(`${project.name}: 24-hour Activity timeline does not expose every 30-minute interval`);
+    if (!(await page.locator('#activity-chart .traffic-line').count()) || !(await page.locator('#activity-chart .traffic-glow').count()) || await page.locator('#activity-chart .traffic-area').count()) throw new Error(`${project.name}: Activity pace is not rendered as a pure line with a local glow`);
+    const chartPaths = await page.locator('#activity-chart').evaluate(element => ({line: element.querySelector('.traffic-line').getAttribute('d'), glow: element.querySelector('.traffic-glow').getAttribute('d')}));
+    if (!chartPaths.line.includes(' C') || chartPaths.glow !== chartPaths.line) throw new Error(`${project.name}: Activity pace does not use the same smooth monotone path for its line and local glow`);
     const inspectorBefore = await page.locator('#chart-inspector-time').textContent();
     if (project.mobile) await timelineColumns.first().click(); else await timelineColumns.first().hover();
     const inspectorAfter = await page.locator('#chart-inspector-time').textContent();
@@ -490,6 +604,37 @@ for (const project of projects) {
     await page.locator('[data-chart-metric="latency"]').click();
     if (await page.locator('[data-chart-metric="latency"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Activity timeline metric cannot be changed`);
     if (!(await page.locator('#chart-inspector-values').getByText('Avg latency', {exact: true}).isVisible())) throw new Error(`${project.name}: Activity timeline inspector omits latency`);
+    const successTones = await page.evaluate(() => [modelSuccessTone(99.4), modelSuccessTone(97), modelSuccessTone(94.9)]);
+    if (successTones.join(',') !== 'model-healthy,model-warning,model-critical') throw new Error(`${project.name}: model success-rate severity does not distinguish healthy, warning, and critical rates`);
+    const modelTable = page.locator('.model-analysis-table');
+    if (!(await modelTable.locator('th', {hasText: 'Input cache hit'}).count()) || !(await modelTable.locator('th', {hasText: 'Reported spend'}).count())) throw new Error(`${project.name}: per-model analysis omits cache efficiency or spend`);
+    if (!(await page.locator('.api-key-analysis-panel').isVisible())) throw new Error(`${project.name}: Activity overview omits Gateway API key analytics`);
+    const modelRow = page.locator('#model-stats tr').first();
+    if (await modelRow.count()) {
+      if (!(await modelRow.textContent()).includes('requests priced')) throw new Error(`${project.name}: per-model spend does not disclose cost coverage`);
+      if (project.mobile && (!(await modelRow.locator('[data-label="Input cache hit"]').isVisible()) || !(await modelRow.locator('[data-label="Reported spend"]').isVisible()))) throw new Error(`${project.name}: mobile model card hides cache efficiency or spend`);
+    }
+    if (project.mobile) {
+      const modelLayout = await page.locator('.model-analysis-wrap').evaluate(element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth}));
+      if (modelLayout.scrollWidth > modelLayout.clientWidth + 1) throw new Error(`${project.name}: per-model analysis hides metrics behind horizontal scrolling`);
+    }
+    if (!project.mobile) {
+      await page.locator('[data-activity-tab="requests"]').click();
+      const sevenDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=56'));
+      await page.locator('#activity-range').selectOption('604800');
+      await sevenDayStats;
+      const dayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
+      await page.locator('#activity-range').selectOption('86400');
+      await dayStats;
+      await page.locator('[data-activity-tab="overview"]').click();
+      await page.waitForFunction(() => {
+        const chart = document.querySelector('#activity-chart'); const svg = chart?.querySelector('.traffic-area-chart');
+        return svg && Math.abs(svg.viewBox.baseVal.width - chart.clientWidth) < 2;
+      });
+      const chartGeometry = await page.locator('#activity-chart').evaluate(chart => ({clientWidth: chart.clientWidth, viewBoxWidth: chart.querySelector('.traffic-area-chart').viewBox.baseVal.width, labelMinutes: [...chart.querySelectorAll('.chart-column small')].map(label => label.textContent.match(/:(\d{2})/)?.[1]).filter(Boolean)}));
+      if ((project.width >= 1200 && chartGeometry.viewBoxWidth < 600) || Math.abs(chartGeometry.viewBoxWidth - chartGeometry.clientWidth) >= 2) throw new Error(`${project.name}: Activity chart keeps a hidden-tab fallback width after changing ranges (${JSON.stringify(chartGeometry)})`);
+      if (!chartGeometry.labelMinutes.length || chartGeometry.labelMinutes.some(minutes => !['00', '30'].includes(minutes))) throw new Error(`${project.name}: 24-hour Activity intervals are not aligned to wall-clock half hours (${JSON.stringify(chartGeometry.labelMinutes)})`);
+    }
     const metricLayout = await page.locator('.activity-metrics').evaluate(element => ({scrollable: element.scrollWidth > element.clientWidth + 1, display: getComputedStyle(element).display}));
     if (project.mobile && !metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries are not swipeable on a narrow screen`);
     if (!project.mobile && project.width >= 1200 && metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries waste wide-screen space`);
@@ -517,8 +662,17 @@ for (const project of projects) {
       if (!(await page.locator('#activity-detail-request').getByText('Request ID', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits request metadata`);
       if (!(await page.locator('#activity-detail-request').getByText('Requested model', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-request').getByText('Upstream model', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog does not distinguish requested and upstream models`);
       if (!(await page.locator('#activity-detail-timing').getByText('Total', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits timing`);
+      if (!(await page.locator('#activity-detail-dialog').getByText('Request timeline', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the shared-scale request timeline`);
+      const timelineGeometry = await page.locator('#activity-detail-timing').evaluate(element => {
+        const scale = element.querySelector('.timeline-scale').getBoundingClientRect(); const track = element.querySelector('.timeline-track'); const trackBox = track.getBoundingClientRect(); const style = getComputedStyle(track); const label = element.querySelector('.timeline-stage-label strong'); const bar = element.querySelector('.timeline-stage-bar'); const totalTrack = element.querySelector('.timeline-total-track').getBoundingClientRect(); const totalLine = element.querySelector('.timeline-total-track > i').getBoundingClientRect();
+        return {scaleLeft: scale.left, scaleRight: scale.right, trackLeft: trackBox.left, trackRight: trackBox.right, trackBorder: style.borderWidth, trackBackground: style.backgroundImage, labelAlign: getComputedStyle(label).textAlign, barClip: getComputedStyle(bar).clipPath, barHeight: getComputedStyle(bar).height, barStartRadius: getComputedStyle(bar).borderTopLeftRadius, barEndRadius: getComputedStyle(bar).borderTopRightRadius, barDecoration: getComputedStyle(bar, '::after').content, totalColor: getComputedStyle(element.querySelector('.timeline-total-track > i')).backgroundColor, totalStartFill: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::before').backgroundColor, totalEndFill: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::after').backgroundColor, totalEndRadius: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::after').borderRadius, totalTrackCenter: (totalTrack.top + totalTrack.bottom) / 2, totalLineCenter: (totalLine.top + totalLine.bottom) / 2};
+      });
+      if (Math.abs(timelineGeometry.scaleLeft - timelineGeometry.trackLeft) > 1 || Math.abs(timelineGeometry.scaleRight - timelineGeometry.trackRight) > 1) throw new Error(`${project.name}: request timeline scale and tracks are not aligned (${JSON.stringify(timelineGeometry)})`);
+      if (timelineGeometry.trackBorder !== '0px' || timelineGeometry.trackBackground !== 'none' || timelineGeometry.labelAlign !== 'left' || timelineGeometry.barClip !== 'none' || timelineGeometry.barHeight !== '5px' || timelineGeometry.barDecoration !== 'none' || timelineGeometry.totalColor !== 'rgb(11, 87, 208)' || timelineGeometry.totalStartFill !== 'rgb(255, 255, 255)' || timelineGeometry.totalEndFill !== 'rgb(11, 87, 208)' || timelineGeometry.totalEndRadius !== '50%' || Math.abs(timelineGeometry.totalTrackCenter - timelineGeometry.totalLineCenter) > .5) throw new Error(`${project.name}: request timeline lacks borderless tracks, thin rounded stage bars, or the centered blue hollow-to-solid total line (${JSON.stringify(timelineGeometry)})`);
+      if (!(await page.locator('#activity-detail-request').getByText('Gateway API key', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the authenticated Gateway API key identity`);
       if (!(await page.locator('#activity-detail-failure').count())) throw new Error(`${project.name}: request detail dialog omits the failure diagnosis region`);
       if (!(await page.locator('#activity-detail-dialog').getByText('Prompt and response content are not retained.').isVisible())) throw new Error(`${project.name}: request detail dialog omits the content-retention notice`);
+      if (await page.locator('#activity-capture-link').count()) throw new Error(`${project.name}: request detail dialog still presents the unrelated Traffic Capture lookup`);
       await page.locator('#activity-detail-dialog .close-activity-detail').first().click();
     }
     await page.locator('#manage-activity-data').click();
