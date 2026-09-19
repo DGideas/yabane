@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use axum::{
     extract::{Request, State},
@@ -14,6 +14,7 @@ use crate::{
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Model {
@@ -74,44 +75,37 @@ struct AnthropicModel {
 
 pub async fn list_models(State(state): State<AppState>, request: Request) -> Response {
     let allowed = crate::auth::authorized_provider_ids(&request);
-    let providers: Vec<_> = state
-        .providers
-        .read()
-        .await
-        .values()
-        .filter(|provider| allowed.is_none_or(|ids| ids.is_empty() || ids.contains(&provider.id)))
-        .cloned()
-        .collect();
-    let results = discover_providers(&state, providers).await;
-    update_discoveries(&state, &results).await;
-
-    let mut data = Vec::new();
-    for (provider, result) in &results {
-        match result {
-            Ok(discovery) => {
-                data.extend(discovery.models.iter().cloned().map(|mut model| {
-                    let upstream_id = model
-                        .id
-                        .strip_prefix(&format!("{}/", provider.id))
-                        .unwrap_or(&model.id);
-                    model.id = format!("{}/{upstream_id}", provider.id);
-                    if model.owned_by.is_empty() {
-                        model.owned_by = provider.id.clone();
-                    }
-                    model
-                }));
-            }
-            Err(err) => warn!(provider = %provider.id, %err, "could not list provider models"),
-        }
-    }
-    data.sort_by(|a, b| a.id.cmp(&b.id));
-    data.dedup_by(|a, b| a.id == b.id);
+    let providers = state.providers.read().await;
+    let data =
+        cached_models(providers.values().filter(|provider| {
+            allowed.is_none_or(|ids| ids.is_empty() || ids.contains(&provider.id))
+        }));
 
     axum::Json(ListModelsResponse {
         object: "list",
         data,
     })
     .into_response()
+}
+
+fn cached_models<'a>(providers: impl Iterator<Item = &'a Provider>) -> Vec<Model> {
+    let mut data = Vec::new();
+    for provider in providers {
+        let prefix = format!("{}/", provider.id);
+        data.extend(provider.discovered_models.iter().map(|model_id| {
+            let upstream_id = model_id.strip_prefix(&prefix).unwrap_or(model_id);
+            Model {
+                id: format!("{}{upstream_id}", prefix),
+                object: model_object(),
+                owned_by: provider.id.clone(),
+                created: None,
+                context_window: None,
+            }
+        }));
+    }
+    data.sort_by(|a, b| a.id.cmp(&b.id));
+    data.dedup_by(|a, b| a.id == b.id);
+    data
 }
 
 pub async fn refresh_provider(
@@ -331,6 +325,16 @@ async fn fetch_models(
     key: Option<&ApiKey>,
     provider: &Provider,
 ) -> Result<Vec<Model>, String> {
+    fetch_models_with_timeout(client, endpoint, key, provider, MODEL_DISCOVERY_TIMEOUT).await
+}
+
+async fn fetch_models_with_timeout(
+    client: &reqwest::Client,
+    endpoint: &ApiEndpoint,
+    key: Option<&ApiKey>,
+    provider: &Provider,
+    timeout: Duration,
+) -> Result<Vec<Model>, String> {
     let path = match endpoint.api_type {
         ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions | ApiType::OpenaiResponses => {
             "/v1/models"
@@ -353,10 +357,17 @@ async fn fetch_models(
     } else if endpoint.api_type == ApiType::Anthropic {
         request = request.header("anthropic-version", ANTHROPIC_VERSION);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("{}: {err}", endpoint.id))?;
+    let response = request.timeout(timeout).send().await.map_err(|err| {
+        if err.is_timeout() {
+            format!(
+                "{}: model discovery timed out after {:.1} seconds",
+                endpoint.id,
+                timeout.as_secs_f64()
+            )
+        } else {
+            format!("{}: {err}", endpoint.id)
+        }
+    })?;
     let status = response.status();
     let body = response
         .bytes()
@@ -422,9 +433,14 @@ fn model_object() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::config::{ApiEndpoint, Provider};
 
-    use super::{discovery_inputs_match, parse_anthropic_models, parse_openai_models};
+    use super::{
+        cached_models, discovery_inputs_match, fetch_models_with_timeout, parse_anthropic_models,
+        parse_openai_models,
+    };
 
     fn provider() -> Provider {
         Provider {
@@ -460,6 +476,60 @@ mod tests {
         current = snapshot.clone();
         current.endpoints.clear();
         assert!(!discovery_inputs_match(&current, &snapshot));
+    }
+
+    #[test]
+    fn cached_models_are_prefixed_sorted_and_deduplicated() {
+        let mut first = provider();
+        first.id = "first".to_owned();
+        first.discovered_models = vec![
+            "zeta".to_owned(),
+            "first/alpha".to_owned(),
+            "alpha".to_owned(),
+        ];
+        let mut second = provider();
+        second.id = "second".to_owned();
+        second.discovered_models = vec!["alpha".to_owned()];
+
+        let models = cached_models([&second, &first].into_iter());
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first/alpha", "first/zeta", "second/alpha"]
+        );
+        assert_eq!(models[0].owned_by, "first");
+    }
+
+    #[tokio::test]
+    async fn model_discovery_request_has_a_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed upstream");
+        let address = listener.local_addr().expect("delayed upstream address");
+        let delayed = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept discovery request");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let endpoint = ApiEndpoint {
+            id: "delayed".to_owned(),
+            base_url: format!("http://{address}/v1"),
+            requires_api_key: false,
+            ..ApiEndpoint::default()
+        };
+        let error = fetch_models_with_timeout(
+            &reqwest::Client::new(),
+            &endpoint,
+            None,
+            &provider(),
+            Duration::from_millis(25),
+        )
+        .await
+        .expect_err("delayed discovery should time out");
+
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        delayed.abort();
     }
 
     #[test]

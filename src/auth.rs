@@ -142,6 +142,13 @@ pub fn now() -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthorizedProviders(pub Option<Vec<String>>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedGatewayKey {
+    pub id: String,
+    pub note: String,
+    pub prefix: String,
+}
+
 pub async fn authorize(
     State(state): State<AppState>,
     mut request: Request,
@@ -178,10 +185,16 @@ pub async fn authorize(
         return api_error(StatusCode::UNAUTHORIZED, "API key has expired");
     }
     let provider_ids = key.provider_ids.clone();
+    let gateway_key = AuthorizedGatewayKey {
+        id: key.id.clone(),
+        note: key.note.clone(),
+        prefix: key.prefix.clone(),
+    };
     drop(auth);
     request
         .extensions_mut()
         .insert(AuthorizedProviders(Some(provider_ids)));
+    request.extensions_mut().insert(gateway_key);
     next.run(request).await
 }
 
@@ -190,6 +203,10 @@ pub fn authorized_provider_ids(request: &Request) -> Option<&[String]> {
         .extensions()
         .get::<AuthorizedProviders>()
         .and_then(|authorization| authorization.0.as_deref())
+}
+
+pub fn authorized_gateway_key(request: &Request) -> Option<&AuthorizedGatewayKey> {
+    request.extensions().get::<AuthorizedGatewayKey>()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -209,8 +226,9 @@ mod tests {
     use axum::body::Body;
 
     use super::{
-        AuthConfig, AuthorizedProviders, GatewayApiKey, authorized_provider_ids, constant_time_eq,
-        generate_secret, hash_secret,
+        AuthConfig, AuthorizedGatewayKey, AuthorizedProviders, GatewayApiKey,
+        authorized_gateway_key, authorized_provider_ids, constant_time_eq, generate_secret,
+        hash_secret,
     };
 
     #[test]
@@ -261,10 +279,16 @@ mod tests {
             .insert(AuthorizedProviders(Some(vec![
                 "allowed-provider".to_owned(),
             ])));
+        request.extensions_mut().insert(AuthorizedGatewayKey {
+            id: "key-id".to_owned(),
+            note: "Production".to_owned(),
+            prefix: "sk-…test".to_owned(),
+        });
 
         assert_eq!(
             authorized_provider_ids(&request),
             Some(["allowed-provider".to_owned()].as_slice())
         );
+        assert_eq!(authorized_gateway_key(&request).unwrap().id, "key-id");
     }
 }

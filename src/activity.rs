@@ -23,6 +23,14 @@ pub struct RequestLog {
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_instance_id: Option<String>,
+    /// Stable identity and safe display metadata for the Yabane Gateway API key.
+    /// The credential itself and its hash are never recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_api_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_api_key_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_api_key_prefix: Option<String>,
     pub path: String,
     /// The model string exactly as supplied by the caller.
     pub model: String,
@@ -142,6 +150,7 @@ pub struct ImportResult {
 #[derive(Serialize)]
 pub struct Stats {
     pub requests: usize,
+    pub priced_requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
@@ -151,6 +160,7 @@ pub struct Stats {
     pub latency_ms: u64,
     pub by_provider: Vec<DimensionStats>,
     pub by_model: Vec<DimensionStats>,
+    pub by_api_key: Vec<ApiKeyStats>,
     pub buckets: Vec<ActivityBucket>,
 }
 
@@ -158,6 +168,22 @@ pub struct Stats {
 pub struct DimensionStats {
     pub name: String,
     pub requests: usize,
+    pub priced_requests: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost: f64,
+    pub errors: usize,
+    pub latency_ms: u64,
+}
+
+#[derive(Serialize)]
+pub struct ApiKeyStats {
+    pub id: Option<String>,
+    pub name: String,
+    pub prefix: Option<String>,
+    pub requests: usize,
+    pub priced_requests: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
@@ -170,6 +196,7 @@ pub struct DimensionStats {
 pub struct ActivityBucket {
     pub start: u64,
     pub requests: usize,
+    pub priced_requests: usize,
     pub tokens: u64,
     pub cached: u64,
     pub cost: f64,
@@ -221,14 +248,22 @@ impl ActivityStore {
         }
     }
 
-    pub async fn logs(&self, since: u64, provider: Option<&str>, limit: usize) -> Vec<RequestLog> {
+    pub async fn logs(
+        &self,
+        since: u64,
+        until: u64,
+        provider: Option<&str>,
+        limit: usize,
+    ) -> Vec<RequestLog> {
         let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
         data.persisted
             .iter()
             .chain(&data.pending)
             .filter(|log| {
-                log.timestamp >= since && provider.is_none_or(|provider| log.provider == provider)
+                log.timestamp >= since
+                    && log.timestamp <= until
+                    && provider.is_none_or(|provider| log.provider == provider)
             })
             .rev()
             .take(limit.min(1000))
@@ -258,6 +293,14 @@ impl ActivityStore {
                 && text.as_ref().is_none_or(|text| {
                     [&log.request_id, &log.model, &log.provider, &log.endpoint]
                         .iter()
+                        .any(|value| value.to_lowercase().contains(text))
+                        || [
+                            log.gateway_api_key_id.as_deref(),
+                            log.gateway_api_key_note.as_deref(),
+                            log.gateway_api_key_prefix.as_deref(),
+                        ]
+                        .into_iter()
+                        .flatten()
                         .any(|value| value.to_lowercase().contains(text))
                         || log
                             .upstream_model
@@ -481,6 +524,7 @@ impl ActivityStore {
                 let stats = values.entry(name.clone()).or_insert(DimensionStats {
                     name,
                     requests: 0,
+                    priced_requests: 0,
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_tokens: 0,
@@ -489,6 +533,7 @@ impl ActivityStore {
                     latency_ms: 0,
                 });
                 stats.requests += 1;
+                stats.priced_requests += usize::from(log.cost.is_some());
                 stats.input_tokens += log.input_tokens;
                 stats.output_tokens += log.output_tokens;
                 stats.cached_tokens += log.cached_tokens;
@@ -505,6 +550,44 @@ impl ActivityStore {
             });
             values
         };
+        let mut api_keys = std::collections::BTreeMap::<Option<String>, ApiKeyStats>::new();
+        for log in &logs {
+            let id = log.gateway_api_key_id.clone();
+            let stats = api_keys.entry(id.clone()).or_insert_with(|| ApiKeyStats {
+                id,
+                name: log
+                    .gateway_api_key_note
+                    .as_deref()
+                    .filter(|note| !note.trim().is_empty())
+                    .or(log.gateway_api_key_prefix.as_deref())
+                    .unwrap_or("Unattributed")
+                    .to_owned(),
+                prefix: log.gateway_api_key_prefix.clone(),
+                requests: 0,
+                priced_requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                cost: 0.0,
+                errors: 0,
+                latency_ms: 0,
+            });
+            stats.requests += 1;
+            stats.priced_requests += usize::from(log.cost.is_some());
+            stats.input_tokens += log.input_tokens;
+            stats.output_tokens += log.output_tokens;
+            stats.cached_tokens += log.cached_tokens;
+            stats.cost += log.cost.unwrap_or(0.0);
+            stats.errors += usize::from(log.status >= 400);
+            stats.latency_ms += log.latency_ms;
+        }
+        let mut by_api_key: Vec<_> = api_keys.into_values().collect();
+        by_api_key.sort_by(|left, right| {
+            right
+                .requests
+                .cmp(&left.requests)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         let bucket_count = bucket_count.clamp(1, 120);
         let width = until
             .saturating_sub(since)
@@ -514,6 +597,7 @@ impl ActivityStore {
             .map(|index| ActivityBucket {
                 start: since.saturating_add(index as u64 * width),
                 requests: 0,
+                priced_requests: 0,
                 tokens: 0,
                 cached: 0,
                 cost: 0.0,
@@ -527,6 +611,7 @@ impl ActivityStore {
             let index = ((log.timestamp.saturating_sub(since)) / width) as usize;
             if let Some(bucket) = buckets.get_mut(index.min(bucket_count - 1)) {
                 bucket.requests += 1;
+                bucket.priced_requests += usize::from(log.cost.is_some());
                 bucket.tokens += log.input_tokens + log.output_tokens;
                 bucket.cached += log.cached_tokens;
                 bucket.cost += log.cost.unwrap_or(0.0);
@@ -538,6 +623,7 @@ impl ActivityStore {
         }
         Stats {
             requests: logs.len(),
+            priced_requests: logs.iter().filter(|log| log.cost.is_some()).count(),
             input_tokens: logs.iter().map(|log| log.input_tokens).sum(),
             output_tokens: logs.iter().map(|log| log.output_tokens).sum(),
             cached_tokens: logs.iter().map(|log| log.cached_tokens).sum(),
@@ -547,6 +633,7 @@ impl ActivityStore {
             latency_ms: logs.iter().map(|log| log.latency_ms).sum(),
             by_provider: dimensions(|log| &log.provider),
             by_model: dimensions(|log| &log.model),
+            by_api_key,
             buckets,
         }
     }
@@ -703,6 +790,9 @@ mod tests {
             timestamp,
             request_id: id.to_owned(),
             source_instance_id: None,
+            gateway_api_key_id: None,
+            gateway_api_key_note: None,
+            gateway_api_key_prefix: None,
             path: "/v1/responses".to_owned(),
             model: format!("{provider}/model-{id}"),
             upstream_model: Some(format!("model-{id}")),
@@ -731,6 +821,7 @@ mod tests {
         let decoded: RequestLog = serde_json::from_str(encoded).unwrap();
         assert_eq!(decoded.model, "alias");
         assert_eq!(decoded.upstream_model, None);
+        assert_eq!(decoded.gateway_api_key_id, None);
     }
 
     #[test]
@@ -791,6 +882,8 @@ mod tests {
         let mut routed = request(now, "routed", "provider", 200);
         routed.model = "public-alias".to_owned();
         routed.upstream_model = Some("actual-model".to_owned());
+        routed.gateway_api_key_id = Some("agent-key".to_owned());
+        routed.gateway_api_key_note = Some("Production agent".to_owned());
         let store = store(vec![routed]);
 
         let (logs, total) = store
@@ -807,6 +900,21 @@ mod tests {
 
         assert_eq!(total, 1);
         assert_eq!(logs[0].model, "public-alias");
+
+        let (logs, total) = store
+            .query_logs(ActivityLogQuery {
+                since: now - 1,
+                until: now,
+                provider: None,
+                text: Some("production agent"),
+                status: None,
+                offset: 0,
+                limit: 10,
+            })
+            .await;
+
+        assert_eq!(total, 1);
+        assert_eq!(logs[0].gateway_api_key_id.as_deref(), Some("agent-key"));
     }
 
     #[tokio::test]
@@ -831,5 +939,63 @@ mod tests {
 
         assert_eq!(total, 1);
         assert_eq!(logs[0].request_id, "snapshot");
+    }
+
+    #[tokio::test]
+    async fn stats_distinguish_reported_zero_cost_from_missing_cost() {
+        let now = crate::auth::now();
+        let mut reported = request(now - 2, "reported", "alpha", 200);
+        reported.cost = Some(0.0);
+        reported.input_tokens = 100;
+        reported.cached_tokens = 80;
+        let missing = request(now - 1, "missing", "alpha", 200);
+        let stats = store(vec![reported, missing])
+            .stats(now - 10, None, 2, now)
+            .await;
+
+        assert_eq!(stats.requests, 2);
+        assert_eq!(stats.priced_requests, 1);
+        assert_eq!(stats.by_provider[0].priced_requests, 1);
+        assert_eq!(
+            stats
+                .by_model
+                .iter()
+                .map(|item| item.priced_requests)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            stats
+                .buckets
+                .iter()
+                .map(|bucket| bucket.priced_requests)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(stats.cost, 0.0);
+    }
+
+    #[tokio::test]
+    async fn stats_group_requests_by_safe_gateway_key_identity() {
+        let now = crate::auth::now();
+        let mut attributed = request(now - 2, "attributed", "alpha", 200);
+        attributed.gateway_api_key_id = Some("key-1".to_owned());
+        attributed.gateway_api_key_note = Some("Production agent".to_owned());
+        attributed.gateway_api_key_prefix = Some("sk-…1234".to_owned());
+        let legacy = request(now - 1, "legacy", "alpha", 500);
+
+        let stats = store(vec![attributed, legacy])
+            .stats(now - 10, None, 2, now)
+            .await;
+
+        assert_eq!(stats.by_api_key.len(), 2);
+        let key = stats
+            .by_api_key
+            .iter()
+            .find(|item| item.id.as_deref() == Some("key-1"))
+            .unwrap();
+        assert_eq!(key.name, "Production agent");
+        assert_eq!(key.prefix.as_deref(), Some("sk-…1234"));
+        assert!(stats.by_api_key.iter().any(|item| item.id.is_none()));
     }
 }

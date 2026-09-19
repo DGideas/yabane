@@ -104,6 +104,7 @@ async fn route_proxied(
 ) -> Response {
     let request_started = Instant::now();
     let allowed_providers = auth::authorized_provider_ids(&request).map(<[String]>::to_vec);
+    let gateway_api_key = auth::authorized_gateway_key(&request).cloned();
     let (parts, body) = request.into_parts();
     let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await {
         Ok(body) => body,
@@ -158,6 +159,7 @@ async fn route_proxied(
             provider,
             endpoint,
             api_key,
+            gateway_api_key,
             model,
             upstream_model,
             parts,
@@ -339,6 +341,7 @@ struct ProxyActivity {
     upstream_model: Option<String>,
     provider: String,
     endpoint: String,
+    gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
     upstream_protocol: Protocol,
     started: Instant,
@@ -405,6 +408,9 @@ impl ProxyActivity {
                 timestamp: crate::auth::now(),
                 request_id: self.request_id.clone(),
                 source_instance_id: None,
+                gateway_api_key_id: self.gateway_api_key.as_ref().map(|key| key.id.clone()),
+                gateway_api_key_note: self.gateway_api_key.as_ref().map(|key| key.note.clone()),
+                gateway_api_key_prefix: self.gateway_api_key.as_ref().map(|key| key.prefix.clone()),
                 path: self.path.clone(),
                 model: self.model.clone(),
                 upstream_model: self.upstream_model.clone(),
@@ -435,6 +441,7 @@ struct ForwardRequest {
     provider: Provider,
     endpoint: ApiEndpoint,
     api_key: Option<ApiKey>,
+    gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     model: String,
     upstream_model: String,
     parts: axum::http::request::Parts,
@@ -451,6 +458,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         provider,
         endpoint,
         api_key,
+        gateway_api_key,
         model,
         upstream_model: resolved_upstream_model,
         parts,
@@ -675,6 +683,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     timestamp: crate::auth::now(),
                     request_id,
                     source_instance_id: None,
+                    gateway_api_key_id: gateway_api_key.as_ref().map(|key| key.id.clone()),
+                    gateway_api_key_note: gateway_api_key.as_ref().map(|key| key.note.clone()),
+                    gateway_api_key_prefix: gateway_api_key.as_ref().map(|key| key.prefix.clone()),
                     path,
                     model,
                     upstream_model: sent_upstream_model,
@@ -731,6 +742,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         upstream_model: sent_upstream_model,
         provider: provider.id.clone(),
         endpoint: endpoint.id.clone(),
+        gateway_api_key,
         caller_protocol,
         upstream_protocol,
         started,

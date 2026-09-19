@@ -282,6 +282,8 @@ scoped_models=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $model_sco
 connection_failure_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null and .failure.stage == "upstream_connect" and .failure.category == "connect_failed")] | length') == 1 ]]
 unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi endpoint","expires_at":null,"provider_ids":[]}')
+unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
+unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
 # Cross-protocol adapters let every caller surface use providers with a different native API.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"anthropic\"}}" >/dev/null
@@ -414,6 +416,8 @@ done
 [[ -n "$capture_id" ]]
 capture=$(admin -f "$base/admin/extensions/traffic-capture/captures/$capture_id")
 [[ $(printf '%s' "$capture" | jq -r '[.status, .outcome, .request_truncated, .response_truncated] | join(":")') == 200:complete:false:false ]]
+[[ $(printf '%s' "$capture" | jq -r '.duration_ms | type') == number ]]
+[[ $(admin -f "$base/admin/extensions/traffic-capture/captures" | jq -r '.[0].duration_ms | type') == number ]]
 [[ $(printf '%s' "$capture" | jq -r '.request_body | implode | fromjson | [.model, .extra, .messages[0].content] | join(":")') == model-a:provider:traffic-capture-secret-marker ]]
 [[ $(printf '%s' "$capture" | jq -r '.response_body | implode | fromjson | [.endpoint, .model] | join(":")') == one:model-a ]]
 [[ $(printf '%s' "$capture" | jq -r '.request_headers[] | select(.name == "authorization") | .value') == '[REDACTED]' ]]
@@ -500,6 +504,11 @@ stats=$(admin -f "$base/admin/activity/stats?since=0&buckets=24")
 [[ $(printf '%s' "$stats" | jq -r '.buckets | length') == 24 ]]
 [[ $(printf '%s' "$stats" | jq -r '[.buckets[].requests] | add') == $(printf '%s' "$stats" | jq -r .requests) ]]
 [[ $(printf '%s' "$stats" | jq -r '.by_model | length > 0') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.priced_requests > 0') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.priced_requests as $priced | ([.buckets[].priced_requests] | add) == $priced') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.priced_requests as $priced | ([.by_model[].priced_requests] | add) == $priced') == true ]]
+[[ $(printf '%s' "$stats" | jq -r --arg id "$unrestricted_id" '[.by_api_key[] | select(.id == $id and .name == "Multi endpoint")] | length > 0') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.requests as $requests | ([.by_api_key[].requests] | add) == $requests') == true ]]
 filtered_stats=$(admin -f "$base/admin/activity/stats?since=0&provider=multi&buckets=12")
 [[ $(printf '%s' "$filtered_stats" | jq -r '.buckets | length') == 12 ]]
 [[ $(printf '%s' "$filtered_stats" | jq '[.by_provider[] | select(.name != "multi")] | length') == 0 ]]
@@ -517,6 +526,8 @@ stats=$(admin -f "$base/admin/activity/stats?since=0")
 [[ $(printf '%s' "$stats" | jq -r '.cost > 0') == true ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
 [[ $(printf '%s' "$logs" | jq '[.[] | select(.cost == 0.0042)] | length') -ge 4 ]]
+[[ $(printf '%s' "$logs" | jq -r --arg id "$unrestricted_id" --arg prefix "$unrestricted_prefix" '[.[] | select(.gateway_api_key_id == $id and .gateway_api_key_note == "Multi endpoint" and .gateway_api_key_prefix == $prefix)] | length > 0') == true ]]
+! printf '%s' "$logs" | grep -Fq "$unrestricted_secret"
 # Activity data can be previewed, range-filtered, and retention is persisted through the control API.
 summary=$(admin -f "$base/admin/activity/export/preview?since=0")
 [[ $(printf '%s' "$summary" | jq -r .records) -gt 0 ]]
@@ -615,6 +626,19 @@ cli_extension=$(admin -f "$base/admin/extensions" | jq -c '.[] | select(.id == "
 cli_without_defaults=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}')
 [[ $(printf '%s' "$cli_without_defaults" | jq -r .extra) == null ]]
 [[ $(jq -r '.enabled["request-defaults"]' data/extensions.json) == true ]]
+# Model listing serves the last successful discovery cache even when every live
+# upstream is unavailable; refreshing models remains an explicit admin action.
+kill "$upstream_pid"
+wait "$upstream_pid" || true
+upstream_pid=
+cached_status=$(status "$base/v1/models" -H "Authorization: Bearer $unrestricted_secret")
+if [[ $cached_status != 200 ]]; then
+  echo "cached model listing returned HTTP $cached_status after upstream shutdown" >&2
+  cat response.json >&2
+  exit 1
+fi
+cached_models=$(<response.json)
+[[ $(printf '%s' "$cached_models" | jq '[.data[] | select(.id == "multi/model-a")] | length') == 1 ]]
 kill -TERM "$pid"
 wait "$pid"
 pid=

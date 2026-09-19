@@ -662,6 +662,7 @@ async fn activity_logs(
             .activity
             .logs(
                 query.since.unwrap_or(0),
+                query.until.unwrap_or_else(now),
                 query.provider.as_deref(),
                 query.limit.unwrap_or(100),
             )

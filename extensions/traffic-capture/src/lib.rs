@@ -66,6 +66,8 @@ pub struct CaptureRecord {
     pub request_body: Vec<u8>,
     pub request_truncated: bool,
     pub status: Option<u16>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
     pub response_headers: Vec<ObservedHeaderValue>,
     pub response_body: Vec<u8>,
     pub response_truncated: bool,
@@ -94,6 +96,7 @@ pub struct CaptureSummary {
     pub provider_id: String,
     pub endpoint_id: String,
     pub status: Option<u16>,
+    pub duration_ms: Option<u64>,
     pub bytes: usize,
     pub truncated: bool,
     pub outcome: String,
@@ -255,6 +258,7 @@ impl TrafficCapture {
                 provider_id: capture.provider_id.clone(),
                 endpoint_id: capture.endpoint_id.clone(),
                 status: capture.status,
+                duration_ms: capture.duration_ms,
                 bytes: capture.request_body.len() + capture.response_body.len(),
                 truncated: capture.request_truncated || capture.response_truncated,
                 outcome: capture.outcome.clone(),
@@ -441,6 +445,7 @@ impl UpstreamExchangeHook for TrafficCapture {
             request_body,
             request_truncated,
             status: None,
+            duration_ms: None,
             response_headers: Vec::new(),
             response_body: Vec::new(),
             response_truncated: false,
@@ -448,6 +453,7 @@ impl UpstreamExchangeHook for TrafficCapture {
         };
         Some(Box::new(CaptureObserver {
             record: Mutex::new(Some(record)),
+            started_at: std::time::Instant::now(),
             sender: self.sender.clone(),
             body_limit: config_snapshot.body_limit,
             redacted,
@@ -463,6 +469,7 @@ enum CaptureMessage {
 
 struct CaptureObserver {
     record: Mutex<Option<CaptureRecord>>,
+    started_at: std::time::Instant,
     sender: tokio::sync::mpsc::Sender<CaptureMessage>,
     body_limit: usize,
     redacted: HashSet<String>,
@@ -491,6 +498,12 @@ impl UpstreamExchangeObserver for CaptureObserver {
         let Some(mut record) = self.record.get_mut().expect("capture observer lock").take() else {
             return;
         };
+        record.duration_ms = Some(
+            self.started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
         record.outcome = match outcome {
             ExchangeOutcome::Complete => "complete",
             ExchangeOutcome::TransportError => "transport_error",
@@ -841,6 +854,7 @@ mod tests {
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut observer = CaptureObserver {
             record: Mutex::new(Some(test_record("request"))),
+            started_at: std::time::Instant::now(),
             sender,
             body_limit: 3,
             redacted: HashSet::new(),
@@ -857,6 +871,7 @@ mod tests {
         assert_eq!(record.response_body, b"abc");
         assert!(record.response_truncated);
         assert_eq!(record.outcome, "response_read_error");
+        assert!(record.duration_ms.is_some());
         assert!(receiver.try_recv().is_err());
     }
 
@@ -963,6 +978,7 @@ mod tests {
             request_body: Vec::new(),
             request_truncated: false,
             status: Some(200),
+            duration_ms: Some(42),
             response_headers: Vec::new(),
             response_body: Vec::new(),
             response_truncated: false,

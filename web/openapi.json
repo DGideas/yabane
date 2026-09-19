@@ -485,6 +485,21 @@
           "request_id": {
             "type": "string"
           },
+          "gateway_api_key_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Stable ID of the authenticated Yabane Gateway API key. Null when authentication was disabled or for records created before this metadata was introduced."
+          },
+          "gateway_api_key_note": {
+            "type": "string",
+            "nullable": true,
+            "description": "Safe display note captured from the Gateway API key at request time. The secret and secret hash are never recorded."
+          },
+          "gateway_api_key_prefix": {
+            "type": "string",
+            "nullable": true,
+            "description": "Non-secret display prefix of the authenticated Gateway API key."
+          },
           "path": {
             "type": "string"
           },
@@ -575,6 +590,7 @@
         "type": "object",
         "required": [
           "requests",
+          "priced_requests",
           "input_tokens",
           "output_tokens",
           "cached_tokens",
@@ -584,11 +600,16 @@
           "latency_ms",
           "by_provider",
           "by_model",
+          "by_api_key",
           "buckets"
         ],
         "properties": {
           "requests": {
             "type": "integer"
+          },
+          "priced_requests": {
+            "type": "integer",
+            "description": "Requests whose upstream response reported a cost, including a reported zero cost."
           },
           "input_tokens": {
             "type": "integer"
@@ -624,6 +645,13 @@
               "$ref": "#/components/schemas/ActivityDimensionStats"
             }
           },
+          "by_api_key": {
+            "type": "array",
+            "description": "Request and usage statistics grouped by stable Gateway API key identity. Legacy and authentication-disabled traffic is grouped as Unattributed.",
+            "items": {
+              "$ref": "#/components/schemas/ActivityApiKeyStats"
+            }
+          },
           "buckets": {
             "type": "array",
             "items": {
@@ -639,6 +667,50 @@
             "type": "string"
           },
           "requests": {
+            "type": "integer"
+          },
+          "priced_requests": {
+            "type": "integer",
+            "description": "Requests in this dimension whose upstream response reported a cost."
+          },
+          "input_tokens": {
+            "type": "integer"
+          },
+          "output_tokens": {
+            "type": "integer"
+          },
+          "cached_tokens": {
+            "type": "integer"
+          },
+          "cost": {
+            "type": "number"
+          },
+          "errors": {
+            "type": "integer"
+          },
+          "latency_ms": {
+            "type": "integer"
+          }
+        }
+      },
+      "ActivityApiKeyStats": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string",
+            "nullable": true
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "priced_requests": {
             "type": "integer"
           },
           "input_tokens": {
@@ -669,6 +741,10 @@
           },
           "requests": {
             "type": "integer"
+          },
+          "priced_requests": {
+            "type": "integer",
+            "description": "Requests in this interval whose upstream response reported a cost."
           },
           "tokens": {
             "type": "integer"
@@ -782,6 +858,11 @@
             "type": "integer",
             "nullable": true
           },
+          "duration_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Elapsed milliseconds from beginning observation of the final upstream request until the exchange completed. Null for captures retained before this field was introduced."
+          },
           "bytes": {
             "type": "integer"
           },
@@ -808,7 +889,7 @@
           "request_id", "timestamp", "expires_at", "public_model", "upstream_model",
           "provider_id", "endpoint_id", "caller_protocol", "upstream_protocol", "streaming",
           "request_headers", "request_body", "request_truncated", "response_headers",
-          "response_body", "response_truncated", "outcome"
+          "response_body", "response_truncated", "outcome", "duration_ms"
         ],
         "properties": {
           "request_id": { "type": "string" },
@@ -828,6 +909,11 @@
           "request_body": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
           "request_truncated": { "type": "boolean" },
           "status": { "type": "integer", "nullable": true },
+          "duration_ms": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Elapsed milliseconds from beginning observation of the final upstream request until the exchange completed."
+          },
           "response_headers": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/TrafficCaptureHeader" }

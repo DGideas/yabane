@@ -21,12 +21,19 @@ let activityLogsLimit = 0;
 let activityPage = 0;
 let activityPageTotal = 0;
 let activityPageRequest = 0;
+let activityPageSince = 0;
 let activityPageUntil = 0;
+let activityCustomRange = null;
 let activitySearchTimer = null;
 let dashboardLoadPromise = null;
 let trafficCaptureStatus = null;
 let trafficCaptures = [];
+let captureFormInitialized = false;
 let selectedCapture = null;
+let captureDetailBodyMode = 'raw';
+let captureDetailBody = '';
+let captureDetailAssembled = '';
+let captureDetailIsSse = false;
 
 async function renderTurnstile(action) {
   const widget = $('#turnstile-widget');
@@ -133,11 +140,11 @@ function showView(name, updateHistory = true) {
   indicator.style.transform = `translateY(${active.offsetTop}px)`;
   selectedProviderId = name === 'providers' ? selectedProviderId : null;
   if (name === 'providers') renderProviderPage();
-  if (name === 'home') loadDashboard();
+  if (name === 'home' && adminSession?.authenticated) loadDashboard();
   if (name === 'extensions') renderExtensions();
-  if (name === 'capture') loadTrafficCapture();
-  if (name === 'activity') loadActivity();
-  if (name === 'management') loadManagementKeys();
+  if (name === 'capture' && adminSession?.authenticated) loadTrafficCapture();
+  if (name === 'activity' && adminSession?.authenticated) loadActivity();
+  if (name === 'management' && adminSession?.authenticated) loadManagementKeys();
   if (updateHistory) history.pushState({}, '', selectedProviderId && name === 'providers' ? `/providers/${encodeURIComponent(selectedProviderId)}` : viewPaths[name]);
   document.title = `${name === 'capture' ? 'Traffic Capture' : active.textContent.trim()} · Yabane`;
 }
@@ -1372,8 +1379,21 @@ function formatCost(value) { return value == null ? '—' : `$${new Intl.NumberF
 let activityLogs = [];
 let activityOverviewLogs = [];
 const activityColors = ['#0b57d0', '#7c4dff', '#00a67e', '#ff8f00', '#d93025', '#00897b'];
-function activityBuckets(logs, seconds, end = Math.floor(Date.now() / 1000)) {
-  const count = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30;
+function activityBucketPlan(seconds, now = Math.floor(Date.now() / 1000), align = true) {
+  const bucketSeconds = seconds <= 900 ? 60 : seconds <= 3600 ? 300 : seconds <= 21600 ? 600 : seconds <= 43200 ? 900 : seconds <= 86400 ? 1800 : seconds <= 259200 ? 3600 : seconds <= 604800 ? 10800 : seconds <= 1209600 ? 21600 : seconds <= 2592000 ? 43200 : 86400;
+  const bucketCount = Math.min(120, Math.max(1, Math.ceil(seconds / bucketSeconds)));
+  return {bucketCount, bucketSeconds, until: align ? Math.ceil(now / bucketSeconds) * bucketSeconds : now};
+}
+function selectedActivityRange() {
+  if (activityCustomRange) {
+    const seconds = activityCustomRange.until - activityCustomRange.since;
+    return {...activityCustomRange, seconds, ...activityBucketPlan(seconds, activityCustomRange.until, false), pageUntil: activityCustomRange.until};
+  }
+  const seconds = Number($('#activity-range').value); const now = Math.floor(Date.now() / 1000); const plan = activityBucketPlan(seconds, now);
+  return {seconds, since: plan.until - seconds, until: plan.until, pageUntil: now, bucketCount: plan.bucketCount, bucketSeconds: plan.bucketSeconds};
+}
+function activityBuckets(logs, seconds, end = activityBucketPlan(seconds).until) {
+  const {bucketCount: count} = activityBucketPlan(seconds, end);
   const start = end - seconds; const width = seconds / count;
   return Array.from({length: count}, (_, index) => ({start: start + index * width, requests: 0, tokens: 0, cached: 0, cost: 0, latency: 0, samples: 0, successful: 0, errors: 0})).map((bucket, index, buckets) => {
     logs.filter(log => log.timestamp >= bucket.start && (index === buckets.length - 1 || log.timestamp < bucket.start + width)).forEach(log => { bucket.requests++; bucket.tokens += log.input_tokens + log.output_tokens; bucket.cached += log.cached_tokens; bucket.cost += log.cost || 0; bucket.latency += log.latency_ms; bucket.samples++; bucket.successful += Number(log.status < 400); bucket.errors += Number(log.status >= 400); }); return bucket;
@@ -1386,6 +1406,8 @@ function sparkline(values, color) {
 let activityChartMetric = 'requests';
 let activityChartBuckets = [];
 let activityChartSeconds = 86400;
+let activityChartRenderWidth = 0;
+let activityChartResizeFrame = 0;
 function activityBucketLabel(bucket, seconds, full = false) {
   const start = new Date(bucket.start * 1000); const end = new Date((bucket.start + seconds / activityChartBuckets.length) * 1000);
   if (!full) return seconds <= 86400 ? start.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : start.toLocaleDateString([], {month: 'short', day: 'numeric'});
@@ -1394,27 +1416,80 @@ function activityBucketLabel(bucket, seconds, full = false) {
   return `${startLabel} – ${endLabel}`;
 }
 function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'latency' ? (bucket.samples ? bucket.latency / bucket.samples : 0) : bucket.requests; }
-function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'latency' ? formatDuration(Math.round(value)) : value.toLocaleString(); }
+function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'latency' ? formatDuration(Math.round(value)) : Math.round(value).toLocaleString(); }
+function formatReportedCost(cost, coverage) { return coverage ? formatCost(cost) : '—'; }
+function activityTrend(buckets) {
+  const bucketSeconds = activityChartSeconds / Math.max(buckets.length, 1); const now = Date.now() / 1000;
+  let currentIndex = buckets.findLastIndex(bucket => bucket.start + bucketSeconds <= now);
+  if (currentIndex < 0) currentIndex = buckets.length - 1;
+  const current = buckets[currentIndex]?.requests || 0; const history = buckets.slice(Math.max(0, currentIndex - 6), currentIndex).map(bucket => bucket.requests);
+  const baseline = history.length ? history.reduce((sum, value) => sum + value, 0) / history.length : 0;
+  if (!current && !baseline) return {label: 'No recent traffic', short: 'No trend', tone: 'steady'};
+  if (!baseline) return {label: `${current.toLocaleString()} in last full interval`, short: 'New traffic', tone: 'up'};
+  const change = (current - baseline) * 100 / baseline; const direction = change >= 0 ? 'above' : 'below';
+  return {label: `${Math.abs(change).toFixed(0)}% ${direction} recent pace`, short: `${change >= 0 ? '+' : ''}${change.toFixed(0)}% vs recent`, tone: Math.abs(change) < 10 ? 'steady' : change > 0 ? 'up' : 'down'};
+}
 function inspectActivityBucket(index) {
   const bucket = activityChartBuckets[index]; if (!bucket) return;
   $$('.chart-column').forEach((column, columnIndex) => column.classList.toggle('selected', columnIndex === index));
   $('#chart-inspector-time').textContent = activityBucketLabel(bucket, activityChartSeconds, true);
   const averageLatency = bucket.samples ? Math.round(bucket.latency / bucket.samples) : null;
   const successRate = bucket.requests ? (bucket.successful * 100 / bucket.requests).toFixed(1) + '%' : '—';
-  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Tokens', compactNumber(bucket.tokens)], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached', compactNumber(bucket.cached)], ['Cost', formatCost(bucket.cost || null)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Tokens', compactNumber(bucket.tokens)], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached input', compactNumber(bucket.cached)], ['Reported spend', formatReportedCost(bucket.cost, bucket.priced_requests)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+}
+function smoothActivityPath(points) {
+  if (points.length < 2) return points.length ? `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}` : '';
+  const slopes = points.slice(0, -1).map((point, index) => (points[index + 1].y - point.y) / (points[index + 1].x - point.x));
+  const tangents = points.map((_, index) => {
+    if (index === 0) return slopes[0];
+    if (index === points.length - 1) return slopes.at(-1);
+    return slopes[index - 1] * slopes[index] <= 0 ? 0 : (slopes[index - 1] + slopes[index]) / 2;
+  });
+  slopes.forEach((slope, index) => {
+    if (slope === 0) { tangents[index] = 0; tangents[index + 1] = 0; return; }
+    const left = tangents[index] / slope; const right = tangents[index + 1] / slope; const magnitude = left * left + right * right;
+    if (magnitude <= 9) return;
+    const scale = 3 / Math.sqrt(magnitude); tangents[index] = scale * left * slope; tangents[index + 1] = scale * right * slope;
+  });
+  return points.slice(1).reduce((path, point, index) => {
+    const previous = points[index]; const width = point.x - previous.x;
+    const firstControl = `${(previous.x + width / 3).toFixed(1)},${(previous.y + tangents[index] * width / 3).toFixed(1)}`;
+    const secondControl = `${(point.x - width / 3).toFixed(1)},${(point.y - tangents[index + 1] * width / 3).toFixed(1)}`;
+    return `${path} C${firstControl} ${secondControl} ${point.x.toFixed(1)},${point.y.toFixed(1)}`;
+  }, `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`);
 }
 function renderActivityChart(buckets = activityChartBuckets, seconds = activityChartSeconds) {
   activityChartBuckets = buckets; activityChartSeconds = seconds;
-  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const max = Math.max(...values, 1);
-  const nonEmpty = buckets.reduce((last, bucket, index) => bucket.requests ? index : last, -1); const selected = nonEmpty >= 0 ? nonEmpty : buckets.length - 1;
-  $('#activity-chart').innerHTML = `<div class="chart-grid"><span><b>${activityMetricLabel(max, activityChartMetric)}</b></span><span></span><span><b>0</b></span></div><div class="chart-bars">${buckets.map((bucket, index) => { const value = values[index]; const label = activityBucketLabel(bucket, seconds); const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatCost(bucket.cost || null)}`; return `<button class="chart-column" type="button" data-chart-index="${index}" aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${activityMetricLabel(value, activityChartMetric)}</span><span class="chart-bar" style="height:${Math.max(value * 100 / max, value ? 3 : 0)}%"></span><small>${index % Math.ceil(buckets.length / 6) === 0 || index === buckets.length - 1 ? label : ''}</small></button>`; }).join('')}</div>`;
-  inspectActivityBucket(selected);
+  const chart = $('#activity-chart'); const measuredWidth = Math.round(chart.clientWidth);
+  if (!measuredWidth) return;
+  activityChartRenderWidth = measuredWidth;
+  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const max = Math.max(...values, 1); const average = values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
+  const width = Math.max(measuredWidth, 320); const height = 250; const left = 48; const right = 16; const top = 18; const bottom = 38; const plotWidth = width - left - right; const plotHeight = height - top - bottom;
+  const points = values.map((value, index) => ({x: left + index * plotWidth / Math.max(values.length - 1, 1), y: top + (1 - value / max) * plotHeight}));
+  const line = smoothActivityPath(points);
+  const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = max * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
+  const averageY = top + (1 - average / max) * plotHeight; const intervalEvery = Math.max(1, Math.ceil(buckets.length / 6));
+  const overlays = buckets.map((bucket, index) => { const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatReportedCost(bucket.cost, bucket.priced_requests)}`; const label = activityBucketLabel(bucket, seconds); return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}" aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${activityMetricLabel(values[index], activityChartMetric)}</span><small>${index % intervalEvery === 0 || index === buckets.length - 1 ? label : ''}</small></button>`; }).join('');
+  $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g><line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('')}</g></svg><div class="chart-bars" style="--activity-buckets:${buckets.length}">${overlays}</div>`;
+  const trend = activityTrend(buckets); const signal = $('#activity-trend-signal'); signal.textContent = trend.label; signal.className = `trend-signal ${trend.tone}`; $('#stat-request-trend').textContent = trend.short;
+  const bucketSeconds = seconds / Math.max(buckets.length, 1); $('#traffic-granularity').textContent = `${bucketSeconds < 3600 ? Math.round(bucketSeconds / 60) + '-minute' : bucketSeconds < 86400 ? Math.round(bucketSeconds / 3600) + '-hour' : Math.round(bucketSeconds / 86400) + '-day'} intervals · line shows ${activityChartMetric}`;
+  const nonEmpty = buckets.reduce((last, bucket, index) => bucket.requests ? index : last, -1); inspectActivityBucket(nonEmpty >= 0 ? nonEmpty : buckets.length - 1);
 }
-function aggregateActivity(logs, key) {
-  const map = new Map(); logs.forEach(log => { const name = log[key]; const item = map.get(name) || {name, requests: 0, tokens: 0, errors: 0, latency: 0}; item.requests++; item.tokens += log.input_tokens + log.output_tokens; item.errors += Number(log.status >= 400); item.latency += log.latency_ms; map.set(name, item); }); return [...map.values()].sort((a, b) => b.requests - a.requests);
+function renderProviderStats(target, items, totalRequests) {
+  const max = Math.max(...items.map(item => item.requests), 1); target.innerHTML = items.length ? items.map((item, index) => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; return `<div class="activity-ranking"><span class="ranking-number">${index + 1}</span><span class="ranking-dot" style="background:${activityColors[index % activityColors.length]}"></span><div><strong>${escapeHtml(item.name)}</strong><span class="ranking-track"><i style="width:${item.requests * 100 / max}%;background:${activityColors[index % activityColors.length]}"></i></span><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% traffic · ${cacheRate.toFixed(1)}% cached input</small></div><span><strong>${item.requests.toLocaleString()}</strong><small>requests</small></span><span><strong>${compactNumber(item.input_tokens + item.output_tokens)}</strong><small>tokens</small></span></div>`; }).join('') : '<div class="activity-empty">No activity in this period.</div>';
 }
-function renderRankings(target, items) {
-  const max = Math.max(...items.map(item => item.requests), 1); target.innerHTML = items.length ? items.slice(0, 5).map((item, index) => `<div class="activity-ranking"><span class="ranking-number">${index + 1}</span><span class="ranking-dot" style="background:${activityColors[index % activityColors.length]}"></span><div><strong>${escapeHtml(item.name)}</strong><span class="ranking-track"><i style="width:${item.requests * 100 / max}%;background:${activityColors[index % activityColors.length]}"></i></span></div><span><strong>${item.requests}</strong><small>requests</small></span><span><strong>${compactNumber(item.tokens)}</strong><small>tokens</small></span></div>`).join('') : '<div class="activity-empty">No activity in this period.</div>';
+function renderApiKeyStats(target, items, totalRequests) {
+  const max = Math.max(...items.map(item => item.requests), 1);
+  target.innerHTML = items.length ? items.map((item, index) => {
+    const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0;
+    const identity = item.prefix || 'No authenticated key';
+    return `<div class="activity-ranking api-key-ranking"><span class="ranking-key-icon">${icon('key')}</span><div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(identity)}</code><span class="ranking-track"><i style="width:${item.requests * 100 / max}%;background:${activityColors[(index + 2) % activityColors.length]}"></i></span><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% traffic · ${successRate.toFixed(1)}% success</small></div><span><strong>${item.requests.toLocaleString()}</strong><small>requests</small></span><span><strong>${formatDuration(item.requests ? Math.round(item.latency_ms / item.requests) : null)}</strong><small>avg latency</small></span></div>`;
+  }).join('') : '<div class="activity-empty">No API key activity in this period.</div>';
+}
+function modelSuccessTone(successRate) { return successRate >= 99 ? 'model-healthy' : successRate >= 95 ? 'model-warning' : 'model-critical'; }
+function renderModelStats(target, items, totalRequests) {
+  $('#model-count').textContent = `${items.length.toLocaleString()} model${items.length === 1 ? '' : 's'}`;
+  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = item.priced_requests || 0; return `<tr><td data-label="Model"><code>${escapeHtml(item.name)}</code><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Reported spend"><strong>${formatReportedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg / priced request · ` : ''}${coverage.toLocaleString()} / ${item.requests.toLocaleString()} requests priced</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
 }
 function statusBadge(status) { const success = status >= 200 && status < 400; return `<span class="status-badge ${success ? 'success' : 'failure'}"><i></i>${status}</span>`; }
 function failureLabel(log) { return log.failure?.message || (log.status >= 400 ? `HTTP ${log.status}` : ''); }
@@ -1430,15 +1505,21 @@ function activityRow(log, detailed = false, index = -1) {
 function formatDuration(milliseconds) { return milliseconds == null ? 'Not available' : milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 1 : 2)} s` : `${milliseconds.toLocaleString()} ms`; }
 function protocolLabel(protocol) { return protocol ? protocol.replace('openai_', 'OpenAI ').replace('anthropic_messages', 'Anthropic Messages').replace('_completions', ' Completions') : 'Unknown'; }
 function openActivityDetail(log) {
-  const dialog = $('#activity-detail-dialog'); const firstByte = log.first_byte_ms; const total = log.latency_ms; const generation = log.generation_ms ?? (firstByte == null ? null : Math.max(total - firstByte, 0));
+  const dialog = $('#activity-detail-dialog'); const firstByte = log.first_byte_ms; const total = log.latency_ms; const gateway = log.gateway_ms; const upstreamHeaders = log.upstream_response_ms; const headersAt = gateway == null || upstreamHeaders == null ? null : gateway + upstreamHeaders; const generation = log.generation_ms ?? (firstByte == null ? null : Math.max(total - firstByte, 0));
   $('#activity-detail-model').textContent = log.model; $('#activity-detail-time').textContent = new Date(log.timestamp * 1000).toLocaleString(); $('#activity-detail-status').innerHTML = statusBadge(log.status);
-  $('#activity-detail-route').textContent = `${log.provider} / ${log.endpoint}`; $('#activity-detail-api').textContent = `${compactPath(log.path)}${log.streaming ? ' · Streaming' : ''}`;
+  $('#activity-detail-route').textContent = `${log.provider} / ${log.endpoint}`; $('#activity-detail-api').textContent = `${compactPath(log.path)}${log.streaming ? ' · Streaming' : ''}`; $('#activity-detail-total').textContent = formatDuration(total);
   const failure = $('#activity-detail-failure'); const failureMessage = log.failure?.message; const failureCategory = log.failure?.category; failure.hidden = !failureMessage; failure.querySelector('p').textContent = failureMessage || ''; failure.querySelector('small').textContent = failureCategory === 'proxy_connect_failed' ? 'Check that the proxy is reachable. If HTTPS works with socks5h but not socks5, let the proxy resolve target hostnames.' : 'Use the request ID below to match this failure with server logs if more detail is needed.';
-  const timing = [['Gateway', log.gateway_ms, '#7c4dff'], ['Upstream response', log.upstream_response_ms, '#00a67e'], ['Time to first byte', firstByte, '#0b57d0'], ['Generation after first byte', generation, '#ff8f00'], ['Total', total, '#202124']];
-  $('#activity-detail-timing').innerHTML = timing.map(([label, value, color]) => `<div><span>${escapeHtml(label)}</span><i><b style="width:${value == null ? 0 : Math.max(2, value * 100 / Math.max(total, 1))}%;background:${color}"></b></i><strong>${escapeHtml(formatDuration(value))}</strong></div>`).join('');
+  const stages = [];
+  if (gateway != null) stages.push({label: 'Gateway processing', detail: 'Route and prepare request', start: 0, duration: gateway, color: '#0b57d0', icon: 'route'});
+  if (upstreamHeaders != null) stages.push({label: 'Upstream response', detail: 'Connect and await headers', start: gateway || 0, duration: upstreamHeaders, color: '#009b84', icon: 'provider'});
+  if (firstByte != null && headersAt != null && firstByte > headersAt) stages.push({label: 'First body byte', detail: 'Wait after response headers', start: headersAt, duration: firstByte - headersAt, color: '#168c9a', icon: 'pulse'});
+  if (generation != null) stages.push({label: 'Generation', detail: 'Read response body', start: firstByte ?? Math.max(total - generation, 0), duration: generation, color: '#7c4dff', icon: 'arrow-right'});
+  const accountedUntil = stages.reduce((end, stage) => Math.max(end, stage.start + stage.duration), 0);
+  if (accountedUntil < total) stages.push({label: 'Response completion', detail: 'Remaining response processing', start: accountedUntil, duration: total - accountedUntil, color: '#697386', icon: 'clock'});
+  $('#activity-detail-timing').innerHTML = `<div class="timeline-axis"><span>Stage</span><div class="timeline-scale"><span>0</span><span>${escapeHtml(formatDuration(total / 2))}</span><span>${escapeHtml(formatDuration(total))}</span></div><span>Duration</span></div>${stages.map(stage => { const left = Math.min(100, stage.start * 100 / Math.max(total, 1)); const width = Math.max(0, Math.min(100 - left, stage.duration * 100 / Math.max(total, 1))); return `<div class="timeline-stage"><div class="timeline-stage-label"><span class="timeline-stage-icon" style="--stage-color:${stage.color}">${icon(stage.icon)}</span><div><strong>${escapeHtml(stage.label)}</strong><small>${escapeHtml(stage.detail)}</small></div></div><div class="timeline-track" aria-hidden="true"><span class="timeline-stage-bar" style="--stage-left:${left}%;--stage-width:${width}%;--stage-color:${stage.color}"></span></div><strong>${escapeHtml(formatDuration(stage.duration))}</strong></div>`; }).join('')}<div class="timeline-total"><span class="timeline-total-label">${icon('route')}<span><em>Total</em><small>End to end</small></span></span><span class="timeline-total-track" aria-hidden="true"><i></i></span><strong>${escapeHtml(formatDuration(total))}</strong></div>`;
   $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], ['Upstream cost', formatCost(log.cost)], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
-  $('#activity-detail-request').innerHTML = [['Request ID', log.request_id], ['Requested model', log.model], ['Upstream model', log.upstream_model || 'Not available (older record)'], ['Path', log.path], ['Caller protocol', protocolLabel(log.caller_protocol)], ['Upstream protocol', protocolLabel(log.upstream_protocol)], ['Provider', log.provider], ['Endpoint', log.endpoint]].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join('');
-  $('#activity-capture-link button').dataset.requestId = log.request_id;
+  const gatewayKey = log.gateway_api_key_note ? `${log.gateway_api_key_note} (${log.gateway_api_key_prefix || log.gateway_api_key_id})` : log.gateway_api_key_prefix || log.gateway_api_key_id || 'Unattributed (authentication disabled or older record)';
+  $('#activity-detail-request').innerHTML = [['Request ID', log.request_id], ['Gateway API key', gatewayKey], ['Requested model', log.model], ['Upstream model', log.upstream_model || 'Not available (older record)'], ['Path', log.path], ['Caller protocol', protocolLabel(log.caller_protocol)], ['Upstream protocol', protocolLabel(log.upstream_protocol)], ['Provider', log.provider], ['Endpoint', log.endpoint]].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join('');
   dialog.showModal();
 }
 $$('.close-activity-detail').forEach(button => button.addEventListener('click', () => $('#activity-detail-dialog').close()));
@@ -1457,7 +1538,7 @@ function renderActivityLogs() {
 async function loadActivityPage() {
   if ($('#activity-requests-panel').hidden) return;
   const request = ++activityPageRequest;
-  const seconds = Number($('#activity-range').value); const until = activityPageUntil || Math.floor(Date.now() / 1000); const since = until - seconds;
+  const range = selectedActivityRange(); const until = activityPageUntil || range.pageUntil; const since = activityPageSince || range.since;
   const params = new URLSearchParams({since, until, offset: activityPage * ACTIVITY_PAGE_SIZE, limit: ACTIVITY_PAGE_SIZE});
   const provider = $('#activity-provider-filter').value; const query = $('#activity-search').value.trim(); const status = $('#activity-status-filter').value;
   if (provider) params.set('provider', provider); if (query) params.set('query', query); if (status) params.set('status', status);
@@ -1476,17 +1557,17 @@ async function loadActivity(requestedLogLimit) {
     if (logLimit <= activityLogsLimit) return;
   }
   activityLoadPromise = (async () => {
-    const seconds = Number($('#activity-range').value); const until = Math.floor(Date.now() / 1000); activityPageUntil = until; const since = until - seconds; const bucketCount = seconds <= 3600 ? 12 : seconds <= 86400 ? 24 : seconds <= 604800 ? 14 : 30; const providerFilter = $('#activity-provider-filter').value;
+    const range = selectedActivityRange(); const {seconds, since, until, bucketCount, pageUntil} = range; activityPageSince = since; activityPageUntil = pageUntil; const providerFilter = $('#activity-provider-filter').value;
     const providerQuery = providerFilter ? `&provider=${encodeURIComponent(providerFilter)}` : '';
     const statsUrl = `/admin/activity/stats?since=${since}&until=${until}&buckets=${bucketCount}${providerQuery}`;
-    const [stats, logs] = await Promise.all([fetch(statsUrl).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&limit=${logLimit}${providerQuery}`).then(response => response.json())]);
+    const [stats, logs] = await Promise.all([fetch(statsUrl).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&until=${pageUntil}&limit=${logLimit}${providerQuery}`).then(response => response.json())]);
     activityOverviewLogs = logs; activityLogsLimit = logLimit;
-    const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
+    const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, priced: stats.priced_requests || 0, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
     const buckets = stats.buckets; const requests = stats.requests; const totalTokens = totals.input + totals.output;
     $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
-    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = totals.cost ? formatCost(totals.cost) : '$0.00'; $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
+    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = formatReportedCost(totals.cost, totals.priced); $('#stat-cost-coverage').textContent = totals.priced ? `${totals.priced.toLocaleString()} / ${requests.toLocaleString()} requests priced` : 'No upstream cost data'; $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
     $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
-    renderActivityChart(buckets, seconds); renderRankings($('#provider-stats'), stats.by_provider.map(item => ({...item, tokens: item.input_tokens + item.output_tokens}))); renderRankings($('#model-stats'), stats.by_model.map(item => ({...item, tokens: item.input_tokens + item.output_tokens})));
+    renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelStats($('#model-stats'), stats.by_model, requests);
     $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
     const filter = $('#activity-provider-filter'); const previous = filter.value;
     if (!providerFilter) filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.name, provider.name)));
@@ -1498,7 +1579,8 @@ async function loadActivity(requestedLogLimit) {
 function showActivityTab(tab) {
   $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
   $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests';
-  if (tab === 'requests') { activityPage = 0; activityPageUntil = Math.floor(Date.now() / 1000); $('#activity-page-previous').disabled = true; loadActivityPage(); }
+  if (tab === 'overview') requestAnimationFrame(() => renderActivityChart());
+  if (tab === 'requests') { activityPage = 0; $('#activity-page-previous').disabled = true; loadActivityPage(); }
 }
 $('#activity-view').addEventListener('click', event => {
   const tab = event.target.closest('[data-activity-tab]');
@@ -1513,11 +1595,53 @@ $('.chart-metric-picker').addEventListener('click', event => { const button = ev
 $('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
 $('#activity-chart').addEventListener('focusin', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
 $('#activity-chart').addEventListener('click', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
+new ResizeObserver(entries => {
+  const width = Math.round(entries[0].contentRect.width);
+  if (!width || !activityChartBuckets.length || Math.abs(width - activityChartRenderWidth) < 2) return;
+  cancelAnimationFrame(activityChartResizeFrame); activityChartResizeFrame = requestAnimationFrame(() => renderActivityChart());
+}).observe($('#activity-chart'));
 function activityLogForRow(row) { return (row.closest('#recent-activity-logs') ? activityOverviewLogs : activityLogs)[Number(row.dataset.activityIndex)]; }
 $('#activity-view').addEventListener('click', event => { const row = event.target.closest('.activity-request-row'); if (row) openActivityDetail(activityLogForRow(row)); });
 $('#activity-view').addEventListener('keydown', event => { const row = event.target.closest('.activity-request-row'); if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openActivityDetail(activityLogForRow(row)); } });
-function resetAndLoadActivity() { activityLogsLimit = 0; activityPage = 0; activityPageUntil = 0; loadActivity(); }
-$('#activity-range').addEventListener('change', resetAndLoadActivity); $('#activity-provider-filter').addEventListener('change', resetAndLoadActivity); $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
+function closeActivityRangePicker() { const popover = $('#activity-range-popover'); popover.hidden = true; $('#activity-range-trigger').setAttribute('aria-expanded', 'false'); $('#activity-range-search').value = ''; $$('#activity-range-options button').forEach(button => { button.hidden = false; }); }
+function localDateTimeValue(timestamp) { const date = new Date(timestamp * 1000); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
+function formatCustomRangeLabel(since, until) {
+  const format = value => new Date(value * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  return `${format(since)} – ${format(until)}`;
+}
+function renderActivityRangeOptions() {
+  const selected = activityCustomRange ? '' : $('#activity-range').value;
+  $('#activity-range-options').replaceChildren(...[...$('#activity-range').options].map(option => {
+    const button = document.createElement('button'); button.type = 'button'; button.dataset.seconds = option.value; button.setAttribute('role', 'option'); button.setAttribute('aria-selected', String(option.value === selected));
+    button.innerHTML = `<span>${escapeHtml(option.textContent)}</span>${option.value === selected ? icon('check') : ''}`;
+    button.addEventListener('click', () => { $('#activity-range').value = option.value; $('#activity-range').dispatchEvent(new Event('change')); });
+    return button;
+  }));
+}
+function openActivityRangePicker() {
+  const popover = $('#activity-range-popover'); const range = selectedActivityRange();
+  renderActivityRangeOptions(); $('#activity-range-from').value = localDateTimeValue(range.since); $('#activity-range-to').value = localDateTimeValue(range.pageUntil); $('#activity-range-error').textContent = '';
+  popover.hidden = false; $('#activity-range-trigger').setAttribute('aria-expanded', 'true'); $('#activity-range-search').focus();
+}
+$('#activity-range-trigger').addEventListener('click', () => { if ($('#activity-range-popover').hidden) openActivityRangePicker(); else closeActivityRangePicker(); });
+$('#activity-range-trigger').addEventListener('keydown', event => { if (event.key === 'ArrowDown') { event.preventDefault(); openActivityRangePicker(); $('#activity-range-options button:not([hidden])')?.focus(); } });
+$('#activity-range-search').addEventListener('input', event => { const query = event.target.value.trim().toLowerCase(); $$('#activity-range-options button').forEach(button => { button.hidden = !button.textContent.toLowerCase().includes(query); }); });
+$('#activity-range-search').addEventListener('keydown', event => { if (event.key === 'ArrowDown') { event.preventDefault(); $('#activity-range-options button:not([hidden])')?.focus(); } });
+$('#activity-range-options').addEventListener('keydown', event => {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return; event.preventDefault(); const buttons = $$('#activity-range-options button:not([hidden])'); const index = buttons.indexOf(event.target); const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length; buttons[next]?.focus();
+});
+$('#activity-range').addEventListener('change', () => { activityCustomRange = null; const option = $('#activity-range').selectedOptions[0]; $('#activity-range-label').textContent = option?.textContent || 'Select range'; closeActivityRangePicker(); renderActivityRangeOptions(); resetAndLoadActivity(); });
+$('#apply-activity-range').addEventListener('click', () => {
+  const since = Math.floor(new Date($('#activity-range-from').value).getTime() / 1000); const until = Math.floor(new Date($('#activity-range-to').value).getTime() / 1000); const error = $('#activity-range-error');
+  if (!Number.isFinite(since) || !Number.isFinite(until)) { error.textContent = 'Choose both a start and end time.'; return; }
+  if (until <= since) { error.textContent = 'End time must be later than start time.'; return; }
+  if (until - since < 60) { error.textContent = 'Choose a range of at least one minute.'; return; }
+  activityCustomRange = {since, until}; $('#activity-range-label').textContent = formatCustomRangeLabel(since, until); closeActivityRangePicker(); renderActivityRangeOptions(); resetAndLoadActivity();
+});
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('#activity-range-popover').hidden) { closeActivityRangePicker(); $('#activity-range-trigger').focus(); } });
+document.addEventListener('click', event => { if (!event.target.closest('.activity-range-picker')) closeActivityRangePicker(); });
+function resetAndLoadActivity() { activityLogsLimit = 0; activityPage = 0; activityPageSince = 0; activityPageUntil = 0; loadActivity(); }
+$('#activity-provider-filter').addEventListener('change', resetAndLoadActivity); $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
 const activityDataDialog = $('#activity-data-dialog');
 let activityImportBytes = null;
 function formatBytes(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB']; let value = bytes / 1024; let unit = units.shift(); while (value >= 1024 && units.length) { value /= 1024; unit = units.shift(); } return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`; }
@@ -1592,21 +1716,24 @@ $('.home-manage-providers').addEventListener('click', () => openHomeView('provid
 async function loadDashboard() {
   if (dashboardLoadPromise) return dashboardLoadPromise;
   dashboardLoadPromise = (async () => {
-    const since = Math.floor(Date.now() / 1000) - 86400;
-    const stats = await fetch(`/admin/activity/stats?since=${since}&buckets=24`).then(response => response.json());
-    $('#home-requests').textContent = compactNumber(stats.requests); $('#home-input').textContent = compactNumber(stats.input_tokens); $('#home-output').textContent = compactNumber(stats.output_tokens); $('#home-cached').textContent = compactNumber(stats.cached_tokens);
+    const now = Math.floor(Date.now() / 1000); const plan = activityBucketPlan(86400, now); const since = plan.until - 86400;
+    const stats = await fetch(`/admin/activity/stats?since=${since}&until=${plan.until}&buckets=${plan.bucketCount}`).then(response => response.json());
+    const errors = stats.requests - stats.successful; const successRate = stats.requests ? stats.successful * 100 / stats.requests : 0; const totalTokens = stats.input_tokens + stats.output_tokens; const cacheRate = stats.input_tokens ? stats.cached_tokens * 100 / stats.input_tokens : 0;
+    $('#home-requests').textContent = compactNumber(stats.requests); $('#home-success').textContent = `${successRate.toFixed(1)}%`; $('#home-errors').textContent = errors ? `${errors.toLocaleString()} error${errors === 1 ? '' : 's'}` : 'No errors'; $('#home-tokens').textContent = compactNumber(totalTokens); $('#home-token-detail').textContent = `${compactNumber(stats.input_tokens)} input · ${compactNumber(stats.output_tokens)} output`; $('#home-cache-rate').textContent = `${cacheRate.toFixed(1)}%`; $('#home-cache-detail').textContent = `${compactNumber(stats.cached_tokens)} cached tokens`;
+    $('#home-health-success').textContent = stats.requests ? `${successRate.toFixed(1)}%` : 'No traffic'; $('#home-health-latency').textContent = stats.requests ? formatDuration(Math.round(stats.latency_ms / stats.requests)) : 'No traffic'; $('#home-provider-health').textContent = providers.length ? `${providers.length} connected` : 'Not configured';
     $('#home-updated').textContent = `Updated ${new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`;
     $('#home-provider-summary').textContent = `${providers.length} provider${providers.length === 1 ? '' : 's'} · ${providers.reduce((sum, provider) => sum + provider.discovered_models.length, 0).toLocaleString()} discovered models`;
     renderHomeTraffic(stats.buckets);
-    const providerItems = providers.map(provider => {
-      const item = document.createElement('button'); item.className = 'home-provider';
-      const credentials = credentialCount(provider); const status = provider.model_discovery_error ? 'Discovery issue' : provider.models_discovered_at ? 'Catalog ready' : 'Discovering…';
-      item.innerHTML = `<span class="home-provider-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="home-provider-main"><strong>${escapeHtml(provider.name)}</strong><small>${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentials} credential${credentials === 1 ? '' : 's'}</small></span><span class="home-provider-meta"><strong>${provider.discovered_models.length.toLocaleString()}</strong><small>${escapeHtml(status)}</small></span>`;
-      item.addEventListener('click', () => { selectedProviderId = provider.id; showView('providers'); }); return item;
+    const providerItems = stats.by_provider.slice(0, 5).map(providerStat => {
+      const provider = providers.find(item => item.id === providerStat.name); const item = document.createElement('button'); item.className = 'home-provider'; const success = providerStat.requests ? (providerStat.requests - providerStat.errors) * 100 / providerStat.requests : 0;
+      item.innerHTML = `<span class="home-provider-mark">${escapeHtml((provider?.name || providerStat.name).slice(0, 1).toUpperCase())}</span><span class="home-provider-main"><strong>${escapeHtml(provider?.name || providerStat.name)}</strong><small>${compactNumber(providerStat.input_tokens + providerStat.output_tokens)} tokens · ${success.toFixed(1)}% success</small></span><span class="home-provider-meta"><strong>${providerStat.requests.toLocaleString()}</strong><small>requests</small></span>`;
+      item.addEventListener('click', () => { selectedProviderId = providerStat.name; showView('providers'); }); return item;
     });
     if (providerItems.length) $('#home-providers').replaceChildren(...providerItems);
-    else $('#home-providers').innerHTML = `<div class="home-providers-empty">${icon('provider')}<strong>No providers connected</strong><p>Add an upstream Endpoint to start routing requests.</p><button class="button secondary" type="button">Add provider</button></div>`;
-    $('#home-providers .home-providers-empty .button')?.addEventListener('click', openProviderDialog);
+    else $('#home-providers').innerHTML = `<div class="home-providers-empty">${icon('provider')}<strong>No provider traffic</strong><p>Connect an upstream Endpoint or send a request to populate this view.</p><button class="button secondary" type="button">Manage providers</button></div>`;
+    $('#home-providers .home-providers-empty .button')?.addEventListener('click', () => openHomeView('providers'));
+    const keyItems = (stats.by_api_key || []).slice(0, 4);
+    $('#home-api-keys').innerHTML = keyItems.length ? keyItems.map(item => `<div class="home-key"><span>${icon('key')}</span><div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.prefix || 'Unattributed')}</code></div><b>${item.requests.toLocaleString()}</b></div>`).join('') : '<div class="home-keys-empty">No API key traffic in the last 24 hours.</div>';
   })().finally(() => { dashboardLoadPromise = null; });
   return dashboardLoadPromise;
 }
@@ -1666,13 +1793,27 @@ function renderCaptureSelectors() {
   endpointSelect.innerHTML = '<option value="">Choose an Endpoint</option>' + (provider?.endpoints || []).map(endpoint => `<option value="${escapeHtml(endpoint.id)}">${escapeHtml(endpoint.id)} · ${escapeHtml(formatType(endpoint.api_type))}</option>`).join('');
   endpointSelect.value = selectedEndpoint || '';
 }
+function renderCaptureScopeSummary() {
+  const form = $('#capture-form'); const provider = form.elements.provider_id.selectedOptions[0]?.textContent || 'a Provider'; const endpoint = form.elements.endpoint_id.value; const model = form.elements.model.value.trim(); const count = Math.max(1, Number(form.elements.remaining.value) || 1); const window = form.elements.timeout.selectedOptions[0]?.textContent || 'the selected window';
+  $('#capture-scope-summary').textContent = endpoint ? `Capture the next ${count} matching request${count === 1 ? '' : 's'} sent through ${provider} / ${endpoint}, for ${model ? `exact model ${model}` : 'all models on this Endpoint'}, for up to ${window}.` : 'Choose a Provider and Endpoint to define where capture applies.';
+}
+function hydrateCaptureForm(config) {
+  if (captureFormInitialized) return;
+  const form = $('#capture-form'); form.elements.model.value = config.model || ''; if (config.remaining > 0) form.elements.remaining.value = config.remaining; form.elements.body_limit.value = String(config.body_limit); form.elements.retention_days.value = String(config.retention_days); form.elements.redacted_headers.value = (config.redacted_headers || []).join(', '); captureFormInitialized = true;
+}
+function captureStatus(capture) {
+  const failed = capture.status == null || capture.status >= 400 || capture.outcome !== 'complete'; const label = capture.status == null ? 'No response' : String(capture.status); const detail = capture.truncated ? 'Truncated' : capture.outcome !== 'complete' ? capture.outcome.replaceAll('_', ' ') : '';
+  return `<span class="capture-result${failed ? ' failed' : ''}"><span><i></i>${escapeHtml(label)}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span>`;
+}
 function renderTrafficCapture() {
   if (!trafficCaptureStatus) return;
-  renderCaptureSelectors(); const config = trafficCaptureStatus.config; const active = config.active && config.remaining > 0;
-  $('#capture-state').textContent = active ? `Capturing next ${config.remaining} matching request${config.remaining === 1 ? '' : 's'}` : 'Capture stopped';
+  renderCaptureSelectors(); const config = trafficCaptureStatus.config; hydrateCaptureForm(config); const active = config.active && config.remaining > 0; const form = $('#capture-form');
+  $('#capture-state').textContent = active ? 'Capture active' : 'Capture stopped'; $('#capture-active-summary').hidden = !active;
+  if (active) { $('#capture-active-title').textContent = `Capturing next ${config.remaining} matching request${config.remaining === 1 ? '' : 's'}`; $('#capture-active-detail').textContent = `${config.provider_id} / ${config.endpoint_id} · ${config.model || 'all models'} · stops ${new Date(config.expires_at * 1000).toLocaleString()}`; }
+  [...form.elements].forEach(element => { element.disabled = active; }); form.querySelector('[type="submit"]').hidden = active; form.classList.toggle('capture-form-locked', active); renderCaptureScopeSummary();
   $('#stop-capture').hidden = !active; $('#capture-count').textContent = trafficCaptureStatus.retained; $('#capture-dropped').textContent = trafficCaptureStatus.dropped;
-  $('#captures-empty').hidden = trafficCaptures.length > 0; $('#delete-all-captures').disabled = !trafficCaptures.length;
-  $('#captures-list').innerHTML = trafficCaptures.map(capture => `<button class="capture-row" type="button" data-capture-id="${escapeHtml(capture.request_id)}"><span><strong>${escapeHtml(capture.public_model)}</strong><code>${escapeHtml(capture.request_id)}</code></span><span>${escapeHtml(capture.provider_id)} → ${escapeHtml(capture.endpoint_id)}</span><span>${capture.status || '—'}</span><span>${Math.ceil(capture.bytes / 1024).toLocaleString()} KiB${capture.truncated ? ' · truncated' : ''}</span><small>${new Date(capture.timestamp * 1000).toLocaleString()}</small></button>`).join('');
+  $('#captures-empty').hidden = trafficCaptures.length > 0; $('#capture-list-head').hidden = trafficCaptures.length === 0; $('#delete-all-captures').disabled = !trafficCaptures.length;
+  $('#captures-list').innerHTML = trafficCaptures.map(capture => { const failed = capture.status == null || capture.status >= 400 || capture.outcome !== 'complete' || capture.truncated; return `<button class="capture-row${failed ? ' capture-row-attention' : ''}" type="button" data-capture-id="${escapeHtml(capture.request_id)}"><span><strong>${escapeHtml(capture.public_model)}</strong><code>${escapeHtml(capture.request_id)}</code><small>${new Date(capture.timestamp * 1000).toLocaleString()}</small></span><span>${escapeHtml(capture.provider_id)} → ${escapeHtml(capture.endpoint_id)}</span>${captureStatus(capture)}<span title="Upstream duration"><strong>${capture.duration_ms == null ? '—' : escapeHtml(formatDuration(capture.duration_ms))}</strong><small>${Math.ceil(capture.bytes / 1024).toLocaleString()} KiB</small></span></button>`; }).join('');
 }
 async function loadTrafficCapture() {
   const [statusResponse, capturesResponse] = await Promise.all([fetch('/admin/extensions/traffic-capture/status'), fetch('/admin/extensions/traffic-capture/captures')]);
@@ -1685,7 +1826,9 @@ $('#refresh-captures').addEventListener('click', async event => {
   try { await loadTrafficCapture(); } finally { button.disabled = false; }
 });
 $('#back-to-extensions').addEventListener('click', () => showView('extensions'));
-$('#capture-form').elements.provider_id.addEventListener('change', renderCaptureSelectors);
+$('#capture-form').elements.provider_id.addEventListener('change', () => { renderCaptureSelectors(); renderCaptureScopeSummary(); });
+$('#capture-form').addEventListener('input', renderCaptureScopeSummary);
+$('#capture-form').addEventListener('change', renderCaptureScopeSummary);
 $('#capture-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.currentTarget); $('#capture-error').textContent = '';
   const response = await fetch('/admin/extensions/traffic-capture/status', {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({active: true, remaining: Number(data.get('remaining')), expires_at: Math.floor(Date.now() / 1000) + Number(data.get('timeout')), provider_id: data.get('provider_id'), endpoint_id: data.get('endpoint_id'), model: data.get('model'), body_limit: Number(data.get('body_limit')), retention_days: Number(data.get('retention_days')), redacted_headers: String(data.get('redacted_headers')).split(',').map(value => value.trim()).filter(Boolean)})});
@@ -1694,22 +1837,130 @@ $('#capture-form').addEventListener('submit', async event => {
 $('#stop-capture').addEventListener('click', async () => { const response = await fetch('/admin/extensions/traffic-capture/stop', {method: 'POST'}); if (response.ok) { trafficCaptureStatus = await response.json(); renderTrafficCapture(); } });
 $('#delete-all-captures').addEventListener('click', async () => { if (!confirm('Delete all captured request and response content?')) return; const response = await fetch('/admin/extensions/traffic-capture/captures', {method: 'DELETE'}); if (response.ok) loadTrafficCapture(); });
 function captureBytes(bytes) { const array = Uint8Array.from(bytes || []); return new TextDecoder().decode(array); }
+function parseCaptureSse(body) {
+  const events = []; let done = false; let malformed = false;
+  body.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split(/\n\n+/).forEach(frame => {
+    const data = [];
+    frame.split('\n').forEach(line => {
+      if (!line.startsWith('data:')) return;
+      let value = line.slice(5); if (value.startsWith(' ')) value = value.slice(1); data.push(value);
+    });
+    if (!data.length) return;
+    const payload = data.join('\n');
+    if (payload === '[DONE]') { done = true; return; }
+    try { events.push(JSON.parse(payload)); } catch { malformed = true; }
+  });
+  return {events, done, malformed};
+}
+function assembleChatCompletion(parsed) {
+  const first = parsed.events[0] || {}; const choices = new Map(); let usage = null;
+  parsed.events.forEach(chunk => {
+    if (chunk.usage) usage = chunk.usage;
+    (chunk.choices || []).forEach(part => {
+      const index = part.index || 0; const choice = choices.get(index) || {index, message: {role: 'assistant', content: ''}, finish_reason: null}; const delta = part.delta || {};
+      if (delta.role) choice.message.role = delta.role;
+      if (typeof delta.content === 'string') choice.message.content += delta.content;
+      if (typeof delta.refusal === 'string') choice.message.refusal = (choice.message.refusal || '') + delta.refusal;
+      (delta.tool_calls || []).forEach(call => {
+        choice.message.tool_calls ||= []; const toolIndex = call.index || 0; const tool = choice.message.tool_calls[toolIndex] ||= {id: '', type: 'function', function: {name: '', arguments: ''}};
+        if (call.id) tool.id = call.id; if (call.type) tool.type = call.type;
+        if (call.function?.name) tool.function.name += call.function.name; if (call.function?.arguments) tool.function.arguments += call.function.arguments;
+      });
+      if (part.finish_reason !== undefined && part.finish_reason !== null) choice.finish_reason = part.finish_reason;
+      if (part.logprobs !== undefined) choice.logprobs = part.logprobs; choices.set(index, choice);
+    });
+  });
+  if (!parsed.done && ![...choices.values()].some(choice => choice.finish_reason !== null)) return null;
+  const result = {id: first.id || '', object: 'chat.completion', created: first.created || 0, model: first.model || '', choices: [...choices.values()].sort((a, b) => a.index - b.index)};
+  if (usage) result.usage = usage; if (first.system_fingerprint !== undefined) result.system_fingerprint = first.system_fingerprint; if (first.service_tier !== undefined) result.service_tier = first.service_tier;
+  return result;
+}
+function assembleAnthropicMessage(parsed) {
+  const start = parsed.events.find(event => event.type === 'message_start')?.message; const stopped = parsed.events.some(event => event.type === 'message_stop');
+  if (!start || !stopped) return null;
+  const message = JSON.parse(JSON.stringify(start)); message.content ||= []; const partialInputs = new Map();
+  parsed.events.forEach(event => {
+    const index = event.index || 0;
+    if (event.type === 'content_block_start') message.content[index] = JSON.parse(JSON.stringify(event.content_block));
+    if (event.type === 'content_block_delta') {
+      const block = message.content[index] ||= {};
+      if (event.delta?.type === 'text_delta') block.text = (block.text || '') + (event.delta.text || '');
+      if (event.delta?.type === 'thinking_delta') block.thinking = (block.thinking || '') + (event.delta.thinking || '');
+      if (event.delta?.type === 'signature_delta') block.signature = (block.signature || '') + (event.delta.signature || '');
+      if (event.delta?.type === 'input_json_delta') partialInputs.set(index, (partialInputs.get(index) || '') + (event.delta.partial_json || ''));
+    }
+    if (event.type === 'message_delta') { Object.assign(message, event.delta || {}); message.usage = {...(message.usage || {}), ...(event.usage || {})}; }
+  });
+  partialInputs.forEach((input, index) => { try { message.content[index].input = JSON.parse(input); } catch { message.content[index].input = input; } });
+  return message;
+}
+function assembleCaptureResponse(protocol, parsed) {
+  if (parsed.malformed) return null;
+  if (protocol === 'openai_responses') {
+    const terminal = [...parsed.events].reverse().find(event => ['response.completed', 'response.incomplete', 'response.failed'].includes(event.type) && event.response);
+    return terminal?.response || null;
+  }
+  if (protocol === 'openai_chat_completions') return assembleChatCompletion(parsed);
+  if (protocol === 'anthropic_messages') return assembleAnthropicMessage(parsed);
+  return null;
+}
+function highlightJson(text) {
+  const pattern = /("(?:\\.|[^"\\])*")(?=\s*:)|"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b/g; let html = ''; let offset = 0;
+  for (const match of text.matchAll(pattern)) {
+    html += escapeHtml(text.slice(offset, match.index)); const token = match[0]; const kind = token.startsWith('"') ? (text.slice(match.index + token.length).match(/^\s*:/) ? 'key' : 'string') : /^(true|false)$/.test(token) ? 'boolean' : token === 'null' ? 'null' : 'number';
+    html += `<span class="syntax-${kind}">${escapeHtml(token)}</span>`; offset = match.index + token.length;
+  }
+  return html + escapeHtml(text.slice(offset));
+}
+function highlightSse(text) {
+  return text.split(/(\r?\n)/).map(line => {
+    if (/^\r?\n$/.test(line)) return line;
+    const match = line.match(/^(event|data|id|retry):( ?)(.*)$/);
+    if (!match) return escapeHtml(line);
+    const value = match[1] === 'data' ? highlightJson(match[3]) : `<span class="syntax-string">${escapeHtml(match[3])}</span>`;
+    return `<span class="syntax-sse">${match[1]}</span>:${match[2]}${value}`;
+  }).join('');
+}
+function resetCaptureDetailScroll() {
+  const body = $('#capture-detail-body'); const headers = $('#capture-detail-headers'); const detail = $('.capture-detail-body');
+  body.scrollTop = 0; body.scrollLeft = 0; headers.scrollTop = 0; headers.scrollLeft = 0; detail.scrollTop = 0; detail.scrollLeft = 0;
+}
+function renderCaptureBodyMode() {
+  const assembled = captureDetailBodyMode === 'assembled'; const display = assembled ? captureDetailAssembled : captureDetailBody;
+  $('#capture-detail-body').innerHTML = assembled ? highlightJson(display) : captureDetailIsSse ? highlightSse(display) : (() => { try { return highlightJson(JSON.stringify(JSON.parse(display), null, 2)); } catch { return escapeHtml(display || '(empty)'); } })();
+  $$('#capture-body-modes button').forEach(button => { const active = button.dataset.captureBodyMode === captureDetailBodyMode; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
+  $('#capture-detail-body').scrollTop = 0; $('#capture-detail-body').scrollLeft = 0; $('.capture-detail-body').scrollTop = 0;
+}
+function renderCaptureBody(body, protocol, canAssemble) {
+  captureDetailBody = body; const parsed = parseCaptureSse(body); captureDetailIsSse = parsed.events.length > 0; const assembled = canAssemble && captureDetailIsSse ? assembleCaptureResponse(protocol, parsed) : null;
+  captureDetailAssembled = assembled ? JSON.stringify(assembled, null, 2) : ''; $('#capture-body-modes').hidden = parsed.events.length === 0;
+  $('#capture-body-modes [data-capture-body-mode="assembled"]').disabled = !captureDetailAssembled;
+  const note = $('#capture-assembly-note'); note.textContent = parsed.events.length && !captureDetailAssembled ? 'A complete non-streaming response cannot be assembled because the capture is truncated, malformed, or has no terminal event.' : ''; note.hidden = !note.textContent;
+  captureDetailBodyMode = captureDetailAssembled ? 'assembled' : 'raw'; renderCaptureBodyMode();
+}
 function renderCaptureDetail(direction) {
-  const response = direction === 'response'; $$('.capture-direction-tabs button').forEach(button => button.classList.toggle('active', button.dataset.captureDirection === direction));
+  const response = direction === 'response'; $$('.capture-direction-tabs button').forEach(button => { const active = button.dataset.captureDirection === direction; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
   $('#capture-detail-headers-title').textContent = `${response ? 'Received from upstream' : 'Sent to upstream'} · Headers`; $('#capture-detail-body-title').textContent = `${response ? 'Received from upstream' : 'Sent to upstream'} · Body`;
   const headers = response ? selectedCapture.response_headers : selectedCapture.request_headers; const body = captureBytes(response ? selectedCapture.response_body : selectedCapture.request_body); const truncated = response ? selectedCapture.response_truncated : selectedCapture.request_truncated;
-  $('#capture-detail-headers').textContent = headers.map(header => `${header.name}: ${header.value}`).join('\n') || '(none)'; $('#capture-detail-truncated').hidden = !truncated;
-  try { $('#capture-detail-body').textContent = JSON.stringify(JSON.parse(body), null, 2); } catch { $('#capture-detail-body').textContent = body || '(empty)'; }
+  $('#capture-detail-headers').innerHTML = headers.map(header => `<span class="syntax-key">${escapeHtml(header.name)}</span>: ${escapeHtml(header.value)}`).join('\n') || '(none)'; $('#capture-detail-truncated').hidden = !truncated; renderCaptureBody(body, selectedCapture.upstream_protocol, response && !truncated && selectedCapture.outcome === 'complete'); resetCaptureDetailScroll();
+}
+async function copyCaptureText(button, text) {
+  await navigator.clipboard.writeText(text); const label = button.querySelector('span'); const original = label.textContent; label.textContent = 'Copied'; button.classList.add('copied');
+  setTimeout(() => { label.textContent = original; button.classList.remove('copied'); }, 1200);
 }
 async function openCaptureDetail(requestId) {
   const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(requestId)}`); if (!response.ok) return;
-  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome}`; renderCaptureDetail('request'); $('#traffic-capture-detail-dialog').showModal();
+  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} upstream`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
 }
 $('#captures-list').addEventListener('click', event => { const row = event.target.closest('[data-capture-id]'); if (row) openCaptureDetail(row.dataset.captureId); });
 $$('.capture-direction-tabs button').forEach(button => button.addEventListener('click', () => renderCaptureDetail(button.dataset.captureDirection)));
+$$('#capture-body-modes button').forEach(button => button.addEventListener('click', () => { captureDetailBodyMode = button.dataset.captureBodyMode; renderCaptureBodyMode(); }));
+$$('.capture-copy-button').forEach(button => button.addEventListener('click', () => {
+  const text = button.dataset.captureCopy === 'headers' ? $('#capture-detail-headers').textContent : captureDetailBodyMode === 'assembled' ? captureDetailAssembled : captureDetailBody;
+  copyCaptureText(button, text);
+}));
 $$('.close-capture-detail').forEach(button => button.addEventListener('click', () => $('#traffic-capture-detail-dialog').close()));
 $('#delete-capture').addEventListener('click', async () => { if (!selectedCapture) return; const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(selectedCapture.request_id)}`, {method: 'DELETE'}); if (response.ok) { $('#traffic-capture-detail-dialog').close(); loadTrafficCapture(); } });
-$('#activity-capture-link button').addEventListener('click', async event => { const id = event.currentTarget.dataset.requestId; const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(id)}`); if (response.ok) { selectedCapture = await response.json(); $('#activity-detail-dialog').close(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome}`; renderCaptureDetail('request'); $('#traffic-capture-detail-dialog').showModal(); } else window.alert('This request was not captured or its capture has expired.'); });
 
 function formatType(type) { return type === 'anthropic' ? 'Anthropic Messages' : type === 'openai_codex' ? 'OpenAI subscription' : type === 'openai_chat_completions' ? 'OpenAI Chat Completions' : type === 'openai_responses' ? 'OpenAI Responses' : 'OpenAI compatible'; }
 function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value); return node.innerHTML; }
