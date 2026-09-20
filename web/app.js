@@ -26,6 +26,9 @@ let activityPageUntil = 0;
 let activityCustomRange = null;
 let activitySearchTimer = null;
 let dashboardLoadPromise = null;
+let homeTrafficBuckets = [];
+let homeTrafficBucketSize = 0;
+let homeTrafficResizeFrame = 0;
 let trafficCaptureStatus = null;
 let trafficCaptures = [];
 let captureFormInitialized = false;
@@ -1704,10 +1707,36 @@ $('#save-activity-retention').addEventListener('click', async () => {
   if (!response.ok) await showApiError(response, $('#activity-retention-error')); else { await loadActivityStorage(); await loadActivity(); }
   button.disabled = false; button.textContent = 'Save retention';
 });
-function renderHomeTraffic(buckets) {
-  const max = Math.max(...buckets.map(bucket => bucket.requests), 1); const requests = buckets.reduce((total, bucket) => total + bucket.requests, 0);
-  $('#home-traffic-chart').innerHTML = `<div class="home-chart-grid"><i></i><i></i><i></i></div><div class="home-chart-bars">${buckets.map((bucket, index) => { const hour = new Date(bucket.start * 1000); const label = index % 6 === 0 || index === buckets.length - 1 ? hour.toLocaleTimeString([], {hour: '2-digit'}) : ''; return `<div class="home-chart-column" title="${bucket.requests} request${bucket.requests === 1 ? '' : 's'}"><span style="height:${bucket.requests * 100 / max}%;animation-delay:${index * 16}ms"></span><small>${label}</small></div>`; }).join('')}</div>${requests ? '' : '<p class="home-chart-empty">No requests in the last 24 hours</p>'}`;
+function aggregateHomeTraffic(buckets, groupSize) {
+  if (groupSize === 1) return buckets;
+  const aggregated = [];
+  for (let index = 0; index < buckets.length; index += groupSize) {
+    const group = buckets.slice(index, index + groupSize);
+    aggregated.push({...group[0], requests: group.reduce((total, bucket) => total + bucket.requests, 0)});
+  }
+  return aggregated;
 }
+function homeTrafficPlan(width, bucketCount) {
+  const visibleBuckets = width >= 768 ? 48 : width >= 400 ? 24 : 12;
+  const groupSize = Math.max(1, Math.ceil(bucketCount / visibleBuckets));
+  return {groupSize, intervalMinutes: groupSize * 30};
+}
+function renderHomeTraffic(buckets) {
+  homeTrafficBuckets = buckets;
+  const chart = $('#home-traffic-chart');
+  const {groupSize, intervalMinutes} = homeTrafficPlan(chart.clientWidth, buckets.length);
+  const visibleBuckets = aggregateHomeTraffic(buckets, groupSize);
+  homeTrafficBucketSize = groupSize;
+  const max = Math.max(...visibleBuckets.map(bucket => bucket.requests), 1); const requests = visibleBuckets.reduce((total, bucket) => total + bucket.requests, 0);
+  const intervalLabel = intervalMinutes < 60 ? `${intervalMinutes}-minute` : intervalMinutes === 60 ? 'Hourly' : `${intervalMinutes / 60}-hour`;
+  $('#home-traffic-description').textContent = `${intervalLabel} traffic intervals reveal changes in demand`;
+  chart.innerHTML = `<div class="home-chart-grid"><i></i><i></i><i></i></div><div class="home-chart-bars">${visibleBuckets.map((bucket, index) => { const start = new Date(bucket.start * 1000); const end = new Date((bucket.start + intervalMinutes * 60) * 1000); const label = index % Math.max(1, Math.ceil(visibleBuckets.length / 6)) === 0 || index === visibleBuckets.length - 1 ? start.toLocaleTimeString([], {hour: '2-digit'}) : ''; const range = `${start.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}–${end.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}`; return `<div class="home-chart-column" title="${range}: ${bucket.requests} request${bucket.requests === 1 ? '' : 's'}"><span style="height:${bucket.requests * 100 / max}%;animation-delay:${index * 16}ms"></span><small>${label}</small></div>`; }).join('')}</div>${requests ? '' : '<p class="home-chart-empty">No requests in the last 24 hours</p>'}`;
+}
+new ResizeObserver(entries => {
+  const width = Math.round(entries[0].contentRect.width);
+  if (!width || !homeTrafficBuckets.length || homeTrafficPlan(width, homeTrafficBuckets.length).groupSize === homeTrafficBucketSize) return;
+  cancelAnimationFrame(homeTrafficResizeFrame); homeTrafficResizeFrame = requestAnimationFrame(() => renderHomeTraffic(homeTrafficBuckets));
+}).observe($('#home-traffic-chart'));
 function openHomeView(name) { showView(name); }
 $('#home-open-activity').addEventListener('click', () => openHomeView('activity'));
 $('.home-explore-activity').addEventListener('click', () => openHomeView('activity'));

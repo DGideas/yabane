@@ -310,6 +310,25 @@ for (const project of projects) {
     if (!(await homeCommand.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its operational header or traffic visualization`);
     if (await page.locator('.home-health-strip > div').count() !== 4) throw new Error(`${project.name}: Home does not summarize runtime, provider, success, and latency health`);
     if (!(await page.locator('.home-command-actions .button-icon').first().isVisible()) || !(await page.locator('#home-api-keys').isVisible())) throw new Error(`${project.name}: Home omits command icons or Gateway API key traffic`);
+    const homeChartResult = await page.evaluate(() => {
+      const start = Math.floor(Date.now() / 1000) - 86400;
+      renderHomeTraffic(Array.from({length: 48}, (_, index) => ({start: start + index * 1800, requests: 1})));
+      const chart = document.querySelector('#home-traffic-chart');
+      const width = chart.clientWidth;
+      const expectedColumns = width >= 768 ? 48 : width >= 400 ? 24 : 12;
+      const columns = [...chart.querySelectorAll('.home-chart-column')];
+      return {
+        width,
+        expectedColumns,
+        columns: columns.length,
+        representedRequests: columns.reduce((total, column) => total + Number(column.title.match(/: (\d+) request/)?.[1] || 0), 0),
+        description: document.querySelector('#home-traffic-description').textContent,
+      };
+    });
+    if (homeChartResult.columns !== homeChartResult.expectedColumns) throw new Error(`${project.name}: ${homeChartResult.width}px Home chart renders ${homeChartResult.columns} bars instead of ${homeChartResult.expectedColumns}`);
+    if (homeChartResult.representedRequests !== 48) throw new Error(`${project.name}: responsive Home chart aggregation changes the represented request total`);
+    const expectedInterval = homeChartResult.expectedColumns === 48 ? '30-minute' : homeChartResult.expectedColumns === 24 ? 'Hourly' : '2-hour';
+    if (!homeChartResult.description.startsWith(expectedInterval)) throw new Error(`${project.name}: responsive Home chart does not describe its ${expectedInterval} intervals`);
 
     if (testLiveRefresh) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
@@ -579,7 +598,8 @@ for (const project of projects) {
       document.querySelector('#activity-range-from').value = local(from); document.querySelector('#activity-range-to').value = local(to);
     });
     await page.locator('#apply-activity-range').click(); await customStats;
-    if (await page.locator('#activity-chart .chart-column').count() !== 36 || !(await page.locator('#activity-range-label').textContent()).includes('–')) throw new Error(`${project.name}: custom six-hour Activity range is not applied at ten-minute resolution`);
+    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 36);
+    if (!(await page.locator('#activity-range-label').textContent()).includes('–')) throw new Error(`${project.name}: custom six-hour Activity range is not applied at ten-minute resolution`);
     const presetStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
     await page.locator('#activity-range').evaluate(select => select.dispatchEvent(new Event('change'))); await presetStats;
     if (testLiveRefresh) {
