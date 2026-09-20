@@ -19,7 +19,8 @@ const CONFIG_FILE: &str = "data/extensions/traffic-capture/config.json";
 const CAPTURES_FILE: &str = "data/extensions/traffic-capture/captures.json";
 const DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
 const DEFAULT_RETENTION_DAYS: u32 = 1;
-const MAX_CAPTURES: usize = 100;
+const MAX_CAPTURE_REQUESTS: u32 = 100;
+const MAX_CAPTURES: usize = MAX_CAPTURE_REQUESTS as usize;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CaptureConfig {
@@ -106,6 +107,8 @@ pub struct TrafficCapture {
     config: Arc<std::sync::RwLock<CaptureConfig>>,
     captures: Arc<RwLock<Vec<CaptureRecord>>>,
     sender: tokio::sync::mpsc::Sender<CaptureMessage>,
+    config_sender: tokio::sync::mpsc::Sender<ConfigMessage>,
+    pending_config: Arc<std::sync::Mutex<Option<(u64, CaptureConfig)>>>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
     config_revision: Arc<std::sync::atomic::AtomicU64>,
     config_persistence: Arc<tokio::sync::Mutex<()>>,
@@ -164,10 +167,34 @@ impl TrafficCapture {
                 }
             }
         });
+        let (config_sender, mut config_receiver) = tokio::sync::mpsc::channel::<ConfigMessage>(32);
+        let pending_config = Arc::new(std::sync::Mutex::new(None));
+        let writer_pending_config = pending_config.clone();
+        let writer_config_path = config_path.clone();
+        let writer_config_dropped = dropped.clone();
+        let writer_config_revision = config_revision.clone();
+        let writer_config_persistence = config_persistence.clone();
+        tokio::spawn(async move {
+            while let Some(message) = config_receiver.recv().await {
+                persist_pending_config(
+                    &writer_pending_config,
+                    &writer_config_path,
+                    &writer_config_revision,
+                    &writer_config_persistence,
+                    &writer_config_dropped,
+                )
+                .await;
+                if let ConfigMessage::Flush(completed) = message {
+                    let _ = completed.send(());
+                }
+            }
+        });
         Ok(Self {
             config,
             captures,
             sender,
+            config_sender,
+            pending_config,
             dropped,
             config_revision,
             config_persistence,
@@ -193,8 +220,10 @@ impl TrafficCapture {
     }
 
     pub async fn configure(&self, mut config: CaptureConfig) -> Result<CaptureStatus, String> {
-        if config.active && config.remaining == 0 {
-            return Err("Capture count must be at least one".to_owned());
+        if config.active && !(1..=MAX_CAPTURE_REQUESTS).contains(&config.remaining) {
+            return Err(format!(
+                "Capture count must be between 1 and {MAX_CAPTURE_REQUESTS}"
+            ));
         }
         if config.active && config.expires_at.is_none_or(|expiry| expiry <= now()) {
             return Err("Active capture expiry must be in the future".to_owned());
@@ -222,12 +251,15 @@ impl TrafficCapture {
         config.redacted_headers.sort();
         let _persistence = self.config_persistence.lock().await;
         persist_json(&self.config_path, &config).await?;
-        *self
-            .config
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-        self.config_revision
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut current_config = self
+                .config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *current_config = config;
+            self.config_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         drop(_persistence);
         Ok(self.status().await)
     }
@@ -312,52 +344,62 @@ impl TrafficCapture {
     }
 
     async fn flush_pending(&self) -> Result<(), String> {
-        let (completed, flushed) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(CaptureMessage::Flush(completed))
-            .await
-            .map_err(|_| "Traffic Capture writer stopped before flush".to_owned())?;
-        flushed
-            .await
-            .map_err(|_| "Traffic Capture writer stopped during flush".to_owned())
+        let captures = async {
+            let (completed, flushed) = tokio::sync::oneshot::channel();
+            self.sender
+                .send(CaptureMessage::Flush(completed))
+                .await
+                .map_err(|_| "Traffic Capture record writer stopped before flush".to_owned())?;
+            flushed
+                .await
+                .map_err(|_| "Traffic Capture record writer stopped during flush".to_owned())
+        };
+        let config = async {
+            let (completed, flushed) = tokio::sync::oneshot::channel();
+            self.config_sender
+                .send(ConfigMessage::Flush(completed))
+                .await
+                .map_err(|_| "Traffic Capture config writer stopped before flush".to_owned())?;
+            flushed
+                .await
+                .map_err(|_| "Traffic Capture config writer stopped during flush".to_owned())
+        };
+        let (captures, config) = tokio::join!(captures, config);
+        captures.and(config)
     }
 
     fn expire_session(&self, current: u64) {
-        let stopped = {
-            let mut config = self
-                .config
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if config.active && config.expires_at.is_some_and(|expiry| expiry <= current) {
-                config.active = false;
-                config.remaining = 0;
-                Some(config.clone())
-            } else {
-                None
-            }
-        };
-        if let Some(config) = stopped {
-            self.persist_config_in_background(config);
+        let mut config = self
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if config.active && config.expires_at.is_some_and(|expiry| expiry <= current) {
+            config.active = false;
+            config.remaining = 0;
+            self.enqueue_config_persistence(config.clone());
         }
     }
 
-    fn persist_config_in_background(&self, config: CaptureConfig) {
+    fn enqueue_config_persistence(&self, config: CaptureConfig) {
         let revision = self
             .config_revision
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
-        let config_revision = self.config_revision.clone();
-        let config_persistence = self.config_persistence.clone();
-        let config_path = self.config_path.clone();
-        let dropped = self.dropped.clone();
-        tokio::spawn(async move {
-            let _persistence = config_persistence.lock().await;
-            if config_revision.load(std::sync::atomic::Ordering::Relaxed) == revision
-                && persist_json(&config_path, &config).await.is_err()
-            {
-                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
+        let should_notify = self
+            .pending_config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace((revision, config))
+            .is_none();
+        if should_notify
+            && matches!(
+                self.config_sender.try_send(ConfigMessage::Persist),
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+            )
+        {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     async fn compact(&self) {
@@ -422,8 +464,8 @@ impl UpstreamExchangeHook for TrafficCapture {
             config.active = false;
         }
         let config_snapshot = config.clone();
+        self.enqueue_config_persistence(config_snapshot.clone());
         drop(config);
-        self.persist_config_in_background(config_snapshot.clone());
         let redacted = config_snapshot
             .redacted_headers
             .iter()
@@ -465,6 +507,33 @@ impl UpstreamExchangeHook for TrafficCapture {
 enum CaptureMessage {
     Record(Box<CaptureRecord>),
     Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+enum ConfigMessage {
+    Persist,
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+async fn persist_pending_config(
+    pending: &std::sync::Mutex<Option<(u64, CaptureConfig)>>,
+    path: &Path,
+    revision: &std::sync::atomic::AtomicU64,
+    persistence: &tokio::sync::Mutex<()>,
+    dropped: &std::sync::atomic::AtomicU64,
+) {
+    let pending = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some((pending_revision, config)) = pending else {
+        return;
+    };
+    let _persistence = persistence.lock().await;
+    if revision.load(std::sync::atomic::Ordering::Relaxed) == pending_revision
+        && persist_json(path, &config).await.is_err()
+    {
+        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 struct CaptureObserver {
@@ -661,7 +730,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_capture_requires_scope_and_future_expiry() {
+    async fn active_capture_requires_bounded_count_scope_and_future_expiry() {
         let directory = std::env::temp_dir().join(format!(
             "yabane-traffic-capture-validation-{}-{}",
             std::process::id(),
@@ -682,6 +751,12 @@ mod tests {
         assert!(capture.configure(config.clone()).await.is_err());
         config.provider_id = "provider".to_owned();
         config.endpoint_id = "endpoint".to_owned();
+        config.remaining = MAX_CAPTURE_REQUESTS + 1;
+        assert_eq!(
+            capture.configure(config.clone()).await.unwrap_err(),
+            "Capture count must be between 1 and 100"
+        );
+        config.remaining = 1;
         config.expires_at = Some(now());
         assert!(capture.configure(config).await.is_err());
         let _ = tokio::fs::remove_dir_all(directory).await;
@@ -848,6 +923,47 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
+    #[tokio::test]
+    async fn config_writer_coalesces_burst_without_losing_latest_state() {
+        let directory = std::env::temp_dir().join(format!(
+            "yabane-traffic-capture-config-burst-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let config_path = directory.join("config.json");
+        let capture =
+            TrafficCapture::load_from(config_path.clone(), directory.join("captures.json"))
+                .await
+                .unwrap();
+        let mut expected = CaptureConfig {
+            active: true,
+            remaining: 1,
+            expires_at: Some(now() + 60),
+            provider_id: "provider".to_owned(),
+            endpoint_id: "endpoint".to_owned(),
+            ..CaptureConfig::default()
+        };
+        capture.configure(expected.clone()).await.unwrap();
+
+        let persistence = capture.config_persistence.lock().await;
+        capture.enqueue_config_persistence(expected.clone());
+        tokio::task::yield_now().await;
+        for remaining in 2..=MAX_CAPTURE_REQUESTS {
+            expected.remaining = remaining;
+            capture.enqueue_config_persistence(expected.clone());
+        }
+        drop(persistence);
+        capture.flush_pending().await.unwrap();
+
+        let persisted: CaptureConfig = load_json(&config_path).await.unwrap().unwrap();
+        assert_eq!(persisted.remaining, MAX_CAPTURE_REQUESTS);
+        assert_eq!(
+            capture.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
     #[test]
     fn observer_bounds_streaming_chunks_and_completes_once() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
@@ -882,11 +998,11 @@ mod tests {
             std::process::id(),
             unique_suffix()
         ));
+        let config_path = directory.join("config.json");
         let captures_path = directory.join("captures.json");
-        let capture =
-            TrafficCapture::load_from(directory.join("config.json"), captures_path.clone())
-                .await
-                .unwrap();
+        let capture = TrafficCapture::load_from(config_path.clone(), captures_path.clone())
+            .await
+            .unwrap();
         capture
             .configure(CaptureConfig {
                 active: true,
@@ -920,16 +1036,14 @@ mod tests {
             )
             .unwrap();
         observer.on_complete(ExchangeOutcome::Complete);
-        for _ in 0..50 {
-            if capture.dropped.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        capture.flush_pending().await.unwrap();
 
         let status = capture.status().await;
+        let persisted_config: CaptureConfig = load_json(&config_path).await.unwrap().unwrap();
         assert_eq!(status.retained, 0);
         assert_eq!(status.dropped, 1);
+        assert!(!persisted_config.active);
+        assert_eq!(persisted_config.remaining, 0);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

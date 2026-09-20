@@ -2,12 +2,13 @@ use crate::config::ApiType;
 
 const MAX_JSON_USAGE_BODY: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
     pub cached: u64,
     pub cost: Option<f64>,
+    pub finish_reason: Option<String>,
 }
 
 pub struct UsageTracker {
@@ -185,6 +186,9 @@ fn merge_event_usage(api_type: ApiType, bytes: &[u8], combined: &mut TokenUsage)
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return;
     };
+    if combined.finish_reason.is_none() {
+        combined.finish_reason = extract_finish_reason(api_type, &value);
+    }
     if let Some(cost) = first_f64(
         &value,
         &[
@@ -230,6 +234,56 @@ fn merge_event_usage(api_type: ApiType, bytes: &[u8], combined: &mut TokenUsage)
     ));
 }
 
+fn extract_finish_reason(api_type: ApiType, value: &serde_json::Value) -> Option<String> {
+    let chat_reason = || {
+        value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| {
+                choices.iter().find_map(|choice| {
+                    choice
+                        .get("finish_reason")
+                        .and_then(serde_json::Value::as_str)
+                })
+            })
+    };
+    let responses_reason = || {
+        let response = value.get("response").unwrap_or(value);
+        response
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                response
+                    .pointer("/incomplete_details/reason")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                response
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|status| matches!(*status, "completed" | "incomplete" | "failed"))
+            })
+            .or_else(|| {
+                value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|event_type| event_type.strip_prefix("response."))
+                    .filter(|status| matches!(*status, "completed" | "incomplete" | "failed"))
+            })
+    };
+    let reason = match api_type {
+        ApiType::OpenaiCompatible => chat_reason().or_else(responses_reason),
+        ApiType::OpenaiChatCompletions => chat_reason(),
+        ApiType::Anthropic => value
+            .pointer("/delta/stop_reason")
+            .or_else(|| value.get("stop_reason"))
+            .and_then(serde_json::Value::as_str),
+        ApiType::OpenaiResponses | ApiType::OpenaiCodex => responses_reason(),
+    }?;
+    (!reason.is_empty() && reason.len() <= 128 && !reason.chars().any(char::is_control))
+        .then(|| reason.to_owned())
+}
+
 fn first_f64(value: &serde_json::Value, paths: &[&[&str]]) -> Option<f64> {
     paths.iter().find_map(|path| {
         let value = path
@@ -269,6 +323,7 @@ mod tests {
                 output: 4,
                 cached: 3,
                 cost: None,
+                finish_reason: None,
             }
         );
     }
@@ -279,6 +334,31 @@ mod tests {
         tracker
             .observe(br#"{"usage":{"prompt_tokens":12,"completion_tokens":4,"cost":"0.00125"}}"#);
         assert_eq!(tracker.finish().0.cost, Some(0.00125));
+    }
+
+    #[test]
+    fn extracts_protocol_specific_finish_reasons() {
+        let mut chat = UsageTracker::new(ApiType::OpenaiChatCompletions, false);
+        chat.observe(br#"{"choices":[{"finish_reason":"length"}]}"#);
+        assert_eq!(chat.finish().0.finish_reason.as_deref(), Some("length"));
+
+        let mut anthropic = UsageTracker::new(ApiType::Anthropic, true);
+        anthropic.observe(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+        );
+        assert_eq!(
+            anthropic.finish().0.finish_reason.as_deref(),
+            Some("tool_use")
+        );
+
+        let mut responses = UsageTracker::new(ApiType::OpenaiResponses, false);
+        responses.observe(
+            br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
+        );
+        assert_eq!(
+            responses.finish().0.finish_reason.as_deref(),
+            Some("max_output_tokens")
+        );
     }
 
     #[test]
@@ -293,6 +373,7 @@ mod tests {
                 output: 8,
                 cached: 7,
                 cost: None,
+                finish_reason: Some("completed".to_owned()),
             }
         );
     }
@@ -327,7 +408,7 @@ mod tests {
     fn combines_anthropic_usage_across_stream_events() {
         let mut tracker = UsageTracker::new(ApiType::Anthropic, true);
         tracker.observe(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"output_tokens\":1,\"cache_read_input_tokens\":9}}}\n\n");
-        tracker.observe(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":11}}\n\n");
+        tracker.observe(b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":11}}\n\n");
         assert_eq!(
             tracker.finish().0,
             TokenUsage {
@@ -335,6 +416,7 @@ mod tests {
                 output: 11,
                 cached: 9,
                 cost: None,
+                finish_reason: Some("end_turn".to_owned()),
             }
         );
     }
@@ -352,6 +434,7 @@ mod tests {
                 output: 1,
                 cached: 0,
                 cost: None,
+                finish_reason: None,
             }
         );
     }

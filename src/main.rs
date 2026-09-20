@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router, middleware,
@@ -18,6 +18,7 @@ mod extensions;
 mod gateway;
 mod models;
 mod openai_subscription;
+mod pricing;
 mod protocol;
 mod protocol_stream;
 mod routes;
@@ -26,7 +27,12 @@ mod usage;
 mod web;
 
 use auth::load_auth;
-use config::{AppState, load_providers, validate_configuration_references};
+use config::{AppState, UpstreamTimeouts, load_providers, validate_configuration_references};
+
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 15;
+const DEFAULT_UPSTREAM_READ_TIMEOUT_SECONDS: u64 = 5 * 60;
+const DEFAULT_UPSTREAM_TOTAL_TIMEOUT_SECONDS: u64 = 8 * 60 * 60;
+const MAX_UPSTREAM_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 
 const HELP: &str = "Yabane — a clear, reliable gateway to every LLM
 
@@ -40,7 +46,10 @@ Options:
   -V, --version     Print commit information
 
 Environment:
-  YABANE_ACTIVITY_RETENTION_DAYS  Initial Activity retention before a setting is saved [default: 30]
+  YABANE_ACTIVITY_RETENTION_DAYS         Initial Activity retention before a setting is saved [default: 30]
+  YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS Upstream connection deadline [default: 15]
+  YABANE_UPSTREAM_READ_TIMEOUT_SECONDS    Upstream per-read deadline [default: 300]
+  YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS   Upstream total request deadline [default: 28800]
   TURNSTILE_SITE_KEY              Cloudflare Turnstile widget site key
   TURNSTILE_SECRET                Cloudflare Turnstile server secret
   TURNSTILE_HOSTNAMES             Comma-separated accepted hostnames
@@ -122,7 +131,38 @@ async fn main() {
         .unwrap_or_else(|error| cli_error(&format!("invalid log filter: {error}")));
     tracing_subscriber::fmt().with_env_filter(log_filter).init();
 
+    storage::recover_transaction(
+        storage::CONFIG_TRANSACTION_FILE,
+        &[auth::AUTH_FILE, config::PROVIDERS_FILE, routes::ROUTES_FILE],
+    )
+    .await
+    .expect("recover interrupted configuration transaction");
+    storage::recover_transaction(
+        activity::ACTIVITY_TRANSACTION_FILE,
+        &[activity::ACTIVITY_FILE, activity::ACTIVITY_SETTINGS_FILE],
+    )
+    .await
+    .expect("recover interrupted Activity retention transaction");
+
+    let upstream_timeouts = UpstreamTimeouts {
+        connect: timeout_from_env(
+            "YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS",
+            DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+        ),
+        read: timeout_from_env(
+            "YABANE_UPSTREAM_READ_TIMEOUT_SECONDS",
+            DEFAULT_UPSTREAM_READ_TIMEOUT_SECONDS,
+        ),
+        total: timeout_from_env(
+            "YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS",
+            DEFAULT_UPSTREAM_TOTAL_TIMEOUT_SECONDS,
+        ),
+    };
+
     let providers = load_providers().await.expect("load provider configuration");
+    let pricing = pricing::load()
+        .await
+        .expect("load global pricing configuration");
     let extensions = extensions::ExtensionRegistry::built_in(cli.no_extensions)
         .await
         .expect("load extensions");
@@ -146,11 +186,16 @@ async fn main() {
     }
     let state = AppState {
         client: reqwest::Client::builder()
+            .connect_timeout(upstream_timeouts.connect)
+            .read_timeout(upstream_timeouts.read)
+            .timeout(upstream_timeouts.total)
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
             .build()
             .expect("build HTTP client"),
+        upstream_timeouts,
         providers: Arc::new(RwLock::new(providers)),
+        pricing: Arc::new(RwLock::new(pricing)),
         auth: Arc::new(RwLock::new(auth)),
         activity,
         routes,
@@ -198,6 +243,7 @@ async fn main() {
         .route("/providers", get(web::index))
         .route("/providers/{id}", get(web::index))
         .route("/model-routing", get(web::index))
+        .route("/model-pricing", get(web::index))
         .route("/extensions", get(web::index))
         .route("/extensions/traffic-capture", get(web::index))
         .route("/api-access", get(web::index))
@@ -250,6 +296,27 @@ async fn main() {
     if let Err(error) = state.traffic_capture.flush().await {
         tracing::error!(%error, "could not flush Traffic Capture during shutdown");
     }
+}
+
+fn timeout_from_env(name: &str, default: u64) -> Duration {
+    let seconds = match env::var(name) {
+        Ok(value) => parse_timeout_seconds(name, &value),
+        Err(env::VarError::NotPresent) => default,
+        Err(error) => cli_error(&format!("could not read {name}: {error}")),
+    };
+    Duration::from_secs(seconds)
+}
+
+fn parse_timeout_seconds(name: &str, value: &str) -> u64 {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=MAX_UPSTREAM_TIMEOUT_SECONDS).contains(seconds))
+        .unwrap_or_else(|| {
+            cli_error(&format!(
+                "{name} must be an integer between 1 and {MAX_UPSTREAM_TIMEOUT_SECONDS}"
+            ))
+        })
 }
 
 async fn shutdown_signal() {

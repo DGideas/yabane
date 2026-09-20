@@ -12,7 +12,7 @@ npx playwright install webkit
 npm run test:responsive
 ```
 
-Set `YABANE_UI_BASE` when Yabane is not running at `http://127.0.0.1:8080`. Set `YABANE_SESSION_COOKIE` to an active administrator session value for complete Help, About, and model-route dialog coverage. Against a logged-out console the script still verifies the responsive login layout. `tests/e2e.sh` supplies its temporary administrator session and runs this check automatically.
+Set `YABANE_UI_BASE` when Yabane is not running at `http://127.0.0.1:8080`. Set `YABANE_SESSION_COOKIE` to an active administrator session value for complete Help, About, and model-route dialog coverage. Against a logged-out console the script still verifies the responsive login layout. `tests/e2e.sh` supplies its temporary administrator session and runs this check automatically; when invoked without a binary path, it rebuilds Yabane first so the embedded assets under test match the working tree.
 
 Covered viewports:
 
