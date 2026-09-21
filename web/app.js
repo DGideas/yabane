@@ -2026,7 +2026,6 @@ function activityLogForRow(row) { return (row.closest('#recent-activity-logs') ?
 $('#activity-view').addEventListener('click', event => { const row = event.target.closest('.activity-request-row'); if (row) openActivityDetail(activityLogForRow(row)); });
 $('#activity-view').addEventListener('keydown', event => { const row = event.target.closest('.activity-request-row'); if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openActivityDetail(activityLogForRow(row)); } });
 function closeActivityRangePicker() { const popover = $('#activity-range-popover'); popover.hidden = true; $('#activity-range-trigger').setAttribute('aria-expanded', 'false'); $('#activity-range-search').value = ''; $$('#activity-range-options button').forEach(button => { button.hidden = false; }); }
-function localDateTimeValue(timestamp) { const date = new Date(timestamp * 1000); return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16); }
 function formatCustomRangeLabel(since, until) {
   const format = value => new Date(value * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
   return `${format(since)} – ${format(until)}`;

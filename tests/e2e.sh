@@ -256,6 +256,10 @@ edited_key=$(admin -f "$base/admin/auth" | jq -c ".api_keys[] | select(.id == \"
 admin -f -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"Note only"}' >/dev/null
 [[ $(admin -f "$base/admin/auth" | jq -r ".api_keys[] | select(.id == \"$id\") | .expires_at") == "$future_expiry" ]]
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 200 ]]
+# An explicitly null expiry clears a previously configured expiration.
+admin -f -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"Never expires","expires_at":null,"provider_ids":[]}' >/dev/null
+[[ $(admin -f "$base/admin/auth" | jq -r ".api_keys[] | select(.id == \"$id\") | .expires_at") == "null" ]]
+[[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 200 ]]
 [[ $(admin_status -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
 admin -f -X DELETE "$base/admin/auth/keys/$id" >/dev/null
