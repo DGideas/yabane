@@ -11,11 +11,11 @@ use rand::RngCore;
 use tracing::error;
 
 use crate::{
-    activity::{ActivityStore, RequestFailure, RequestLog},
+    activity::{ActivityStore, CostSource, RequestFailure, RequestLog},
     auth,
     config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
     error::{self, api_error},
-    openai_subscription,
+    openai_subscription, pricing,
     protocol::{self, Protocol},
     protocol_stream::StreamConverter,
     usage::{TokenUsage, UsageTracker},
@@ -341,6 +341,7 @@ struct ProxyActivity {
     upstream_model: Option<String>,
     provider: String,
     endpoint: String,
+    pricing: Option<pricing::ModelPricing>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
     upstream_protocol: Protocol,
@@ -403,6 +404,7 @@ impl ProxyActivity {
         latency_ms: u64,
         failure: Option<RequestFailure>,
     ) {
+        let (cost, cost_source) = self.cost_for_usage(&usage);
         self.store
             .record(RequestLog {
                 timestamp: crate::auth::now(),
@@ -429,10 +431,23 @@ impl ProxyActivity {
                 input_tokens: usage.input,
                 output_tokens: usage.output,
                 cached_tokens: usage.cached,
-                cost: usage.cost,
+                cost_source,
+                cost,
+                finish_reason: usage.finish_reason,
                 streaming,
             })
             .await;
+    }
+
+    fn cost_for_usage(&self, usage: &TokenUsage) -> (Option<f64>, Option<CostSource>) {
+        if let Some(cost) = usage.cost {
+            return (Some(cost), Some(CostSource::Reported));
+        }
+        self.pricing
+            .as_ref()
+            .and_then(|pricing| pricing::calculate(pricing, usage))
+            .map(|cost| (Some(cost), Some(CostSource::Estimated)))
+            .unwrap_or((None, None))
     }
 }
 
@@ -642,7 +657,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         &interested_exchange_hooks,
     );
 
-    let client = match endpoint.client(&state.client) {
+    let client = match endpoint.client(&state.client, state.upstream_timeouts) {
         Ok(client) => client,
         Err(err) => {
             complete_exchange_observers(
@@ -703,7 +718,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_tokens: 0,
+                    cost_source: None,
                     cost: None,
+                    finish_reason: None,
                     streaming: requested_streaming,
                 })
                 .await;
@@ -734,6 +751,12 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             .is_some_and(|implementation| implementation.endpoint_type().always_event_stream),
         content_type,
     );
+    let activity_pricing = {
+        let global_pricing = state.pricing.read().await;
+        sent_upstream_model.as_deref().and_then(|model| {
+            pricing::effective_pricing(&global_pricing, &provider, &endpoint, model)
+        })
+    };
     let activity = ProxyActivity {
         store: state.activity.clone(),
         request_id,
@@ -742,6 +765,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         upstream_model: sent_upstream_model,
         provider: provider.id.clone(),
         endpoint: endpoint.id.clone(),
+        pricing: activity_pricing,
         gateway_api_key,
         caller_protocol,
         upstream_protocol,
@@ -758,6 +782,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         let mut usage = UsageTracker::new(api_type, true);
         let mut converter = StreamConverter::new_aggregating(upstream_protocol, caller_protocol);
         let mut failure = None;
+        let mut failure_record = None;
         let mut first_byte_ms = None;
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
@@ -767,7 +792,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 }
                 Err(err) => {
                     error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream stream for protocol conversion");
-                    failure = Some("Upstream stream failed".to_owned());
+                    let record = upstream_read_failure(&err, true);
+                    failure = Some(record.message.clone());
+                    failure_record = Some(record);
                     break;
                 }
             };
@@ -808,7 +835,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     true,
                     first_byte_ms,
                     completion_ms,
-                    Some(stream_failure(&err)),
+                    Some(failure_record.unwrap_or_else(|| stream_failure(&err))),
                 )
                 .await;
             complete_exchange_observers(
@@ -843,24 +870,22 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Ok(bytes) => bytes,
             Err(err) => {
                 error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream response for protocol conversion");
+                let failure = upstream_read_failure(&err, false);
+                let message = failure.message.clone();
                 activity
                     .record_failure(
                         StatusCode::BAD_GATEWAY,
                         TokenUsage::default(),
                         false,
                         None,
-                        RequestFailure::new(
-                            "upstream_response",
-                            "read_failed",
-                            "Could not read the upstream response",
-                        ),
+                        failure,
                     )
                     .await;
                 complete_exchange_observers(
                     &mut exchange_observers,
                     yabane_extension_api::ExchangeOutcome::ResponseReadError,
                 );
-                return api_error(StatusCode::BAD_GATEWAY, "Could not read upstream response");
+                return api_error(StatusCode::BAD_GATEWAY, message);
             }
         };
         observe_response_chunk(&mut exchange_observers, &bytes);
@@ -962,9 +987,27 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     }
                 }
                 Err(err) => {
-                    conversion_failed = true;
-                    yield Err(std::io::Error::other(err.to_string()));
-                    break;
+                    let kind = if err.is_timeout() {
+                        std::io::ErrorKind::TimedOut
+                    } else {
+                        std::io::ErrorKind::Other
+                    };
+                    let failure = upstream_read_failure(&err, true);
+                    let message = failure.message.clone();
+                    complete_exchange_observers(
+                        &mut exchange_observers,
+                        yabane_extension_api::ExchangeOutcome::Interrupted,
+                    );
+                    let (usage, _) = usage.finish();
+                    activity.record_failure(
+                        StatusCode::BAD_GATEWAY,
+                        usage,
+                        requested_streaming || event_stream,
+                        first_byte_ms,
+                        failure,
+                    ).await;
+                    yield Err(std::io::Error::new(kind, message));
+                    return;
                 }
             }
         }
@@ -1308,11 +1351,20 @@ fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) ->
         ""
     };
     if err.is_timeout() {
-        return RequestFailure::new(
-            "upstream_connect",
-            "timeout",
-            format!("Upstream request{route} timed out"),
-        );
+        let (stage, category, message) = if err.is_connect() {
+            (
+                "upstream_connect",
+                "connect_timeout",
+                format!("Could not connect to upstream{route} before the deadline"),
+            )
+        } else {
+            (
+                "upstream_response",
+                "timeout",
+                format!("Upstream request{route} timed out"),
+            )
+        };
+        return RequestFailure::new(stage, category, message);
     }
     let detail = io_failure_detail(err).map(|detail| format!(": {detail}"));
     if err.is_connect() {
@@ -1337,6 +1389,37 @@ fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) ->
             "Upstream request{route} failed{}",
             detail.unwrap_or_default()
         ),
+    )
+}
+
+fn upstream_read_failure(err: &reqwest::Error, streaming: bool) -> RequestFailure {
+    if err.is_timeout() {
+        return RequestFailure::new(
+            if streaming {
+                "upstream_stream"
+            } else {
+                "upstream_response"
+            },
+            "timeout",
+            "Upstream response timed out",
+        );
+    }
+    RequestFailure::new(
+        if streaming {
+            "upstream_stream"
+        } else {
+            "upstream_response"
+        },
+        if streaming {
+            "interrupted"
+        } else {
+            "read_failed"
+        },
+        if streaming {
+            "Upstream stream ended or could not be converted"
+        } else {
+            "Could not read the upstream response"
+        },
     )
 }
 

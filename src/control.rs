@@ -18,6 +18,7 @@ use crate::{
     },
     error::api_error,
     models, openai_subscription, routes,
+    storage::{AtomicWrite, CONFIG_TRANSACTION_FILE, write_transaction},
 };
 
 pub fn router(state: AppState) -> Router<AppState> {
@@ -34,6 +35,18 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/providers",
             get(list_providers).post(create_provider),
+        )
+        .route(
+            "/admin/pricing",
+            get(get_global_pricing).patch(update_global_pricing),
+        )
+        .route(
+            "/admin/pricing/providers/{provider_id}",
+            patch(update_provider_pricing),
+        )
+        .route(
+            "/admin/pricing/providers/{provider_id}/endpoints/{endpoint_id}",
+            patch(update_endpoint_pricing),
         )
         .route(
             "/admin/openai-subscriptions/device-code",
@@ -83,6 +96,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/admin/activity/logs", get(activity_logs))
         .route("/admin/activity/logs/page", get(activity_log_page))
         .route("/admin/activity/stats", get(activity_stats))
+        .route(
+            "/admin/activity/recalculate-costs",
+            post(recalculate_activity_costs),
+        )
         .route("/admin/activity/export", get(export_activity))
         .route(
             "/admin/activity/export/preview",
@@ -149,6 +166,7 @@ struct CreateEndpoint {
     extra_headers: std::collections::HashMap<String, String>,
     #[serde(default)]
     extra_body: serde_json::Map<String, serde_json::Value>,
+    pricing: Option<crate::pricing::PricingTable>,
     requires_api_key: bool,
     api_key: Option<String>,
 }
@@ -160,6 +178,7 @@ struct UpdateEndpoint {
     base_url: String,
     socks5_proxy: Option<String>,
     requires_api_key: bool,
+    pricing: Option<crate::pricing::PricingTable>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +259,7 @@ struct ProviderView {
     name: String,
     extra_headers: std::collections::HashMap<String, String>,
     extra_body: serde_json::Map<String, serde_json::Value>,
+    pricing: Option<crate::pricing::PricingTable>,
     defaults_endpoint_ids: Vec<String>,
     endpoints: Vec<EndpointView>,
     discovered_models: Vec<String>,
@@ -257,6 +277,7 @@ struct EndpointView {
     socks5_proxy: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
     extra_body: serde_json::Map<String, serde_json::Value>,
+    pricing: Option<crate::pricing::PricingTable>,
     requires_api_key: bool,
     api_keys: Vec<ApiKeyView>,
     subscription_connected: bool,
@@ -463,7 +484,7 @@ async fn save_global_route(
         .iter()
         .map(|target| u64::from(target.weight))
         .sum();
-    if !valid_model_pattern(input.pattern.trim())
+    if !routes::valid_model_pattern(input.pattern.trim())
         || input.targets.is_empty()
         || input
             .targets
@@ -643,9 +664,53 @@ struct ActivityQuery {
     query: Option<String>,
     status: Option<String>,
     provider: Option<String>,
+    providers: Option<String>,
+    models: Option<String>,
+    api_keys: Option<String>,
     buckets: Option<usize>,
     until: Option<u64>,
 }
+
+struct OwnedActivityFilters {
+    providers: Vec<String>,
+    models: Vec<String>,
+    api_keys: Vec<String>,
+}
+
+impl OwnedActivityFilters {
+    fn from_query(query: &ActivityQuery) -> Self {
+        let mut providers = split_activity_filter(query.providers.as_deref());
+        if let Some(provider) = query.provider.as_deref().filter(|value| !value.is_empty())
+            && !providers.iter().any(|value| value == provider)
+        {
+            providers.push(provider.to_owned());
+        }
+        Self {
+            providers,
+            models: split_activity_filter(query.models.as_deref()),
+            api_keys: split_activity_filter(query.api_keys.as_deref()),
+        }
+    }
+
+    fn borrowed(&self) -> crate::activity::ActivityFilters<'_> {
+        crate::activity::ActivityFilters {
+            providers: &self.providers,
+            models: &self.models,
+            api_keys: &self.api_keys,
+        }
+    }
+}
+
+fn split_activity_filter(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Serialize)]
 struct ActivityLogPage {
     data: Vec<crate::activity::RequestLog>,
@@ -657,13 +722,14 @@ async fn activity_logs(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
 ) -> impl IntoResponse {
+    let filters = OwnedActivityFilters::from_query(&query);
     axum::Json(
         state
             .activity
             .logs(
                 query.since.unwrap_or(0),
                 query.until.unwrap_or_else(now),
-                query.provider.as_deref(),
+                filters.borrowed(),
                 query.limit.unwrap_or(100),
             )
             .await,
@@ -675,12 +741,13 @@ async fn activity_log_page(
 ) -> impl IntoResponse {
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    let filters = OwnedActivityFilters::from_query(&query);
     let (data, total) = state
         .activity
         .query_logs(crate::activity::ActivityLogQuery {
             since: query.since.unwrap_or(0),
             until: query.until.unwrap_or_else(now),
-            provider: query.provider.as_deref(),
+            filters: filters.borrowed(),
             text: query.query.as_deref(),
             status: query.status.as_deref(),
             offset,
@@ -698,17 +765,80 @@ async fn activity_stats(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<ActivityQuery>,
 ) -> impl IntoResponse {
+    let filters = OwnedActivityFilters::from_query(&query);
     axum::Json(
         state
             .activity
             .stats(
                 query.since.unwrap_or(0),
-                query.provider.as_deref(),
+                filters.borrowed(),
                 query.buckets.unwrap_or(24),
                 query.until.unwrap_or_else(now),
             )
             .await,
     )
+}
+
+#[derive(Default, Deserialize)]
+struct ActivityCostRecalculationRequest {
+    request_id: Option<String>,
+    source_instance_id: Option<String>,
+}
+
+async fn recalculate_activity_costs(
+    State(state): State<AppState>,
+    axum::Json(input): axum::Json<ActivityCostRecalculationRequest>,
+) -> Response {
+    let record = match (
+        input.request_id.as_deref(),
+        input.source_instance_id.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(""), _) => {
+            return api_error(StatusCode::BAD_REQUEST, "request_id cannot be empty");
+        }
+        (Some(request_id), source_instance_id) => Some((request_id, source_instance_id)),
+        (None, Some(_)) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "source_instance_id requires request_id",
+            );
+        }
+    };
+    let global = state.pricing.read().await.clone();
+    let providers = state.providers.read().await.clone();
+    let result = state
+        .activity
+        .recalculate_non_reported_costs(record, |log| {
+            let Some(upstream_model) = log.upstream_model.as_deref() else {
+                return crate::activity::CostRecalculationResolution::MissingRoute;
+            };
+            let Some(provider) = providers.get(&log.provider) else {
+                return crate::activity::CostRecalculationResolution::MissingRoute;
+            };
+            let Some(endpoint) = provider
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == log.endpoint)
+            else {
+                return crate::activity::CostRecalculationResolution::MissingRoute;
+            };
+            match crate::pricing::effective_pricing(&global, provider, endpoint, upstream_model) {
+                Some(pricing) => crate::activity::CostRecalculationResolution::Available(pricing),
+                None => crate::activity::CostRecalculationResolution::MissingPricing,
+            }
+        })
+        .await;
+    match result {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => {
+            error!(%error, "failed to recalculate Activity costs");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not recalculate Activity costs",
+            )
+        }
+    }
 }
 
 async fn preview_activity_export(
@@ -821,7 +951,22 @@ async fn import_activity(State(state): State<AppState>, body: Bytes) -> Response
     };
     match state.activity.import(import).await {
         Ok(result) => axum::Json(result).into_response(),
-        Err(message) => api_error(StatusCode::BAD_REQUEST, message),
+        Err(error) => activity_import_error(error),
+    }
+}
+
+fn activity_import_error(error: crate::activity::ActivityImportError) -> Response {
+    match error {
+        crate::activity::ActivityImportError::Invalid(message) => {
+            api_error(StatusCode::BAD_REQUEST, message)
+        }
+        crate::activity::ActivityImportError::Persist(error) => {
+            error!(%error, "failed to persist imported activity");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist imported Activity",
+            )
+        }
     }
 }
 
@@ -974,6 +1119,83 @@ async fn delete_all_traffic_captures(State(state): State<AppState>) -> Response 
     }
 }
 
+async fn get_global_pricing(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.pricing.read().await.clone())
+}
+
+async fn update_global_pricing(
+    State(state): State<AppState>,
+    axum::Json(mut pricing): axum::Json<crate::pricing::PricingTable>,
+) -> Response {
+    if let Err(message) = crate::pricing::validate_table(&pricing, "Global pricing") {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    pricing.updated_at = if pricing.models.is_empty() { 0 } else { now() };
+    let mut current = state.pricing.write().await;
+    if let Err(error) = crate::pricing::save(&pricing).await {
+        error!(%error, "failed to persist global pricing");
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not save global pricing",
+        );
+    }
+    *current = pricing;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_provider_pricing(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    axum::Json(pricing): axum::Json<crate::pricing::PricingTable>,
+) -> Response {
+    if let Err(message) =
+        crate::pricing::validate_table(&pricing, &format!("Provider '{provider_id}'"))
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let Some(provider) = updated.get_mut(&provider_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    provider.pricing = normalize_pricing(pricing);
+    let response = persist_or_error(&updated).await;
+    if response.status().is_success() {
+        *providers = updated;
+    }
+    response
+}
+
+async fn update_endpoint_pricing(
+    State(state): State<AppState>,
+    Path((provider_id, endpoint_id)): Path<(String, String)>,
+    axum::Json(pricing): axum::Json<crate::pricing::PricingTable>,
+) -> Response {
+    if let Err(message) =
+        crate::pricing::validate_table(&pricing, &format!("Endpoint '{provider_id}/{endpoint_id}'"))
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    let mut providers = state.providers.write().await;
+    let mut updated = providers.clone();
+    let Some(provider) = updated.get_mut(&provider_id) else {
+        return api_error(StatusCode::NOT_FOUND, "Provider not found");
+    };
+    let Some(endpoint) = provider
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.id == endpoint_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
+    };
+    endpoint.pricing = normalize_pricing(pricing);
+    let response = persist_or_error(&updated).await;
+    if response.status().is_success() {
+        *providers = updated;
+    }
+    response
+}
+
 async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers = state.providers.read().await;
     let mut providers: Vec<_> = providers.values().map(provider_view).collect();
@@ -987,6 +1209,7 @@ fn provider_view(provider: &Provider) -> ProviderView {
         name: provider.name.clone(),
         extra_headers: provider.extra_headers.clone(),
         extra_body: provider.extra_body.clone(),
+        pricing: provider.pricing.clone(),
         defaults_endpoint_ids: provider.defaults_endpoint_ids.clone(),
         endpoints: provider
             .endpoints
@@ -998,6 +1221,7 @@ fn provider_view(provider: &Provider) -> ProviderView {
                 socks5_proxy: endpoint.socks5_proxy.clone(),
                 extra_headers: endpoint.extra_headers.clone(),
                 extra_body: endpoint.extra_body.clone(),
+                pricing: endpoint.pricing.clone(),
                 requires_api_key: endpoint.requires_api_key,
                 subscription_connected: endpoint.openai_subscription.is_some(),
                 subscription_expires_at: endpoint
@@ -1035,6 +1259,7 @@ struct ProviderOptions {
     name: Option<String>,
     extra_headers: Option<std::collections::HashMap<String, String>>,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    pricing: Option<crate::pricing::PricingTable>,
     defaults_endpoint_ids: Option<Vec<String>>,
 }
 
@@ -1094,6 +1319,11 @@ async fn update_provider_options(
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Some(pricing) = &input.pricing
+        && let Err(message) = crate::pricing::validate_table(pricing, &format!("Provider '{id}'"))
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
     let Some(provider) = updated.get_mut(&id) else {
@@ -1129,11 +1359,25 @@ async fn update_provider_options(
     if let Some(body) = input.extra_body {
         provider.extra_body = body;
     }
+    if let Some(pricing) = input.pricing {
+        provider.pricing = normalize_pricing(pricing);
+    }
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
         *providers = updated;
     }
     response
+}
+
+fn normalize_pricing(
+    mut pricing: crate::pricing::PricingTable,
+) -> Option<crate::pricing::PricingTable> {
+    if pricing.models.is_empty() {
+        None
+    } else {
+        pricing.updated_at = now();
+        Some(pricing)
+    }
 }
 
 async fn start_openai_subscription(
@@ -1247,6 +1491,11 @@ async fn create_provider(
     if let Err(message) = validate_extra_headers(&input.endpoint.extra_headers) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Some(pricing) = &input.endpoint.pricing
+        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint")
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
     if input.endpoint.requires_api_key
         && input.endpoint.api_key.as_deref().is_none_or(str::is_empty)
     {
@@ -1274,6 +1523,7 @@ async fn create_provider(
         name: input.name.trim().to_owned(),
         extra_headers: std::collections::HashMap::new(),
         extra_body: serde_json::Map::new(),
+        pricing: None,
         defaults_endpoint_ids: Vec::new(),
         endpoints: vec![ApiEndpoint {
             id: endpoint_id,
@@ -1287,6 +1537,7 @@ async fn create_provider(
             socks5_proxy: normalized_socks5_proxy(input.endpoint.socks5_proxy.as_deref()),
             extra_headers: input.endpoint.extra_headers,
             extra_body: input.endpoint.extra_body,
+            pricing: input.endpoint.pricing.and_then(normalize_pricing),
             requires_api_key: input.endpoint.requires_api_key,
             api_keys,
             ..ApiEndpoint::default()
@@ -1381,14 +1632,8 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
         );
     }
 
-    if let Err(err) = save_auth_provider_and_routes(
-        &updated_auth,
-        &updated_providers,
-        &updated_routes,
-        &auth,
-        &providers,
-    )
-    .await
+    if let Err(err) =
+        save_auth_provider_and_routes(&updated_auth, &updated_providers, &updated_routes).await
     {
         #[cfg(feature = "extension-traffic-capture")]
         if let Some((previous, _)) = capture_update
@@ -1437,6 +1682,11 @@ async fn create_endpoint(
     if let Err(message) = validate_extra_headers(&input.extra_headers) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Some(pricing) = &input.pricing
+        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint")
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
     if input.requires_api_key && input.api_key.as_deref().is_none_or(str::is_empty) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -1467,6 +1717,7 @@ async fn create_endpoint(
         socks5_proxy: normalized_socks5_proxy(input.socks5_proxy.as_deref()),
         extra_headers: input.extra_headers,
         extra_body: input.extra_body,
+        pricing: input.pricing.and_then(normalize_pricing),
         requires_api_key: input.requires_api_key,
         api_keys,
         ..ApiEndpoint::default()
@@ -1498,6 +1749,14 @@ async fn update_endpoint(
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     if let Err(message) = validate_endpoint_base_url(&input.base_url) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    if let Some(pricing) = &input.pricing
+        && let Err(message) = crate::pricing::validate_table(
+            pricing,
+            &format!("Endpoint '{}/{}'", provider_id, endpoint_id),
+        )
+    {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
 
@@ -1592,6 +1851,9 @@ async fn update_endpoint(
         endpoint.base_url = normalized_base_url;
         endpoint.socks5_proxy = normalized_proxy;
         endpoint.requires_api_key = input.requires_api_key;
+        if let Some(pricing) = input.pricing {
+            endpoint.pricing = normalize_pricing(pricing);
+        }
         endpoint.proxy_client = Default::default();
     }
 
@@ -1633,7 +1895,7 @@ async fn update_endpoint(
         );
     }
 
-    let response = match save_provider_and_routes(&updated, &updated_routes, &providers).await {
+    let response = match save_provider_and_routes(&updated, &updated_routes).await {
         Ok(()) => {
             *providers = updated;
             *routes = updated_routes;
@@ -1730,9 +1992,7 @@ async fn delete_endpoint(
         );
     }
 
-    if let Err(err) =
-        save_provider_and_routes(&updated_providers, &updated_routes, &providers).await
-    {
+    if let Err(err) = save_provider_and_routes(&updated_providers, &updated_routes).await {
         #[cfg(feature = "extension-traffic-capture")]
         if let Some((previous, _)) = capture_update
             && let Err(rollback_err) = state.traffic_capture.configure(previous).await
@@ -1942,7 +2202,7 @@ async fn delete_api_key(
         });
     }
     updated.retain(|route| !route.targets.is_empty());
-    if let Err(err) = save_provider_and_routes(&updated_providers, &updated, &providers).await {
+    if let Err(err) = save_provider_and_routes(&updated_providers, &updated).await {
         error!(%err, "failed to persist provider and route mutation");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2101,50 +2361,44 @@ fn unique_key_id(endpoint: &ApiEndpoint, base: &str) -> String {
         .expect("finite key ID space")
 }
 
-fn valid_model_pattern(pattern: &str) -> bool {
-    !pattern.is_empty()
-        && (pattern.matches('*').count() == 0
-            || (pattern.ends_with('*') && pattern.matches('*').count() == 1 && pattern.len() > 1))
-}
-
 async fn save_auth_provider_and_routes(
     auth: &auth::AuthConfig,
     providers: &std::collections::HashMap<String, Provider>,
     routes: &[routes::ModelRoute],
-    previous_auth: &auth::AuthConfig,
-    previous_providers: &std::collections::HashMap<String, Provider>,
 ) -> Result<(), String> {
-    save_auth(auth)
+    let writes = [
+        AtomicWrite::json(auth::AUTH_FILE, auth)
+            .map_err(|err| format!("serialize authentication: {err}"))?,
+        providers_atomic_write(providers)?,
+        AtomicWrite::json(routes::ROUTES_FILE, &routes)
+            .map_err(|err| format!("serialize routes: {err}"))?,
+    ];
+    write_transaction(CONFIG_TRANSACTION_FILE, &writes)
         .await
-        .map_err(|err| format!("save authentication: {err}"))?;
-    if let Err(err) = save_provider_and_routes(providers, routes, previous_providers).await {
-        if let Err(rollback_err) = save_auth(previous_auth).await {
-            return Err(format!(
-                "{err}; authentication rollback also failed: {rollback_err}"
-            ));
-        }
-        return Err(err);
-    }
-    Ok(())
+        .map_err(|err| format!("save authentication, providers, and routes: {err}"))
 }
 
 async fn save_provider_and_routes(
     providers: &std::collections::HashMap<String, Provider>,
     routes: &[routes::ModelRoute],
-    previous_providers: &std::collections::HashMap<String, Provider>,
 ) -> Result<(), String> {
-    save_providers(providers)
+    let writes = [
+        providers_atomic_write(providers)?,
+        AtomicWrite::json(routes::ROUTES_FILE, &routes)
+            .map_err(|err| format!("serialize routes: {err}"))?,
+    ];
+    write_transaction(CONFIG_TRANSACTION_FILE, &writes)
         .await
-        .map_err(|err| format!("save providers: {err}"))?;
-    if let Err(err) = routes::RouteStore::save_value(routes).await {
-        if let Err(rollback_err) = save_providers(previous_providers).await {
-            return Err(format!(
-                "save routes: {err}; provider rollback also failed: {rollback_err}"
-            ));
-        }
-        return Err(format!("save routes: {err}"));
-    }
-    Ok(())
+        .map_err(|err| format!("save providers and routes: {err}"))
+}
+
+fn providers_atomic_write(
+    providers: &std::collections::HashMap<String, Provider>,
+) -> Result<AtomicWrite, String> {
+    let mut values: Vec<_> = providers.values().cloned().collect();
+    values.sort_by(|left, right| left.id.cmp(&right.id));
+    AtomicWrite::json(crate::config::PROVIDERS_FILE, &values)
+        .map_err(|err| format!("serialize providers: {err}"))
 }
 
 async fn persist_or_error(providers: &std::collections::HashMap<String, Provider>) -> Response {
@@ -2164,6 +2418,49 @@ mod tests {
 
     use crate::config::{ApiEndpoint, ApiType, OpenAiSubscription, Provider};
 
+    #[tokio::test]
+    async fn activity_import_persistence_error_is_server_side_and_redacted() {
+        let response = super::activity_import_error(crate::activity::ActivityImportError::Persist(
+            std::io::Error::other("private/data/activity.jsonl: disk failure"),
+        ));
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Failed to persist imported Activity"));
+        assert!(!body.contains("private/data/activity.jsonl"));
+        assert!(!body.contains("disk failure"));
+    }
+
+    #[test]
+    fn pricing_normalization_uses_server_timestamp_and_empty_clears() {
+        let table = crate::pricing::PricingTable {
+            updated_at: 1,
+            models: HashMap::from([(
+                "model".to_owned(),
+                crate::pricing::ModelPricing {
+                    input_per_million: Some(1.0),
+                    output_per_million: Some(2.0),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let normalized = super::normalize_pricing(table).unwrap();
+        assert!(normalized.updated_at > 1);
+        assert!(
+            super::normalize_pricing(crate::pricing::PricingTable {
+                updated_at: 99,
+                models: HashMap::new(),
+            })
+            .is_none()
+        );
+    }
+
     #[test]
     fn provider_view_redacts_subscription_tokens_and_account_id() {
         let provider = Provider {
@@ -2171,6 +2468,7 @@ mod tests {
             name: "OpenAI".to_owned(),
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints: vec![ApiEndpoint {
                 id: "chatgpt".to_owned(),

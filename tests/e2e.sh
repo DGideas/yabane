@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-binary=${1:-target/debug/yabane}
-binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
+if [[ $# -gt 0 ]]; then
+  binary=$1
+  binary=$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")
+else
+  cargo build --manifest-path "$repo/Cargo.toml"
+  binary="$repo/target/debug/yabane"
+fi
 work=$(mktemp -d)
 available_port() {
   python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()'
@@ -18,16 +23,55 @@ cd "$work"
 version_output=$("$binary" --version)
 [[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
 [[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
+[[ $("$binary" --help) == *"Upstream total request deadline [default: 28800]"* ]]
 [[ $("$binary" --help) == *"--no-extensions"* ]]
 if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-retention.log 2>&1; then
   echo "invalid activity retention unexpectedly started" >&2; exit 1
 fi
 grep -q 'YABANE_ACTIVITY_RETENTION_DAYS must be between 1 and 3650' invalid-retention.log
+if YABANE_UPSTREAM_READ_TIMEOUT_SECONDS=0 "$binary" --addr "127.0.0.1:$port" >invalid-upstream-timeout.log 2>&1; then
+  echo "invalid upstream timeout unexpectedly started" >&2; exit 1
+fi
+grep -q 'YABANE_UPSTREAM_READ_TIMEOUT_SECONDS must be an integer between 1 and 86400' invalid-upstream-timeout.log
 mkdir -p data
 cat >data/providers.json <<'JSON'
 [{"id":"subscription-fixture","name":"Subscription fixture","extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[],"endpoints":[{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","socks5_proxy":null,"extra_headers":{},"extra_body":{},"requires_api_key":false,"api_keys":[],"openai_subscription":{"access_token":"fixture","refresh_token":"fixture","expires_at":4102444800,"account_id":"fixture"}}],"discovered_models":[],"model_endpoints":{},"model_endpoint_preferences":[],"models_discovered_at":null,"model_discovery_error":null}]
 JSON
-TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" "$binary" --addr "127.0.0.1:$port" >server.log 2>&1 & pid=$!
+# Simulate crashes after multi-file replacements but before their rollback
+# journals were removed. Startup must restore each complete old file set before
+# parsing either configuration or Activity.
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path('data/providers.json')
+previous = path.read_bytes()
+path.write_bytes(b'{interrupted')
+Path('data/config-transaction.json').write_text(json.dumps({
+    'version': 1,
+    'entries': [{'path': str(path), 'previous': list(previous)}],
+}))
+activity_path = Path('data/activity.jsonl')
+settings_path = Path('data/activity-settings.json')
+activity_path.write_bytes(b'')
+settings_path.write_text(json.dumps({'retention_days': 30}))
+activity_previous = activity_path.read_bytes()
+settings_previous = settings_path.read_bytes()
+activity_path.write_bytes(b'{interrupted')
+settings_path.write_text(json.dumps({'retention_days': 1}))
+Path('data/activity-transaction.json').write_text(json.dumps({
+    'version': 1,
+    'entries': [
+        {'path': str(activity_path), 'previous': list(activity_previous)},
+        {'path': str(settings_path), 'previous': list(settings_previous)},
+    ],
+}))
+PY
+TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" \
+YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS=1 \
+YABANE_UPSTREAM_READ_TIMEOUT_SECONDS=1 \
+YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS=3 \
+"$binary" --addr "127.0.0.1:$port" >server.log 2>&1 & pid=$!
 ready=false
 for _ in $(seq 1 50); do
   if curl -sf "http://127.0.0.1:$port/healthz" >/dev/null; then ready=true; break; fi
@@ -35,6 +79,11 @@ for _ in $(seq 1 50); do
   sleep .1
 done
 if [[ $ready != true ]]; then cat server.log >&2; echo "Yabane did not become ready" >&2; exit 1; fi
+[[ ! -e data/config-transaction.json ]]
+[[ ! -e data/activity-transaction.json ]]
+[[ ! -s data/activity.jsonl ]]
+[[ $(jq -r '.retention_days' data/activity-settings.json) == 30 ]]
+[[ $(jq -r '.[0].id' data/providers.json) == subscription-fixture ]]
 base="http://127.0.0.1:$port"
 cookie="$work/cookie.txt"
 about=$(curl -fsS "$base/about")
@@ -58,6 +107,7 @@ cat >upstream.py <<'PY'
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
+import time
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -72,6 +122,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('content-length', 0)); request = json.loads(self.rfile.read(length))
         endpoint = self.headers.get('authorization', '').removeprefix('Bearer ') or self.headers.get('x-api-key', 'unknown')
+        if request.get('model') == 'timeout-before-headers':
+            time.sleep(2)
+            try:
+                self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(b'{}')
+            except BrokenPipeError:
+                pass
+            return
+        if request.get('model') == 'timeout-idle-stream':
+            self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.flush()
+            time.sleep(2)
+            try:
+                self.wfile.write(b'data: [DONE]\\n\\n')
+            except BrokenPipeError:
+                pass
+            return
+        if request.get('model') == 'timeout-keepalive-stream':
+            self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers()
+            try:
+                for _ in range(16):
+                    self.wfile.write(b': keepalive\\n\\n'); self.wfile.flush(); time.sleep(0.25)
+            except BrokenPipeError:
+                pass
+            return
         if self.path == '/v1/messages':
             if self.headers.get('openai-organization') or self.headers.get('openai-project') or self.headers.get('anthropic-version') != '2023-06-01' or self.headers.get('accept-encoding') != 'identity':
                 self.send_response(400); self.end_headers(); return
@@ -123,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
             bad_choice = isinstance(request.get('tool_choice'), dict) and not request['tool_choice'].get('function', {}).get('name')
             if self.path != '/v1/chat/completions' or not isinstance(request.get('messages'), list) or 'max_tool_calls' in request or 'prompt_cache_key' in request or malformed_tools or bad_format or bad_choice:
                 self.send_response(400); self.end_headers(); return
-            body = json.dumps({'id': 'chat-converted', 'object': 'chat.completion', 'created': 10, 'model': request['model'], 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'from-openai'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8}}).encode()
+            body = json.dumps({'id': 'chat-converted', 'object': 'chat.completion', 'created': 10, 'model': request['model'], 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'from-openai'}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 6, 'completion_tokens': 2, 'total_tokens': 8, 'cost': 0.0042}}).encode()
             self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
         if request.get('model') == 'provider-error':
             body = json.dumps({'error': {'message': 'provider exploded', 'type': 'server_error'}}).encode()
@@ -285,8 +358,39 @@ unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: applic
 unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
 unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
+# Upstream safety deadlines release requests that stop making progress, including
+# streams that keep the TCP connection active with comment-only keepalives.
+for timeout_model in timeout-before-headers timeout-idle-stream timeout-keepalive-stream; do
+  admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"$timeout_model\",\"targets\":[{\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"api_key_id\":\"default\",\"upstream_model\":\"$timeout_model\",\"weight\":100}]}" >/dev/null
+done
+curl -sS -D timeout-before-headers.headers -o timeout-before-headers.json -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"timeout-before-headers","messages":[]}' >timeout-before-headers.status & timeout_headers_pid=$!
+curl -sS -o timeout-idle-stream.body -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"timeout-idle-stream","messages":[],"stream":true}' >timeout-idle-stream.status & timeout_idle_pid=$!
+curl -sS -o timeout-keepalive-stream.body -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"timeout-keepalive-stream","messages":[],"stream":true}' >timeout-keepalive-stream.status & timeout_keepalive_pid=$!
+wait "$timeout_headers_pid" || true
+wait "$timeout_idle_pid" || true
+wait "$timeout_keepalive_pid" || true
+[[ $(<timeout-before-headers.status) == 502 ]]
+[[ $(jq -r '.error.message' timeout-before-headers.json) == "Upstream request timed out" ]]
+grep -qi '^x-yabane-error-origin: yabane' timeout-before-headers.headers
+[[ $(<timeout-idle-stream.status) == 200 ]]
+[[ $(<timeout-keepalive-stream.status) == 200 ]]
+timeout_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$timeout_logs" | jq '[.[] | select(.model == "timeout-before-headers" and .status == 502 and .failure.stage == "upstream_response" and .failure.category == "timeout")] | length') == 1 ]]
+[[ $(printf '%s' "$timeout_logs" | jq '[.[] | select(.model == "timeout-idle-stream" and .status == 502 and .failure.stage == "upstream_stream" and .failure.category == "timeout")] | length') == 1 ]]
+[[ $(printf '%s' "$timeout_logs" | jq '[.[] | select(.model == "timeout-keepalive-stream" and .status == 502 and .failure.stage == "upstream_stream" and .failure.category == "timeout")] | length') == 1 ]]
 # Cross-protocol adapters let every caller surface use providers with a different native API.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"anthropic\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"anthropic\",\"pricing\":{\"models\":{\"endpoint-create-check\":{\"input_per_million\":3,\"output_per_million\":4}}}}}" >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | (.endpoints[0].pricing.updated_at > 0 and .endpoints[0].pricing.models["endpoint-create-check"].output_per_million == 4)) == [true]') == true ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude":{"input_per_million":-1,"output_per_million":2}}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude*-invalid":{"input_per_million":1,"output_per_million":2}}}') == 400 ]]
+admin -f -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude*":{"input_per_million":1,"output_per_million":1.5,"cache_read_per_million":0.5}}}' >/dev/null
+[[ $(admin -f "$base/admin/pricing" | jq -r '.updated_at > 0 and .models["claude*"].input_per_million == 1') == true ]]
+[[ $(jq -r '.models["claude*"].output_per_million' data/pricing.json) == 1.5 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing/providers/missing" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
+admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only" -H 'content-type: application/json' -d '{"models":{"claude":{"output_per_million":2}}}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | (.pricing.models.claude.input_per_million == null and .pricing.models.claude.output_per_million == 2)) == [true]') == true ]]
+admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only/endpoints/messages" -H 'content-type: application/json' -d '{"models":{"claude":{"cache_read_per_million":0.25}}}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | .endpoints[0].pricing.models.claude.cache_read_per_million == 0.25) == [true]') == true ]]
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-chat-only\",\"name\":\"OpenAI Chat only\",\"endpoint\":{\"id\":\"chat\",\"api_type\":\"openai_chat_completions\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"convert\"}}" >/dev/null
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-responses-only\",\"name\":\"OpenAI Responses only\",\"endpoint\":{\"id\":\"responses\",\"api_type\":\"openai_responses\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"responses-stream\"}}" >/dev/null
 chat_converted=$(curl -sf -D conversion.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'OpenAI-Organization: org-caller' -H 'OpenAI-Project: project-caller' -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","messages":[{"role":"system","content":"Be concise"},{"role":"user","content":"hello"}],"max_completion_tokens":64}')
@@ -336,6 +440,11 @@ stream_converted=$(curl -sfN -X POST "$base/v1/chat/completions" -H "Authorizati
 [[ $stream_converted == *'data: [DONE]'* ]]
 conversion_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.caller_protocol == "openai_chat_completions" and .upstream_protocol == "anthropic_messages")] | length') -ge 2 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.upstream_protocol == "anthropic_messages" and .finish_reason == "end_turn")] | length') -ge 2 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "anthropic-only/claude" and .cost_source == "estimated" and .cost == 0.000011)] | length') -ge 2 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "multi/model-a" and .cost_source == "reported" and .cost == 0.0042)] | length') -ge 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-chat-only/gpt" and .finish_reason == "stop")] | length') -ge 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt" and .finish_reason == "completed")] | length') -ge 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502 and .failure.stage == "protocol_conversion" and .failure.category == "invalid_response")] | length') == 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true and .failure.stage == "upstream_stream" and .failure.category == "interrupted")] | length') == 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "anthropic-only/claude" and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms != null and .generation_ms != null and .latency_ms >= .first_byte_ms)] | length') == 1 ]]
@@ -404,6 +513,8 @@ admin -f -X PATCH "$base/admin/extensions/request-defaults" -H 'content-type: ap
 # Traffic Capture is explicitly scoped and stopped by default. It observes final upstream
 # bytes, redacts both Core-managed and configured headers, and stays outside Activity.
 capture_expiry=$(($(date +%s) + 600))
+[[ $(admin_status -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":101,\"expires_at\":$capture_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"model\":\"multi/model-a\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[]}") == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Capture count must be between 1 and 100" ]]
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$capture_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"model\":\"multi/model-a\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[\"x-provider\"]}" >/dev/null
 capture_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[{"role":"user","content":"traffic-capture-secret-marker"}]}')
 [[ $(printf '%s' "$capture_response" | jq -r .endpoint) == one ]]
@@ -466,21 +577,59 @@ admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: applicatio
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":100}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/routed-temporary" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "temporary-route")] | length') == 0 ]]
+# Explicit cost refresh recalculates estimated values, fills missing values, and preserves
+# both upstream-reported costs and legacy costs without cost_source.
+admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a":{"input_per_million":1,"output_per_million":2}}}' >/dev/null
+cost_refresh_at=$(date +%s)
+cost_refresh_payload=$(jq -cn --argjson at "$cost_refresh_at" '{format:"yabane-activity",version:1,instance_id:"cost-refresh-test",records:[
+  {timestamp:$at,request_id:"req-cost-estimated",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:9,cost_source:"estimated",streaming:false},
+  {timestamp:$at,request_id:"req-cost-missing",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:null,streaming:false},
+  {timestamp:$at,request_id:"req-cost-reported",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:7,cost_source:"reported",streaming:false},
+  {timestamp:$at,request_id:"req-cost-legacy",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:8,streaming:false}
+]}')
+[[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$cost_refresh_payload" | jq -r .imported) == 4 ]]
+cost_collision_payload=$(jq -cn --argjson at "$cost_refresh_at" '{format:"yabane-activity",version:1,instance_id:"cost-refresh-collision",records:[
+  {timestamp:$at,request_id:"req-cost-estimated",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:11,cost_source:"estimated",streaming:false}
+]}')
+[[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$cost_collision_payload" | jq -r .imported) == 1 ]]
+cost_recalculated=$(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-estimated","source_instance_id":"cost-refresh-test"}')
+[[ $(printf '%s' "$cost_recalculated" | jq -r '[.updated,.filled,.recalculated,.reported_preserved] | join(":")') == 1:0:1:0 ]]
+cost_filled=$(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-missing","source_instance_id":"cost-refresh-test"}')
+[[ $(printf '%s' "$cost_filled" | jq -r '[.updated,.filled,.recalculated] | join(":")') == 1:1:0 ]]
+[[ $(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-reported","source_instance_id":"cost-refresh-test"}' | jq -r '[.updated,.reported_preserved] | join(":")') == 0:1 ]]
+[[ $(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-legacy","source_instance_id":"cost-refresh-test"}' | jq -r '[.updated,.reported_preserved] | join(":")') == 0:1 ]]
+refreshed_cost_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$refreshed_cost_logs" | jq -r 'any(.[]; .request_id == "req-cost-estimated" and .source_instance_id == "cost-refresh-test" and .cost == 0.003 and .cost_source == "estimated")') == true ]]
+[[ $(printf '%s' "$refreshed_cost_logs" | jq -r 'any(.[]; .request_id == "req-cost-estimated" and .source_instance_id == "cost-refresh-collision" and .cost == 11 and .cost_source == "estimated")') == true ]]
+[[ $(printf '%s' "$refreshed_cost_logs" | jq -r 'any(.[]; .request_id == "req-cost-missing" and .source_instance_id == "cost-refresh-test" and .cost == 0.003 and .cost_source == "estimated")') == true ]]
+[[ $(printf '%s' "$refreshed_cost_logs" | jq -r 'any(.[]; .request_id == "req-cost-reported" and .source_instance_id == "cost-refresh-test" and .cost == 7 and .cost_source == "reported")') == true ]]
+[[ $(printf '%s' "$refreshed_cost_logs" | jq -r 'any(.[]; .request_id == "req-cost-legacy" and .source_instance_id == "cost-refresh-test" and .cost == 8 and .cost_source == null)') == true ]]
+admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a":{"input_per_million":2,"output_per_million":4}}}' >/dev/null
+[[ $(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-estimated","source_instance_id":"cost-refresh-test"}' | jq -r '[.updated,.recalculated] | join(":")') == 1:1 ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq -r 'any(.[]; .request_id == "req-cost-estimated" and .source_instance_id == "cost-refresh-test" and .cost == 0.006 and .cost_source == "estimated")') == true ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/activity/recalculate-costs"].post.responses | has("500")') == true ]]
 # Deleting an endpoint removes its keys, discovery availability, and exact route destinations.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
+admin -f -X PATCH "$base/admin/pricing/providers/multi/endpoints/two" -H 'content-type: application/json' -d '{"models":{"model-b*":{"input_per_million":0.2,"output_per_million":0.8}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two")] | length') == 0 ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | has("model_endpoints") and (.model_endpoints | has("model-b") | not)') == true ]]
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "endpoint-deletion-route")] | length') == 0 ]]
 [[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.provider_id, .config.endpoint_id] | join(":")') == : ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing/providers/multi/endpoints/two" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
+[[ $(jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .pricing] | length' data/providers.json) == 0 ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/missing") == 404 ]]
 # Deleting a Provider removes every route destination that refers to it.
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a*":{"input_per_million":0.3,"output_per_million":0.9}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/denied" >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "provider-deletion-route")] | length') == 0 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
+[[ $(jq '[.[] | select(.id == "multi") | .pricing] | length' data/providers.json) == 0 ]]
+[[ $(admin -f "$base/admin/pricing" | jq -r '.models["claude*"].input_per_million == 1') == true ]]
 # Deletion cannot turn an exact Provider scope into the empty-list "all Providers" meaning.
 # Keys scoped only to the deleted Provider are revoked, while multi-Provider scopes retain
 # their remaining allowlist entries.
@@ -500,11 +649,33 @@ done
 [[ $((after_batch_count - before_batch_count)) -eq 10 ]]
 stats=$(admin -f "$base/admin/activity/stats?since=0&buckets=24")
 [[ $(printf '%s' "$stats" | jq -r .requests) -ge 10 ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.required | index("provider_buckets") != null') == true ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.required | index("filter_options") != null') == true ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.required | index("reported_requests") != null and index("estimated_requests") != null') == true ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.RequestLog.properties.cost_source.enum | join(",")') == reported,estimated ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.ProviderView.properties.pricing.allOf[0]."$ref"') == '#/components/schemas/PricingTable' ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/pricing"].get.responses["200"].content["application/json"].schema."$ref"') == '#/components/schemas/PricingTable' ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/activity/recalculate-costs"].post.requestBody.content["application/json"].schema.properties | has("source_instance_id")') == true ]]
+[[ $(admin_status -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"source_instance_id":"remote-only"}') == 400 ]]
+curl -fsS "$base/model-pricing" -o "$work/model-pricing.html"
+grep -q 'id="pricing-view"' "$work/model-pricing.html"
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.properties.provider_buckets.items."$ref"') == '#/components/schemas/ActivityProviderBuckets' ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.ActivityBucket.properties | has("input") and has("output")') == true ]]
 [[ $(printf '%s' "$stats" | jq -r .input_tokens) -ge 4800 ]]
 [[ $(printf '%s' "$stats" | jq -r '.buckets | length') == 24 ]]
+[[ $(printf '%s' "$stats" | jq -r '[.buckets[] | select(.tokens != (.input + .output))] | length') == 0 ]]
+[[ $(printf '%s' "$stats" | jq -r '.filter_options.providers | index("multi") != null') == true ]]
+[[ $(printf '%s' "$stats" | jq -r --arg id "$unrestricted_id" --arg prefix "$unrestricted_prefix" '[.filter_options.api_keys[] | select(.id == $id and .prefix == $prefix)] | length') == 1 ]]
+! printf '%s' "$stats" | grep -Fq "$unrestricted_secret"
 [[ $(printf '%s' "$stats" | jq -r '[.buckets[].requests] | add') == $(printf '%s' "$stats" | jq -r .requests) ]]
+[[ $(printf '%s' "$stats" | jq -r '.provider_buckets[] | select(.name == "multi") | .requests | length') == 24 ]]
+[[ $(printf '%s' "$stats" | jq -r '.provider_buckets[] | select(.name == "multi") | [.requests[]] | add') == $(printf '%s' "$stats" | jq -r '.by_provider[] | select(.name == "multi") | .requests') ]]
 [[ $(printf '%s' "$stats" | jq -r '.by_model | length > 0') == true ]]
 [[ $(printf '%s' "$stats" | jq -r '.priced_requests > 0') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.priced_requests == (.reported_requests + .estimated_requests)') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '.reported_requests > 0 and .estimated_requests > 0') == true ]]
+[[ $(printf '%s' "$stats" | jq -r '[.buckets[] | select(.priced_requests != (.reported_requests + .estimated_requests))] | length') == 0 ]]
+[[ $(printf '%s' "$stats" | jq -r '[.by_provider[], .by_model[], .by_api_key[] | select(.priced_requests != (.reported_requests + .estimated_requests))] | length') == 0 ]]
 [[ $(printf '%s' "$stats" | jq -r '.priced_requests as $priced | ([.buckets[].priced_requests] | add) == $priced') == true ]]
 [[ $(printf '%s' "$stats" | jq -r '.priced_requests as $priced | ([.by_model[].priced_requests] | add) == $priced') == true ]]
 [[ $(printf '%s' "$stats" | jq -r --arg id "$unrestricted_id" '[.by_api_key[] | select(.id == $id and .name == "Multi endpoint")] | length > 0') == true ]]
@@ -512,6 +683,15 @@ stats=$(admin -f "$base/admin/activity/stats?since=0&buckets=24")
 filtered_stats=$(admin -f "$base/admin/activity/stats?since=0&provider=multi&buckets=12")
 [[ $(printf '%s' "$filtered_stats" | jq -r '.buckets | length') == 12 ]]
 [[ $(printf '%s' "$filtered_stats" | jq '[.by_provider[] | select(.name != "multi")] | length') == 0 ]]
+multi_filtered_stats=$(admin -f "$base/admin/activity/stats?since=0&providers=multi&models=multi/model-a&api_keys=$unrestricted_id&buckets=12")
+[[ $(printf '%s' "$multi_filtered_stats" | jq -r '.requests > 0') == true ]]
+[[ $(printf '%s' "$multi_filtered_stats" | jq '[.by_provider[] | select(.name != "multi")] + [.by_model[] | select(.name != "multi/model-a")] | length') == 0 ]]
+[[ $(printf '%s' "$multi_filtered_stats" | jq -r '.filter_options.providers | length > 1') == true ]]
+multi_filtered_logs=$(admin -f "$base/admin/activity/logs?since=0&providers=multi&models=multi/model-a&api_keys=$unrestricted_id&limit=1000")
+[[ $(printf '%s' "$multi_filtered_logs" | jq --arg id "$unrestricted_id" '[.[] | select(.provider != "multi" or .model != "multi/model-a" or .gateway_api_key_id != $id)] | length') == 0 ]]
+multi_filtered_page=$(admin -f "$base/admin/activity/logs/page?since=0&providers=multi&models=multi/model-a&api_keys=$unrestricted_id&limit=100")
+[[ $(printf '%s' "$multi_filtered_page" | jq --arg id "$unrestricted_id" '[.data[] | select(.provider != "multi" or .model != "multi/model-a" or .gateway_api_key_id != $id)] | length') == 0 ]]
+[[ $(printf '%s' "$multi_filtered_page" | jq -r '.total >= (.data | length) and (.data | length) > 0') == true ]]
 logs=$(admin -f "$base/admin/activity/logs?since=0")
 [[ $(printf '%s' "$logs" | jq 'length') -ge 4 ]]
 filtered_logs=$(admin -f "$base/admin/activity/logs?since=0&provider=multi&limit=1000")
@@ -575,15 +755,18 @@ import_result=$(admin -f -X POST "$base/admin/activity/import" -H 'content-type:
 [[ $(printf '%s' "$import_result" | jq -r .duplicates) == 1 ]]
 [[ $(admin_status -X POST "$base/admin/activity/import/preview" -H 'content-type: application/json' -d '{"format":"unknown","version":1,"records":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d '{"format":"unknown","version":1,"records":[]}') == 400 ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/activity/import"].post.responses | has("500")') == true ]]
 # Management API keys call control endpoints without a browser session.
 management=$(admin -f -X POST "$base/admin/management-keys" -H 'content-type: application/json' -d '{"name":"E2E","expires_at":null}')
 management_secret=$(printf '%s' "$management" | jq -r .secret)
+management_id=$(printf '%s' "$management" | jq -r .api_key.id)
 [[ $management_secret == yab_mgmt_* ]]
 [[ $(status "$base/admin/activity/stats?since=0" -H "Authorization: Bearer $management_secret") == 200 ]]
 [[ $(status "$base/admin/providers" -H "Authorization: Bearer $management_secret") == 200 ]]
+[[ $(admin -f "$base/admin/management-keys" | jq -r --arg id "$management_id" '.[] | select(.id == $id) | .last_used_at != null') == true ]]
+[[ $(jq -r --arg id "$management_id" '.management_api_keys[] | select(.id == $id) | .last_used_at != null' data/admin.json) == true ]]
 # Management keys cannot touch the profile or management-key endpoints.
 [[ $(status -X PATCH "$base/admin/profile" -H "Authorization: Bearer $management_secret" -H 'content-type: application/json' -d '{"username":"x","email":"x@example.com"}') == 401 ]]
-management_id=$(printf '%s' "$management" | jq -r .api_key.id)
 admin -f -X DELETE "$base/admin/management-keys/$management_id" >/dev/null
 [[ $(status "$base/admin/providers" -H "Authorization: Bearer $management_secret") == 401 ]]
 # Live API docs and the embedded OpenAPI spec are public.

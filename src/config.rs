@@ -5,6 +5,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,10 +20,19 @@ use crate::{
 
 pub const PROVIDERS_FILE: &str = "data/providers.json";
 
+#[derive(Clone, Copy, Debug)]
+pub struct UpstreamTimeouts {
+    pub connect: Duration,
+    pub read: Duration,
+    pub total: Duration,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub client: reqwest::Client,
+    pub upstream_timeouts: UpstreamTimeouts,
     pub providers: Arc<RwLock<HashMap<String, Provider>>>,
+    pub pricing: Arc<RwLock<crate::pricing::PricingTable>>,
     pub auth: SharedAuth,
     pub admin: AdminState,
     pub activity: ActivityStore,
@@ -94,7 +104,10 @@ pub struct ApiEndpoint {
     pub extra_headers: HashMap<String, String>,
     #[serde(default)]
     pub extra_body: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::pricing::PricingTable>,
     pub requires_api_key: bool,
+    #[serde(default)]
     pub api_keys: Vec<ApiKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_subscription: Option<OpenAiSubscription>,
@@ -113,6 +126,7 @@ impl Default for ApiEndpoint {
             socks5_proxy: None,
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             requires_api_key: true,
             api_keys: Vec::new(),
             openai_subscription: None,
@@ -123,7 +137,11 @@ impl Default for ApiEndpoint {
 }
 
 impl ApiEndpoint {
-    pub fn client(&self, default: &reqwest::Client) -> Result<reqwest::Client, String> {
+    pub fn client(
+        &self,
+        default: &reqwest::Client,
+        timeouts: UpstreamTimeouts,
+    ) -> Result<reqwest::Client, String> {
         let Some(proxy_url) = &self.socks5_proxy else {
             return Ok(default.clone());
         };
@@ -134,6 +152,9 @@ impl ApiEndpoint {
                 })?;
                 reqwest::Client::builder()
                     .proxy(proxy)
+                    .connect_timeout(timeouts.connect)
+                    .read_timeout(timeouts.read)
+                    .timeout(timeouts.total)
                     .pool_max_idle_per_host(64)
                     .tcp_nodelay(true)
                     .build()
@@ -177,6 +198,8 @@ pub struct Provider {
     pub extra_headers: HashMap<String, String>,
     #[serde(default)]
     pub extra_body: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::pricing::PricingTable>,
     #[serde(default)]
     pub defaults_endpoint_ids: Vec<String>,
     pub endpoints: Vec<ApiEndpoint>,
@@ -228,6 +251,9 @@ pub async fn load_providers() -> Result<HashMap<String, Provider>, String> {
 fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
     let mut provider_ids = std::collections::HashSet::new();
     for provider in providers {
+        if let Some(pricing) = &provider.pricing {
+            crate::pricing::validate_table(pricing, &format!("Provider '{}'", provider.id))?;
+        }
         if provider.id.is_empty() || !provider_ids.insert(provider.id.as_str()) {
             return Err(format!(
                 "parse {PROVIDERS_FILE}: Provider IDs must be non-empty and unique"
@@ -235,6 +261,12 @@ fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
         }
         let mut endpoint_ids = std::collections::HashSet::new();
         for endpoint in &provider.endpoints {
+            if let Some(pricing) = &endpoint.pricing {
+                crate::pricing::validate_table(
+                    pricing,
+                    &format!("Endpoint '{}/{}'", provider.id, endpoint.id),
+                )?;
+            }
             if endpoint.id.is_empty() || !endpoint_ids.insert(endpoint.id.as_str()) {
                 return Err(format!(
                     "parse {PROVIDERS_FILE}: Endpoint IDs within Provider '{}' must be non-empty and unique",
@@ -418,6 +450,7 @@ mod tests {
             name: "Provider".to_owned(),
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints: vec![endpoint],
             discovered_models: Vec::new(),
@@ -436,6 +469,7 @@ mod tests {
             name: id.to_owned(),
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints,
             discovered_models: Vec::new(),
@@ -476,6 +510,7 @@ mod tests {
             name: "Provider".to_owned(),
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints: vec![ApiEndpoint {
                 id: "endpoint".to_owned(),
@@ -593,6 +628,7 @@ mod tests {
             socks5_proxy: None,
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             requires_api_key: true,
             openai_subscription: None,
             api_keys: vec![

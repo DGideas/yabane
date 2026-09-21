@@ -1,6 +1,13 @@
 let providers = [];
 let authSettings = {enabled: true, api_keys: []};
 let modelRoutes = [];
+let globalPricing = {updated_at: 0, models: {}};
+let pricingActivityModels = [];
+let pricingEditTarget = null;
+let modelsDevCatalogPromise = null;
+let modelsDevReferenceResults = [];
+let modelsDevSearchTimer = null;
+let modelsDevSearchSequence = 0;
 let extensions = [];
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -8,6 +15,7 @@ const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hi
 const providerDialog = $('#provider-dialog');
 const providerForm = $('#provider-form');
 const providerIdentityDialog = $('#provider-identity-dialog');
+const endpointDialog = $('#endpoint-dialog');
 let providerStep = 1;
 let providerIdEdited = false;
 let selectedProviderId = null;
@@ -25,7 +33,11 @@ let activityPageSince = 0;
 let activityPageUntil = 0;
 let activityCustomRange = null;
 let activitySearchTimer = null;
+const activityFilters = {providers: new Set(), models: new Set(), apiKeys: new Set()};
+let activityFilterOptions = {providers: [], models: [], api_keys: []};
 let dashboardLoadPromise = null;
+let providerActivityLoadPromise = null;
+let providerActivity = new Map();
 let homeTrafficBuckets = [];
 let homeTrafficBucketSize = 0;
 let homeTrafficResizeFrame = 0;
@@ -79,7 +91,7 @@ async function initializeAdmin() {
   const initial = (adminSession.username || 'A').slice(0, 1).toUpperCase();
   $('#account-menu').textContent = initial; $('.account-avatar-large').textContent = initial;
   $('#account-name').textContent = adminSession.username || 'Administrator'; $('#account-email').textContent = adminSession.email || '';
-  await Promise.all([loadProviders(), loadAuth(), loadRoutes(), loadExtensions(), loadAbout()]);
+  await Promise.all([loadProviders(), loadPricing(), loadAuth(), loadRoutes(), loadExtensions(), loadAbout()]);
   refreshVisibleView();
 }
 
@@ -126,11 +138,12 @@ function slugify(value) {
   return value.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
-const viewPaths = {home: '/home', providers: '/providers', models: '/model-routing', extensions: '/extensions', capture: '/extensions/traffic-capture', access: '/api-access', activity: '/activity', management: '/management-api'};
+const viewPaths = {home: '/home', providers: '/providers', models: '/model-routing', pricing: '/model-pricing', extensions: '/extensions', capture: '/extensions/traffic-capture', access: '/api-access', activity: '/activity', management: '/management-api'};
 function showView(name, updateHistory = true) {
   $('#home-view').hidden = name !== 'home';
   $('#providers-view').hidden = name !== 'providers';
   $('#models-view').hidden = name !== 'models';
+  $('#pricing-view').hidden = name !== 'pricing';
   $('#extensions-view').hidden = name !== 'extensions';
   $('#traffic-capture-view').hidden = name !== 'capture';
   $('#access-view').hidden = name !== 'access';
@@ -143,7 +156,9 @@ function showView(name, updateHistory = true) {
   indicator.style.transform = `translateY(${active.offsetTop}px)`;
   selectedProviderId = name === 'providers' ? selectedProviderId : null;
   if (name === 'providers') renderProviderPage();
+  if (name === 'providers' && adminSession?.authenticated && !selectedProviderId) loadProviderActivity();
   if (name === 'home' && adminSession?.authenticated) loadDashboard();
+  if (name === 'pricing') { showPricingList(); renderPricingPage(); }
   if (name === 'extensions') renderExtensions();
   if (name === 'capture' && adminSession?.authenticated) loadTrafficCapture();
   if (name === 'activity' && adminSession?.authenticated) loadActivity();
@@ -155,8 +170,10 @@ $$('.nav[data-view]').forEach(item => item.addEventListener('click', () => { sho
 function routeFromLocation() {
   const path = location.pathname;
   if (path.startsWith('/providers/')) { selectedProviderId = decodeURIComponent(path.slice('/providers/'.length)); showView('providers', false); }
+  else if (path === '/providers') { selectedProviderId = null; showView('providers', false); }
   else if (path === '/home' || path === '/') showView('home', false);
   else if (path === '/model-routing') showView('models', false);
+  else if (path === '/model-pricing') showView('pricing', false);
   else if (path === '/extensions/traffic-capture') showView('capture', false);
   else if (path === '/extensions') showView('extensions', false);
   else if (path === '/api-access') showView('access', false);
@@ -469,7 +486,10 @@ function renderProviders() {
     card.className = 'provider-list-item';
     card.dataset.provider = provider.id;
     const modelStatus = provider.model_discovery_error ? 'Model discovery failed' : provider.models_discovered_at ? `${provider.discovered_models.length} models` : 'Discovering models…';
-    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
+    const activity = providerActivity.get(provider.id) || [];
+    const requests = activity.reduce((total, value) => total + value, 0);
+    const activityLabel = `${requests.toLocaleString()} request${requests === 1 ? '' : 's'} in the last 24 hours`;
+    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-activity" aria-label="${escapeHtml(activityLabel)}"><span class="provider-sparkline">${sparkline(activity.length ? activity : [0, 0], '#0b57d0')}</span><small>${compactNumber(requests)} requests · 24h</small></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
     card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); });
     return card;
   }));
@@ -498,9 +518,9 @@ function renderProviderPage() {
       const renewal = endpoint.subscription_connected
         ? `<div><h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or OpenAI revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(credentialDetail)} Access and refresh tokens are never shown in the console or API.</p></details></div><span class="renewal-status">Automatic renewal</span>`
         : `<div><h4>Reconnect required</h4><p>${escapeHtml(credentialDetail)}</p></div><span class="renewal-status attention">Not connected</span>`;
-      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit endpoint</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
+      return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit endpoint</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
     }
-    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
+    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
@@ -517,7 +537,7 @@ function renderProviderPage() {
   const defaultsNotice = requestDefaultsExtension && !requestDefaultsExtension.enabled ? `<div class="defaults-disabled-notice" role="status"><span class="defaults-disabled-mark" aria-hidden="true">!</span><span><strong>Request defaults are off</strong><small>No saved headers or body fields will be added to upstream requests. ${defaultsEnableGuidance}</small></span></div>` : '';
   const defaultsAction = requestDefaultsExtension ? '<button class="button secondary edit-provider-options">Configure</button>' : '<button class="button secondary include-request-defaults-extension" type="button">How to include</button>';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section><section class="card provider-pricing-card"><div class="card-head"><div><span class="section-kicker">Provider default</span><h2>Cost estimation</h2><p>Yabane uses these rates when an Endpoint has no override. This setting is separate from Request Defaults.</p></div><button class="button secondary edit-provider-pricing" data-provider="${provider.id}" type="button">Configure pricing</button></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -642,6 +662,8 @@ function bindProviderActions() {
     await Promise.all([loadProviders(), loadRoutes(), loadAuth()]);
   }));
   $$('.endpoint-edit').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider, button.dataset.endpoint)));
+  $$('.endpoint-pricing').forEach(button => button.addEventListener('click', () => openPricingEditor(button.dataset.provider, button.dataset.endpoint)));
+  $$('.edit-provider-pricing').forEach(button => button.addEventListener('click', () => openPricingEditor(button.dataset.provider)));
   $$('.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     const endpoint = provider.endpoints.find(item => item.id === button.dataset.endpoint);
@@ -701,7 +723,249 @@ async function patchKey(providerId, endpointId, keyId, update) {
   await loadProviders();
 }
 
-const endpointDialog = $('#endpoint-dialog');
+function pricingTable(scope, providerId = null, endpointId = null) {
+  if (scope === 'global') return globalPricing;
+  const provider = providers.find(item => item.id === providerId);
+  if (scope === 'provider') return provider?.pricing || {updated_at: 0, models: {}};
+  return provider?.endpoints.find(item => item.id === endpointId)?.pricing || {updated_at: 0, models: {}};
+}
+
+function pricingEntries() {
+  const entries = Object.entries(globalPricing.models || {}).map(([model, rates]) => ({scope: 'global', providerId: null, endpointId: null, model, rates, updatedAt: globalPricing.updated_at}));
+  for (const provider of providers) {
+    for (const [model, rates] of Object.entries(provider.pricing?.models || {})) entries.push({scope: 'provider', providerId: provider.id, endpointId: null, model, rates, updatedAt: provider.pricing.updated_at});
+    for (const endpoint of provider.endpoints) for (const [model, rates] of Object.entries(endpoint.pricing?.models || {})) entries.push({scope: 'endpoint', providerId: provider.id, endpointId: endpoint.id, model, rates, updatedAt: endpoint.pricing.updated_at});
+  }
+  return entries.sort((a, b) => a.model.localeCompare(b.model) || a.scope.localeCompare(b.scope) || (a.providerId || '').localeCompare(b.providerId || '') || (a.endpointId || '').localeCompare(b.endpointId || ''));
+}
+
+function pricingScopeText(entry) {
+  if (entry.scope === 'global') return {label: 'Global', detail: 'All Providers'};
+  if (entry.scope === 'provider') return {label: 'Provider', detail: entry.providerId};
+  return {label: 'Endpoint', detail: `${entry.providerId} / ${entry.endpointId}`};
+}
+function formatPricingRate(value) { return value == null ? 'Inherit' : `$${new Intl.NumberFormat('en', {maximumFractionDigits: 12}).format(value)}`; }
+function showPricingList() { $('#pricing-list-page').hidden = false; $('#pricing-editor-page').hidden = true; pricingEditTarget = null; }
+function renderPricingPage() {
+  if (!$('#pricing-view')) return;
+  const entries = pricingEntries();
+  $('#pricing-global-count').textContent = entries.filter(entry => entry.scope === 'global').length.toLocaleString();
+  $('#pricing-provider-count').textContent = entries.filter(entry => entry.scope === 'provider').length.toLocaleString();
+  $('#pricing-endpoint-count').textContent = entries.filter(entry => entry.scope === 'endpoint').length.toLocaleString();
+  const query = $('#pricing-search').value.trim().toLowerCase(); const scope = $('#pricing-scope-filter').value;
+  const filtered = entries.filter(entry => (!scope || entry.scope === scope) && (!query || `${entry.model} ${entry.scope} ${entry.providerId || ''} ${entry.endpointId || ''}`.toLowerCase().includes(query)));
+  $('#pricing-list-empty').hidden = entries.length > 0;
+  $('#pricing-table-wrap').hidden = entries.length === 0;
+  $('#pricing-table-body').innerHTML = filtered.length ? filtered.map((entry, index) => {
+    const scopeText = pricingScopeText(entry); const incomplete = entry.rates.input_per_million == null || entry.rates.output_per_million == null;
+    return `<tr><td><code>${escapeHtml(entry.model)}</code>${incomplete ? '<small class="pricing-incomplete">Incomplete effective rate</small>' : ''}</td><td><span class="pricing-scope-badge ${entry.scope}">${scopeText.label}</span><small>${escapeHtml(scopeText.detail)}</small></td><td>${formatPricingRate(entry.rates.input_per_million)}</td><td>${formatPricingRate(entry.rates.output_per_million)}</td><td>${formatPricingRate(entry.rates.cache_read_per_million)}</td><td>${entry.updatedAt ? escapeHtml(new Date(entry.updatedAt * 1000).toLocaleDateString()) : '—'}</td><td><button class="text-link edit-pricing-entry" type="button" data-pricing-index="${index}">Edit</button></td></tr>`;
+  }).join('') : '<tr><td colspan="7"><div class="activity-empty">No prices match this search.</div></td></tr>';
+  $$('.edit-pricing-entry').forEach(button => button.addEventListener('click', () => openCentralPricingEditor(filtered[Number(button.dataset.pricingIndex)])));
+}
+
+function pricingSuggestions(scope, providerId, endpointId) {
+  const models = new Set(Object.keys(globalPricing.models || {}));
+  const provider = providers.find(item => item.id === providerId);
+  const candidates = scope === 'global' ? providers : provider ? [provider] : [];
+  for (const item of candidates) {
+    item.discovered_models.forEach(model => {
+      if (scope !== 'endpoint' || (item.model_endpoints[model] || []).includes(endpointId)) models.add(model);
+    });
+    Object.keys(item.pricing?.models || {}).forEach(model => models.add(model));
+    for (const endpoint of item.endpoints) {
+      if (scope !== 'endpoint' || endpoint.id === endpointId) Object.keys(endpoint.pricing?.models || {}).forEach(model => models.add(model));
+    }
+  }
+  for (const activity of pricingActivityModels) {
+    if (scope === 'global' || activity.providerId === providerId && (scope !== 'endpoint' || activity.endpointId === endpointId)) models.add(activity.model);
+  }
+  for (const route of modelRoutes) for (const target of route.targets) {
+    if (scope === 'global' || target.provider_id === providerId && (scope !== 'endpoint' || target.endpoint_id === endpointId)) models.add(target.upstream_model);
+  }
+  return [...models].filter(Boolean).sort();
+}
+function updatePricingEndpoints() {
+  const provider = providers.find(item => item.id === $('#pricing-provider').value);
+  const select = $('#pricing-endpoint'); const previous = select.value;
+  select.replaceChildren(...(provider?.endpoints || []).map(endpoint => new Option(endpoint.id, endpoint.id)));
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
+}
+function updatePricingModelSuggestions() {
+  const scope = $('#central-pricing-form [name="scope"]:checked').value;
+  const suggestions = pricingSuggestions(scope, $('#pricing-provider').value, $('#pricing-endpoint').value);
+  $('#pricing-model-suggestions').replaceChildren(...suggestions.map(model => new Option(model)));
+  $('#pricing-model').setAttribute('list', 'pricing-model-suggestions');
+  const value = $('#pricing-model').value.trim();
+  const validPattern = value && /^[^*]+\*?$/.test(value);
+  $('#pricing-model-notice').textContent = !value
+    ? `${suggestions.length} model pattern${suggestions.length === 1 ? '' : 's'} available as suggestions. Custom patterns are allowed.`
+    : !validPattern
+      ? 'Use an exact model ID or one trailing * for a prefix match.'
+      : value.endsWith('*')
+        ? `Matches every upstream model beginning with "${value.slice(0, -1)}". Exact rules still take priority.`
+        : !suggestions.includes(value)
+          ? 'Custom exact model ID — it was not discovered or used by a route, but it will still be saved as entered.'
+          : 'Exact model ID.';
+  scheduleModelsDevReference(value);
+}
+
+function loadModelsDevCatalog() {
+  if (!modelsDevCatalogPromise) {
+    modelsDevCatalogPromise = fetch('https://models.dev/api.json', {credentials: 'omit'})
+      .then(response => {
+        if (!response.ok) throw new Error(`models.dev returned HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(catalog => Object.entries(catalog).flatMap(([providerId, provider]) =>
+        Object.entries(provider.models || {}).flatMap(([modelId, model]) => {
+          const cost = model.cost;
+          if (!cost || !Number.isFinite(cost.input) || !Number.isFinite(cost.output)) return [];
+          return [{providerId, providerName: provider.name || providerId, modelId, modelName: model.name || modelId, cost}];
+        })
+      ))
+      .catch(error => { modelsDevCatalogPromise = null; throw error; });
+  }
+  return modelsDevCatalogPromise;
+}
+
+function modelsDevMatchScore(reference, query) {
+  const id = reference.modelId.toLowerCase(); const name = reference.modelName.toLowerCase();
+  if (id === query) return 0;
+  if (id.endsWith(`/${query}`)) return 1;
+  if (name === query) return 2;
+  if (id.startsWith(query)) return 3;
+  if (id.includes(`/${query}`)) return 4;
+  if (id.includes(query)) return 5;
+  if (name.includes(query)) return 6;
+  return null;
+}
+
+function renderModelsDevReferences(results, message = '') {
+  modelsDevReferenceResults = results;
+  $('#pricing-reference-status').textContent = message;
+  $('#pricing-reference-status').hidden = !message;
+  $('#pricing-reference-results').innerHTML = results.map((reference, index) => {
+    const cache = Number.isFinite(reference.cost.cache_read) ? `$${formatPricingRate(reference.cost.cache_read).slice(1)}` : 'Not listed';
+    return `<article class="pricing-reference-item"><header><div><strong>${escapeHtml(reference.modelName)}</strong><small>${escapeHtml(reference.providerName)}</small></div><span>${escapeHtml(reference.providerId)}</span></header><code title="${escapeHtml(reference.modelId)}">${escapeHtml(reference.modelId)}</code><dl><div><dt>Input / M</dt><dd>$${escapeHtml(reference.cost.input)}</dd></div><div><dt>Output / M</dt><dd>$${escapeHtml(reference.cost.output)}</dd></div><div><dt>Cache read / M</dt><dd>${escapeHtml(cache)}</dd></div></dl><button class="button secondary use-reference-rates" type="button" data-reference-index="${index}">Use rates</button></article>`;
+  }).join('');
+}
+
+function scheduleModelsDevReference(value) {
+  clearTimeout(modelsDevSearchTimer);
+  const query = value.trim().replace(/\*$/, '').toLowerCase(); const sequence = ++modelsDevSearchSequence;
+  if (!matchMedia('(min-width:1280px)').matches || query.length < 2) {
+    renderModelsDevReferences([], 'Enter at least two model characters to find references.');
+    return;
+  }
+  $('#pricing-reference-status').hidden = false;
+  $('#pricing-reference-status').textContent = 'Loading models.dev references…';
+  $('#pricing-reference-results').replaceChildren();
+  modelsDevSearchTimer = setTimeout(async () => {
+    try {
+      const catalog = await loadModelsDevCatalog();
+      if (sequence !== modelsDevSearchSequence) return;
+      const results = catalog
+        .map(reference => ({reference, score: modelsDevMatchScore(reference, query)}))
+        .filter(item => item.score != null)
+        .sort((left, right) => left.score - right.score || left.reference.providerName.localeCompare(right.reference.providerName) || left.reference.modelId.localeCompare(right.reference.modelId))
+        .slice(0, 8)
+        .map(item => item.reference);
+      renderModelsDevReferences(results, results.length ? '' : 'No priced models.dev references match this pattern.');
+    } catch {
+      if (sequence === modelsDevSearchSequence) renderModelsDevReferences([], 'models.dev references are unavailable. You can still enter rates manually.');
+    }
+  }, 350);
+}
+function updatePricingScopeFields() {
+  const scope = $('#central-pricing-form [name="scope"]:checked').value;
+  $('#pricing-resource-fields').hidden = scope === 'global';
+  $('#pricing-endpoint-field').hidden = scope !== 'endpoint';
+  $('#pricing-provider').required = scope !== 'global';
+  $('#pricing-endpoint').required = scope === 'endpoint';
+  updatePricingEndpoints(); updatePricingModelSuggestions();
+}
+function openCentralPricingEditor(options = {}) {
+  const form = $('#central-pricing-form'); form.reset(); $('#central-pricing-error').textContent = '';
+  const scope = options.scope || 'global'; const providerId = options.providerId || options.provider_id || providers[0]?.id || ''; const endpointId = options.endpointId || options.endpoint_id || '';
+  const model = options.model || options.modelId || '';
+  const existing = Boolean(options.rates) || Boolean(model && pricingTable(scope, providerId, endpointId).models?.[model]);
+  const rates = options.rates || pricingTable(scope, providerId, endpointId).models?.[model] || {};
+  pricingEditTarget = {scope, providerId, endpointId, originalModel: existing ? model : null};
+  $('#pricing-provider').replaceChildren(...providers.map(provider => new Option(provider.name, provider.id)));
+  if (providerId && [...$('#pricing-provider').options].some(option => option.value === providerId)) $('#pricing-provider').value = providerId;
+  form.elements.scope.value = scope;
+  $$('#central-pricing-form [name="scope"]').forEach(input => { input.disabled = existing; input.closest('label').classList.toggle('locked', existing && !input.checked); });
+  updatePricingEndpoints();
+  if (endpointId && [...$('#pricing-endpoint').options].some(option => option.value === endpointId)) $('#pricing-endpoint').value = endpointId;
+  form.elements.model.value = model;
+  for (const field of ['input_per_million', 'output_per_million', 'cache_read_per_million']) form.elements[field].value = rates[field] ?? '';
+  $('#pricing-editor-title').textContent = existing ? `Edit ${model}` : 'Add model price';
+  $('#pricing-editor-breadcrumb').textContent = existing ? 'Edit price' : 'Add price';
+  $('#pricing-editor-description').textContent = existing ? 'Update this explicit rule. Historical Activity values remain unchanged.' : 'Create an explicit global default or a narrower upstream override.';
+  $('#delete-pricing-rule').hidden = !existing;
+  $('#pricing-list-page').hidden = true; $('#pricing-editor-page').hidden = false;
+  updatePricingScopeFields(); $('#pricing-model').focus();
+}
+function openPricingEditor(providerId, endpointId = null, modelId = null) {
+  const provider = providers.find(item => item.id === providerId);
+  const endpoint = provider?.endpoints.find(item => item.id === endpointId);
+  let scope = 'global';
+  if (modelId && endpoint?.pricing?.models?.[modelId]) scope = 'endpoint';
+  else if (modelId && provider?.pricing?.models?.[modelId]) scope = 'provider';
+  showView('pricing');
+  openCentralPricingEditor({scope, providerId, endpointId, modelId});
+}
+async function savePricingScope(scope, providerId, endpointId, table) {
+  const url = scope === 'global' ? '/admin/pricing' : scope === 'provider' ? `/admin/pricing/providers/${encodeURIComponent(providerId)}` : `/admin/pricing/providers/${encodeURIComponent(providerId)}/endpoints/${encodeURIComponent(endpointId)}`;
+  return fetch(url, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify(table)});
+}
+async function refreshPricingConfiguration() { await Promise.all([loadPricing(), loadProviders()]); renderPricingPage(); }
+
+$('#open-pricing-editor').addEventListener('click', () => openCentralPricingEditor());
+$('#empty-add-pricing').addEventListener('click', () => openCentralPricingEditor());
+$('#back-to-pricing').addEventListener('click', () => { showPricingList(); renderPricingPage(); });
+$('#cancel-pricing-edit').addEventListener('click', () => { showPricingList(); renderPricingPage(); });
+$('#pricing-search').addEventListener('input', renderPricingPage);
+$('#pricing-scope-filter').addEventListener('change', renderPricingPage);
+$$('#central-pricing-form [name="scope"]').forEach(input => input.addEventListener('change', updatePricingScopeFields));
+$('#pricing-provider').addEventListener('change', () => { updatePricingEndpoints(); updatePricingModelSuggestions(); });
+$('#pricing-endpoint').addEventListener('change', updatePricingModelSuggestions);
+$('#pricing-model').addEventListener('input', updatePricingModelSuggestions);
+$('#pricing-reference-results').addEventListener('click', event => {
+  const button = event.target.closest('.use-reference-rates');
+  if (!button) return;
+  const reference = modelsDevReferenceResults[Number(button.dataset.referenceIndex)];
+  if (!reference) return;
+  const form = $('#central-pricing-form');
+  form.elements.input_per_million.value = reference.cost.input;
+  form.elements.output_per_million.value = reference.cost.output;
+  form.elements.cache_read_per_million.value = Number.isFinite(reference.cost.cache_read) ? reference.cost.cache_read : '';
+  $('#central-pricing-error').textContent = '';
+});
+$('#central-pricing-form').addEventListener('submit', async event => {
+  event.preventDefault(); const form = event.currentTarget; const scope = form.elements.scope.value; const providerId = form.elements.provider_id.value; const endpointId = form.elements.endpoint_id.value; const model = form.elements.model.value.trim();
+  if (!/^[^*]+\*?$/.test(model)) return ($('#central-pricing-error').textContent = 'Use an exact model ID or one trailing * for a prefix match.');
+  const values = ['input_per_million', 'output_per_million', 'cache_read_per_million'].map(field => form.elements[field].value === '' ? null : Number(form.elements[field].value));
+  if (values.every(value => value == null)) return ($('#central-pricing-error').textContent = 'Enter at least one rate.');
+  if (values.some(value => value != null && (!Number.isFinite(value) || value < 0))) return ($('#central-pricing-error').textContent = 'Rates must be finite, non-negative numbers.');
+  const table = structuredClone(pricingTable(scope, providerId, endpointId)); table.models ||= {};
+  const oldModel = pricingEditTarget?.originalModel;
+  const preservedCacheWrite = oldModel ? table.models[oldModel]?.cache_write_per_million ?? null : null;
+  if (oldModel && oldModel !== model) delete table.models[oldModel];
+  if (!oldModel && table.models[model]) return ($('#central-pricing-error').textContent = 'A price already exists for this model pattern in the selected scope. Edit the existing rule instead.');
+  table.models[model] = {input_per_million: values[0], output_per_million: values[1], cache_read_per_million: values[2], cache_write_per_million: preservedCacheWrite};
+  const response = await savePricingScope(scope, providerId, endpointId, table);
+  if (!response.ok) return showApiError(response, $('#central-pricing-error'));
+  await refreshPricingConfiguration(); showPricingList();
+});
+$('#delete-pricing-rule').addEventListener('click', async () => {
+  if (!pricingEditTarget?.originalModel || !confirm(`Delete the explicit price for “${pricingEditTarget.originalModel}”?\n\nHistorical Activity values will not change.`)) return;
+  const {scope, providerId, endpointId, originalModel} = pricingEditTarget; const table = structuredClone(pricingTable(scope, providerId, endpointId)); delete table.models[originalModel];
+  const response = await savePricingScope(scope, providerId, endpointId, table);
+  if (!response.ok) return showApiError(response, $('#central-pricing-error'));
+  await refreshPricingConfiguration(); showPricingList();
+});
+
 function openEndpointDialog(providerId, endpointId = null) {
   const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; form.elements.id.dataset.edited = ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
   const provider = providers.find(item => item.id === providerId);
@@ -1157,28 +1421,32 @@ $$('.close-about').forEach(button => button.addEventListener('click', () => abou
 const helpDialog = $('#help-dialog');
 function openHelp(context = 'general', providerId = null) {
   helpDialog.dataset.context = context;
-  selectHelpTab('agent');
   helpDialog.dataset.provider = providerId || '';
-  updateHelpGuide();
+  selectHelpTab('agent');
+  updateHelpGuide(providerId);
   helpDialog.showModal();
 }
 function helpModels() {
   const discovered = providers.flatMap(provider => provider.discovered_models.map(model => `${provider.id}/${model}`));
   return [...new Set([...modelRoutes.map(route => route.pattern).filter(pattern => !pattern.endsWith('*')), ...discovered])].sort();
 }
-function updateHelpGuide() {
+function updateHelpGuide(preferredProviderId = null) {
   const modelSelect = $('#help-model'); const keySelect = $('#help-key');
   const previousModel = modelSelect.value; const previousKey = keySelect.value;
   const models = helpModels();
+  const provider = providers.find(item => item.id === (preferredProviderId || helpDialog.dataset.provider));
+  const preferredModel = preferredProviderId && provider?.discovered_models.length ? `${provider.id}/${provider.discovered_models[0]}` : null;
   modelSelect.replaceChildren(...models.map(model => new Option(model, model)));
   if (!models.length) modelSelect.append(new Option('No discovered models yet', ''));
-  if (models.includes(previousModel)) modelSelect.value = previousModel;
+  if (preferredModel && models.includes(preferredModel)) modelSelect.value = preferredModel;
+  else if (models.includes(previousModel)) modelSelect.value = previousModel;
   keySelect.replaceChildren(...authSettings.api_keys.map(key => new Option(`${key.note || 'Gateway API key'} · ${key.prefix}`, key.secret || '')));
   if (!authSettings.api_keys.length) keySelect.append(new Option('Generate a Gateway API key first', ''));
-  if ([...keySelect.options].some(option => option.value === previousKey)) keySelect.value = previousKey;
+  const preferredKey = preferredProviderId && authSettings.api_keys.find(key => key.secret && (!key.expires_at || key.expires_at * 1000 > Date.now()) && (!key.provider_ids.length || key.provider_ids.includes(preferredProviderId)));
+  if (preferredKey) keySelect.value = preferredKey.secret || '';
+  else if ([...keySelect.options].some(option => option.value === previousKey)) keySelect.value = previousKey;
   const baseUrl = `${location.origin}/v1`; const model = modelSelect.value || 'provider/model-id'; const key = keySelect.value || 'sk-your-yabane-key';
   const context = helpDialog.dataset.context || 'general';
-  const provider = providers.find(item => item.id === helpDialog.dataset.provider);
   const title = context === 'provider' && provider ? `Connect clients to ${provider.name}` : context === 'access' ? 'Connect clients to Yabane' : 'Connect your Agent to Yabane';
   helpDialog.querySelector('h2').textContent = title;
   $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an Endpoint and upstream credential'}</small></span>`;
@@ -1337,16 +1605,24 @@ const searchItems = [
   {label: 'Providers', description: 'Manage LLM providers', view: 'providers'},
   {label: 'Model routing', description: 'Route model IDs to upstream credentials', view: 'models'},
   {label: 'Provider models', description: 'Discover models from providers', view: 'models'},
+  {label: 'Model pricing', description: 'Global model rates and upstream overrides', view: 'pricing'},
   {label: 'Extensions', description: 'Compiled request Hooks and capabilities', view: 'extensions'},
-  {label: 'Request Defaults extension', description: 'Extra Header and Extra JSON Body Hooks', view: 'extensions'},
   {label: 'API access', description: 'Authentication and gateway keys', view: 'access'},
   {label: 'Generate Gateway API key', description: 'Create an inference credential', view: 'access', action: () => $('#open-gateway-key').click()},
-  {label: 'Activity', description: 'Requests, tokens, latency, upstream cost, and routing logs', view: 'activity'},
+  {label: 'Activity', description: 'Requests, tokens, latency, usage value, and routing logs', view: 'activity'},
   {label: 'Management API', description: 'Programmatic control keys and live docs', view: 'management'},
   {label: 'Create Management API key', description: 'Create a control-plane credential', view: 'management', action: () => $('#open-management-key').click()},
   {label: 'Getting started', description: 'Connect an Agent to Yabane', view: 'home', action: () => openHelp()},
   {label: 'Live API docs', description: 'Interactive OpenAPI documentation', view: 'management', action: () => location.assign('/docs')}
 ];
+function extensionSearchItems() {
+  return extensions.map(extension => ({
+    label: `${extension.name} extension`,
+    description: extension.description,
+    keywords: `${extension.id} ${extension.hooks.join(' ')}`,
+    view: extension.id === 'traffic-capture' && extension.enabled ? 'capture' : 'extensions'
+  }));
+}
 let selectedSearchIndex = -1;
 function searchResultButtons() { return $$('#search-results button[role="option"]'); }
 function selectSearchResult(index) {
@@ -1359,7 +1635,7 @@ function closeSearch() { const input = $('#settings-search'); $('#search-results
 $('#settings-search').addEventListener('input', event => {
   const query = event.target.value.trim().toLowerCase(); const results = $('#search-results'); selectedSearchIndex = -1;
   if (!query) return closeSearch();
-  const matches = [...searchItems, ...providers.map(provider => ({label: provider.name, description: `Provider · ${provider.id}`, view: 'providers', action: () => { selectedProviderId = provider.id; renderProviderPage(); }}))].filter(item => `${item.label} ${item.description}`.toLowerCase().includes(query));
+  const matches = [...searchItems, ...extensionSearchItems(), ...providers.map(provider => ({label: provider.name, description: `Provider · ${provider.id}`, view: 'providers', action: () => { selectedProviderId = provider.id; renderProviderPage(); }}))].filter(item => `${item.label} ${item.description} ${item.keywords || ''}`.toLowerCase().includes(query));
   results.replaceChildren(...matches.map((item, index) => { const button = document.createElement('button'); button.id = `search-option-${index}`; button.setAttribute('role', 'option'); button.setAttribute('aria-selected', 'false'); button.innerHTML = `<strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(item.description)}</small>`; button.addEventListener('mouseenter', () => selectSearchResult(index)); button.addEventListener('click', () => { showView(item.view); item.action?.(); $('#settings-search').value = ''; closeSearch(); }); return button; }));
   if (!matches.length) { const empty = document.createElement('span'); empty.className = 'search-empty'; empty.textContent = 'No settings found'; results.replaceChildren(empty); }
   results.hidden = false; event.target.setAttribute('aria-expanded', 'true');
@@ -1378,10 +1654,49 @@ function copyIcon() { return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect 
 
 async function showApiError(response, target) { const body = await response.json(); const message = body.error?.message || `Request failed (${response.status})`; if (target) target.textContent = message; else alert(message); }
 function compactNumber(value) { return Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); }
-function formatCost(value) { return value == null ? '—' : `$${new Intl.NumberFormat('en', {minimumFractionDigits: 2, maximumFractionDigits: 6}).format(value)}`; }
+function formatCost(value) {
+  if (value == null) return '—';
+  const absolute = Math.abs(value);
+  const maximumFractionDigits = absolute > 0 && absolute < 0.01 ? Math.min(15, Math.max(6, Math.ceil(-Math.log10(absolute)) + 2)) : 6;
+  return `$${new Intl.NumberFormat('en', {minimumFractionDigits: 2, maximumFractionDigits}).format(value)}`;
+}
 let activityLogs = [];
 let activityOverviewLogs = [];
 const activityColors = ['#0b57d0', '#7c4dff', '#00a67e', '#ff8f00', '#d93025', '#00897b'];
+function activeActivityFilterCount() { return activityFilters.providers.size + activityFilters.models.size + activityFilters.apiKeys.size; }
+function activityFilterGroups() {
+  return [
+    {key: 'providers', label: 'Providers', values: activityFilterOptions.providers.map(value => ({value, label: value, detail: 'Provider'}))},
+    {key: 'models', label: 'Requested models', values: activityFilterOptions.models.map(value => ({value, label: value, detail: 'Public model'}))},
+    {key: 'apiKeys', label: 'Gateway API keys', values: activityFilterOptions.api_keys.map(item => ({value: item.id, label: item.name, detail: item.prefix || 'No authenticated key'}))},
+  ];
+}
+function updateActivityFilterState() {
+  const count = activeActivityFilterCount(); const badge = $('#activity-filter-count');
+  badge.textContent = count; badge.hidden = !count; $('#activity-filter-trigger').classList.toggle('active', count > 0);
+  const labels = new Map(activityFilterGroups().flatMap(group => group.values.map(item => [`${group.key}:${item.value}`, item.label])));
+  const chips = [];
+  for (const [key, values] of Object.entries(activityFilters)) for (const value of values) chips.push(`<button type="button" data-remove-filter="${escapeHtml(key)}" data-filter-value="${escapeHtml(value)}" title="Remove filter">${escapeHtml(labels.get(`${key}:${value}`) || value)}${icon('close')}</button>`);
+  $('#activity-filter-chips').innerHTML = chips.join(''); $('#activity-filter-chips').hidden = !chips.length;
+}
+function renderActivityFilterOptions() {
+  const search = $('#activity-filter-search').value.trim().toLowerCase();
+  $('#activity-filter-options').innerHTML = activityFilterGroups().map(group => {
+    const options = group.values.map(item => {
+      const hidden = search && !`${item.label} ${item.detail}`.toLowerCase().includes(search);
+      return `<label class="activity-filter-option"${hidden ? ' hidden' : ''}><input type="checkbox" data-filter-group="${group.key}" value="${escapeHtml(item.value)}"${activityFilters[group.key].has(item.value) ? ' checked' : ''}><span class="activity-filter-check" aria-hidden="true">${icon('check')}</span><span><strong>${escapeHtml(item.label)}</strong><small>${escapeHtml(item.detail)}</small></span></label>`;
+    }).join('');
+    const visible = group.values.some(item => !search || `${item.label} ${item.detail}`.toLowerCase().includes(search));
+    return `<section${visible ? '' : ' hidden'}><h3>${group.label}<span>${group.values.length}</span></h3><div>${options || '<p>No values in this time range.</p>'}</div></section>`;
+  }).join('');
+  updateActivityFilterState();
+}
+function addActivityFilterParams(params) {
+  if (activityFilters.providers.size) params.set('providers', [...activityFilters.providers].join(','));
+  if (activityFilters.models.size) params.set('models', [...activityFilters.models].join(','));
+  if (activityFilters.apiKeys.size) params.set('api_keys', [...activityFilters.apiKeys].join(','));
+  return params;
+}
 function activityBucketPlan(seconds, now = Math.floor(Date.now() / 1000), align = true) {
   const bucketSeconds = seconds <= 900 ? 60 : seconds <= 3600 ? 300 : seconds <= 21600 ? 600 : seconds <= 43200 ? 900 : seconds <= 86400 ? 1800 : seconds <= 259200 ? 3600 : seconds <= 604800 ? 10800 : seconds <= 1209600 ? 21600 : seconds <= 2592000 ? 43200 : 86400;
   const bucketCount = Math.min(120, Math.max(1, Math.ceil(seconds / bucketSeconds)));
@@ -1419,8 +1734,23 @@ function activityBucketLabel(bucket, seconds, full = false) {
   return `${startLabel} – ${endLabel}`;
 }
 function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'latency' ? (bucket.samples ? bucket.latency / bucket.samples : 0) : bucket.requests; }
+function activityTokenValues(bucket) {
+  const input = bucket.input ?? Math.max((bucket.tokens || 0) - (bucket.output || 0), 0); const output = bucket.output || 0;
+  return {input, output, cacheRate: input ? Math.min(100, bucket.cached * 100 / input) : 0};
+}
 function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'latency' ? formatDuration(Math.round(value)) : Math.round(value).toLocaleString(); }
-function formatReportedCost(cost, coverage) { return coverage ? formatCost(cost) : '—'; }
+function formatTrackedCost(cost, coverage) { return coverage ? formatCost(cost) : '—'; }
+function pricedRequestCount(stats) {
+  const explicit = Number.isFinite(stats.priced_requests) ? stats.priced_requests : 0;
+  const sourced = (stats.reported_requests || 0) + (stats.estimated_requests || 0);
+  return Math.max(explicit, sourced);
+}
+function costCoverageLabel(stats, requests = stats.requests) {
+  const sources = [];
+  if (stats.reported_requests) sources.push(`${stats.reported_requests.toLocaleString()} reported`);
+  if (stats.estimated_requests) sources.push(`${stats.estimated_requests.toLocaleString()} estimated value`);
+  return sources.length ? `${sources.join(' · ')} · ${pricedRequestCount(stats).toLocaleString()} / ${requests.toLocaleString()} requests valued` : 'No cost data';
+}
 function activityTrend(buckets) {
   const bucketSeconds = activityChartSeconds / Math.max(buckets.length, 1); const now = Date.now() / 1000;
   let currentIndex = buckets.findLastIndex(bucket => bucket.start + bucketSeconds <= now);
@@ -1434,11 +1764,31 @@ function activityTrend(buckets) {
 }
 function inspectActivityBucket(index) {
   const bucket = activityChartBuckets[index]; if (!bucket) return;
-  $$('.chart-column').forEach((column, columnIndex) => column.classList.toggle('selected', columnIndex === index));
+  $$('.chart-column').forEach(column => column.classList.toggle('selected', Number(column.dataset.chartIndex) === index));
   $('#chart-inspector-time').textContent = activityBucketLabel(bucket, activityChartSeconds, true);
   const averageLatency = bucket.samples ? Math.round(bucket.latency / bucket.samples) : null;
   const successRate = bucket.requests ? (bucket.successful * 100 / bucket.requests).toFixed(1) + '%' : '—';
-  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Tokens', compactNumber(bucket.tokens)], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached input', compactNumber(bucket.cached)], ['Reported spend', formatReportedCost(bucket.cost, bucket.priced_requests)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+  const tokenValues = activityTokenValues(bucket);
+  const pricedRequests = pricedRequestCount(bucket);
+  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Input', compactNumber(tokenValues.input)], ['Output', compactNumber(tokenValues.output)], ['Cache hit', `${tokenValues.cacheRate.toFixed(1)}%`], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached input', compactNumber(bucket.cached)], ['Usage value', formatTrackedCost(bucket.cost, pricedRequests)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+}
+function selectActivityChartSeries(column, clientY) {
+  if (!Number.isFinite(clientY) || !['requests', 'tokens'].includes(activityChartMetric)) return;
+  const chartBox = $('#activity-chart').getBoundingClientRect();
+  const pointerY = (clientY - chartBox.top) * 250 / chartBox.height;
+  const candidates = activityChartMetric === 'tokens' ? [
+    {name: 'input', label: 'Input', y: Number(column.dataset.inputY), value: column.dataset.inputValue, color: '#7c4dff'},
+    {name: 'output', label: 'Output', y: Number(column.dataset.outputY), value: column.dataset.outputValue, color: '#0b57d0'},
+    {name: 'cache', label: 'Cache hit', y: Number(column.dataset.cacheY), value: column.dataset.cacheValue, color: '#00897b'},
+  ] : [
+    {name: 'requests', label: 'Requests', y: Number(column.dataset.requestsY), value: column.dataset.requestsValue, color: '#0b57d0'},
+    {name: 'error-rate', label: 'Error rate', y: Number(column.dataset.errorY), value: column.dataset.errorValue, color: '#b86f67'},
+  ];
+  const series = candidates.reduce((nearest, candidate) => Math.abs(candidate.y - pointerY) < Math.abs(nearest.y - pointerY) ? candidate : nearest);
+  column.dataset.activeSeries = series.name;
+  column.style.setProperty('--point-y', `${series.y}px`);
+  column.style.setProperty('--point-color', series.color);
+  column.querySelector('.chart-value').textContent = `${series.label} ${series.value}`;
 }
 function smoothActivityPath(points) {
   if (points.length < 2) return points.length ? `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}` : '';
@@ -1466,16 +1816,50 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
   const chart = $('#activity-chart'); const measuredWidth = Math.round(chart.clientWidth);
   if (!measuredWidth) return;
   activityChartRenderWidth = measuredWidth;
-  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const max = Math.max(...values, 1); const average = values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
-  const width = Math.max(measuredWidth, 320); const height = 250; const left = 48; const right = 16; const top = 18; const bottom = 38; const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const points = values.map((value, index) => ({x: left + index * plotWidth / Math.max(values.length - 1, 1), y: top + (1 - value / max) * plotHeight}));
-  const line = smoothActivityPath(points);
+  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const tokenMode = activityChartMetric === 'tokens'; const requestMode = activityChartMetric === 'requests';
+  const tokenSeries = buckets.map(activityTokenValues); const max = tokenMode ? Math.max(...tokenSeries.flatMap(value => [value.input, value.output]), 1) : Math.max(...values, 1);
+  const errorRates = requestMode ? buckets.map(bucket => bucket.requests ? Math.min(100, bucket.errors * 100 / bucket.requests) : 0) : [];
+  const errorScaleMax = requestMode ? Math.min(100, Math.max(1, Math.ceil(Math.max(...errorRates, 0)))) : 100;
+  const average = values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
+  const width = Math.max(measuredWidth, 320); const height = 250; const left = 48; const right = tokenMode || requestMode ? 42 : 16; const top = 18; const bottom = 38; const plotWidth = width - left - right; const plotHeight = height - top - bottom;
+  const pointsFor = (series, scale) => series.map((value, index) => ({x: left + (index + .5) * plotWidth / Math.max(series.length, 1), y: top + (1 - value / scale) * plotHeight}));
+  const primaryValues = tokenMode ? tokenSeries.map(value => value.input) : values; const points = pointsFor(primaryValues, max); const line = smoothActivityPath(points);
+  const inputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.input), max) : []; const outputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.output), max) : []; const cachePoints = tokenMode ? pointsFor(tokenSeries.map(value => value.cacheRate), 100) : [];
+  const errorPoints = requestMode ? pointsFor(errorRates, errorScaleMax) : [];
   const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = max * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
-  const averageY = top + (1 - average / max) * plotHeight; const intervalEvery = Math.max(1, Math.ceil(buckets.length / 6));
-  const overlays = buckets.map((bucket, index) => { const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatReportedCost(bucket.cost, bucket.priced_requests)}`; const label = activityBucketLabel(bucket, seconds); return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}" aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${activityMetricLabel(values[index], activityChartMetric)}</span><small>${index % intervalEvery === 0 || index === buckets.length - 1 ? label : ''}</small></button>`; }).join('');
-  $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g><line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('')}</g></svg><div class="chart-bars" style="--activity-buckets:${buckets.length}">${overlays}</div>`;
+  const intervalEvery = Math.max(1, Math.ceil(buckets.length / 6));
+  const overlays = buckets.map((bucket, index) => {
+    const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatTrackedCost(bucket.cost, pricedRequestCount(bucket))}`; const label = activityBucketLabel(bucket, seconds); const pointLabel = tokenMode ? `Input ${compactNumber(primaryValues[index])}` : requestMode ? `Requests ${activityMetricLabel(values[index], activityChartMetric)}` : activityMetricLabel(values[index], activityChartMetric);
+    const seriesData = tokenMode
+      ? ` data-input-y="${inputPoints[index].y}" data-output-y="${outputPoints[index].y}" data-cache-y="${cachePoints[index].y}" data-input-value="${compactNumber(tokenSeries[index].input)}" data-output-value="${compactNumber(tokenSeries[index].output)}" data-cache-value="${tokenSeries[index].cacheRate.toFixed(1)}%" data-active-series="input"`
+      : requestMode
+        ? ` data-requests-y="${points[index].y}" data-error-y="${errorPoints[index].y}" data-requests-value="${activityMetricLabel(values[index], activityChartMetric)}" data-error-value="${errorRates[index].toFixed(1)}%" data-active-series="requests"`
+        : '';
+    return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}"${seriesData} aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${pointLabel}</span><small>${index % intervalEvery === 0 || index === buckets.length - 1 ? label : ''}</small></button>`;
+  }).join('');
+  let seriesMarkup;
+  if (tokenMode) {
+    const inputLine = smoothActivityPath(inputPoints);
+    const outputLine = smoothActivityPath(outputPoints);
+    const cacheLine = smoothActivityPath(cachePoints);
+    const rightAxis = [0, .5, 1].map(ratio => `<text class="traffic-axis-right token-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${Math.round((1 - ratio) * 100)}%</text>`).join('');
+    seriesMarkup = `<path class="traffic-glow token-input-glow" d="${inputLine}"></path><path class="traffic-line token-input-line" d="${inputLine}"></path><path class="traffic-line token-output-line" d="${outputLine}"></path><path class="traffic-line token-cache-line" d="${cacheLine}"></path>${rightAxis}`;
+  } else {
+    const averageY = top + (1 - average / max) * plotHeight;
+    const primarySeries = `<line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('')}</g>`;
+    if (requestMode) {
+      const errorLine = smoothActivityPath(errorPoints);
+      const rightAxis = [0, .5, 1].map(ratio => { const value = errorScaleMax * (1 - ratio); const label = Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1); return `<text class="traffic-axis-right error-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${label}%</text>`; }).join('');
+      seriesMarkup = `${primarySeries}<path class="error-rate-line" d="${errorLine}"></path>${rightAxis}`;
+    } else seriesMarkup = primarySeries;
+  }
+  $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g>${seriesMarkup}</svg><div class="chart-bars" style="--activity-buckets:${buckets.length};--chart-right:${right}px;--point-color:${tokenMode ? '#7c4dff' : '#0b57d0'}">${overlays}</div>`;
+  const legend = $('#activity-chart-legend');
+  legend.hidden = activityChartMetric === 'latency';
+  legend.innerHTML = tokenMode ? '<span><i class="token-input"></i>Input</span><span><i class="token-output"></i>Output</span><span><i class="token-cache"></i>Cache hit rate</span>' : requestMode ? '<span><i class="request-volume"></i>Requests</span><span><i class="request-errors"></i>Error rate</span>' : '';
   const trend = activityTrend(buckets); const signal = $('#activity-trend-signal'); signal.textContent = trend.label; signal.className = `trend-signal ${trend.tone}`; $('#stat-request-trend').textContent = trend.short;
-  const bucketSeconds = seconds / Math.max(buckets.length, 1); $('#traffic-granularity').textContent = `${bucketSeconds < 3600 ? Math.round(bucketSeconds / 60) + '-minute' : bucketSeconds < 86400 ? Math.round(bucketSeconds / 3600) + '-hour' : Math.round(bucketSeconds / 86400) + '-day'} intervals · line shows ${activityChartMetric}`;
+  const bucketSeconds = seconds / Math.max(buckets.length, 1); const interval = bucketSeconds < 3600 ? Math.round(bucketSeconds / 60) + '-minute' : bucketSeconds < 86400 ? Math.round(bucketSeconds / 3600) + '-hour' : Math.round(bucketSeconds / 86400) + '-day';
+  $('#traffic-granularity').textContent = `${interval} intervals · ${tokenMode ? 'input, output, and cache hit rate' : requestMode ? 'requests with error rate overlay' : `line shows ${activityChartMetric}`}`;
   const nonEmpty = buckets.reduce((last, bucket, index) => bucket.requests ? index : last, -1); inspectActivityBucket(nonEmpty >= 0 ? nonEmpty : buckets.length - 1);
 }
 function renderProviderStats(target, items, totalRequests) {
@@ -1492,25 +1876,48 @@ function renderApiKeyStats(target, items, totalRequests) {
 function modelSuccessTone(successRate) { return successRate >= 99 ? 'model-healthy' : successRate >= 95 ? 'model-warning' : 'model-critical'; }
 function renderModelStats(target, items, totalRequests) {
   $('#model-count').textContent = `${items.length.toLocaleString()} model${items.length === 1 ? '' : 's'}`;
-  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = item.priced_requests || 0; return `<tr><td data-label="Model"><code>${escapeHtml(item.name)}</code><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Reported spend"><strong>${formatReportedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg / priced request · ` : ''}${coverage.toLocaleString()} / ${item.requests.toLocaleString()} requests priced</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
+  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = pricedRequestCount(item); return `<tr><td data-label="Model"><code>${escapeHtml(item.name)}</code><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Usage value"><strong>${formatTrackedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg · ` : ''}${costCoverageLabel(item)}</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
 }
 function statusBadge(status) { const success = status >= 200 && status < 400; return `<span class="status-badge ${success ? 'success' : 'failure'}"><i></i>${status}</span>`; }
 function failureLabel(log) { return log.failure?.message || (log.status >= 400 ? `HTTP ${log.status}` : ''); }
 function compactPath(path) { return path.replace('/v1/', '').replace('chat/completions', 'Chat').replace('responses', 'Responses').replace('messages', 'Messages'); }
+function activityModelCell(log, detailed) {
+  const upstreamModel = log.upstream_model;
+  const providerValue = !upstreamModel
+    ? '<span class="activity-model-unavailable">Not recorded</span>'
+    : upstreamModel === log.model
+      ? '<span class="activity-model-unchanged">Same model ID</span>'
+      : `<code title="Model sent to Provider">${escapeHtml(upstreamModel)}</code>`;
+  return `<span class="activity-model activity-model-route"><span class="activity-model-leg"><b>Client</b><code title="Model requested by client">${escapeHtml(log.model)}</code></span><span class="activity-model-leg activity-upstream-model"><b>Provider</b>${providerValue}</span>${detailed ? `<small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small>` : ''}</span>`;
+}
 function activityRow(log, detailed = false, index = -1) {
   const tokens = log.input_tokens + log.output_tokens; const time = new Date(log.timestamp * 1000);
   const conversion = log.caller_protocol && log.upstream_protocol && log.caller_protocol !== log.upstream_protocol ? ` · ${log.caller_protocol.replace('openai_', '').replace('_completions', '')} → ${log.upstream_protocol.replace('openai_', '').replace('_completions', '')}` : '';
-  const upstreamModel = log.upstream_model || 'Not available';
-  const modelCell = `<span class="activity-model"><code title="Requested model">${escapeHtml(log.model)}</code><small class="activity-upstream-model" title="Upstream model">→ ${escapeHtml(upstreamModel)}</small>${detailed ? `<small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small>` : ''}</span>`;
-  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td><span class="activity-status-cell">${statusBadge(log.status)}${log.failure ? `<small title="${escapeHtml(failureLabel(log))}">${escapeHtml(failureLabel(log))}</small>` : ''}</span></td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${formatCost(log.cost)}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
+  const modelCell = activityModelCell(log, detailed);
+  const costSource = log.cost == null ? '' : log.cost_source === 'estimated' ? ' · estimated' : ' · reported';
+  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td><span class="activity-status-cell">${statusBadge(log.status)}${log.failure ? `<small title="${escapeHtml(failureLabel(log))}">${escapeHtml(failureLabel(log))}</small>` : ''}</span></td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number" title="${log.cost == null ? 'No cost available' : log.cost_source === 'estimated' ? 'Yabane estimated usage value' : 'Reported by upstream'}">${formatCost(log.cost)}${costSource}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
   return `<tr class="activity-request-row" data-activity-index="${index}" tabindex="0" aria-label="Open details for ${escapeHtml(log.model)} request">${row}</tr>`;
 }
 function formatDuration(milliseconds) { return milliseconds == null ? 'Not available' : milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 1 : 2)} s` : `${milliseconds.toLocaleString()} ms`; }
-function protocolLabel(protocol) { return protocol ? protocol.replace('openai_', 'OpenAI ').replace('anthropic_messages', 'Anthropic Messages').replace('_completions', ' Completions') : 'Unknown'; }
+function protocolLabel(protocol) {
+  return {
+    openai_chat_completions: 'OpenAI Chat Completions',
+    openai_responses: 'OpenAI Responses',
+    anthropic_messages: 'Anthropic Messages',
+  }[protocol] || 'Unknown';
+}
 function openActivityDetail(log) {
   const dialog = $('#activity-detail-dialog'); const firstByte = log.first_byte_ms; const total = log.latency_ms; const gateway = log.gateway_ms; const upstreamHeaders = log.upstream_response_ms; const headersAt = gateway == null || upstreamHeaders == null ? null : gateway + upstreamHeaders; const generation = log.generation_ms ?? (firstByte == null ? null : Math.max(total - firstByte, 0));
   $('#activity-detail-model').textContent = log.model; $('#activity-detail-time').textContent = new Date(log.timestamp * 1000).toLocaleString(); $('#activity-detail-status').innerHTML = statusBadge(log.status);
-  $('#activity-detail-route').textContent = `${log.provider} / ${log.endpoint}`; $('#activity-detail-api').textContent = `${compactPath(log.path)}${log.streaming ? ' · Streaming' : ''}`; $('#activity-detail-total').textContent = formatDuration(total);
+  $('#activity-detail-route').textContent = `Provider ${log.provider} · Endpoint ${log.endpoint}`; $('#activity-detail-api').textContent = `Client API ${protocolLabel(log.caller_protocol)}${log.streaming ? ' · Streaming' : ''}`; $('#activity-detail-total').textContent = formatDuration(total);
+  const upstreamModel = log.upstream_model || 'Not available (older record)'; const modelUnchanged = log.upstream_model && log.model === log.upstream_model;
+  $('#activity-detail-model-route').innerHTML = `<div><span>Client requested</span><code>${escapeHtml(log.model)}</code><small>Model ID received by Yabane</small></div><span class="activity-model-route-arrow" aria-hidden="true">${icon('arrow-right')}</span><div><span>Sent to Provider</span><code id="activity-detail-upstream-model">${escapeHtml(upstreamModel)}</code><small>Final model ID in the Provider request</small></div>`;
+  const modelOutcome = $('#activity-detail-model-outcome');
+  modelOutcome.textContent = !log.upstream_model ? 'Provider model not recorded' : modelUnchanged ? 'Model ID unchanged' : 'Model ID changed';
+  modelOutcome.className = `activity-model-outcome ${!log.upstream_model ? 'unavailable' : modelUnchanged ? 'unchanged' : 'changed'}`;
+  const clientProtocol = protocolLabel(log.caller_protocol); const providerProtocol = protocolLabel(log.upstream_protocol); const protocolUnchanged = log.caller_protocol && log.caller_protocol === log.upstream_protocol;
+  $('#activity-detail-api-route').innerHTML = `<div><span>Client API</span><strong>${escapeHtml(clientProtocol)}</strong><small>Format received by Yabane</small></div><div><span>Provider API</span><strong>${escapeHtml(providerProtocol)}</strong><small class="activity-routing-result ${protocolUnchanged ? 'unchanged' : ''}">${protocolUnchanged ? 'No API conversion' : log.upstream_protocol ? 'Converted by Yabane' : 'Not recorded'}</small></div>`;
+  $('#activity-detail-destination').innerHTML = `<div><span>Provider</span><code>${escapeHtml(log.provider)}</code><small>Configured Provider</small></div><div><span>Endpoint</span><code>${escapeHtml(log.endpoint)}</code><small>Selected connection</small></div>`;
   const failure = $('#activity-detail-failure'); const failureMessage = log.failure?.message; const failureCategory = log.failure?.category; failure.hidden = !failureMessage; failure.querySelector('p').textContent = failureMessage || ''; failure.querySelector('small').textContent = failureCategory === 'proxy_connect_failed' ? 'Check that the proxy is reachable. If HTTPS works with socks5h but not socks5, let the proxy resolve target hostnames.' : 'Use the request ID below to match this failure with server logs if more detail is needed.';
   const stages = [];
   if (gateway != null) stages.push({label: 'Gateway processing', detail: 'Route and prepare request', start: 0, duration: gateway, color: '#0b57d0', icon: 'route'});
@@ -1519,10 +1926,22 @@ function openActivityDetail(log) {
   if (generation != null) stages.push({label: 'Generation', detail: 'Read response body', start: firstByte ?? Math.max(total - generation, 0), duration: generation, color: '#7c4dff', icon: 'arrow-right'});
   const accountedUntil = stages.reduce((end, stage) => Math.max(end, stage.start + stage.duration), 0);
   if (accountedUntil < total) stages.push({label: 'Response completion', detail: 'Remaining response processing', start: accountedUntil, duration: total - accountedUntil, color: '#697386', icon: 'clock'});
-  $('#activity-detail-timing').innerHTML = `<div class="timeline-axis"><span>Stage</span><div class="timeline-scale"><span>0</span><span>${escapeHtml(formatDuration(total / 2))}</span><span>${escapeHtml(formatDuration(total))}</span></div><span>Duration</span></div>${stages.map(stage => { const left = Math.min(100, stage.start * 100 / Math.max(total, 1)); const width = Math.max(0, Math.min(100 - left, stage.duration * 100 / Math.max(total, 1))); return `<div class="timeline-stage"><div class="timeline-stage-label"><span class="timeline-stage-icon" style="--stage-color:${stage.color}">${icon(stage.icon)}</span><div><strong>${escapeHtml(stage.label)}</strong><small>${escapeHtml(stage.detail)}</small></div></div><div class="timeline-track" aria-hidden="true"><span class="timeline-stage-bar" style="--stage-left:${left}%;--stage-width:${width}%;--stage-color:${stage.color}"></span></div><strong>${escapeHtml(formatDuration(stage.duration))}</strong></div>`; }).join('')}<div class="timeline-total"><span class="timeline-total-label">${icon('route')}<span><em>Total</em><small>End to end</small></span></span><span class="timeline-total-track" aria-hidden="true"><i></i></span><strong>${escapeHtml(formatDuration(total))}</strong></div>`;
-  $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], ['Upstream cost', formatCost(log.cost)], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+  $('#activity-detail-timing').innerHTML = `<div class="timeline-axis"><span>Stage</span><div class="timeline-scale"><span>0</span><span>${escapeHtml(formatDuration(total / 2))}</span><span>${escapeHtml(formatDuration(total))}</span></div><span>Duration</span></div>${stages.map(stage => { const left = Math.min(100, stage.start * 100 / Math.max(total, 1)); const width = Math.max(0, Math.min(100 - left, stage.duration * 100 / Math.max(total, 1))); return `<div class="timeline-stage"><div class="timeline-stage-label"><span class="timeline-stage-icon" style="--stage-color:${stage.color}">${icon(stage.icon)}</span><div><strong>${escapeHtml(stage.label)}</strong><small>${escapeHtml(stage.detail)}</small></div></div><div class="timeline-track" aria-hidden="true"><span class="timeline-stage-bar" style="--stage-left:${left}%;--stage-width:${width}%;--stage-color:${stage.color}"></span></div><strong>${escapeHtml(formatDuration(stage.duration))}</strong></div>`; }).join('')}`;
+  const costLabel = log.cost_source === 'estimated' ? 'Estimated usage value' : log.cost == null ? 'Cost' : 'Upstream reported cost';
+  const canEditPricing = log.cost == null && log.upstream_model && providers.some(provider => provider.id === log.provider && provider.endpoints.some(endpoint => endpoint.id === log.endpoint));
+  const canRefreshCost = log.cost_source === 'estimated' || (log.cost == null && log.upstream_model);
+  const costActions = [canEditPricing ? '<button type="button" class="text-link edit-activity-pricing">Set price</button>' : '', canRefreshCost ? '<button type="button" class="text-link refresh-activity-cost">Refresh cost</button>' : ''].filter(Boolean).join(' ');
+  $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], [costLabel, formatCost(log.cost), costActions], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value, action = '']) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${action}</div>`).join('');
+  $('#activity-detail-usage .edit-activity-pricing')?.addEventListener('click', () => {
+    dialog.close();
+    openPricingEditor(log.provider, log.endpoint, log.upstream_model);
+  });
+  $('#activity-detail-usage .refresh-activity-cost')?.addEventListener('click', async () => {
+    dialog.close();
+    await recalculateActivityCosts(log.request_id, log.source_instance_id);
+  });
   const gatewayKey = log.gateway_api_key_note ? `${log.gateway_api_key_note} (${log.gateway_api_key_prefix || log.gateway_api_key_id})` : log.gateway_api_key_prefix || log.gateway_api_key_id || 'Unattributed (authentication disabled or older record)';
-  $('#activity-detail-request').innerHTML = [['Request ID', log.request_id], ['Gateway API key', gatewayKey], ['Requested model', log.model], ['Upstream model', log.upstream_model || 'Not available (older record)'], ['Path', log.path], ['Caller protocol', protocolLabel(log.caller_protocol)], ['Upstream protocol', protocolLabel(log.upstream_protocol)], ['Provider', log.provider], ['Endpoint', log.endpoint]].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join('');
+  $('#activity-detail-request').innerHTML = [['Request ID', log.request_id], ['Gateway API key', gatewayKey], ['API path', log.path], ['Provider finish reason', log.finish_reason || 'Not reported']].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join('');
   dialog.showModal();
 }
 $$('.close-activity-detail').forEach(button => button.addEventListener('click', () => $('#activity-detail-dialog').close()));
@@ -1542,9 +1961,9 @@ async function loadActivityPage() {
   if ($('#activity-requests-panel').hidden) return;
   const request = ++activityPageRequest;
   const range = selectedActivityRange(); const until = activityPageUntil || range.pageUntil; const since = activityPageSince || range.since;
-  const params = new URLSearchParams({since, until, offset: activityPage * ACTIVITY_PAGE_SIZE, limit: ACTIVITY_PAGE_SIZE});
-  const provider = $('#activity-provider-filter').value; const query = $('#activity-search').value.trim(); const status = $('#activity-status-filter').value;
-  if (provider) params.set('provider', provider); if (query) params.set('query', query); if (status) params.set('status', status);
+  const params = addActivityFilterParams(new URLSearchParams({since, until, offset: activityPage * ACTIVITY_PAGE_SIZE, limit: ACTIVITY_PAGE_SIZE}));
+  const query = $('#activity-search').value.trim(); const status = $('#activity-status-filter').value;
+  if (query) params.set('query', query); if (status) params.set('status', status);
   const response = await fetch(`/admin/activity/logs/page?${params}`); const page = await response.json();
   if (request !== activityPageRequest) return;
   activityLogs = page.data; activityPageTotal = page.total;
@@ -1560,21 +1979,20 @@ async function loadActivity(requestedLogLimit) {
     if (logLimit <= activityLogsLimit) return;
   }
   activityLoadPromise = (async () => {
-    const range = selectedActivityRange(); const {seconds, since, until, bucketCount, pageUntil} = range; activityPageSince = since; activityPageUntil = pageUntil; const providerFilter = $('#activity-provider-filter').value;
-    const providerQuery = providerFilter ? `&provider=${encodeURIComponent(providerFilter)}` : '';
-    const statsUrl = `/admin/activity/stats?since=${since}&until=${until}&buckets=${bucketCount}${providerQuery}`;
-    const [stats, logs] = await Promise.all([fetch(statsUrl).then(response => response.json()), fetch(`/admin/activity/logs?since=${since}&until=${pageUntil}&limit=${logLimit}${providerQuery}`).then(response => response.json())]);
+    const range = selectedActivityRange(); const {seconds, since, until, bucketCount, pageUntil} = range; activityPageSince = since; activityPageUntil = pageUntil;
+    const statsParams = addActivityFilterParams(new URLSearchParams({since, until, buckets: bucketCount}));
+    const logsParams = addActivityFilterParams(new URLSearchParams({since, until: pageUntil, limit: logLimit}));
+    const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?${statsParams}`).then(response => response.json()), fetch(`/admin/activity/logs?${logsParams}`).then(response => response.json())]);
     activityOverviewLogs = logs; activityLogsLimit = logLimit;
-    const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, priced: stats.priced_requests || 0, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
+    const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, priced: pricedRequestCount(stats), reported_requests: stats.reported_requests || 0, estimated_requests: stats.estimated_requests || 0, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
     const buckets = stats.buckets; const requests = stats.requests; const totalTokens = totals.input + totals.output;
     $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
-    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = formatReportedCost(totals.cost, totals.priced); $('#stat-cost-coverage').textContent = totals.priced ? `${totals.priced.toLocaleString()} / ${requests.toLocaleString()} requests priced` : 'No upstream cost data'; $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
+    $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = formatTrackedCost(totals.cost, totals.priced); $('#stat-cost-coverage').textContent = costCoverageLabel(totals, requests); $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
     $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
     renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelStats($('#model-stats'), stats.by_model, requests);
     $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
-    const filter = $('#activity-provider-filter'); const previous = filter.value;
-    if (!providerFilter) filter.replaceChildren(new Option('All providers', ''), ...stats.by_provider.map(provider => new Option(provider.name, provider.name)));
-    filter.value = [...filter.options].some(option => option.value === previous) ? previous : '';
+    activityFilterOptions = stats.filter_options || {providers: [], models: [], api_keys: []};
+    renderActivityFilterOptions();
     if (explorerVisible) loadActivityPage();
   })().finally(() => { activityLoadPromise = null; });
   return activityLoadPromise;
@@ -1595,9 +2013,10 @@ $('#activity-status-filter').addEventListener('change', () => { activityPage = 0
 $('#activity-page-previous').addEventListener('click', () => { if (activityPage > 0) { activityPage--; loadActivityPage(); } });
 $('#activity-page-next').addEventListener('click', () => { if ((activityPage + 1) * ACTIVITY_PAGE_SIZE < activityPageTotal) { activityPage++; loadActivityPage(); } });
 $('.chart-metric-picker').addEventListener('click', event => { const button = event.target.closest('[data-chart-metric]'); if (!button) return; activityChartMetric = button.dataset.chartMetric; $$('.chart-metric-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); renderActivityChart(); });
-$('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
+$('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) { inspectActivityBucket(Number(column.dataset.chartIndex)); selectActivityChartSeries(column, event.clientY); } });
+$('#activity-chart').addEventListener('pointermove', event => { const column = event.target.closest('.chart-column'); if (column) selectActivityChartSeries(column, event.clientY); });
 $('#activity-chart').addEventListener('focusin', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
-$('#activity-chart').addEventListener('click', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
+$('#activity-chart').addEventListener('click', event => { const column = event.target.closest('.chart-column'); if (column) { inspectActivityBucket(Number(column.dataset.chartIndex)); if (event.detail) selectActivityChartSeries(column, event.clientY); } });
 new ResizeObserver(entries => {
   const width = Math.round(entries[0].contentRect.width);
   if (!width || !activityChartBuckets.length || Math.abs(width - activityChartRenderWidth) < 2) return;
@@ -1643,8 +2062,54 @@ $('#apply-activity-range').addEventListener('click', () => {
 });
 document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('#activity-range-popover').hidden) { closeActivityRangePicker(); $('#activity-range-trigger').focus(); } });
 document.addEventListener('click', event => { if (!event.target.closest('.activity-range-picker')) closeActivityRangePicker(); });
-function resetAndLoadActivity() { activityLogsLimit = 0; activityPage = 0; activityPageSince = 0; activityPageUntil = 0; loadActivity(); }
-$('#activity-provider-filter').addEventListener('change', resetAndLoadActivity); $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
+function closeActivityFilterPicker() { const popover = $('#activity-filter-popover'); popover.hidden = true; $('#activity-filter-trigger').setAttribute('aria-expanded', 'false'); $('#activity-filter-search').value = ''; }
+function openActivityFilterPicker() { renderActivityFilterOptions(); $('#activity-filter-popover').hidden = false; $('#activity-filter-trigger').setAttribute('aria-expanded', 'true'); $('#activity-filter-search').focus(); }
+$('#activity-filter-trigger').addEventListener('click', () => { if ($('#activity-filter-popover').hidden) openActivityFilterPicker(); else closeActivityFilterPicker(); });
+$('#activity-filter-search').addEventListener('input', renderActivityFilterOptions);
+$('#activity-filter-options').addEventListener('change', event => {
+  const input = event.target.closest('[data-filter-group]'); if (!input) return;
+  const values = activityFilters[input.dataset.filterGroup];
+  if (input.checked) values.add(input.value); else values.delete(input.value);
+  updateActivityFilterState(); resetAndLoadActivity();
+});
+$('#reset-activity-filters').addEventListener('click', () => { Object.values(activityFilters).forEach(values => values.clear()); renderActivityFilterOptions(); resetAndLoadActivity(); });
+$('#activity-filter-chips').addEventListener('click', event => { const chip = event.target.closest('[data-remove-filter]'); if (!chip) return; activityFilters[chip.dataset.removeFilter].delete(chip.dataset.filterValue); renderActivityFilterOptions(); resetAndLoadActivity(); });
+document.addEventListener('keydown', event => { if (event.key === 'Escape' && !$('#activity-filter-popover').hidden) { closeActivityFilterPicker(); $('#activity-filter-trigger').focus(); } });
+document.addEventListener('click', event => { if (!event.target.closest('.activity-filter-picker')) closeActivityFilterPicker(); });
+async function recalculateActivityCosts(requestId = null, sourceInstanceId = null) {
+  const button = $('#refresh-missing-costs');
+  const status = $('#activity-cost-refresh-status');
+  const message = requestId
+    ? 'Recalculate this Activity cost using current explicit pricing? Official upstream costs will not change.'
+    : 'Recalculate every retained non-reported Activity cost using current explicit pricing? Official upstream costs will not change.';
+  if (!confirm(message)) return;
+  if (button) button.disabled = true;
+  if (status) status.textContent = 'Refreshing costs…';
+  try {
+    const response = await fetch('/admin/activity/recalculate-costs', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify(requestId ? {request_id: requestId, source_instance_id: sourceInstanceId} : {}),
+    });
+    if (!response.ok) {
+      if (status) status.textContent = 'Could not refresh Activity costs.';
+      return;
+    }
+    const result = await response.json();
+    if (status) status.textContent = result.updated
+      ? `Updated ${result.updated} cost${result.updated === 1 ? '' : 's'} (${result.recalculated} recalculated, ${result.filled} filled).`
+      : 'No non-reported costs could be recalculated.';
+    await resetAndLoadActivity();
+  } catch {
+    if (status) status.textContent = 'Could not refresh Activity costs.';
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function resetAndLoadActivity() { if (activityLoadPromise) await activityLoadPromise; activityLogsLimit = 0; activityPage = 0; activityPageSince = 0; activityPageUntil = 0; return loadActivity(); }
+$('#refresh-activity').addEventListener('click', resetAndLoadActivity);
+$('#refresh-missing-costs').addEventListener('click', () => recalculateActivityCosts());
 const activityDataDialog = $('#activity-data-dialog');
 let activityImportBytes = null;
 function formatBytes(bytes) { if (bytes < 1024) return `${bytes} B`; const units = ['KB', 'MB', 'GB']; let value = bytes / 1024; let unit = units.shift(); while (value >= 1024 && units.length) { value /= 1024; unit = units.shift(); } return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`; }
@@ -1767,10 +2232,24 @@ async function loadDashboard() {
   return dashboardLoadPromise;
 }
 
+async function loadProviderActivity() {
+  if (providerActivityLoadPromise) return providerActivityLoadPromise;
+  providerActivityLoadPromise = (async () => {
+    const now = Math.floor(Date.now() / 1000); const plan = activityBucketPlan(86400, now); const since = plan.until - 86400;
+    const response = await fetch(`/admin/activity/stats?since=${since}&until=${plan.until}&buckets=${plan.bucketCount}`);
+    if (!response.ok) return;
+    const stats = await response.json();
+    providerActivity = new Map((stats.provider_buckets || []).map(item => [item.name, item.requests]));
+    if (!$('#providers-view').hidden && !selectedProviderId) renderProviders();
+  })().finally(() => { providerActivityLoadPromise = null; });
+  return providerActivityLoadPromise;
+}
+
 function refreshVisibleView() {
   if (!adminSession?.authenticated || document.hidden) return;
   if (!$('#home-view').hidden) loadDashboard();
   else if (!$('#activity-view').hidden) loadActivity();
+  else if (!$('#providers-view').hidden && !selectedProviderId) loadProviderActivity();
 }
 setInterval(refreshVisibleView, LIVE_REFRESH_INTERVAL_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisibleView(); });
@@ -1993,6 +2472,17 @@ $('#delete-capture').addEventListener('click', async () => { if (!selectedCaptur
 
 function formatType(type) { return type === 'anthropic' ? 'Anthropic Messages' : type === 'openai_codex' ? 'OpenAI subscription' : type === 'openai_chat_completions' ? 'OpenAI Chat Completions' : type === 'openai_responses' ? 'OpenAI Responses' : 'OpenAI compatible'; }
 function escapeHtml(value) { const node = document.createElement('span'); node.textContent = String(value); return node.innerHTML; }
-async function loadProviders() { const response = await fetch('/admin/providers'); providers = await response.json(); renderProviders(); }
-async function loadRoutes() { const response = await fetch('/admin/routes'); modelRoutes = await response.json(); renderRoutes(); }
+async function loadProviders() { const response = await fetch('/admin/providers'); providers = await response.json(); renderProviders(); if (!$('#providers-view').hidden && !selectedProviderId) await loadProviderActivity(); if (!$('#pricing-view').hidden) renderPricingPage(); }
+async function loadPricing() {
+  const [pricingResponse, activityResponse] = await Promise.all([
+    fetch('/admin/pricing'),
+    fetch('/admin/activity/logs?since=0&limit=100'),
+  ]);
+  globalPricing = await pricingResponse.json();
+  if (activityResponse.ok) pricingActivityModels = (await activityResponse.json())
+    .filter(log => log.upstream_model)
+    .map(log => ({model: log.upstream_model, providerId: log.provider, endpointId: log.endpoint}));
+  if (!$('#pricing-view').hidden) renderPricingPage();
+}
+async function loadRoutes() { const response = await fetch('/admin/routes'); modelRoutes = await response.json(); renderRoutes(); if (!$('#pricing-view').hidden) renderPricingPage(); }
 initializeAdmin();

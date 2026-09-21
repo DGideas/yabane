@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::ErrorKind, sync::Arc};
+use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
@@ -543,18 +543,30 @@ async fn authenticate_management_key(state: &AppState, headers: &axum::http::Hea
     let Some(user) = user.as_mut() else {
         return false;
     };
-    let Some(key) = user.management_api_keys.iter_mut().find(|key| {
+    let Some(key_index) = user.management_api_keys.iter().position(|key| {
         constant_time_eq(&key.secret_hash, &hash)
             && !key.expires_at.is_some_and(|expires| expires <= now)
     }) else {
         return false;
     };
-    key.last_used_at = Some(now);
-    let key_id = key.id.clone();
-    if let Err(err) = save_admin(user).await {
+    let key_id = user.management_api_keys[key_index].id.clone();
+    if let Err(err) = persist_management_key_use(user, key_index, now, ADMIN_FILE).await {
         warn!(%err, %key_id, "could not persist Management API key usage");
     }
     true
+}
+
+async fn persist_management_key_use(
+    user: &mut AdminUser,
+    key_index: usize,
+    used_at: u64,
+    path: impl AsRef<Path>,
+) -> Result<(), std::io::Error> {
+    let mut updated = user.clone();
+    updated.management_api_keys[key_index].last_used_at = Some(used_at);
+    save_admin_at(path, &updated).await?;
+    *user = updated;
+    Ok(())
 }
 
 fn bearer_secret(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -598,7 +610,11 @@ fn turnstile_credentials() -> Option<(String, String)> {
 }
 
 async fn save_admin(user: &AdminUser) -> Result<(), std::io::Error> {
-    crate::storage::write_json_atomic(ADMIN_FILE, user).await
+    save_admin_at(ADMIN_FILE, user).await
+}
+
+async fn save_admin_at(path: impl AsRef<Path>, user: &AdminUser) -> Result<(), std::io::Error> {
+    crate::storage::write_json_atomic(path, user).await
 }
 
 fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -619,7 +635,7 @@ use axum::response::IntoResponse;
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminUser, ManagementApiKey};
+    use super::{AdminUser, ManagementApiKey, persist_management_key_use};
 
     #[test]
     fn rejects_ambiguous_management_api_key_identities() {
@@ -640,5 +656,38 @@ mod tests {
         };
 
         assert!(super::validate_management_key_identities(&user).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_last_use_persistence_does_not_change_memory() {
+        let directory = std::env::temp_dir().join(format!(
+            "yabane-admin-last-use-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let blocked_parent = directory.join("not-a-directory");
+        tokio::fs::write(&blocked_parent, b"blocked").await.unwrap();
+        let mut user = AdminUser {
+            username: "admin".to_owned(),
+            email: "admin@example.com".to_owned(),
+            password_hash: "hash".to_owned(),
+            management_api_keys: vec![ManagementApiKey {
+                id: "key-id".to_owned(),
+                name: "key".to_owned(),
+                secret_hash: "hash".to_owned(),
+                prefix: "yab_mgmt_…test".to_owned(),
+                created_at: 0,
+                expires_at: None,
+                last_used_at: None,
+            }],
+        };
+
+        let result =
+            persist_management_key_use(&mut user, 0, 123, blocked_parent.join("admin.json")).await;
+
+        assert!(result.is_err());
+        assert_eq!(user.management_api_keys[0].last_used_at, None);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

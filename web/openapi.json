@@ -40,6 +40,10 @@
       "description": "Providers, endpoints, upstream keys, request defaults, and model discovery."
     },
     {
+      "name": "Model pricing",
+      "description": "Explicit global model rates and Provider or Endpoint overrides used for local usage-value estimation."
+    },
+    {
       "name": "Extensions",
       "description": "Trusted native extensions compiled into this Yabane build."
     },
@@ -144,6 +148,28 @@
           }
         }
       },
+      "ModelPricing": {
+        "type": "object",
+        "description": "Explicit USD rates per million tokens. Input and output must both be available after Endpoint, Provider, and Global field inheritance before Yabane can estimate cost. Within each scope, an exact upstream model pattern wins; otherwise the longest matching prefix ending in one '*' wins. No Provider type, Endpoint URL, model name, or built-in catalog supplies an implicit price.",
+        "properties": {
+          "input_per_million": {"type": "number", "nullable": true, "minimum": 0},
+          "output_per_million": {"type": "number", "nullable": true, "minimum": 0},
+          "cache_read_per_million": {"type": "number", "nullable": true, "minimum": 0},
+          "cache_write_per_million": {"type": "number", "nullable": true, "minimum": 0, "description": "Reserved for compatibility. Current normalized usage has no cache-write token count, so estimation does not apply this rate."}
+        }
+      },
+      "PricingTable": {
+        "type": "object",
+        "required": ["models"],
+        "properties": {
+          "updated_at": {"type": "integer", "readOnly": true, "description": "Unix timestamp set by Yabane when the effective table is saved."},
+          "models": {
+            "type": "object",
+            "description": "Exact upstream model IDs or non-empty prefixes ending in one '*' mapped to rates. An empty map clears this pricing scope.",
+            "additionalProperties": {"$ref": "#/components/schemas/ModelPricing"}
+          }
+        }
+      },
       "EndpointView": {
         "type": "object",
         "description": "An upstream connection. OAuth tokens and account IDs are never included.",
@@ -176,6 +202,11 @@
           },
           "extra_body": {
             "type": "object"
+          },
+          "pricing": {
+            "nullable": true,
+            "allOf": [{"$ref": "#/components/schemas/PricingTable"}],
+            "description": "Endpoint overrides for exact or trailing-wildcard upstream model patterns; omitted fields inherit from the selected Provider and Global rules."
           },
           "requires_api_key": {
             "type": "boolean"
@@ -255,6 +286,10 @@
           },
           "extra_body": {
             "type": "object"
+          },
+          "pricing": {
+            "nullable": true,
+            "allOf": [{"$ref": "#/components/schemas/PricingTable"}]
           },
           "defaults_endpoint_ids": {
             "type": "array",
@@ -476,6 +511,20 @@
           }
         }
       },
+      "CostRecalculationResult": {
+        "type": "object",
+        "properties": {
+          "candidates": {"type": "integer"},
+          "updated": {"type": "integer"},
+          "filled": {"type": "integer"},
+          "recalculated": {"type": "integer"},
+          "reported_preserved": {"type": "integer"},
+          "skipped_missing_route": {"type": "integer"},
+          "skipped_missing_pricing": {"type": "integer"},
+          "skipped_missing_usage": {"type": "integer"}
+        },
+        "required": ["candidates", "updated", "filled", "recalculated", "reported_preserved", "skipped_missing_route", "skipped_missing_pricing", "skipped_missing_usage"]
+      },
       "RequestLog": {
         "type": "object",
         "properties": {
@@ -574,7 +623,19 @@
           },
           "cost": {
             "type": "number",
-            "nullable": true
+            "nullable": true,
+            "description": "Upstream-reported cost when available, otherwise an estimate from explicit pricing; null when neither is available."
+          },
+          "cost_source": {
+            "type": "string",
+            "nullable": true,
+            "enum": ["reported", "estimated"],
+            "description": "Origin of cost. Older records with cost but no source are interpreted as reported."
+          },
+          "finish_reason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Terminal reason or status reported by the upstream protocol. OpenAI Chat Completions uses finish_reason, Anthropic Messages uses stop_reason, and OpenAI Responses uses incomplete_details.reason or its terminal status. Null when unavailable or for older records."
           },
           "streaming": {
             "type": "boolean"
@@ -591,6 +652,8 @@
         "required": [
           "requests",
           "priced_requests",
+          "reported_requests",
+          "estimated_requests",
           "input_tokens",
           "output_tokens",
           "cached_tokens",
@@ -601,7 +664,9 @@
           "by_provider",
           "by_model",
           "by_api_key",
-          "buckets"
+          "buckets",
+          "provider_buckets",
+          "filter_options"
         ],
         "properties": {
           "requests": {
@@ -609,7 +674,13 @@
           },
           "priced_requests": {
             "type": "integer",
-            "description": "Requests whose upstream response reported a cost, including a reported zero cost."
+            "description": "Requests with either upstream-reported or explicitly estimated cost."
+          },
+          "reported_requests": {
+            "type": "integer"
+          },
+          "estimated_requests": {
+            "type": "integer"
           },
           "input_tokens": {
             "type": "integer"
@@ -657,6 +728,86 @@
             "items": {
               "$ref": "#/components/schemas/ActivityBucket"
             }
+          },
+          "provider_buckets": {
+            "type": "array",
+            "description": "Request counts for each Provider using the same ordered intervals as buckets.",
+            "items": {
+              "$ref": "#/components/schemas/ActivityProviderBuckets"
+            }
+          },
+          "filter_options": {
+            "description": "Available Provider, exact requested-model, and safe Gateway API-key values from the selected time range before dimension filters are applied.",
+            "$ref": "#/components/schemas/ActivityFilterOptions"
+          }
+        }
+      },
+      "ActivityFilterOptions": {
+        "type": "object",
+        "required": [
+          "providers",
+          "models",
+          "api_keys"
+        ],
+        "properties": {
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "api_keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityFilterApiKey"
+            }
+          }
+        }
+      },
+      "ActivityFilterApiKey": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable Gateway API key ID, or __unattributed__ for traffic without an attributed key."
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string",
+            "nullable": true,
+            "description": "Non-secret display prefix."
+          }
+        }
+      },
+      "ActivityProviderBuckets": {
+        "type": "object",
+        "required": [
+          "name",
+          "requests"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Provider ID recorded in Activity."
+          },
+          "requests": {
+            "type": "array",
+            "description": "Request count in each interval; its length matches buckets.",
+            "items": {
+              "type": "integer"
+            }
           }
         }
       },
@@ -671,7 +822,13 @@
           },
           "priced_requests": {
             "type": "integer",
-            "description": "Requests in this dimension whose upstream response reported a cost."
+            "description": "Requests in this dimension with reported or estimated cost."
+          },
+          "reported_requests": {
+            "type": "integer"
+          },
+          "estimated_requests": {
+            "type": "integer"
           },
           "input_tokens": {
             "type": "integer"
@@ -713,6 +870,12 @@
           "priced_requests": {
             "type": "integer"
           },
+          "reported_requests": {
+            "type": "integer"
+          },
+          "estimated_requests": {
+            "type": "integer"
+          },
           "input_tokens": {
             "type": "integer"
           },
@@ -744,10 +907,24 @@
           },
           "priced_requests": {
             "type": "integer",
-            "description": "Requests in this interval whose upstream response reported a cost."
+            "description": "Requests in this interval with reported or estimated cost."
+          },
+          "reported_requests": {
+            "type": "integer"
+          },
+          "estimated_requests": {
+            "type": "integer"
           },
           "tokens": {
             "type": "integer"
+          },
+          "input": {
+            "type": "integer",
+            "description": "Input tokens reported for this interval."
+          },
+          "output": {
+            "type": "integer",
+            "description": "Output tokens reported for this interval."
           },
           "cached": {
             "type": "integer"
@@ -2196,6 +2373,62 @@
         }
       }
     },
+    "/admin/pricing": {
+      "get": {
+        "tags": ["Model pricing"],
+        "summary": "Get the explicit global model pricing table",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "responses": {
+          "200": {"description": "Global pricing table", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      },
+      "patch": {
+        "tags": ["Model pricing"],
+        "summary": "Replace the explicit global model pricing table",
+        "description": "Patterns use exact upstream model IDs or one trailing '*' prefix wildcard. An empty models map clears global pricing; no built-in prices are restored.",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "responses": {
+          "204": {"$ref": "#/components/responses/NoContent"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/admin/pricing/providers/{provider_id}": {
+      "patch": {
+        "tags": ["Model pricing"],
+        "summary": "Replace one Provider pricing override table",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [{"name": "provider_id", "in": "path", "required": true, "schema": {"type": "string"}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "responses": {
+          "204": {"$ref": "#/components/responses/NoContent"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/admin/pricing/providers/{provider_id}/endpoints/{endpoint_id}": {
+      "patch": {
+        "tags": ["Model pricing"],
+        "summary": "Replace one Endpoint pricing override table",
+        "security": [{"managementKey": []}, {"adminSession": []}],
+        "parameters": [
+          {"name": "provider_id", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"name": "endpoint_id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "responses": {
+          "204": {"$ref": "#/components/responses/NoContent"},
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
     "/admin/providers": {
       "get": {
         "tags": [
@@ -2291,6 +2524,9 @@
                         "type": "string",
                         "nullable": true
                       },
+                      "pricing": {
+                        "$ref": "#/components/schemas/PricingTable"
+                      },
                       "requires_api_key": {
                         "type": "boolean"
                       },
@@ -2377,6 +2613,9 @@
                   },
                   "extra_body": {
                     "type": "object"
+                  },
+                  "pricing": {
+                    "$ref": "#/components/schemas/PricingTable"
                   },
                   "defaults_endpoint_ids": {
                     "type": "array",
@@ -2507,6 +2746,9 @@
                   "socks5_proxy": {
                     "type": "string",
                     "nullable": true
+                  },
+                  "pricing": {
+                    "$ref": "#/components/schemas/PricingTable"
                   },
                   "requires_api_key": {
                     "type": "boolean"
@@ -2939,6 +3181,14 @@
             "description": "Unix seconds lower bound."
           },
           {
+            "name": "until",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Unix seconds inclusive upper bound."
+          },
+          {
             "name": "limit",
             "in": "query",
             "schema": {
@@ -2953,7 +3203,31 @@
             "schema": {
               "type": "string"
             },
-            "description": "Optional exact Provider ID filter."
+            "description": "Optional exact Provider ID filter retained for compatibility."
+          },
+          {
+            "name": "providers",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Provider IDs."
+          },
+          {
+            "name": "models",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated exact requested model IDs."
+          },
+          {
+            "name": "api_keys",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Gateway API key IDs; use __unattributed__ for traffic without an attributed key."
           }
         ],
         "responses": {
@@ -3031,7 +3305,32 @@
             "in": "query",
             "schema": {
               "type": "string"
-            }
+            },
+            "description": "Optional exact Provider ID filter retained for compatibility."
+          },
+          {
+            "name": "providers",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Provider IDs."
+          },
+          {
+            "name": "models",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated exact requested model IDs."
+          },
+          {
+            "name": "api_keys",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Gateway API key IDs; use __unattributed__ for traffic without an attributed key."
           },
           {
             "name": "query",
@@ -3039,7 +3338,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Case-insensitive request ID, model, Provider, or Endpoint search."
+            "description": "Case-insensitive request ID, requested or upstream model, Provider, Endpoint, or safe Gateway API key metadata search."
           },
           {
             "name": "status",
@@ -3093,6 +3392,50 @@
         }
       }
     },
+    "/admin/activity/recalculate-costs": {
+      "post": {
+        "tags": ["Activity"],
+        "summary": "Recalculate non-reported Activity costs",
+        "description": "Recalculates existing estimated costs and fills missing costs using the current explicit Global, Provider, and Endpoint pricing. Upstream-reported costs and legacy costs without a cost_source are preserved. An optional request_id limits the operation to one Activity record; source_instance_id disambiguates imported records that share a request ID.",
+        "security": [
+          {"managementKey": []},
+          {"adminSession": []}
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "request_id": {
+                    "type": "string",
+                    "description": "Stable request ID. When omitted, every retained non-reported record is considered."
+                  },
+                  "source_instance_id": {
+                    "type": "string",
+                    "description": "Source Activity instance ID for an imported record. Omit it with request_id to select a record created by this Yabane instance."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Cost refresh counts",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/CostRecalculationResult"}
+              }
+            }
+          },
+          "400": {"$ref": "#/components/responses/BadRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "500": {"$ref": "#/components/responses/InternalServerError"}
+        }
+      }
+    },
     "/admin/activity/stats": {
       "get": {
         "tags": [
@@ -3130,7 +3473,31 @@
             "schema": {
               "type": "string"
             },
-            "description": "Optional exact Provider ID filter."
+            "description": "Optional exact Provider ID filter retained for compatibility."
+          },
+          {
+            "name": "providers",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Provider IDs."
+          },
+          {
+            "name": "models",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated exact requested model IDs."
+          },
+          {
+            "name": "api_keys",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional comma-separated Gateway API key IDs; use __unattributed__ for traffic without an attributed key."
           },
           {
             "name": "buckets",
@@ -3145,7 +3512,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Exact totals, ranked Provider/model dimensions, and time buckets for the requested range",
+            "description": "Exact filtered totals, ranked dimensions, time-range filter options, input/output/cache-aware time buckets, and per-Provider request buckets",
             "content": {
               "application/json": {
                 "schema": {
@@ -3400,6 +3767,9 @@
                   "socks5_proxy": {
                     "type": "string",
                     "nullable": true
+                  },
+                  "pricing": {
+                    "$ref": "#/components/schemas/PricingTable"
                   },
                   "requires_api_key": {
                     "type": "boolean"
@@ -3900,6 +4270,16 @@
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "description": "The validated Activity records could not be persisted; no records are published in memory.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }

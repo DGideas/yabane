@@ -31,6 +31,22 @@ for (const project of projects) {
       await context.addCookies([{ name: 'yabane_session', value: sessionCookie, url: base, httpOnly: true, sameSite: 'Strict' }]);
     }
     const page = await context.newPage();
+    page.on('pageerror', error => console.error(`${project.name}: page error: ${error.stack || error.message}`));
+    await page.route('https://models.dev/api.json', async route => {
+      await route.fulfill({
+        status: 200,
+        headers: {'access-control-allow-origin': '*'},
+        contentType: 'application/json',
+        body: JSON.stringify({
+          'reference-provider': {
+            name: 'Reference Provider',
+            models: {
+              'activity-only-model': {id: 'activity-only-model', name: 'Activity Reference', cost: {input: 0.42, output: 1.75, cache_read: 0.08}},
+            },
+          },
+        }),
+      });
+    });
     await page.route(`${base}/admin/extensions/traffic-capture/captures`, async route => {
       if (route.request().method() !== 'GET') return route.continue();
       await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify([{...captureFixture, bytes: captureRequestBody.length + captureResponseBody.length, truncated: false}])});
@@ -81,8 +97,60 @@ for (const project of projects) {
       });
       await route.fulfill({response, json: body});
     });
+    await page.route('**/admin/activity/logs*', async route => {
+      const url = new URL(route.request().url());
+      if (route.request().method() !== 'GET' || url.pathname !== '/admin/activity/logs') return route.continue();
+      const response = await route.fetch();
+      if (!response.ok()) return route.fulfill({response});
+      const body = await response.json();
+      body.unshift({
+        timestamp: Math.floor(Date.now() / 1000), request_id: `ui-unchanged-model-${project.name}`, source_instance_id: 'responsive-remote-instance',
+        path: '/v1/responses', model: 'activity-only-model', upstream_model: 'activity-only-model',
+        provider: 'ui-subscription', endpoint: 'chatgpt', caller_protocol: 'openai_responses', upstream_protocol: 'openai_responses',
+        status: 200, latency_ms: 110, gateway_ms: 4, upstream_response_ms: 18, first_byte_ms: 28, generation_ms: 82,
+        input_tokens: 100, output_tokens: 30, cached_tokens: 10, cost: null, finish_reason: 'completed', streaming: false,
+      }, {
+        timestamp: Math.floor(Date.now() / 1000) - 1, request_id: `ui-mapped-model-${project.name}`,
+        path: '/v1/messages', model: 'ui-subscription/gpt-fixture', upstream_model: 'activity-only-model',
+        provider: 'ui-subscription', endpoint: 'chatgpt', caller_protocol: 'anthropic_messages', upstream_protocol: 'openai_responses',
+        status: 200, latency_ms: 120, gateway_ms: 4, upstream_response_ms: 20, first_byte_ms: 30, generation_ms: 90,
+        input_tokens: 120, output_tokens: 40, cached_tokens: 20, cost: null, finish_reason: 'completed', streaming: false,
+      });
+      await route.fulfill({response, json: body});
+    });
+    await page.route('**/admin/activity/recalculate-costs', async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({candidates: 2, updated: 2, filled: 1, recalculated: 1, reported_preserved: 3, skipped_missing_route: 0, skipped_missing_pricing: 0, skipped_missing_usage: 0})});
+    });
     const testLiveRefresh = project.name === 'desktop-chrome';
     if (testLiveRefresh) await page.clock.install();
+
+    await page.goto(`${base}/docs`, {waitUntil: 'domcontentloaded'});
+    await page.locator('.docs-op').first().waitFor();
+    await assertNoPageOverflow(page, project.name, 'API docs');
+    if (project.width > 900) {
+      const docsScroll = await page.locator('#docs-nav').evaluate(nav => {
+        const main = document.querySelector('#docs-main');
+        const spacer = document.createElement('div');
+        spacer.style.height = '150vh';
+        main.append(spacer);
+        nav.scrollTop = nav.scrollHeight;
+        main.scrollTop = main.scrollHeight;
+        return {
+          navScrollTop: nav.scrollTop,
+          mainScrollTop: main.scrollTop,
+          navBottom: nav.getBoundingClientRect().bottom,
+          mainBottom: main.getBoundingClientRect().bottom,
+          viewportHeight: window.innerHeight,
+          pageScrollY: window.scrollY,
+        };
+      });
+      if (docsScroll.navScrollTop <= 0) throw new Error(`${project.name}: API docs Endpoint navigation is not independently scrollable`);
+      if (docsScroll.mainScrollTop <= 0) throw new Error(`${project.name}: API docs reference content is not independently scrollable`);
+      if (docsScroll.pageScrollY !== 0) throw new Error(`${project.name}: scrolling API docs content also scrolls the page`);
+      if (Math.abs(docsScroll.navBottom - docsScroll.viewportHeight) > 1 || Math.abs(docsScroll.mainBottom - docsScroll.viewportHeight) > 1) throw new Error(`${project.name}: API docs panes are not contained by the viewport`);
+    }
+
     await page.goto(base, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => !document.querySelector('#login-screen')?.hidden || !document.querySelector('#admin-app')?.hidden);
     if (await page.locator('#login-screen').isVisible()) {
@@ -112,6 +180,11 @@ for (const project of projects) {
     const backdropAnimations = await backdrop.locator('g').evaluateAll(groups => groups.map(group => getComputedStyle(group).animationName));
     if (backdropAnimations.some(name => name !== 'none')) throw new Error(`${project.name}: console background ignores reduced-motion preference`);
     await page.emulateMedia({ reducedMotion: 'no-preference' });
+
+    await page.goto(`${base}/providers`, {waitUntil: 'domcontentloaded'});
+    await page.waitForFunction(() => location.pathname === '/providers' && document.querySelector('.nav.active')?.dataset.view === 'providers');
+    if (!(await page.locator('#provider-list-page').isVisible())) throw new Error(`${project.name}: directly opening /providers does not show the Provider list`);
+    await page.evaluate(() => document.querySelector('[data-view="home"]').click());
 
     const accountAvatar = page.locator('#account-menu');
     const topbar = page.locator('.topbar');
@@ -188,6 +261,19 @@ for (const project of projects) {
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
     if (!(await trafficCaptureExtension.getByText('traffic-capture · v0.1.1', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not expose version 0.1.1`);
+    if (!project.mobile) {
+      const settingsSearch = page.locator('#settings-search');
+      await settingsSearch.fill('extension');
+      const extensionSearchLabels = await page.locator('#search-results strong').allTextContents();
+      const expectedExtensionSearchLabels = await page.evaluate(() => ['Extensions', ...extensions.map(extension => `${extension.name} extension`)]);
+      for (const label of expectedExtensionSearchLabels) {
+        if (!extensionSearchLabels.includes(label)) throw new Error(`${project.name}: settings search omits the current ${label} entry`);
+      }
+      await settingsSearch.fill('traffic-capture');
+      await page.locator('#search-results').getByText('Traffic Capture extension', {exact: true}).click();
+      await page.locator('#traffic-capture-view').waitFor({state: 'visible'});
+      await page.locator('#back-to-extensions').click();
+    }
     await trafficCaptureExtension.getByRole('button', {name: 'Configure capture'}).click();
     await page.locator('#traffic-capture-view').waitFor({state: 'visible'});
     if (!(await page.getByText('Captured bodies may contain prompts, files, tool calls, and model output.', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not warn about captured content`);
@@ -297,6 +383,10 @@ for (const project of projects) {
     }
     await assertNoPageOverflow(page, project.name, 'Extensions page');
     await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+    await page.waitForFunction(() => document.querySelectorAll('#providers .provider-list-activity svg').length === document.querySelectorAll('#providers .provider-list-item').length);
+    const providerActivity = page.locator('#providers .provider-list-activity').first();
+    if (!(await providerActivity.isVisible()) || !(await providerActivity.getByText(/requests · 24h/).isVisible())) throw new Error(`${project.name}: Provider list does not show its 24-hour activity sparkline`);
+    if (!await providerActivity.getAttribute('aria-label').then(label => /requests? in the last 24 hours/.test(label || ''))) throw new Error(`${project.name}: Provider activity sparkline lacks an accessible request summary`);
     const stretchedProviderLabels = await page.locator('.provider-list-main code').evaluateAll(labels => labels.filter(label => {
       const range = document.createRange();
       range.selectNodeContents(label);
@@ -427,6 +517,20 @@ for (const project of projects) {
     await subscriptionProvider.click();
     const credential = page.locator('.subscription-credential');
     await credential.waitFor({state: 'visible'});
+    await page.evaluate(() => {
+      window.__helpTestKeys = authSettings.api_keys;
+      authSettings.api_keys = [
+        {id: 'wrong-provider', note: 'Wrong Provider', prefix: 'sk-wrong', secret: 'sk-wrong-provider', expires_at: null, provider_ids: ['ui-keyless']},
+        {id: 'expired-provider', note: 'Expired Provider key', prefix: 'sk-expired', secret: 'sk-expired-provider', expires_at: 1, provider_ids: ['ui-subscription']},
+        {id: 'matching-provider', note: 'Matching Provider', prefix: 'sk-matching', secret: 'sk-matching-provider', expires_at: null, provider_ids: ['ui-subscription']},
+      ];
+    });
+    await page.locator('.contextual-help[data-help-context="provider"]').click();
+    await page.locator('#help-dialog').waitFor({state: 'visible'});
+    if (await page.locator('#help-model').inputValue() !== 'ui-subscription/gpt-fixture') throw new Error(`${project.name}: Provider guide does not default to a discovered model from that Provider`);
+    if (await page.locator('#help-key').inputValue() !== 'sk-matching-provider') throw new Error(`${project.name}: Provider guide does not default to a non-expired Gateway key authorized for that Provider`);
+    await page.locator('#help-dialog .close-help').first().click();
+    await page.evaluate(() => { authSettings.api_keys = window.__helpTestKeys; delete window.__helpTestKeys; });
     if (await credential.getByText('Automatic renewal enabled', {exact: true}).count() !== 1) throw new Error(`${project.name}: connected OpenAI subscription does not present automatic renewal as its primary state`);
     if (await credential.getByText(/^Token expires /).count()) throw new Error(`${project.name}: OpenAI subscription still presents access-token expiry as its primary state`);
     const details = credential.locator('.credential-details');
@@ -442,7 +546,7 @@ for (const project of projects) {
       const defaultsCard = page.locator('.defaults-card');
       const defaultsIncluded = await defaultsCard.getByText(/^Extension (enabled|disabled)/).count();
       if (defaultsIncluded) {
-        if (!(await defaultsCard.getByRole('button', {name: 'Configure'}).isVisible())) throw new Error(`${project.name}: included Request Defaults cannot be configured`);
+        if (!(await defaultsCard.getByRole('button', {name: 'Configure', exact: true}).isVisible())) throw new Error(`${project.name}: included Request Defaults cannot be configured`);
         if (await defaultsCard.getByRole('button', {name: 'View extension'}).count()) throw new Error(`${project.name}: included Request Defaults retains a redundant View extension action`);
       } else {
         if (!(await defaultsCard.getByRole('button', {name: 'How to include'}).isVisible())) throw new Error(`${project.name}: unavailable Request Defaults does not explain how to include it`);
@@ -504,7 +608,8 @@ for (const project of projects) {
     if (project.name === 'desktop-chrome') {
       const providerFixture = {
         id: 'ui-delete-provider', name: 'UI delete provider', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
-        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, requires_api_key: true, api_keys: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true}], subscription_connected: false, subscription_expires_at: null}],
+        pricing: {updated_at: 1, models: {'ui-provider-price*': {input_per_million: 1, output_per_million: 2}}},
+        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, pricing: {updated_at: 1, models: {'ui-endpoint-price*': {output_per_million: 3}}}, requires_api_key: true, api_keys: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true}], subscription_connected: false, subscription_expires_at: null}],
         discovered_models: [], model_endpoints: {}, model_endpoint_preferences: [], models_discovered_at: null, model_discovery_error: null,
       };
       const routeFixture = {pattern: 'ui-delete-route', targets: [{provider_id: providerFixture.id, endpoint_id: 'deletable', api_key_id: 'delete-key', upstream_model: 'upstream-delete-model', weight: 100, enabled: true}]};
@@ -533,6 +638,9 @@ for (const project of projects) {
       ]);
       if (!confirmation.includes('1 Endpoint') || !confirmation.includes('1 upstream credential') || !confirmation.includes('1 model-route destination') || !confirmation.includes('deletes 1 route left without a destination') || !confirmation.includes('revokes 1 Gateway API key scoped only to this Provider')) throw new Error(`${project.name}: Provider deletion does not explain its cascading route, credential, and Gateway key impact`);
       if (await page.locator('#routes').getByText('ui-delete-route', {exact: true}).count()) throw new Error(`${project.name}: Provider deletion leaves stale model routes rendered in the console`);
+      await page.evaluate(() => document.querySelector('[data-view="pricing"]').click());
+      const deletedPricingText = await page.locator('#pricing-list-page').textContent();
+      if (deletedPricingText.includes('ui-provider-price') || deletedPricingText.includes('ui-endpoint-price')) throw new Error(`${project.name}: Provider deletion leaves its pricing overrides in the central pricing list`);
     }
     await page.evaluate(() => document.querySelector('[data-view="models"]').click());
     const renderedRoute = page.locator('#routes .route-destination').first();
@@ -575,6 +683,51 @@ for (const project of projects) {
     await page.locator('#route-targets [name="target_enabled"]').nth(1).uncheck();
     if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be turned off`);
     await page.locator('#route-dialog .close-route').first().click();
+    await page.evaluate(() => document.querySelector('[data-view="pricing"]').click());
+    await page.locator('#pricing-view').waitFor({state: 'visible'});
+    if (!(await page.locator('#pricing-list-page').isVisible()) || !(await page.locator('#open-pricing-editor').isVisible())) throw new Error(`${project.name}: Model pricing lacks a dedicated top-level management entry`);
+    await page.locator('#open-pricing-editor').click();
+    if (!(await page.locator('#pricing-editor-page').isVisible()) || !(await page.locator('#pricing-list-page').isHidden())) throw new Error(`${project.name}: price editing does not use the full pricing workspace`);
+    const suggestedModels = await page.locator('#pricing-model-suggestions option').evaluateAll(options => options.map(option => option.value));
+    if (!suggestedModels.includes('gpt-fixture')) throw new Error(`${project.name}: pricing model input does not suggest runtime-discovered model IDs`);
+    if (!suggestedModels.includes('activity-only-model')) throw new Error(`${project.name}: pricing model input does not suggest historical Activity upstream model IDs`);
+    await page.locator('#pricing-model').fill('model-family-*');
+    if (!(await page.locator('#pricing-model-notice').textContent()).includes('Matches every upstream model beginning with')) throw new Error(`${project.name}: pricing model input does not explain prefix wildcard matching`);
+    if (await page.locator('[name="cache_write_per_million"]').count()) throw new Error(`${project.name}: pricing editor exposes a cache-write rate that current usage cannot apply`);
+    const rateInputModes = await page.locator('.pricing-money-input input').evaluateAll(inputs => inputs.map(input => ({type: input.type, inputMode: input.inputMode})));
+    if (rateInputModes.some(input => input.type !== 'number' || input.inputMode !== 'decimal')) throw new Error(`${project.name}: pricing rates do not preserve validated numeric input and the mobile decimal keyboard hint`);
+    if (project.name === 'desktop-chrome') {
+      if (!(await page.locator('#models-dev-reference').isVisible())) throw new Error(`${project.name}: wide pricing editor does not use the available space for models.dev references`);
+      await page.locator('#pricing-model').fill('activity-only-model');
+      await page.clock.fastForward(400);
+      await page.locator('.pricing-reference-item').waitFor({state: 'visible'});
+      if (!(await page.locator('.pricing-reference-item').getByText('Reference Provider', {exact: true}).isVisible())) throw new Error(`${project.name}: models.dev references do not identify the serving provider`);
+      const referenceLayout = await page.locator('.pricing-reference-item').first().evaluate(item => {
+        const panel = item.closest('.pricing-reference').getBoundingClientRect(); const rates = item.querySelector('dl').getBoundingClientRect(); const button = item.querySelector('button').getBoundingClientRect();
+        const labels = [...item.querySelectorAll('dt')].map(label => ({clientWidth: label.clientWidth, scrollWidth: label.scrollWidth, height: label.getBoundingClientRect().height}));
+        return {panelWidth: panel.width, ratesRight: rates.right, buttonLeft: button.left, labels};
+      });
+      if (referenceLayout.panelWidth < 400 || referenceLayout.ratesRight > referenceLayout.buttonLeft || referenceLayout.labels.some(label => label.scrollWidth > label.clientWidth || label.height > 16)) throw new Error(`${project.name}: models.dev reference results are compressed (${JSON.stringify(referenceLayout)})`);
+      const referenceTypography = await page.locator('.pricing-reference-item').first().evaluate(item => ({model: parseFloat(getComputedStyle(item.querySelector('strong')).fontSize), price: parseFloat(getComputedStyle(item.querySelector('dd')).fontSize), button: parseFloat(getComputedStyle(item.querySelector('button')).fontSize)}));
+      if (referenceTypography.model < 15 || referenceTypography.price < 16 || referenceTypography.button < 12) throw new Error(`${project.name}: models.dev reference typography remains too small (${JSON.stringify(referenceTypography)})`);
+      if (process.env.YABANE_UI_SCREENSHOT_DIR) await page.screenshot({path: `${process.env.YABANE_UI_SCREENSHOT_DIR}/${project.name}-pricing.png`, fullPage: true});
+      await page.locator('.use-reference-rates').click();
+      const referenceRates = await page.locator('#central-pricing-form').evaluate(form => [form.elements.input_per_million.value, form.elements.output_per_million.value, form.elements.cache_read_per_million.value]);
+      if (referenceRates.join(',') !== '0.42,1.75,0.08') throw new Error(`${project.name}: selecting a models.dev reference does not fill the visible rates (${referenceRates.join(',')})`);
+    } else if (!(await page.locator('#models-dev-reference').isHidden())) throw new Error(`${project.name}: models.dev reference panel crowds a narrow pricing editor`);
+    await page.locator('#pricing-model').fill('arbitrary/vendor-model');
+    if (!(await page.locator('#pricing-model-notice').textContent()).includes('will still be saved as entered')) throw new Error(`${project.name}: pricing model input does not explicitly permit arbitrary exact IDs`);
+    await page.locator('#central-pricing-form [name="scope"][value="endpoint"]').check();
+    await page.locator('#pricing-provider').selectOption('ui-subscription');
+    await page.locator('#pricing-endpoint').selectOption('chatgpt');
+    if (!(await page.locator('#pricing-resource-fields').isVisible()) || !(await page.locator('#pricing-endpoint-field').isVisible())) throw new Error(`${project.name}: centralized pricing cannot select an Endpoint override`);
+    await assertNoPageOverflow(page, project.name, 'Model pricing editor');
+    const [cancelBox, saveBox] = await Promise.all([
+      page.locator('#cancel-pricing-edit').boundingBox(),
+      page.locator('#central-pricing-form button[type="submit"]').boundingBox(),
+    ]);
+    if (!cancelBox || !saveBox || cancelBox.width > Math.max(180, saveBox.width * 2)) throw new Error(`${project.name}: pricing Cancel action stretches across the workspace`);
+    await page.locator('#cancel-pricing-edit').click();
     const initialActivityLoad = testLiveRefresh ? Promise.all([
       page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48') && response.url().includes('until=')),
       page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
@@ -582,6 +735,38 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('[data-view="activity"]').click());
     if (initialActivityLoad) await initialActivityLoad;
     await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
+    const coverageFallback = await page.evaluate(() => costCoverageLabel({requests: 19146, priced_requests: 0, reported_requests: 12, estimated_requests: 14668}));
+    if (coverageFallback !== '12 reported · 14,668 estimated value · 14,680 / 19,146 requests valued') throw new Error(`${project.name}: Activity cost coverage trusts an inconsistent aggregate over its source counts (${coverageFallback})`);
+    if (!(await page.locator('#refresh-missing-costs').isVisible())) throw new Error(`${project.name}: Activity does not expose the explicit non-reported cost refresh action`);
+    if (project.name === 'desktop-chrome') {
+      page.once('dialog', dialog => dialog.accept());
+      const costRefresh = page.waitForResponse(response => new URL(response.url()).pathname === '/admin/activity/recalculate-costs');
+      await page.locator('#refresh-missing-costs').click();
+      await costRefresh;
+      if (!(await page.locator('#activity-cost-refresh-status').textContent()).includes('Updated 2 costs')) throw new Error(`${project.name}: Activity cost refresh does not show its result summary`);
+    }
+    if (project.name === 'desktop-chrome') {
+      await page.locator('#activity-filter-trigger').click();
+      const providerFilter = page.locator('#activity-filter-options [data-filter-group="providers"]').first();
+      if (!(await providerFilter.count())) throw new Error(`${project.name}: Activity filter picker has no runtime Provider options`);
+      const providerValue = await providerFilter.inputValue();
+      const filteredOverview = Promise.all([
+        page.waitForResponse(response => new URL(response.url()).pathname === '/admin/activity/stats' && new URL(response.url()).searchParams.get('providers') === providerValue),
+        page.waitForResponse(response => new URL(response.url()).pathname === '/admin/activity/logs' && new URL(response.url()).searchParams.get('providers') === providerValue),
+      ]);
+      await providerFilter.check();
+      await filteredOverview;
+      if (await page.locator('#activity-filter-count').textContent() !== '1' || !(await page.locator('#activity-filter-chips button').filter({hasText: providerValue}).isVisible())) throw new Error(`${project.name}: selected Activity filter is not summarized as a count and removable chip`);
+      const filteredExplorer = page.waitForResponse(response => new URL(response.url()).pathname === '/admin/activity/logs/page' && new URL(response.url()).searchParams.get('providers') === providerValue);
+      await page.locator('[data-activity-tab="requests"]').click();
+      await filteredExplorer;
+      await page.locator('[data-activity-tab="overview"]').click();
+      await page.locator('#activity-filter-trigger').click();
+      const resetStats = page.waitForResponse(response => new URL(response.url()).pathname === '/admin/activity/stats' && !new URL(response.url()).searchParams.has('providers'));
+      await page.locator('#reset-activity-filters').click();
+      await resetStats;
+      if (!(await page.locator('#activity-filter-count').isHidden()) || !(await page.locator('#activity-filter-chips').isHidden())) throw new Error(`${project.name}: resetting Activity filters leaves active state visible`);
+    }
     await page.locator('#activity-range-trigger').click();
     if (!(await page.locator('#activity-range-popover').isVisible())) throw new Error(`${project.name}: advanced Activity time range picker does not open`);
     await page.locator('#activity-range-search').fill('90 days');
@@ -602,6 +787,7 @@ for (const project of projects) {
     if (!(await page.locator('#activity-range-label').textContent()).includes('–')) throw new Error(`${project.name}: custom six-hour Activity range is not applied at ten-minute resolution`);
     const presetStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
     await page.locator('#activity-range').evaluate(select => select.dispatchEvent(new Event('change'))); await presetStats;
+    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
     if (testLiveRefresh) {
       const activityRefresh = Promise.all([
         page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48') && response.url().includes('until=')),
@@ -611,28 +797,61 @@ for (const project of projects) {
       await activityRefresh;
     }
     const timelineColumns = page.locator('#activity-chart .chart-column');
-    await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
     if (await timelineColumns.count() !== 48) throw new Error(`${project.name}: 24-hour Activity timeline does not expose every 30-minute interval`);
     if (!(await page.locator('#activity-chart .traffic-line').count()) || !(await page.locator('#activity-chart .traffic-glow').count()) || await page.locator('#activity-chart .traffic-area').count()) throw new Error(`${project.name}: Activity pace is not rendered as a pure line with a local glow`);
+    if (await page.locator('#activity-chart .error-rate-line').count() !== 1 || await page.locator('#activity-chart .error-axis').count() !== 3 || !(await page.locator('#activity-chart-legend').getByText('Error rate', {exact: true}).isVisible())) throw new Error(`${project.name}: Request timeline does not overlay a labeled error-rate curve and percentage axis`);
+    const errorLineStyle = await page.locator('#activity-chart .error-rate-line').evaluate(element => { const style = getComputedStyle(element); return {width: style.strokeWidth, opacity: style.opacity, dash: style.strokeDasharray}; });
+    if (errorLineStyle.width !== '1.5px' || Number(errorLineStyle.opacity) >= 0.75 || errorLineStyle.dash === 'none') throw new Error(`${project.name}: error-rate curve competes with the primary request line (${JSON.stringify(errorLineStyle)})`);
     const chartPaths = await page.locator('#activity-chart').evaluate(element => ({line: element.querySelector('.traffic-line').getAttribute('d'), glow: element.querySelector('.traffic-glow').getAttribute('d')}));
     if (!chartPaths.line.includes(' C') || chartPaths.glow !== chartPaths.line) throw new Error(`${project.name}: Activity pace does not use the same smooth monotone path for its line and local glow`);
+    const timelineAlignment = await page.locator('#activity-chart').evaluate(chart => {
+      const chartBox = chart.getBoundingClientRect();
+      const lineStart = Number(chart.querySelector('.traffic-line').getAttribute('d').match(/^M([\d.]+)/)?.[1]);
+      const firstColumnBox = chart.querySelector('.chart-column').getBoundingClientRect();
+      const firstColumnCenter = firstColumnBox.left - chartBox.left + firstColumnBox.width / 2;
+      return {lineStart, firstColumnCenter};
+    });
+    if (Math.abs(timelineAlignment.lineStart - timelineAlignment.firstColumnCenter) > 1) throw new Error(`${project.name}: Activity interval value is not centered in its interactive interval (${JSON.stringify(timelineAlignment)})`);
     const inspectorBefore = await page.locator('#chart-inspector-time').textContent();
     if (project.mobile) await timelineColumns.first().click(); else await timelineColumns.first().hover();
     const inspectorAfter = await page.locator('#chart-inspector-time').textContent();
     const firstColumnClass = await timelineColumns.first().getAttribute('class');
     if (!inspectorAfter || inspectorAfter === '—' || (inspectorAfter === inspectorBefore && !firstColumnClass.includes('selected'))) throw new Error(`${project.name}: Activity timeline does not respond to interval interaction`);
+    const requestSeriesTooltips = await page.locator('#activity-chart .chart-column').first().evaluate(column => {
+      column.dataset.requestsY = '20'; column.dataset.errorY = '180';
+      const chartBox = column.closest('#activity-chart').getBoundingClientRect();
+      const inspectAt = y => {
+        column.dispatchEvent(new PointerEvent('pointerover', {bubbles: true, clientY: chartBox.top + chartBox.height * y / 250}));
+        return {series: column.dataset.activeSeries, label: column.querySelector('.chart-value').textContent, pointY: column.style.getPropertyValue('--point-y'), pointColor: column.style.getPropertyValue('--point-color')};
+      };
+      return {error: inspectAt(180), requests: inspectAt(20)};
+    });
+    const errorTooltip = requestSeriesTooltips.error; const requestsTooltip = requestSeriesTooltips.requests;
+    if (errorTooltip.series !== 'error-rate' || !errorTooltip.label.startsWith('Error rate ') || errorTooltip.pointY !== '180px' || errorTooltip.pointColor !== '#b86f67') throw new Error(`${project.name}: Request timeline does not select the Error rate tooltip nearest the pointer (${JSON.stringify(errorTooltip)})`);
+    if (requestsTooltip.series !== 'requests' || !requestsTooltip.label.startsWith('Requests ') || requestsTooltip.pointY !== '20px' || requestsTooltip.pointColor !== '#0b57d0') throw new Error(`${project.name}: Request timeline does not select the Requests tooltip nearest the pointer (${JSON.stringify(requestsTooltip)})`);
+    await page.locator('[data-chart-metric="tokens"]').click();
+    if (await page.locator('#activity-chart .token-input-line').count() !== 1 || await page.locator('#activity-chart .token-output-line').count() !== 1 || await page.locator('#activity-chart .token-cache-line').count() !== 1) throw new Error(`${project.name}: Token timeline does not separate input, output, and cache hit rate`);
+    if (!(await page.locator('#activity-chart-legend').isVisible()) || await page.locator('#activity-chart .traffic-axis-right.token-axis').count() !== 3) throw new Error(`${project.name}: Token timeline does not explain its series or percentage scale`);
+    for (const label of ['Input', 'Output', 'Cache hit']) if (!(await page.locator('#chart-inspector-values').getByText(label, {exact: true}).isVisible())) throw new Error(`${project.name}: Token timeline inspector omits ${label}`);
+    const outputTooltip = await page.locator('#activity-chart .chart-column').first().evaluate(column => {
+      column.dataset.inputY = '20'; column.dataset.outputY = '180'; column.dataset.cacheY = '60';
+      const chartBox = column.closest('#activity-chart').getBoundingClientRect();
+      column.dispatchEvent(new PointerEvent('pointerover', {bubbles: true, clientY: chartBox.top + chartBox.height * 180 / 250}));
+      return {series: column.dataset.activeSeries, label: column.querySelector('.chart-value').textContent, pointY: column.style.getPropertyValue('--point-y'), pointColor: column.style.getPropertyValue('--point-color')};
+    });
+    if (outputTooltip.series !== 'output' || !outputTooltip.label.startsWith('Output ') || outputTooltip.pointY !== '180px' || outputTooltip.pointColor !== '#0b57d0') throw new Error(`${project.name}: Token timeline does not select the Output tooltip nearest the pointer (${JSON.stringify(outputTooltip)})`);
     await page.locator('[data-chart-metric="latency"]').click();
     if (await page.locator('[data-chart-metric="latency"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Activity timeline metric cannot be changed`);
     if (!(await page.locator('#chart-inspector-values').getByText('Avg latency', {exact: true}).isVisible())) throw new Error(`${project.name}: Activity timeline inspector omits latency`);
     const successTones = await page.evaluate(() => [modelSuccessTone(99.4), modelSuccessTone(97), modelSuccessTone(94.9)]);
     if (successTones.join(',') !== 'model-healthy,model-warning,model-critical') throw new Error(`${project.name}: model success-rate severity does not distinguish healthy, warning, and critical rates`);
     const modelTable = page.locator('.model-analysis-table');
-    if (!(await modelTable.locator('th', {hasText: 'Input cache hit'}).count()) || !(await modelTable.locator('th', {hasText: 'Reported spend'}).count())) throw new Error(`${project.name}: per-model analysis omits cache efficiency or spend`);
+    if (!(await modelTable.locator('th', {hasText: 'Input cache hit'}).count()) || !(await modelTable.locator('th', {hasText: 'Usage value'}).count())) throw new Error(`${project.name}: per-model analysis omits cache efficiency or usage value`);
     if (!(await page.locator('.api-key-analysis-panel').isVisible())) throw new Error(`${project.name}: Activity overview omits Gateway API key analytics`);
     const modelRow = page.locator('#model-stats tr').first();
     if (await modelRow.count()) {
-      if (!(await modelRow.textContent()).includes('requests priced')) throw new Error(`${project.name}: per-model spend does not disclose cost coverage`);
-      if (project.mobile && (!(await modelRow.locator('[data-label="Input cache hit"]').isVisible()) || !(await modelRow.locator('[data-label="Reported spend"]').isVisible()))) throw new Error(`${project.name}: mobile model card hides cache efficiency or spend`);
+      if (!(await modelRow.textContent()).includes('reported')) throw new Error(`${project.name}: per-model spend does not identify its cost source`);
+      if (project.mobile && (!(await modelRow.locator('[data-label="Input cache hit"]').isVisible()) || !(await modelRow.locator('[data-label="Usage value"]').isVisible()))) throw new Error(`${project.name}: mobile model card hides cache efficiency or usage value`);
     }
     if (project.mobile) {
       const modelLayout = await page.locator('.model-analysis-wrap').evaluate(element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth}));
@@ -675,25 +894,102 @@ for (const project of projects) {
       if (!(await explorerRow.locator('.activity-model').isVisible()) || !(await explorerRow.locator('.activity-upstream-model').isVisible()) || !(await explorerRow.locator('.route-cell').isVisible()) || !(await explorerRow.locator('.activity-output').isVisible())) throw new Error(`${project.name}: Request explorer does not emphasize requested/upstream models, route, and output usage`);
     }
     await page.locator('[data-activity-tab="overview"]').click();
-    const activityRow = page.locator('#recent-activity-logs .activity-request-row').first();
-    if (await activityRow.count()) {
+    const recentActivityRows = page.locator('#recent-activity-logs .activity-request-row');
+    const activityRow = recentActivityRows.filter({hasText: 'Same model ID'}).first();
+    const mappedActivityRow = recentActivityRows.filter({hasText: 'ui-subscription/gpt-fixture'}).first();
+    if (await recentActivityRows.count()) {
+      if (!(await activityRow.count()) || !(await mappedActivityRow.count())) throw new Error(`${project.name}: Activity model routing fixtures are missing from recent requests`);
+      const routingVisibility = await activityRow.locator('.activity-model').evaluate(element => [...element.querySelectorAll('.activity-model-leg b, .activity-model-unchanged')].map(item => { const box = item.getBoundingClientRect(); const style = getComputedStyle(item); return {text: item.textContent, width: box.width, height: box.height, display: style.display, visibility: style.visibility, overflow: style.overflow}; }));
+      if (!(await activityRow.getByText('Client', {exact: true}).isVisible()) || !(await activityRow.getByText('Provider', {exact: true}).isVisible()) || !(await activityRow.getByText('Same model ID', {exact: true}).isVisible())) throw new Error(`${project.name}: unchanged Activity model routing is not explicitly identified by client and Provider side (${JSON.stringify(routingVisibility)})`);
+      if (!(await mappedActivityRow.getByText('ui-subscription/gpt-fixture', {exact: true}).isVisible()) || !(await mappedActivityRow.getByText('activity-only-model', {exact: true}).isVisible()) || await mappedActivityRow.getByText('Same model ID', {exact: true}).count()) throw new Error(`${project.name}: mapped Activity model routing does not show both distinct model IDs`);
       await activityRow.click();
       await assertDialog(page, '#activity-detail-dialog', project.name);
+      if (!project.mobile) {
+        const drawerBox = await page.locator('#activity-detail-dialog').boundingBox();
+        const viewport = page.viewportSize();
+        if (!drawerBox || !viewport || Math.abs(drawerBox.x + drawerBox.width - viewport.width) > 1 || Math.abs(drawerBox.y) > 1 || Math.abs(drawerBox.height - viewport.height) > 1) throw new Error(`${project.name}: request details are not a right-side full-height desktop drawer (${JSON.stringify(drawerBox)})`);
+        const drawerLayout = await page.locator('#activity-detail-dialog').evaluate(dialog => {
+          const head = dialog.querySelector('.activity-detail-head').getBoundingClientRect();
+          const body = dialog.querySelector('.activity-detail-body');
+          const bodyBox = body.getBoundingClientRect();
+          return {flexDirection: getComputedStyle(dialog).flexDirection, headHeight: head.height, headBottom: head.bottom, bodyTop: bodyBox.top, bodyWidth: body.clientWidth, bodyScrollWidth: body.scrollWidth};
+        });
+        if (drawerLayout.flexDirection !== 'column' || drawerLayout.bodyTop < drawerLayout.headBottom - 1 || drawerLayout.headHeight > 72 || drawerLayout.bodyScrollWidth > drawerLayout.bodyWidth + 1) throw new Error(`${project.name}: request details header consumes the drawer width or body content is clipped (${JSON.stringify(drawerLayout)})`);
+      }
       if (!(await page.locator('#activity-detail-request').getByText('Request ID', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits request metadata`);
-      if (!(await page.locator('#activity-detail-request').getByText('Requested model', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-request').getByText('Upstream model', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog does not distinguish requested and upstream models`);
-      if (!(await page.locator('#activity-detail-timing').getByText('Total', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits timing`);
+      if (!(await page.locator('.activity-routing-request-group #activity-detail-request').isVisible())) throw new Error(`${project.name}: request metadata remains in a separate detail section instead of Routing`);
+      const requestMetadataLayout = await page.locator('#activity-detail-request').evaluate(element => {
+        const items = [...element.children];
+        const valueLines = items.map(item => {
+          const range = document.createRange(); range.selectNodeContents(item.querySelector('code'));
+          return range.getClientRects().length;
+        });
+        return {
+          items: items.length,
+          rows: new Set(items.map(item => Math.round(item.getBoundingClientRect().top))).size,
+          columnsPerItem: items.map(item => getComputedStyle(item).gridTemplateColumns.split(' ').length),
+          valueLines,
+        };
+      });
+      if (requestMetadataLayout.rows !== requestMetadataLayout.items) throw new Error(`${project.name}: request metadata still places multiple facts on one row (${JSON.stringify(requestMetadataLayout)})`);
+      if (project.width > 600 && (requestMetadataLayout.columnsPerItem.some(count => count !== 2) || requestMetadataLayout.valueLines.some(count => count !== 1))) throw new Error(`${project.name}: desktop request metadata does not keep each label and value together on one full-width row (${JSON.stringify(requestMetadataLayout)})`);
+      if (project.width <= 600 && requestMetadataLayout.columnsPerItem.some(count => count !== 1)) throw new Error(`${project.name}: narrow request metadata does not stack labels over full-width values (${JSON.stringify(requestMetadataLayout)})`);
+      if (!(await page.locator('#activity-detail-model-route').getByText('Client requested', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-model-route').getByText('Sent to Provider', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not name the client and Provider sides of model routing`);
+      if (!(await page.locator('#activity-detail-model-outcome').getByText('Model ID unchanged', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain identical client and Provider model IDs`);
+      if (!(await page.locator('#activity-detail-api-route').getByText('Client API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('Provider API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('No API conversion', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain the client and Provider API formats`);
+      if (!(await page.locator('#activity-detail-destination').getByText('Provider', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-destination').getByText('Endpoint', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not group Provider and Endpoint under the routing destination`);
+      if (await page.locator('#activity-detail-request').getByText('Caller protocol', { exact: true }).count() || await page.locator('#activity-detail-request').getByText('Upstream protocol', { exact: true }).count()) throw new Error(`${project.name}: request metadata still uses unexplained protocol terminology`);
+      if (!(await page.locator('#activity-detail-request').getByText('Provider finish reason', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the Provider finish reason`);
+      const detailTypography = await page.locator('#activity-detail-dialog').evaluate(dialog => {
+        const fontSize = selector => parseFloat(getComputedStyle(dialog.querySelector(selector)).fontSize);
+        return {
+          header: fontSize('.activity-detail-head h2'), summary: fontSize('#activity-detail-route'), section: fontSize('.activity-detail-section h3'), description: fontSize('.detail-section-heading p'),
+          modelLabel: fontSize('.activity-detail-model-route > div > span'), modelValue: fontSize('.activity-detail-model-route code'), modelHelp: fontSize('.activity-detail-model-route small'),
+          factLabel: fontSize('.activity-routing-facts span'), factValue: fontSize('.activity-routing-facts strong'), factHelp: fontSize('.activity-routing-facts small'), requestValue: fontSize('.activity-request-facts code'),
+          timelineAxis: fontSize('.timeline-axis'), timelineStage: fontSize('.timeline-stage'), timelineHelp: fontSize('.timeline-stage-label small'), usageLabel: fontSize('.activity-detail-grid span'), usageValue: fontSize('.activity-detail-grid strong'), privacy: fontSize('.activity-privacy-note'),
+        };
+      });
+      const minimumDetailTypography = {header: 20, summary: 13, section: 16, description: 13, modelLabel: 11, modelValue: 15, modelHelp: 12, factLabel: 11, factValue: 14, factHelp: 11, requestValue: 13, timelineAxis: 10, timelineStage: 12, timelineHelp: 10, usageLabel: 12, usageValue: 18, privacy: 12};
+      const undersizedDetailText = Object.entries(minimumDetailTypography).filter(([name, minimum]) => detailTypography[name] < minimum);
+      if (undersizedDetailText.length) throw new Error(`${project.name}: request detail typography is too small (${JSON.stringify({detailTypography, undersizedDetailText})})`);
+      if (!await page.locator('#activity-detail-total').textContent() || await page.locator('#activity-detail-total').textContent() === '—' || await page.locator('#activity-detail-timing .timeline-total').count()) throw new Error(`${project.name}: request timeline does not keep one heading total or still repeats it as a table row`);
       if (!(await page.locator('#activity-detail-dialog').getByText('Request timeline', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the shared-scale request timeline`);
       const timelineGeometry = await page.locator('#activity-detail-timing').evaluate(element => {
-        const scale = element.querySelector('.timeline-scale').getBoundingClientRect(); const track = element.querySelector('.timeline-track'); const trackBox = track.getBoundingClientRect(); const style = getComputedStyle(track); const label = element.querySelector('.timeline-stage-label strong'); const bar = element.querySelector('.timeline-stage-bar'); const totalTrack = element.querySelector('.timeline-total-track').getBoundingClientRect(); const totalLine = element.querySelector('.timeline-total-track > i').getBoundingClientRect();
-        return {scaleLeft: scale.left, scaleRight: scale.right, trackLeft: trackBox.left, trackRight: trackBox.right, trackBorder: style.borderWidth, trackBackground: style.backgroundImage, labelAlign: getComputedStyle(label).textAlign, barClip: getComputedStyle(bar).clipPath, barHeight: getComputedStyle(bar).height, barStartRadius: getComputedStyle(bar).borderTopLeftRadius, barEndRadius: getComputedStyle(bar).borderTopRightRadius, barDecoration: getComputedStyle(bar, '::after').content, totalColor: getComputedStyle(element.querySelector('.timeline-total-track > i')).backgroundColor, totalStartFill: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::before').backgroundColor, totalEndFill: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::after').backgroundColor, totalEndRadius: getComputedStyle(element.querySelector('.timeline-total-track > i'), '::after').borderRadius, totalTrackCenter: (totalTrack.top + totalTrack.bottom) / 2, totalLineCenter: (totalLine.top + totalLine.bottom) / 2};
+        const scale = element.querySelector('.timeline-scale').getBoundingClientRect(); const track = element.querySelector('.timeline-track'); const trackBox = track.getBoundingClientRect(); const style = getComputedStyle(track); const label = element.querySelector('.timeline-stage-label strong'); const bar = element.querySelector('.timeline-stage-bar');
+        return {scaleLeft: scale.left, scaleRight: scale.right, trackLeft: trackBox.left, trackRight: trackBox.right, trackBorder: style.borderWidth, trackBackground: style.backgroundImage, labelAlign: getComputedStyle(label).textAlign, barClip: getComputedStyle(bar).clipPath, barHeight: getComputedStyle(bar).height, barStartRadius: getComputedStyle(bar).borderTopLeftRadius, barEndRadius: getComputedStyle(bar).borderTopRightRadius, barDecoration: getComputedStyle(bar, '::after').content};
       });
       if (Math.abs(timelineGeometry.scaleLeft - timelineGeometry.trackLeft) > 1 || Math.abs(timelineGeometry.scaleRight - timelineGeometry.trackRight) > 1) throw new Error(`${project.name}: request timeline scale and tracks are not aligned (${JSON.stringify(timelineGeometry)})`);
-      if (timelineGeometry.trackBorder !== '0px' || timelineGeometry.trackBackground !== 'none' || timelineGeometry.labelAlign !== 'left' || timelineGeometry.barClip !== 'none' || timelineGeometry.barHeight !== '5px' || timelineGeometry.barDecoration !== 'none' || timelineGeometry.totalColor !== 'rgb(11, 87, 208)' || timelineGeometry.totalStartFill !== 'rgb(255, 255, 255)' || timelineGeometry.totalEndFill !== 'rgb(11, 87, 208)' || timelineGeometry.totalEndRadius !== '50%' || Math.abs(timelineGeometry.totalTrackCenter - timelineGeometry.totalLineCenter) > .5) throw new Error(`${project.name}: request timeline lacks borderless tracks, thin rounded stage bars, or the centered blue hollow-to-solid total line (${JSON.stringify(timelineGeometry)})`);
+      if (timelineGeometry.trackBorder !== '0px' || timelineGeometry.trackBackground !== 'none' || timelineGeometry.labelAlign !== 'left' || timelineGeometry.barClip !== 'none' || timelineGeometry.barHeight !== '5px' || timelineGeometry.barDecoration !== 'none') throw new Error(`${project.name}: request timeline lacks borderless tracks or thin rounded stage bars (${JSON.stringify(timelineGeometry)})`);
       if (!(await page.locator('#activity-detail-request').getByText('Gateway API key', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the authenticated Gateway API key identity`);
       if (!(await page.locator('#activity-detail-failure').count())) throw new Error(`${project.name}: request detail dialog omits the failure diagnosis region`);
       if (!(await page.locator('#activity-detail-dialog').getByText('Prompt and response content are not retained.').isVisible())) throw new Error(`${project.name}: request detail dialog omits the content-retention notice`);
       if (await page.locator('#activity-capture-link').count()) throw new Error(`${project.name}: request detail dialog still presents the unrelated Traffic Capture lookup`);
-      await page.locator('#activity-detail-dialog .close-activity-detail').first().click();
+      const refreshCost = page.locator('#activity-detail-usage .refresh-activity-cost');
+      if (!(await refreshCost.count())) throw new Error(`${project.name}: non-reported Activity detail omits its cost refresh action`);
+      page.once('dialog', dialog => dialog.accept());
+      const costRefreshResponse = page.waitForResponse(response => response.url().endsWith('/admin/activity/recalculate-costs') && response.request().method() === 'POST');
+      await refreshCost.click();
+      const costRefreshRequest = (await costRefreshResponse).request().postDataJSON();
+      if (costRefreshRequest.request_id !== `ui-unchanged-model-${project.name}` || costRefreshRequest.source_instance_id !== 'responsive-remote-instance') throw new Error(`${project.name}: single-record cost refresh omits the stable Activity source identity (${JSON.stringify(costRefreshRequest)})`);
+      await page.waitForFunction(() => document.querySelector('#activity-cost-refresh-status').textContent.length > 0);
+      await page.locator('#activity-detail-dialog').evaluate(dialog => dialog.close());
+      await mappedActivityRow.click();
+      await assertDialog(page, '#activity-detail-dialog', project.name);
+      if (!(await page.locator('#activity-detail-model-outcome').getByText('Model ID changed', {exact: true}).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('Converted by Yabane', {exact: true}).isVisible())) throw new Error(`${project.name}: mapped request detail does not identify model mapping and API conversion`);
+      if (!(await page.locator('#activity-detail-api-route').getByText('Anthropic Messages', {exact: true}).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('OpenAI Responses', {exact: true}).isVisible())) throw new Error(`${project.name}: converted request detail does not show both API formats`);
+      await page.locator('#activity-detail-dialog').evaluate(dialog => dialog.close());
+      await activityRow.click();
+      await assertDialog(page, '#activity-detail-dialog', project.name);
+      const editActivityPricing = page.locator('#activity-detail-usage .edit-activity-pricing');
+      if (!(await editActivityPricing.count())) throw new Error(`${project.name}: missing-cost Activity detail does not offer a price action`);
+      const upstreamModel = await page.locator('#activity-detail-upstream-model').textContent();
+      await editActivityPricing.click();
+      await page.locator('#pricing-view').waitFor({state: 'visible'});
+      if (!(await page.locator('#pricing-editor-page').isVisible())) throw new Error(`${project.name}: Activity price action does not open the centralized pricing editor`);
+      if (await page.locator('#pricing-model').inputValue() !== upstreamModel) throw new Error(`${project.name}: Activity pricing action does not prefill the exact upstream model`);
+      if (!(await page.locator('#central-pricing-form [name="scope"][value="global"]').isChecked())) throw new Error(`${project.name}: a new Activity price does not default to the global scope`);
+      await page.locator('#cancel-pricing-edit').click();
+      await page.evaluate(() => document.querySelector('[data-view="activity"]').click());
     }
     await page.locator('#manage-activity-data').click();
     await assertDialog(page, '#activity-data-dialog', project.name);
@@ -702,7 +998,7 @@ for (const project of projects) {
       timestamp: Math.floor(Date.now() / 1000), request_id: `responsive-preview-${project.name}`,
       path: '/v1/responses', model: 'preview/model', provider: 'preview', endpoint: 'preview',
       status: 200, latency_ms: 1200, gateway_ms: 4, upstream_response_ms: 180, first_byte_ms: 250, generation_ms: 950,
-      input_tokens: 120, output_tokens: 40, cached_tokens: 20, cost: null, streaming: false,
+      input_tokens: 120, output_tokens: 40, cached_tokens: 20, cost: null, finish_reason: 'completed', streaming: false,
     };
     await page.locator('#activity-import-file').setInputFiles({
       name: 'activity-preview.json', mimeType: 'application/json',
@@ -726,7 +1022,9 @@ async function assertNoPageOverflow(page, name, surface) {
 }
 
 async function assertDialog(page, selector, name) {
-  const box = await page.locator(selector).boundingBox();
+  const dialog = page.locator(selector);
+  await dialog.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {}))));
+  const box = await dialog.boundingBox();
   const viewport = page.viewportSize();
   if (!box || !viewport) throw new Error(`${name}: ${selector} is not visible`);
   const tolerance = 1;

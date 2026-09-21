@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-const ROUTES_FILE: &str = "data/routes.json";
+pub const ROUTES_FILE: &str = "data/routes.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RouteTarget {
@@ -79,30 +79,29 @@ impl RouteStore {
 
     pub async fn resolve(&self, model: &str) -> Option<RouteTarget> {
         let routes = self.0.read().await;
-        routes
+        let selected = routes
             .iter()
             .find(|route| route.pattern == model)
             .or_else(|| {
                 routes
                     .iter()
                     .filter_map(|route| {
-                        let prefix = route.pattern.strip_suffix('*')?;
-                        model.starts_with(prefix).then_some((prefix.len(), route))
+                        model_pattern_specificity(&route.pattern, model)
+                            .map(|specificity| (specificity, route))
                     })
-                    .max_by_key(|(length, _)| *length)
+                    .max_by_key(|(specificity, _)| *specificity)
                     .map(|(_, route)| route)
-            })
-            .and_then(ModelRoute::select_target)
-            .cloned()
+            });
+        selected.and_then(ModelRoute::select_target).cloned()
     }
 }
 
 fn validate_route_identities(routes: &[ModelRoute]) -> Result<(), String> {
     let mut patterns = std::collections::HashSet::new();
     for route in routes {
-        if route.pattern.is_empty() || !patterns.insert(route.pattern.as_str()) {
+        if !valid_model_pattern(&route.pattern) || !patterns.insert(route.pattern.as_str()) {
             return Err(format!(
-                "parse {ROUTES_FILE}: model route patterns must be non-empty and unique"
+                "parse {ROUTES_FILE}: model route patterns must be unique exact IDs or non-empty prefixes ending in one '*'"
             ));
         }
         if route.targets.is_empty()
@@ -124,6 +123,22 @@ fn validate_route_identities(routes: &[ModelRoute]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn valid_model_pattern(pattern: &str) -> bool {
+    !pattern.trim().is_empty()
+        && (pattern.matches('*').count() == 0
+            || (pattern.ends_with('*') && pattern.matches('*').count() == 1 && pattern.len() > 1))
+}
+
+/// Exact patterns sort above every wildcard. Wildcards use their literal prefix
+/// length, so the longest matching prefix wins.
+pub(crate) fn model_pattern_specificity(pattern: &str, model: &str) -> Option<usize> {
+    if pattern == model {
+        return Some(usize::MAX);
+    }
+    let prefix = pattern.strip_suffix('*')?;
+    model.starts_with(prefix).then_some(prefix.len())
 }
 
 fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {

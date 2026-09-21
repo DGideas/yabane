@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
-    config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
+    config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider, UpstreamTimeouts},
     gateway::join_upstream_url,
 };
 
@@ -298,10 +298,15 @@ async fn list_endpoint_models(
         return Err(format!("endpoint '{}' has no enabled API key", endpoint.id));
     }
 
-    let responses = join_all(
-        keys.iter()
-            .map(|key| fetch_models(client, endpoint, key.as_ref(), provider)),
-    )
+    let responses = join_all(keys.iter().map(|key| {
+        fetch_models(
+            client,
+            state.upstream_timeouts,
+            endpoint,
+            key.as_ref(),
+            provider,
+        )
+    }))
     .await;
     let mut models = Vec::new();
     let mut errors = Vec::new();
@@ -321,15 +326,25 @@ async fn list_endpoint_models(
 
 async fn fetch_models(
     client: &reqwest::Client,
+    timeouts: UpstreamTimeouts,
     endpoint: &ApiEndpoint,
     key: Option<&ApiKey>,
     provider: &Provider,
 ) -> Result<Vec<Model>, String> {
-    fetch_models_with_timeout(client, endpoint, key, provider, MODEL_DISCOVERY_TIMEOUT).await
+    fetch_models_with_timeout(
+        client,
+        timeouts,
+        endpoint,
+        key,
+        provider,
+        MODEL_DISCOVERY_TIMEOUT,
+    )
+    .await
 }
 
 async fn fetch_models_with_timeout(
     client: &reqwest::Client,
+    timeouts: UpstreamTimeouts,
     endpoint: &ApiEndpoint,
     key: Option<&ApiKey>,
     provider: &Provider,
@@ -342,7 +357,7 @@ async fn fetch_models_with_timeout(
         ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
         ApiType::Anthropic => "/v1/models?limit=1000",
     };
-    let client = endpoint.client(client)?;
+    let client = endpoint.client(client, timeouts)?;
     let mut request = client.get(join_upstream_url(&endpoint.base_url, path));
     if let Some(key) = key {
         request = match endpoint.api_type {
@@ -435,7 +450,7 @@ fn model_object() -> String {
 mod tests {
     use std::time::Duration;
 
-    use crate::config::{ApiEndpoint, Provider};
+    use crate::config::{ApiEndpoint, Provider, UpstreamTimeouts};
 
     use super::{
         cached_models, discovery_inputs_match, fetch_models_with_timeout, parse_anthropic_models,
@@ -448,6 +463,7 @@ mod tests {
             name: "Test".to_owned(),
             extra_headers: std::collections::HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints: Vec::new(),
             discovered_models: Vec::new(),
@@ -520,6 +536,11 @@ mod tests {
         };
         let error = fetch_models_with_timeout(
             &reqwest::Client::new(),
+            UpstreamTimeouts {
+                connect: Duration::from_secs(1),
+                read: Duration::from_secs(1),
+                total: Duration::from_secs(1),
+            },
             &endpoint,
             None,
             &provider(),

@@ -111,7 +111,7 @@ pub async fn start(
         ..ApiEndpoint::default()
     };
     let client = oauth_endpoint
-        .client(&state.client)
+        .client(&state.client, state.upstream_timeouts)
         .map_err(StartError::Invalid)?;
     let create_provider = {
         let providers = state.providers.read().await;
@@ -207,7 +207,7 @@ pub async fn start_browser(
         socks5_proxy: socks5_proxy.clone(),
         ..ApiEndpoint::default()
     }
-    .client(&state.client)
+    .client(&state.client, state.upstream_timeouts)
     .map_err(StartError::Invalid)?;
     let create_provider = {
         let providers = state.providers.read().await;
@@ -425,7 +425,7 @@ pub async fn refreshed_endpoint(
     if credential.expires_at > crate::auth::now().saturating_add(60) {
         return Ok(endpoint);
     }
-    let client = endpoint.client(&state.client)?;
+    let client = endpoint.client(&state.client, state.upstream_timeouts)?;
     let implementation = state
         .extensions
         .subscription_provider("openai_codex")
@@ -496,6 +496,7 @@ async fn attach_subscription(
                 .unwrap_or_else(|| "OpenAI subscription".to_owned()),
             extra_headers: HashMap::new(),
             extra_body: serde_json::Map::new(),
+            pricing: None,
             defaults_endpoint_ids: Vec::new(),
             endpoints: Vec::new(),
             discovered_models: Vec::new(),
