@@ -436,6 +436,7 @@ for (const project of projects) {
       if (!(await listedKey.locator('.icon-copy-key[aria-label="Copy API key"]').isVisible())) throw new Error(`${project.name}: masked API key cannot be copied`);
       await editGatewayKey.click();
       await assertDialog(page, '#edit-gateway-key-dialog', project.name);
+      if (firstKey.expires_at === null && await page.locator('#edit-gateway-key-dialog [name="expires_at"]').inputValue() !== '') throw new Error(`${project.name}: editing a key without expiry fills the expiry field with the Unix epoch`);
       await page.locator('#edit-gateway-key-dialog .close-edit-gateway-key').first().click();
     }
     await page.locator('.contextual-help[data-help-context="access"]').click();
