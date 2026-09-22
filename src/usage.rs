@@ -216,14 +216,9 @@ fn merge_event_usage(api_type: ApiType, bytes: &[u8], combined: &mut TokenUsage)
         return;
     };
 
-    combined.input = combined
-        .input
-        .max(first_u64(usage, &[&["input_tokens"], &["prompt_tokens"]]));
-    combined.output = combined.output.max(first_u64(
-        usage,
-        &[&["output_tokens"], &["completion_tokens"]],
-    ));
-    combined.cached = combined.cached.max(first_u64(
+    let input = first_u64(usage, &[&["input_tokens"], &["prompt_tokens"]]);
+    let output = first_u64(usage, &[&["output_tokens"], &["completion_tokens"]]);
+    let cached = first_u64(
         usage,
         &[
             &["cache_read_input_tokens"],
@@ -231,7 +226,14 @@ fn merge_event_usage(api_type: ApiType, bytes: &[u8], combined: &mut TokenUsage)
             &["prompt_tokens_details", "cached_tokens"],
             &["input_tokens_details", "cached_tokens"],
         ],
-    ));
+    );
+    let normalized_input = match api_type {
+        ApiType::Anthropic => input.saturating_add(cached),
+        _ => input,
+    };
+    combined.input = combined.input.max(normalized_input);
+    combined.output = combined.output.max(output);
+    combined.cached = combined.cached.max(cached);
 }
 
 fn extract_finish_reason(api_type: ApiType, value: &serde_json::Value) -> Option<String> {
@@ -329,6 +331,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_anthropic_usage_with_cache_as_total_input() {
+        let mut tracker = UsageTracker::new(ApiType::Anthropic, false);
+        tracker.observe(br#"{"usage":{"input_tokens":1835,"output_tokens":2976,"cache_read_input_tokens":23552}}"#);
+        assert_eq!(
+            tracker.finish().0,
+            TokenUsage {
+                input: 25387,
+                output: 2976,
+                cached: 23552,
+                cost: None,
+                finish_reason: None,
+            }
+        );
+    }
+
+    #[test]
     fn extracts_numeric_or_string_upstream_cost() {
         let mut tracker = UsageTracker::new(ApiType::OpenaiCompatible, false);
         tracker
@@ -412,7 +430,7 @@ mod tests {
         assert_eq!(
             tracker.finish().0,
             TokenUsage {
-                input: 30,
+                input: 39,
                 output: 11,
                 cached: 9,
                 cost: None,

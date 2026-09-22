@@ -1698,8 +1698,8 @@ function addActivityFilterParams(params) {
   return params;
 }
 function activityBucketPlan(seconds, now = Math.floor(Date.now() / 1000), align = true) {
-  const bucketSeconds = seconds <= 900 ? 60 : seconds <= 3600 ? 300 : seconds <= 21600 ? 600 : seconds <= 43200 ? 900 : seconds <= 86400 ? 1800 : seconds <= 259200 ? 3600 : seconds <= 604800 ? 10800 : seconds <= 1209600 ? 21600 : seconds <= 2592000 ? 43200 : 86400;
-  const bucketCount = Math.min(120, Math.max(1, Math.ceil(seconds / bucketSeconds)));
+  const bucketSeconds = seconds <= 900 ? 60 : seconds <= 3600 ? 300 : seconds <= 21600 ? 600 : seconds <= 43200 ? 900 : seconds <= 86400 ? 1800 : seconds <= 259200 ? 3600 : seconds <= 604800 ? 3600 : seconds <= 1209600 ? 7200 : seconds <= 2592000 ? 21600 : 86400;
+  const bucketCount = Math.min(336, Math.max(1, Math.ceil(seconds / bucketSeconds)));
   return {bucketCount, bucketSeconds, until: align ? Math.ceil(now / bucketSeconds) * bucketSeconds : now};
 }
 function selectedActivityRange() {
@@ -1827,15 +1827,25 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
   const inputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.input), max) : []; const outputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.output), max) : []; const cachePoints = tokenMode ? pointsFor(tokenSeries.map(value => value.cacheRate), 100) : [];
   const errorPoints = requestMode ? pointsFor(errorRates, errorScaleMax) : [];
   const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = max * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
-  const intervalEvery = Math.max(1, Math.ceil(buckets.length / 6));
+  const labelBudget = Math.max(4, Math.min(8, Math.floor(width / 110)));
+  const intervalEvery = Math.max(1, Math.ceil(buckets.length / labelBudget));
+  const columnLabels = buckets.map(bucket => activityBucketLabel(bucket, seconds));
+  const shownLabels = [];
+  let lastShownLabel = '';
+  columnLabels.forEach((label, index) => {
+    const candidate = index % intervalEvery === 0 || index === columnLabels.length - 1;
+    const show = candidate && label !== lastShownLabel;
+    if (show) lastShownLabel = label;
+    shownLabels.push(show ? label : '');
+  });
   const overlays = buckets.map((bucket, index) => {
-    const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatTrackedCost(bucket.cost, pricedRequestCount(bucket))}`; const label = activityBucketLabel(bucket, seconds); const pointLabel = tokenMode ? `Input ${compactNumber(primaryValues[index])}` : requestMode ? `Requests ${activityMetricLabel(values[index], activityChartMetric)}` : activityMetricLabel(values[index], activityChartMetric);
+    const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatTrackedCost(bucket.cost, pricedRequestCount(bucket))}`; const label = columnLabels[index]; const pointLabel = tokenMode ? `Input ${compactNumber(primaryValues[index])}` : requestMode ? `Requests ${activityMetricLabel(values[index], activityChartMetric)}` : activityMetricLabel(values[index], activityChartMetric);
     const seriesData = tokenMode
       ? ` data-input-y="${inputPoints[index].y}" data-output-y="${outputPoints[index].y}" data-cache-y="${cachePoints[index].y}" data-input-value="${compactNumber(tokenSeries[index].input)}" data-output-value="${compactNumber(tokenSeries[index].output)}" data-cache-value="${tokenSeries[index].cacheRate.toFixed(1)}%" data-active-series="input"`
       : requestMode
         ? ` data-requests-y="${points[index].y}" data-error-y="${errorPoints[index].y}" data-requests-value="${activityMetricLabel(values[index], activityChartMetric)}" data-error-value="${errorRates[index].toFixed(1)}%" data-active-series="requests"`
         : '';
-    return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}"${seriesData} aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${pointLabel}</span><small>${index % intervalEvery === 0 || index === buckets.length - 1 ? label : ''}</small></button>`;
+    return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}"${seriesData} aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${pointLabel}</span><small>${shownLabels[index]}</small></button>`;
   }).join('');
   let seriesMarkup;
   if (tokenMode) {
@@ -1846,7 +1856,8 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
     seriesMarkup = `<path class="traffic-glow token-input-glow" d="${inputLine}"></path><path class="traffic-line token-input-line" d="${inputLine}"></path><path class="traffic-line token-output-line" d="${outputLine}"></path><path class="traffic-line token-cache-line" d="${cacheLine}"></path>${rightAxis}`;
   } else {
     const averageY = top + (1 - average / max) * plotHeight;
-    const primarySeries = `<line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('')}</g>`;
+    const showPointMarkers = plotWidth / Math.max(points.length, 1) >= 12;
+    const primarySeries = `<line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${showPointMarkers ? points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('') : ''}</g>`;
     if (requestMode) {
       const errorLine = smoothActivityPath(errorPoints);
       const rightAxis = [0, .5, 1].map(ratio => { const value = errorScaleMax * (1 - ratio); const label = Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1); return `<text class="traffic-axis-right error-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${label}%</text>`; }).join('');

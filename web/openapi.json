@@ -3506,7 +3506,7 @@
               "type": "integer",
               "default": 24,
               "minimum": 1,
-              "maximum": 120
+              "maximum": 336
             }
           }
         ],

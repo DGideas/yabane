@@ -862,7 +862,7 @@ impl ActivityStore {
                 .cmp(&left.requests)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        let bucket_count = bucket_count.clamp(1, 120);
+        let bucket_count = bucket_count.clamp(1, 336);
         let width = until
             .saturating_sub(since)
             .max(1)

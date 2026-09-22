@@ -860,7 +860,7 @@ for (const project of projects) {
     }
     if (!project.mobile) {
       await page.locator('[data-activity-tab="requests"]').click();
-      const sevenDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=56'));
+      const sevenDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=168'));
       await page.locator('#activity-range').selectOption('604800');
       await sevenDayStats;
       const dayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
@@ -874,6 +874,28 @@ for (const project of projects) {
       const chartGeometry = await page.locator('#activity-chart').evaluate(chart => ({clientWidth: chart.clientWidth, viewBoxWidth: chart.querySelector('.traffic-area-chart').viewBox.baseVal.width, labelMinutes: [...chart.querySelectorAll('.chart-column small')].map(label => label.textContent.match(/:(\d{2})/)?.[1]).filter(Boolean)}));
       if ((project.width >= 1200 && chartGeometry.viewBoxWidth < 600) || Math.abs(chartGeometry.viewBoxWidth - chartGeometry.clientWidth) >= 2) throw new Error(`${project.name}: Activity chart keeps a hidden-tab fallback width after changing ranges (${JSON.stringify(chartGeometry)})`);
       if (!chartGeometry.labelMinutes.length || chartGeometry.labelMinutes.some(minutes => !['00', '30'].includes(minutes))) throw new Error(`${project.name}: 24-hour Activity intervals are not aligned to wall-clock half hours (${JSON.stringify(chartGeometry.labelMinutes)})`);
+      const weekStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=168'));
+      await page.locator('#activity-range').selectOption('604800');
+      await weekStats;
+      await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 168);
+      const weekChart = await page.locator('#activity-chart').evaluate(chart => {
+        const labels = [...chart.querySelectorAll('.chart-column small')].map(label => label.textContent).filter(Boolean);
+        return {columns: chart.querySelectorAll('.chart-column').length, granularity: document.querySelector('#traffic-granularity').textContent, visibleLabels: labels.length, hourlyLabels: labels.filter(text => /:\d{2}$/.test(text)).length, pointMarkers: chart.querySelectorAll('.traffic-points circle').length};
+      });
+      if (weekChart.columns !== 168 || !weekChart.granularity.startsWith('1-hour')) throw new Error(`${project.name}: 7-day Activity timeline is not rendered at hourly resolution (${JSON.stringify(weekChart)})`);
+      if (weekChart.visibleLabels < 4 || weekChart.visibleLabels > 9 || weekChart.hourlyLabels) throw new Error(`${project.name}: hourly 7-day Activity timeline shows crowded or non-day-boundary labels (${JSON.stringify(weekChart)})`);
+      if (weekChart.pointMarkers) throw new Error(`${project.name}: dense hourly Activity timeline still draws per-interval point markers (${JSON.stringify(weekChart)})`);
+      const backToDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
+      await page.locator('#activity-range').selectOption('86400');
+      await backToDayStats;
+      await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 48);
+      const dayMarkers = await page.locator('#activity-chart').evaluate(chart => {
+        const nonZero = [...chart.querySelectorAll('.chart-column')].filter(column => Number((column.getAttribute('aria-label') || '').match(/: ([\d,]+) requests/)?.[1]?.replace(/,/g, '') || 0) > 0).length;
+        const columns = chart.querySelectorAll('.chart-column').length;
+        const plotWidth = Math.max(chart.clientWidth, 320) - 48 - 42;
+        return {markers: chart.querySelectorAll('.traffic-points circle').length, expected: plotWidth / Math.max(columns, 1) >= 12 ? nonZero : 0};
+      });
+      if (dayMarkers.markers !== dayMarkers.expected) throw new Error(`${project.name}: 24-hour Activity timeline point markers do not follow interval density (${JSON.stringify(dayMarkers)})`);
     }
     const metricLayout = await page.locator('.activity-metrics').evaluate(element => ({scrollable: element.scrollWidth > element.clientWidth + 1, display: getComputedStyle(element).display}));
     if (project.mobile && !metricLayout.scrollable) throw new Error(`${project.name}: Activity summaries are not swipeable on a narrow screen`);
