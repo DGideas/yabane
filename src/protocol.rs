@@ -174,6 +174,7 @@ impl CanonicalResponse {
             .and_then(|usage| usage.get("cache_read_input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        response.input_tokens = response.input_tokens.saturating_add(response.cached_tokens);
         Ok(response)
     }
 
@@ -328,7 +329,7 @@ impl CanonicalResponse {
             "stop_reason": anthropic_stop_reason(self.stop_reason.as_deref(), !self.tool_calls.is_empty()),
             "stop_sequence": null,
             "usage": {
-                "input_tokens": self.input_tokens,
+                "input_tokens": self.input_tokens.saturating_sub(self.cached_tokens),
                 "output_tokens": self.output_tokens,
                 "cache_read_input_tokens": self.cached_tokens
             }
@@ -1338,6 +1339,8 @@ mod tests {
             converted["usage"]["prompt_tokens_details"]["cached_tokens"],
             3
         );
+        assert_eq!(converted["usage"]["prompt_tokens"], 15);
+        assert_eq!(converted["usage"]["total_tokens"], 20);
     }
 
     #[test]
@@ -1362,7 +1365,8 @@ mod tests {
         assert_eq!(converted["content"][0]["text"], "Done");
         assert_eq!(converted["content"][1]["input"]["ok"], true);
         assert_eq!(converted["stop_reason"], "tool_use");
-        assert_eq!(converted["usage"]["input_tokens"], 8);
+        assert_eq!(converted["usage"]["input_tokens"], 6);
+        assert_eq!(converted["usage"]["cache_read_input_tokens"], 2);
     }
 
     #[test]

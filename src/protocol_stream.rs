@@ -155,7 +155,7 @@ impl StreamConverter {
                 json!({
                     "id": self.state.id, "type": "message", "role": "assistant", "model": self.state.model,
                     "content": content, "stop_reason": anthropic_finish(None, !self.state.tools.is_empty()), "stop_sequence": null,
-                    "usage": {"input_tokens": self.state.input_tokens, "output_tokens": self.state.output_tokens,
+                    "usage": {"input_tokens": self.state.input_tokens.saturating_sub(self.state.cached_tokens), "output_tokens": self.state.output_tokens,
                         "cache_read_input_tokens": self.state.cached_tokens}
                 })
             }
@@ -739,7 +739,7 @@ impl StreamConverter {
                 &json!({
                     "type": "message_start", "message": {"id": self.state.id, "type": "message", "role": "assistant", "model": self.state.model,
                     "content": [], "stop_reason": null, "stop_sequence": null,
-                    "usage": {"input_tokens": self.state.input_tokens, "output_tokens": 0, "cache_read_input_tokens": self.state.cached_tokens}}
+                    "usage": {"input_tokens": self.state.input_tokens.saturating_sub(self.state.cached_tokens), "output_tokens": 0, "cache_read_input_tokens": self.state.cached_tokens}}
                 }),
             )?;
         }
@@ -870,18 +870,20 @@ fn read_chat_usage(usage: Option<&Value>, state: &mut StreamState) {
 }
 
 fn read_anthropic_usage(usage: Option<&Value>, state: &mut StreamState) {
-    state.input_tokens = usage
+    let input = usage
         .and_then(|v| v.get("input_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(state.input_tokens);
+        .unwrap_or(0);
+    let cached = usage
+        .and_then(|v| v.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    state.input_tokens = input.saturating_add(cached).max(state.input_tokens);
     state.output_tokens = usage
         .and_then(|v| v.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(state.output_tokens);
-    state.cached_tokens = usage
-        .and_then(|v| v.get("cache_read_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(state.cached_tokens);
+    state.cached_tokens = cached.max(state.cached_tokens);
 }
 
 fn read_responses_usage(usage: Option<&Value>, state: &mut StreamState) {
@@ -907,7 +909,7 @@ mod tests {
     #[test]
     fn anthropic_stream_becomes_chat_stream_across_network_chunks() {
         let input = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":9}}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
@@ -923,7 +925,7 @@ mod tests {
         assert!(
             output.contains("\\\"content\\\":\\\"Hi\\\"") || output.contains("\"content\":\"Hi\"")
         );
-        assert!(output.contains("\"prompt_tokens\":3"));
+        assert!(output.contains("\"prompt_tokens\":12"));
         assert!(output.contains("data: [DONE]"));
     }
 
