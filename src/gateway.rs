@@ -537,23 +537,20 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             .upstream_exchange
             .push(state.traffic_capture.as_ref());
     }
-    let mut request_headers = sanitize_request_headers(
-        parts.headers,
-        endpoint.api_type,
-        (caller_protocol, upstream_protocol),
-    );
+    let mut request_headers =
+        sanitize_request_headers(parts.headers, (caller_protocol, upstream_protocol));
     if !extension_hooks.upstream_headers.is_empty() {
-        let overlay = match state
-            .extensions
-            .run_upstream_headers(&extension_context, &extension_hooks.upstream_headers)
-        {
-            Ok(crate::extensions::DispatchOutcome::Continue(headers)) => headers,
+        match state.extensions.run_upstream_headers(
+            &extension_context,
+            &mut request_headers,
+            &extension_hooks.upstream_headers,
+        ) {
+            Ok(crate::extensions::DispatchOutcome::Continue(())) => {}
             Ok(crate::extensions::DispatchOutcome::Reject(rejection)) => {
                 return crate::extensions::rejection_response(rejection);
             }
             Err(failure) => return crate::extensions::execution_error(failure),
         };
-        request_headers.extend(overlay);
     }
     apply_core_upstream_headers(
         &mut request_headers,
@@ -1185,9 +1182,13 @@ pub(crate) fn join_upstream_url(base_url: &str, path_and_query: &str) -> String 
     )
 }
 
+/// Removes only headers that are meaningless or unsafe to forward on every upstream
+/// request, plus caller-protocol context that must not leak across an explicit
+/// protocol conversion. Core stays a transparent proxy here: it never branches on an
+/// Endpoint's API type, because provider-specific header ownership belongs to that
+/// provider's Extension.
 fn sanitize_request_headers(
     mut headers: HeaderMap,
-    api_type: ApiType,
     protocol_route: (Protocol, Protocol),
 ) -> HeaderMap {
     for name in [
@@ -1219,12 +1220,6 @@ fn sanitize_request_headers(
         ] {
             headers.remove(name);
         }
-    }
-    if api_type == ApiType::OpenaiCodex {
-        headers.remove(header::CONTENT_ENCODING);
-        headers.remove(header::USER_AGENT);
-        headers.remove("session-id");
-        headers.remove("x-client-request-id");
     }
     headers
 }
@@ -1629,7 +1624,6 @@ mod tests {
         request_headers.insert("cookie", HeaderValue::from_static("yabane_session=private"));
         let sanitized = sanitize_request_headers(
             request_headers,
-            ApiType::OpenaiCompatible,
             (Protocol::OpenAiChat, Protocol::OpenAiChat),
         );
         assert!(!sanitized.contains_key("cookie"));
@@ -1684,11 +1678,8 @@ mod tests {
             "anthropic-version",
             HeaderValue::from_static("caller-version"),
         );
-        let mut sanitized = sanitize_request_headers(
-            headers,
-            ApiType::Anthropic,
-            (Protocol::OpenAiChat, Protocol::AnthropicMessages),
-        );
+        let mut sanitized =
+            sanitize_request_headers(headers, (Protocol::OpenAiChat, Protocol::AnthropicMessages));
         apply_core_upstream_headers(
             &mut sanitized,
             ApiType::Anthropic,
@@ -1701,6 +1692,39 @@ mod tests {
         assert!(!sanitized.contains_key("openai-project"));
         assert_eq!(sanitized["anthropic-version"], "2023-06-01");
         assert!(!sanitized.contains_key("anthropic-beta"));
+    }
+
+    #[test]
+    fn core_sanitization_leaves_provider_specific_headers_to_extensions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer caller"));
+        headers.insert("cookie", HeaderValue::from_static("session=private"));
+        // Core removes the two credential headers above on every request, but it must
+        // not decide what any of the following mean: they are provider concerns owned
+        // by that provider's Extension, which is what keeps Core a transparent proxy.
+        headers.insert("content-encoding", HeaderValue::from_static("zstd"));
+        headers.insert("user-agent", HeaderValue::from_static("caller-agent"));
+        headers.insert("session-id", HeaderValue::from_static("caller-session"));
+        headers.insert(
+            "x-client-request-id",
+            HeaderValue::from_static("caller-request"),
+        );
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.7"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+
+        let sanitized = sanitize_request_headers(
+            headers,
+            (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
+        );
+
+        assert!(!sanitized.contains_key("authorization"));
+        assert!(!sanitized.contains_key("cookie"));
+        assert_eq!(sanitized["content-encoding"], "zstd");
+        assert_eq!(sanitized["user-agent"], "caller-agent");
+        assert_eq!(sanitized["session-id"], "caller-session");
+        assert_eq!(sanitized["x-client-request-id"], "caller-request");
+        assert_eq!(sanitized["cf-connecting-ip"], "203.0.113.7");
+        assert_eq!(sanitized["x-forwarded-for"], "203.0.113.7");
     }
 
     #[test]
@@ -1742,7 +1766,6 @@ mod tests {
         );
         let mut sanitized = sanitize_request_headers(
             headers,
-            ApiType::OpenaiCodex,
             (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
         );
         apply_core_upstream_headers(

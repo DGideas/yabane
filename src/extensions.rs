@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -312,15 +312,23 @@ impl ExtensionRegistry {
             .collect()
     }
 
+    /// Runs the ordered upstream-header Hook chain directly against the final
+    /// upstream `HeaderMap`, after Core has sanitized caller-supplied headers but
+    /// before Core injects its own reserved headers (authentication, subscription
+    /// identity, hop-by-hop control). Hooks may add, override, or remove any
+    /// header that is not Core-reserved; a reserved-header mutation is rejected
+    /// and attributed to the offending hook instance, exactly as before, and the
+    /// request fails closed without reaching the upstream.
     pub fn run_upstream_headers(
         &self,
         context: &RequestContext<'_>,
+        headers: &mut HeaderMap,
         hooks: &[&dyn UpstreamHeadersHook],
-    ) -> Result<DispatchOutcome<HeaderMap>, HookFailure> {
-        let mut overlay = HeaderMap::new();
+    ) -> Result<DispatchOutcome<()>, HookFailure> {
+        let mut snapshot = headers.clone();
         for hook in hooks {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hook.call(context, &mut overlay)
+                hook.call(context, headers)
             }))
             .map_err(|_| HookFailure::panicked(hook.extension_id(), hook.instance_id()))?
             .map_err(|source| {
@@ -336,11 +344,12 @@ impl ExtensionRegistry {
                     }));
                 }
             }
-            validate_header_overlay(&overlay).map_err(|source| {
+            validate_no_reserved_header_changes(&snapshot, headers).map_err(|source| {
                 HookFailure::from_error(hook.extension_id(), hook.instance_id(), source)
             })?;
+            snapshot = headers.clone();
         }
-        Ok(DispatchOutcome::Continue(overlay))
+        Ok(DispatchOutcome::Continue(()))
     }
 }
 
@@ -390,12 +399,24 @@ fn extension_info(extension: Extension) -> Result<ExtensionInfo, String> {
     })
 }
 
-fn validate_header_overlay(headers: &HeaderMap) -> Result<(), ExtensionError> {
-    if let Some(name) = headers.keys().find(|name| reserved_header(name.as_str())) {
-        return Err(ExtensionError::new(
-            "reserved_header",
-            format!("extension attempted to modify Core-managed header '{name}'"),
-        ));
+fn validate_no_reserved_header_changes(
+    before: &HeaderMap,
+    after: &HeaderMap,
+) -> Result<(), ExtensionError> {
+    let names: HashSet<&HeaderName> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|name| reserved_header(name.as_str()))
+        .collect();
+    for name in names {
+        let before_values: Vec<&HeaderValue> = before.get_all(name).iter().collect();
+        let after_values: Vec<&HeaderValue> = after.get_all(name).iter().collect();
+        if before_values != after_values {
+            return Err(ExtensionError::new(
+                "reserved_header",
+                format!("extension attempted to modify Core-managed header '{name}'"),
+            ));
+        }
     }
     Ok(())
 }
@@ -486,6 +507,7 @@ pub fn execution_error(failure: HookFailure) -> axum::response::Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use bytes::Bytes;
     use yabane_extension_api::{
         EXTENSION_API_VERSION, Extension, ExtensionError, ExtensionHook, ExtensionRejection,
@@ -600,13 +622,35 @@ mod tests {
         fn call(
             &self,
             _context: &RequestContext<'_>,
-            headers: &mut axum::http::HeaderMap,
+            headers: &mut HeaderMap,
         ) -> Result<HookOutcome<()>, ExtensionError> {
             headers.insert(
                 axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_static("Bearer leaked"),
+                HeaderValue::from_static("Bearer leaked"),
             );
             Ok(HookOutcome::Continue(()))
+        }
+    }
+
+    struct RejectHeaders;
+
+    impl ExtensionHook for RejectHeaders {
+        fn extension_id(&self) -> &'static str {
+            "reject-headers"
+        }
+    }
+
+    impl UpstreamHeadersHook for RejectHeaders {
+        fn call(
+            &self,
+            _context: &RequestContext<'_>,
+            _headers: &mut HeaderMap,
+        ) -> Result<HookOutcome<()>, ExtensionError> {
+            Ok(HookOutcome::Reject(ExtensionRejection::new(
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "test_rejection",
+                "blocked",
+            )))
         }
     }
 
@@ -677,13 +721,176 @@ mod tests {
     }
 
     #[test]
-    fn reserved_header_failure_is_attributed_to_the_hook() {
+    fn reserved_header_insertion_is_attributed_to_the_hook() {
+        let mut headers = HeaderMap::new();
         let failure = registry()
-            .run_upstream_headers(&context(), &[&ReservedHeader])
+            .run_upstream_headers(&context(), &mut headers, &[&ReservedHeader])
             .unwrap_err();
         assert_eq!(failure.extension_id, "reserved-header");
         assert_eq!(failure.instance_id, "reserved-header");
         assert_eq!(failure.source.code, "reserved_header");
+    }
+
+    struct RemoveCallerHeader(&'static str);
+
+    impl ExtensionHook for RemoveCallerHeader {
+        fn extension_id(&self) -> &'static str {
+            "remove-caller-header"
+        }
+    }
+
+    impl UpstreamHeadersHook for RemoveCallerHeader {
+        fn call(
+            &self,
+            _context: &RequestContext<'_>,
+            headers: &mut HeaderMap,
+        ) -> Result<HookOutcome<()>, ExtensionError> {
+            headers.remove(self.0);
+            Ok(HookOutcome::Continue(()))
+        }
+    }
+
+    struct RemoveReservedHeader(&'static str);
+
+    impl ExtensionHook for RemoveReservedHeader {
+        fn extension_id(&self) -> &'static str {
+            "remove-reserved-header"
+        }
+    }
+
+    impl UpstreamHeadersHook for RemoveReservedHeader {
+        fn call(
+            &self,
+            _context: &RequestContext<'_>,
+            headers: &mut HeaderMap,
+        ) -> Result<HookOutcome<()>, ExtensionError> {
+            headers.remove(self.0);
+            Ok(HookOutcome::Continue(()))
+        }
+    }
+
+    struct AddHeader {
+        name: &'static str,
+        value: &'static str,
+    }
+
+    impl ExtensionHook for AddHeader {
+        fn extension_id(&self) -> &'static str {
+            "add-header"
+        }
+    }
+
+    impl UpstreamHeadersHook for AddHeader {
+        fn call(
+            &self,
+            _context: &RequestContext<'_>,
+            headers: &mut HeaderMap,
+        ) -> Result<HookOutcome<()>, ExtensionError> {
+            headers.insert(
+                HeaderName::from_static(self.name),
+                HeaderValue::from_static(self.value),
+            );
+            Ok(HookOutcome::Continue(()))
+        }
+    }
+
+    #[test]
+    fn header_hooks_may_remove_caller_supplied_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("value"),
+        );
+        registry()
+            .run_upstream_headers(
+                &context(),
+                &mut headers,
+                &[&RemoveCallerHeader("cf-connecting-ip")],
+            )
+            .unwrap();
+        assert!(headers.get("cf-connecting-ip").is_none());
+        assert_eq!(headers["x-keep"], "value");
+    }
+
+    #[test]
+    fn header_hooks_may_not_remove_reserved_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("secret"),
+        );
+        let failure = registry()
+            .run_upstream_headers(
+                &context(),
+                &mut headers,
+                &[&RemoveReservedHeader("x-api-key")],
+            )
+            .unwrap_err();
+        assert_eq!(failure.extension_id, "remove-reserved-header");
+        assert_eq!(failure.source.code, "reserved_header");
+    }
+
+    #[test]
+    fn header_hooks_chain_in_declared_order_and_see_prior_changes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-stale"),
+            HeaderValue::from_static("old"),
+        );
+        let outcome = registry()
+            .run_upstream_headers(
+                &context(),
+                &mut headers,
+                &[
+                    &RemoveCallerHeader("x-stale"),
+                    &AddHeader {
+                        name: "x-added",
+                        value: "new",
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Continue(())));
+        assert!(headers.get("x-stale").is_none());
+        assert_eq!(headers["x-added"], "new");
+    }
+
+    #[test]
+    fn header_hook_rejection_stops_later_hooks() {
+        let mut headers = HeaderMap::new();
+        let outcome = registry()
+            .run_upstream_headers(
+                &context(),
+                &mut headers,
+                &[
+                    &RejectHeaders,
+                    &AddHeader {
+                        name: "x-must-not-run",
+                        value: "1",
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::Reject(_)));
+        assert!(headers.get("x-must-not-run").is_none());
+    }
+
+    #[test]
+    fn empty_header_hook_list_is_a_no_op() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-caller"),
+            HeaderValue::from_static("value"),
+        );
+        let original = headers.clone();
+        registry()
+            .run_upstream_headers(&context(), &mut headers, &[])
+            .unwrap();
+        assert_eq!(headers, original);
     }
 
     #[test]

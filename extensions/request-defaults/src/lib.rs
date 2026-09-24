@@ -50,23 +50,30 @@ impl UpstreamHeadersHook for RequestDefaults<'_> {
         _context: &RequestContext<'_>,
         headers: &mut http::HeaderMap,
     ) -> Result<HookOutcome<()>, ExtensionError> {
+        // Validate every configured name/value pair before touching `headers`, so
+        // an invalid entry cannot leave a partially applied set behind on the
+        // final upstream HeaderMap now that Hooks mutate it in place.
+        let mut validated = Vec::new();
         for (name, value) in self
             .provider_headers
             .iter()
             .chain(self.endpoint_headers.iter())
         {
-            let name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            let parsed_name = http::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                 ExtensionError::new(
                     "invalid_header_name",
                     format!("invalid configured header '{name}': {error}"),
                 )
             })?;
-            let value = http::HeaderValue::from_str(value).map_err(|error| {
+            let parsed_value = http::HeaderValue::from_str(value).map_err(|error| {
                 ExtensionError::new(
                     "invalid_header_value",
                     format!("invalid configured value for '{name}': {error}"),
                 )
             })?;
+            validated.push((parsed_name, parsed_value));
+        }
+        for (name, value) in validated {
             headers.insert(name, value);
         }
         Ok(HookOutcome::Continue(()))
@@ -155,12 +162,20 @@ mod tests {
             &provider_body,
             &endpoint_body,
         );
+        // Headers are now the final upstream HeaderMap, not an empty overlay: an
+        // unrelated caller-supplied header must survive untouched while the
+        // configured header is still applied and endpoint still wins over provider.
         let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-caller"),
+            http::HeaderValue::from_static("preserved"),
+        );
         assert!(matches!(
             UpstreamHeadersHook::call(&extension, &context(), &mut headers).unwrap(),
             HookOutcome::Continue(())
         ));
         assert_eq!(headers["x-region"], "endpoint");
+        assert_eq!(headers["x-caller"], "preserved");
 
         let HookOutcome::Continue(body) = UpstreamRequestHook::call(
             &extension,
@@ -172,5 +187,84 @@ mod tests {
         };
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn empty_configuration_leaves_existing_headers_unchanged() {
+        let provider_headers = HashMap::new();
+        let endpoint_headers = HashMap::new();
+        let provider_body = serde_json::Map::new();
+        let endpoint_body = serde_json::Map::new();
+        let extension = RequestDefaults::new(
+            &provider_headers,
+            &endpoint_headers,
+            &provider_body,
+            &endpoint_body,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-caller"),
+            http::HeaderValue::from_static("value"),
+        );
+        let original = headers.clone();
+        assert!(matches!(
+            UpstreamHeadersHook::call(&extension, &context(), &mut headers).unwrap(),
+            HookOutcome::Continue(())
+        ));
+        assert_eq!(headers, original);
+    }
+
+    #[test]
+    fn invalid_header_name_does_not_partially_apply_other_headers() {
+        let provider_headers = HashMap::from([("x-valid".to_owned(), "ok".to_owned())]);
+        // Insertion order is HashMap-defined, so use an endpoint-level invalid name
+        // that is guaranteed to be visited (both maps are iterated in sequence).
+        let endpoint_headers = HashMap::from([("bad header name".to_owned(), "value".to_owned())]);
+        let provider_body = serde_json::Map::new();
+        let endpoint_body = serde_json::Map::new();
+        let extension = RequestDefaults::new(
+            &provider_headers,
+            &endpoint_headers,
+            &provider_body,
+            &endpoint_body,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-caller"),
+            http::HeaderValue::from_static("value"),
+        );
+        let original = headers.clone();
+        let error = UpstreamHeadersHook::call(&extension, &context(), &mut headers).unwrap_err();
+        assert_eq!(error.code, "invalid_header_name");
+        assert_eq!(
+            headers, original,
+            "no header may be applied when validation fails"
+        );
+    }
+
+    #[test]
+    fn invalid_header_value_does_not_partially_apply_other_headers() {
+        let provider_headers = HashMap::from([("x-valid".to_owned(), "ok".to_owned())]);
+        let endpoint_headers = HashMap::from([("x-bad-value".to_owned(), "bad\nvalue".to_owned())]);
+        let provider_body = serde_json::Map::new();
+        let endpoint_body = serde_json::Map::new();
+        let extension = RequestDefaults::new(
+            &provider_headers,
+            &endpoint_headers,
+            &provider_body,
+            &endpoint_body,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::HeaderName::from_static("x-caller"),
+            http::HeaderValue::from_static("value"),
+        );
+        let original = headers.clone();
+        let error = UpstreamHeadersHook::call(&extension, &context(), &mut headers).unwrap_err();
+        assert_eq!(error.code, "invalid_header_value");
+        assert_eq!(
+            headers, original,
+            "no header may be applied when validation fails"
+        );
     }
 }

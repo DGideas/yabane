@@ -24,7 +24,7 @@ Yabane Extension 是独立 Rust crate，通过 Cargo feature 编译并静态链�
 |---|---|---|
 | `ProviderEndpoint` / `SubscriptionProvider` | Endpoint metadata、model catalog、OAuth lifecycle 和最终 wire request | Core 保持 Provider/Endpoint 资源、路由、持久化和凭据所有权；实现负责 Provider-specific 行为 |
 | `UpstreamRequestHook` | 上游协议的 JSON body，类型为 `Bytes` | 完成认证、路由、Provider 前缀移除和显式协议转换之后；发送及 Core 的 Provider 特殊适配之前 |
-| `UpstreamHeadersHook` | 独立的空 Header overlay | 清理调用方 Header 之后；Core 注入上游凭据、协议默认 Header 和订阅身份之前 |
+| `UpstreamHeadersHook` | 清理调用方 Header 之后的最终上游 `HeaderMap` | 清理调用方 Header 之后；Core 注入上游凭据、协议默认 Header 和订阅身份之前 |
 | `UpstreamExchangeHook` | 最终上游请求及原始上游响应的只读增量视图 | Core 完成请求改写和认证之后开始；响应头、每个原始响应 chunk 和最终 outcome 分别通知 observer |
 
 `UpstreamExchangeHook` 只能观察，不能改写或拒绝流量。其 `is_interested` preflight 必须便宜且不分配，并与 `begin` 使用可在同步 Hook 路径安全读取的短临界区状态；Core 只在至少一个 observer 对该请求感兴趣时构造 Header 快照，并只对通过 preflight 的同一组 Hook 调用一次 `begin`（不能在两者之间再次用易变状态筛选）。Core 在调用前必须永久遮蔽 Authorization、API key、Cookie、订阅身份、代理认证和请求亲和标识；observer 应保持同步、非阻塞、有界，并把持久化排入队列。observer 的 panic 或内部失败不能改变代理响应。
@@ -164,7 +164,7 @@ impl yabane_extension_api::UpstreamHeadersHook for Example {
 }
 ```
 
-`headers` 是多个 Header Hook 按顺序共享的 overlay，不是调用方 Header。后一个 Hook 能看到并覆盖前一个 Hook 的值。
+`headers` 是 Core 清理调用方 Header 之后、注入自身保留 Header 之前的最终上游 `HeaderMap`，由多个 Header Hook 按顺序共享。后一个 Hook 能看到、覆盖或删除前一个 Hook 以及调用方设置的任何非保留 Header；但不得触碰下方“Header 安全边界”列出的 Core-managed Header，Core 会在每个 Hook 执行后校验保留 Header 是否被改动，并把违规归因给当前实例。
 
 ### 4. 结构化拒绝与执行错误
 
@@ -226,7 +226,7 @@ let hooks = RequestHooks {
 
 ## Header 安全边界
 
-Header Hook 不能设置以下 Core-managed Header：
+Header Hook 不能新增、修改或删除以下 Core-managed Header：
 
 - `Host`
 - `Authorization`
@@ -238,7 +238,7 @@ Header Hook 不能设置以下 Core-managed Header：
 - `chatgpt-account-id`
 - `originator`
 
-Runner 会在每个 Header Hook 后验证整个 overlay，并把违规归因给当前实例。管理 API 若允许配置 Header，也必须在保存时执行同等限制，不能等到流量路径才失败。
+Runner 会在每个 Header Hook 前后对比这些保留 Header 的名称和全部取值（包括删除），把违规归因给当前实例，并 fail closed。管理 API 若允许配置 Header，也必须在保存时执行同等限制，不能等到流量路径才失败。
 
 普通请求 Hook 不得读取 Gateway API key、上游 API key、OAuth token、Cookie 或订阅账号身份。实现 `SubscriptionProvider` 的可信 Provider Endpoint Extension 可以接收完成当前 OAuth 或 wire preparation 所需的短生命周期订阅凭据，但不得记录、返回、另行持久化或保留这些值。原生 Extension 是部署方审核的可信进程内代码，不是安全沙箱。
 

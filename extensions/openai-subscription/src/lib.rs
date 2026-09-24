@@ -1,7 +1,7 @@
 use std::{sync::OnceLock, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use http::{HeaderName, HeaderValue, header};
+use http::{HeaderMap, HeaderName, HeaderValue, header};
 use rand::RngCore as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -82,6 +82,46 @@ struct JwtAuthClaims {
     chatgpt_account_id: Option<String>,
 }
 
+/// Header name prefixes that only ever describe how a request travelled to Yabane.
+/// A reverse proxy such as Cloudflare injects them, the Codex backend rejects requests
+/// carrying them, and no caller can legitimately set them for this Endpoint.
+const PROXY_METADATA_PREFIXES: &[&str] = &["cf-", "x-forwarded-"];
+
+/// Reverse-proxy metadata headers that share no common prefix.
+const PROXY_METADATA_NAMES: &[&str] = &["cdn-loop", "forwarded", "via"];
+
+/// Headers this Endpoint derives from the request body and the connected subscription,
+/// so every inbound value is stale by definition and is cleared before being reset.
+const ENDPOINT_OWNED_HEADERS: &[&str] = &[
+    "content-encoding",
+    "user-agent",
+    "session-id",
+    "x-client-request-id",
+];
+
+/// Clears reverse-proxy metadata and Endpoint-owned headers before `prepare_request`
+/// installs the Codex wire identity. Yabane Core stays a transparent proxy and never
+/// inspects an Endpoint's API type to decide what a caller header means, so this
+/// Endpoint owns the whole removal itself. Header names in a `HeaderMap` are already
+/// lowercase, so the literal comparisons below need no further normalization.
+fn strip_inbound_headers(headers: &mut HeaderMap) {
+    let stale: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            ENDPOINT_OWNED_HEADERS.contains(&name)
+                || PROXY_METADATA_NAMES.contains(&name)
+                || PROXY_METADATA_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        })
+        .cloned()
+        .collect();
+    for name in stale {
+        headers.remove(name);
+    }
+}
+
 impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
     fn extension_id(&self) -> &'static str {
         ID
@@ -107,6 +147,7 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
         let credential = request
             .credential
             .ok_or_else(|| "OpenAI subscription is not connected".to_owned())?;
+        strip_inbound_headers(request.headers);
         request.headers.insert(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
@@ -611,5 +652,139 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn strips_reverse_proxy_metadata_but_keeps_unrelated_caller_headers() {
+        let mut headers = http::HeaderMap::new();
+        // A reverse proxy may use any casing; `HeaderMap` lowercases names on insert,
+        // so the prefix match must hold for every spelling the proxy chose.
+        headers.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.insert(
+            HeaderName::from_bytes(b"CF-Visitor").expect("valid header name"),
+            HeaderValue::from_static(r#"{"scheme":"https"}"#),
+        );
+        headers.insert(
+            HeaderName::from_static("cf-warp-tag-id"),
+            HeaderValue::from_static("warp-tag"),
+        );
+        headers.insert(
+            HeaderName::from_static("cf-ray"),
+            HeaderValue::from_static("ray-id"),
+        );
+        headers.insert(
+            HeaderName::from_static("cf-ipcountry"),
+            HeaderValue::from_static("SG"),
+        );
+        headers.insert(
+            HeaderName::from_static("cdn-loop"),
+            HeaderValue::from_static("cloudflare; loops=1"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.7"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        headers.insert(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("for=203.0.113.7"),
+        );
+        headers.insert(
+            HeaderName::from_static("via"),
+            HeaderValue::from_static("1.1 proxy"),
+        );
+        headers.insert(
+            HeaderName::from_static("accept-language"),
+            HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-stainless-lang"),
+            HeaderValue::from_static("js"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-mode"),
+            HeaderValue::from_static("cors"),
+        );
+        let mut body = br#"{"model":"gpt-5.4","input":"hello"}"#.to_vec();
+        let mut target_path = "/v1/responses".to_owned();
+
+        ENDPOINT
+            .prepare_request(ProviderEndpointRequest {
+                headers: &mut headers,
+                body: &mut body,
+                target_path: &mut target_path,
+                credential: Some(yabane_extension_api::ProviderEndpointCredential {
+                    access_token: "upstream-token",
+                    account_id: "upstream-account",
+                }),
+            })
+            .unwrap();
+
+        for name in [
+            "cf-connecting-ip",
+            "cf-visitor",
+            "cf-warp-tag-id",
+            "cf-ray",
+            "cf-ipcountry",
+            "cdn-loop",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "forwarded",
+            "via",
+        ] {
+            assert!(
+                !headers.contains_key(name),
+                "reverse-proxy metadata '{name}' must not reach Codex"
+            );
+        }
+        // Caller headers that carry no proxy metadata are still forwarded untouched.
+        assert_eq!(headers["accept-language"], "*");
+        assert_eq!(headers["x-stainless-lang"], "js");
+        assert_eq!(headers["sec-fetch-mode"], "cors");
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer upstream-token");
+    }
+
+    #[test]
+    fn owns_content_encoding_and_affinity_headers_without_a_prompt_cache_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("caller-agent"));
+        headers.insert(
+            HeaderName::from_static("session-id"),
+            HeaderValue::from_static("caller-session"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-client-request-id"),
+            HeaderValue::from_static("caller-request"),
+        );
+        // No `prompt_cache_key`, so the Endpoint has no affinity value to install and
+        // must leave these headers absent rather than forward the inbound ones.
+        let mut body = br#"{"model":"gpt-5.4","input":"hello"}"#.to_vec();
+        let mut target_path = "/v1/responses".to_owned();
+
+        ENDPOINT
+            .prepare_request(ProviderEndpointRequest {
+                headers: &mut headers,
+                body: &mut body,
+                target_path: &mut target_path,
+                credential: Some(yabane_extension_api::ProviderEndpointCredential {
+                    access_token: "upstream-token",
+                    account_id: "upstream-account",
+                }),
+            })
+            .unwrap();
+
+        assert!(!headers.contains_key(header::CONTENT_ENCODING));
+        assert!(!headers.contains_key("session-id"));
+        assert!(!headers.contains_key("x-client-request-id"));
+        assert_eq!(headers[header::USER_AGENT], pi_user_agent());
+        assert_ne!(headers[header::USER_AGENT], "caller-agent");
+        assert_eq!(headers[header::ACCEPT_ENCODING], "identity");
     }
 }
