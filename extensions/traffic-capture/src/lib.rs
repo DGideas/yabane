@@ -705,7 +705,7 @@ pub fn metadata() -> Extension {
         name: "Traffic Capture",
         version: env!("CARGO_PKG_VERSION"),
         api_version: EXTENSION_API_VERSION,
-        description: "Temporarily captures credential-redacted upstream request and response exchanges for troubleshooting.",
+        description: "Temporarily captures credential-redacted Provider request and response exchanges for troubleshooting.",
         hooks: &[HookStage::UpstreamExchange],
     }
 }

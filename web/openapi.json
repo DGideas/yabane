@@ -3,7 +3,7 @@
   "info": {
     "title": "Yabane API",
     "version": "unversioned",
-    "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured upstream providers. OpenAI Responses can explicitly target a ChatGPT Plus/Pro OAuth subscription Endpoint. Control endpoints manage providers, endpoints, upstream credentials, model routes, gateway access, and activity. Every action available in the web console is available here."
+    "description": "Yabane is a transparent LLM gateway. Inference endpoints proxy OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages to configured Providers. OpenAI Responses can explicitly target a ChatGPT Plus/Pro OAuth subscription Endpoint. Control endpoints manage Providers, Endpoints, Provider credentials, model routes, gateway access, and activity. Every action available in the web console is available here."
   },
   "servers": [
     {
@@ -37,7 +37,7 @@
     },
     {
       "name": "Providers",
-      "description": "Providers, endpoints, upstream keys, request defaults, and model discovery."
+      "description": "Providers, Endpoints, Provider credentials, request defaults, and model discovery."
     },
     {
       "name": "Model pricing",
@@ -150,29 +150,61 @@
       },
       "ModelPricing": {
         "type": "object",
-        "description": "Explicit USD rates per million tokens. Input and output must both be available after Endpoint, Provider, and Global field inheritance before Yabane can estimate cost. Within each scope, an exact upstream model pattern wins; otherwise the longest matching prefix ending in one '*' wins. No Provider type, Endpoint URL, model name, or built-in catalog supplies an implicit price.",
+        "description": "Explicit USD rates per million tokens. Input and output must both be available after Endpoint, Provider, and Global field inheritance before Yabane can estimate cost. Within one scope, an exact model pattern wins; otherwise the longest matching prefix ending in one '*' wins. Across scopes, the narrower scope supplies the rate, field by field. No Provider type, Endpoint URL, model name, or built-in catalog supplies an implicit price.",
         "properties": {
-          "input_per_million": {"type": "number", "nullable": true, "minimum": 0},
-          "output_per_million": {"type": "number", "nullable": true, "minimum": 0},
-          "cache_read_per_million": {"type": "number", "nullable": true, "minimum": 0},
-          "cache_write_per_million": {"type": "number", "nullable": true, "minimum": 0, "description": "Reserved for compatibility. Current normalized usage has no cache-write token count, so estimation does not apply this rate."}
+          "input_per_million": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0
+          },
+          "output_per_million": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0
+          },
+          "cache_read_per_million": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0
+          },
+          "cache_write_per_million": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "description": "Reserved for compatibility. Current normalized usage has no cache-write token count, so estimation does not apply this rate."
+          }
         }
       },
       "PricingTable": {
         "type": "object",
-        "required": ["models"],
+        "required": [
+          "models"
+        ],
         "properties": {
-          "updated_at": {"type": "integer", "readOnly": true, "description": "Unix timestamp set by Yabane when the effective table is saved."},
+          "updated_at": {
+            "type": "integer",
+            "readOnly": true,
+            "description": "Unix timestamp set by Yabane when the effective table is saved."
+          },
           "models": {
             "type": "object",
-            "description": "Exact upstream model IDs or non-empty prefixes ending in one '*' mapped to rates. An empty map clears this pricing scope.",
-            "additionalProperties": {"$ref": "#/components/schemas/ModelPricing"}
+            "description": "Outgoing rules: exact model IDs Yabane sends to the Provider, or non-empty prefixes ending in one '*', mapped to rates. These prices win over incoming rules for the same request. An empty map clears this part of the scope.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelPricing"
+            }
+          },
+          "incoming_models": {
+            "type": "object",
+            "description": "Incoming rules: exact model names callers send, including public routing aliases, or non-empty prefixes ending in one '*', mapped to rates. Supported only by Global pricing, because a caller-facing name belongs to no single connection. One rule covers every destination whose model has no outgoing price. The same pattern may not appear in both maps of one table, and patterns must not start or end with whitespace.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelPricing"
+            }
           }
         }
       },
       "EndpointView": {
         "type": "object",
-        "description": "An upstream connection. OAuth tokens and account IDs are never included.",
+        "description": "A Provider Endpoint. OAuth tokens and account IDs are never included.",
         "properties": {
           "id": {
             "type": "string"
@@ -205,8 +237,12 @@
           },
           "pricing": {
             "nullable": true,
-            "allOf": [{"$ref": "#/components/schemas/PricingTable"}],
-            "description": "Endpoint overrides for exact or trailing-wildcard upstream model patterns; omitted fields inherit from the selected Provider and Global rules."
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PricingTable"
+              }
+            ],
+            "description": "Outgoing overrides for exact or trailing-wildcard Provider model patterns; omitted fields inherit from the selected Provider and Global rules, and these rules win over a Global rule for the caller-facing name."
           },
           "requires_api_key": {
             "type": "boolean"
@@ -289,7 +325,11 @@
           },
           "pricing": {
             "nullable": true,
-            "allOf": [{"$ref": "#/components/schemas/PricingTable"}]
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PricingTable"
+              }
+            ]
           },
           "defaults_endpoint_ids": {
             "type": "array",
@@ -514,16 +554,73 @@
       "CostRecalculationResult": {
         "type": "object",
         "properties": {
-          "candidates": {"type": "integer"},
-          "updated": {"type": "integer"},
-          "filled": {"type": "integer"},
-          "recalculated": {"type": "integer"},
-          "reported_preserved": {"type": "integer"},
-          "skipped_missing_route": {"type": "integer"},
-          "skipped_missing_pricing": {"type": "integer"},
-          "skipped_missing_usage": {"type": "integer"}
+          "candidates": {
+            "type": "integer"
+          },
+          "updated": {
+            "type": "integer"
+          },
+          "filled": {
+            "type": "integer"
+          },
+          "recalculated": {
+            "type": "integer"
+          },
+          "reported_preserved": {
+            "type": "integer"
+          },
+          "skipped_missing_route": {
+            "type": "integer"
+          },
+          "skipped_missing_pricing": {
+            "type": "integer"
+          },
+          "skipped_missing_usage": {
+            "type": "integer"
+          }
         },
-        "required": ["candidates", "updated", "filled", "recalculated", "reported_preserved", "skipped_missing_route", "skipped_missing_pricing", "skipped_missing_usage"]
+        "required": [
+          "candidates",
+          "updated",
+          "filled",
+          "recalculated",
+          "reported_preserved",
+          "skipped_missing_route",
+          "skipped_missing_pricing",
+          "skipped_missing_usage"
+        ]
+      },
+      "PricingSource": {
+        "type": "object",
+        "nullable": true,
+        "description": "The configured pricing rule behind one effective rate.",
+        "required": [
+          "scope",
+          "pattern",
+          "name"
+        ],
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "global",
+              "provider",
+              "endpoint"
+            ]
+          },
+          "pattern": {
+            "type": "string",
+            "description": "The matching key in that scope's pricing table."
+          },
+          "name": {
+            "type": "string",
+            "enum": [
+              "incoming",
+              "outgoing"
+            ],
+            "description": "Whether the rule matched the model name the caller sent or the model ID Yabane sent to the Provider."
+          }
+        }
       },
       "RequestLog": {
         "type": "object",
@@ -559,7 +656,7 @@
           "upstream_model": {
             "type": "string",
             "nullable": true,
-            "description": "Exact model ID selected by routing and placed in the upstream request. Null for records created before this metadata was introduced."
+            "description": "Exact model ID selected by routing and placed in the request to the Provider. Null for records created before this metadata was introduced."
           },
           "provider": {
             "type": "string"
@@ -581,7 +678,7 @@
           },
           "failure": {
             "nullable": true,
-            "description": "Structured, safe diagnosis for a failed proxied request. It does not contain credentials, prompt or response content, upstream URLs, proxy addresses, or untrusted upstream error text.",
+            "description": "Structured, safe diagnosis for a failed proxied request. It does not contain credentials, prompt or response content, Provider URLs, proxy addresses, or untrusted Provider error text.",
             "allOf": [
               {
                 "$ref": "#/components/schemas/RequestFailure"
@@ -595,17 +692,17 @@
           "gateway_ms": {
             "type": "integer",
             "nullable": true,
-            "description": "Milliseconds spent reading, routing, and preparing the request before starting the upstream call. Null for records created before timing breakdowns were introduced."
+            "description": "Milliseconds spent reading, routing, and preparing the request before starting the Provider request. Null for records created before timing breakdowns were introduced."
           },
           "upstream_response_ms": {
             "type": "integer",
             "nullable": true,
-            "description": "Milliseconds from starting the upstream call until upstream response headers arrive."
+            "description": "Milliseconds from starting the Provider request until its response headers arrive."
           },
           "first_byte_ms": {
             "type": "integer",
             "nullable": true,
-            "description": "Milliseconds from request arrival until the first upstream response-body chunk is observed; unavailable when no body chunk is observed."
+            "description": "Milliseconds from request arrival until the first Provider response-body chunk is observed; unavailable when no body chunk is observed."
           },
           "generation_ms": {
             "type": "integer",
@@ -624,21 +721,47 @@
           "cost": {
             "type": "number",
             "nullable": true,
-            "description": "Upstream-reported cost when available, otherwise an estimate from explicit pricing; null when neither is available."
+            "description": "Provider-reported cost when available, otherwise an estimate from explicit pricing; null when neither is available."
+          },
+          "pricing_sources": {
+            "type": "object",
+            "nullable": true,
+            "description": "Which configured rule supplied each estimated rate, so an estimate stays explainable after pricing changes. Written only for estimated costs.",
+            "properties": {
+              "input": {
+                "$ref": "#/components/schemas/PricingSource"
+              },
+              "output": {
+                "$ref": "#/components/schemas/PricingSource"
+              },
+              "cache_read": {
+                "$ref": "#/components/schemas/PricingSource"
+              },
+              "cache_write": {
+                "$ref": "#/components/schemas/PricingSource"
+              }
+            }
           },
           "cost_source": {
             "type": "string",
             "nullable": true,
-            "enum": ["reported", "estimated"],
+            "enum": [
+              "reported",
+              "estimated"
+            ],
             "description": "Origin of cost. Older records with cost but no source are interpreted as reported."
           },
           "finish_reason": {
             "type": "string",
             "nullable": true,
-            "description": "Terminal reason or status reported by the upstream protocol. OpenAI Chat Completions uses finish_reason, Anthropic Messages uses stop_reason, and OpenAI Responses uses incomplete_details.reason or its terminal status. Null when unavailable or for older records."
+            "description": "Terminal reason or status reported by the Provider protocol. OpenAI Chat Completions uses finish_reason, Anthropic Messages uses stop_reason, and OpenAI Responses uses incomplete_details.reason or its terminal status. Null when unavailable or for older records."
           },
           "streaming": {
             "type": "boolean"
+          },
+          "upstream_streaming": {
+            "type": "boolean",
+            "description": "Whether the Provider response itself streamed. Only a streamed response has a generation phase to time, so throughput and first-token averages are aggregated from these records instead of being inferred from the caller's streaming preference. False for older records."
           },
           "source_instance_id": {
             "type": "string",
@@ -674,7 +797,7 @@
           },
           "priced_requests": {
             "type": "integer",
-            "description": "Requests with either upstream-reported or explicitly estimated cost."
+            "description": "Requests with either Provider-reported or explicitly estimated cost."
           },
           "reported_requests": {
             "type": "integer"
@@ -714,7 +837,8 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ActivityDimensionStats"
-            }
+            },
+            "description": "Per-model totals grouped by the requested model_dimension: the incoming name by default, otherwise the model ID sent to the Provider, with an empty name for requests that recorded none."
           },
           "by_api_key": {
             "type": "array",
@@ -933,10 +1057,32 @@
             "type": "number"
           },
           "latency": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Sum of end-to-end latency in milliseconds across samples."
           },
           "samples": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Requests contributing to latency."
+          },
+          "first_byte": {
+            "type": "integer",
+            "description": "Sum of first-byte latency in milliseconds over first_byte_samples."
+          },
+          "first_byte_samples": {
+            "type": "integer",
+            "description": "Successful requests whose Provider response streamed, so a first byte could be timed."
+          },
+          "generation": {
+            "type": "integer",
+            "description": "Sum of generation time in milliseconds after the first byte over generation_samples."
+          },
+          "generation_tokens": {
+            "type": "integer",
+            "description": "Output tokens generated during generation time; divide it by generation to read throughput as a measured ratio."
+          },
+          "generation_samples": {
+            "type": "integer",
+            "description": "Successful streamed responses with a positive measured generation time."
           },
           "successful": {
             "type": "integer"
@@ -1038,7 +1184,7 @@
           "duration_ms": {
             "type": "integer",
             "nullable": true,
-            "description": "Elapsed milliseconds from beginning observation of the final upstream request until the exchange completed. Null for captures retained before this field was introduced."
+            "description": "Elapsed milliseconds from beginning observation of the final Provider request until the exchange completed. Null for captures retained before this field was introduced."
           },
           "bytes": {
             "type": "integer"
@@ -1053,51 +1199,125 @@
       },
       "TrafficCaptureHeader": {
         "type": "object",
-        "required": ["name", "value"],
+        "required": [
+          "name",
+          "value"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "value": { "type": "string" }
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
         }
       },
       "TrafficCaptureRecord": {
         "type": "object",
-        "description": "Credential-redacted upstream request and response headers and bounded body byte arrays.",
+        "description": "Credential-redacted Provider request and response headers and bounded body byte arrays.",
         "required": [
-          "request_id", "timestamp", "expires_at", "public_model", "upstream_model",
-          "provider_id", "endpoint_id", "caller_protocol", "upstream_protocol", "streaming",
-          "request_headers", "request_body", "request_truncated", "response_headers",
-          "response_body", "response_truncated", "outcome", "duration_ms"
+          "request_id",
+          "timestamp",
+          "expires_at",
+          "public_model",
+          "upstream_model",
+          "provider_id",
+          "endpoint_id",
+          "caller_protocol",
+          "upstream_protocol",
+          "streaming",
+          "request_headers",
+          "request_body",
+          "request_truncated",
+          "response_headers",
+          "response_body",
+          "response_truncated",
+          "outcome",
+          "duration_ms"
         ],
         "properties": {
-          "request_id": { "type": "string" },
-          "timestamp": { "type": "integer" },
-          "expires_at": { "type": "integer" },
-          "public_model": { "type": "string" },
-          "upstream_model": { "type": "string" },
-          "provider_id": { "type": "string" },
-          "endpoint_id": { "type": "string" },
-          "caller_protocol": { "type": "string" },
-          "upstream_protocol": { "type": "string" },
-          "streaming": { "type": "boolean" },
+          "request_id": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "integer"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "public_model": {
+            "type": "string"
+          },
+          "upstream_model": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "string"
+          },
+          "endpoint_id": {
+            "type": "string"
+          },
+          "caller_protocol": {
+            "type": "string"
+          },
+          "upstream_protocol": {
+            "type": "string"
+          },
+          "streaming": {
+            "type": "boolean"
+          },
           "request_headers": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/TrafficCaptureHeader" }
+            "items": {
+              "$ref": "#/components/schemas/TrafficCaptureHeader"
+            }
           },
-          "request_body": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
-          "request_truncated": { "type": "boolean" },
-          "status": { "type": "integer", "nullable": true },
+          "request_body": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          },
+          "request_truncated": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "integer",
+            "nullable": true
+          },
           "duration_ms": {
             "type": "integer",
             "nullable": true,
-            "description": "Elapsed milliseconds from beginning observation of the final upstream request until the exchange completed."
+            "description": "Elapsed milliseconds from beginning observation of the final Provider request until the exchange completed."
           },
           "response_headers": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/TrafficCaptureHeader" }
+            "items": {
+              "$ref": "#/components/schemas/TrafficCaptureHeader"
+            }
           },
-          "response_body": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
-          "response_truncated": { "type": "boolean" },
-          "outcome": { "type": "string", "enum": ["complete", "transport_error", "response_read_error", "interrupted"] }
+          "response_body": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          },
+          "response_truncated": {
+            "type": "boolean"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "transport_error",
+              "response_read_error",
+              "interrupted"
+            ]
+          }
         }
       }
     },
@@ -1414,7 +1634,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Chat Completions",
-        "description": "The model field selects routing: provider/model, or a public model route alias. Yabane prefers a native Chat Completions Endpoint and otherwise converts the request and successful response to the configured upstream protocol; conversion is reported in the response header and Activity.",
+        "description": "The model field selects routing: provider/model, or a public model route alias. Yabane prefers a native Chat Completions Endpoint and otherwise converts the request and successful response to the configured Provider protocol; conversion is reported in the response header and Activity.",
         "security": [
           {
             "gatewayKey": []
@@ -1459,7 +1679,7 @@
         },
         "responses": {
           "200": {
-            "description": "Upstream response, streamed when requested"
+            "description": "Provider response, streamed when requested"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -1471,7 +1691,7 @@
             "description": "Gateway key provider scope denied"
           },
           "502": {
-            "description": "Upstream connection failure"
+            "description": "Provider connection failure"
           }
         }
       }
@@ -1482,7 +1702,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Responses",
-        "description": "Yabane prefers a native Responses Endpoint and otherwise converts the request and successful response to the configured upstream protocol. ChatGPT Plus/Pro subscription Endpoints require stream=true upstream and use the explicitly configured Codex backend adapter.",
+        "description": "Yabane prefers a native Responses Endpoint and otherwise converts the request and successful response to the configured Provider protocol. ChatGPT Plus/Pro subscription Endpoints require stream=true when calling the Provider and use the explicitly configured Codex backend adapter.",
         "security": [
           {
             "gatewayKey": []
@@ -1529,7 +1749,7 @@
         },
         "responses": {
           "200": {
-            "description": "Upstream response"
+            "description": "Provider response"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -1538,7 +1758,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "502": {
-            "description": "Upstream connection failure"
+            "description": "Provider connection failure"
           }
         }
       }
@@ -1549,7 +1769,7 @@
           "Inference"
         ],
         "summary": "Proxy Anthropic Messages",
-        "description": "Yabane prefers a native Anthropic Messages Endpoint and otherwise converts the request and successful response to the configured upstream protocol; native paths remain transparent.",
+        "description": "Yabane prefers a native Anthropic Messages Endpoint and otherwise converts the request and successful response to the configured Provider protocol; native paths remain transparent.",
         "security": [
           {
             "gatewayKey": []
@@ -1594,7 +1814,7 @@
         },
         "responses": {
           "200": {
-            "description": "Upstream response"
+            "description": "Provider response"
           },
           "400": {
             "$ref": "#/components/responses/BadRequest"
@@ -1603,7 +1823,7 @@
             "$ref": "#/components/responses/Unauthorized"
           },
           "502": {
-            "description": "Upstream connection failure"
+            "description": "Provider connection failure"
           }
         }
       }
@@ -2375,57 +2595,178 @@
     },
     "/admin/pricing": {
       "get": {
-        "tags": ["Model pricing"],
+        "tags": [
+          "Model pricing"
+        ],
         "summary": "Get the explicit global model pricing table",
-        "security": [{"managementKey": []}, {"adminSession": []}],
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
         "responses": {
-          "200": {"description": "Global pricing table", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
-          "401": {"$ref": "#/components/responses/Unauthorized"}
+          "200": {
+            "description": "Global pricing table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PricingTable"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       },
       "patch": {
-        "tags": ["Model pricing"],
+        "tags": [
+          "Model pricing"
+        ],
         "summary": "Replace the explicit global model pricing table",
-        "description": "Patterns use exact upstream model IDs or one trailing '*' prefix wildcard. An empty models map clears global pricing; no built-in prices are restored.",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "description": "Patterns use exact model IDs Yabane sends to the Provider or one trailing '*' prefix wildcard, and they win over incoming rules for the same request. `incoming_models` holds prices for the model names callers send, including public routing aliases; it is Global-only, and one such rule covers every destination whose model has no outgoing price. Both maps are cleared together when they are empty, and patterns must not start or end with whitespace; no built-in prices are restored.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingTable"
+              }
+            }
+          }
+        },
         "responses": {
-          "204": {"$ref": "#/components/responses/NoContent"},
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"}
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
         }
       }
     },
     "/admin/pricing/providers/{provider_id}": {
       "patch": {
-        "tags": ["Model pricing"],
+        "tags": [
+          "Model pricing"
+        ],
         "summary": "Replace one Provider pricing override table",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "parameters": [{"name": "provider_id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "description": "Only outgoing rules apply here: a caller-facing model name spans connections, so `incoming_models` must be empty and Global pricing owns those rules.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingTable"
+              }
+            }
+          }
+        },
         "responses": {
-          "204": {"$ref": "#/components/responses/NoContent"},
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "404": {"$ref": "#/components/responses/NotFound"}
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
     "/admin/pricing/providers/{provider_id}/endpoints/{endpoint_id}": {
       "patch": {
-        "tags": ["Model pricing"],
-        "summary": "Replace one Endpoint pricing override table",
-        "security": [{"managementKey": []}, {"adminSession": []}],
-        "parameters": [
-          {"name": "provider_id", "in": "path", "required": true, "schema": {"type": "string"}},
-          {"name": "endpoint_id", "in": "path", "required": true, "schema": {"type": "string"}}
+        "tags": [
+          "Model pricing"
         ],
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PricingTable"}}}},
+        "summary": "Replace one Endpoint pricing override table",
+        "description": "Only outgoing rules apply here: a caller-facing model name spans connections, so `incoming_models` must be empty and Global pricing owns those rules.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PricingTable"
+              }
+            }
+          }
+        },
         "responses": {
-          "204": {"$ref": "#/components/responses/NoContent"},
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "404": {"$ref": "#/components/responses/NotFound"}
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
         }
       }
     },
@@ -2660,7 +3001,7 @@
           "Providers"
         ],
         "summary": "Delete a provider",
-        "description": "Deletes the Provider, its Endpoints and upstream credentials, removes model-route targets that refer to it, and removes it from Gateway API-key allowlists. Routes left without targets and Gateway keys scoped only to this Provider are deleted rather than allowing dangling routes or accidentally broadening an empty allowlist to all Providers.",
+        "description": "Deletes the Provider, its Endpoints and Provider credentials, removes model-route targets that refer to it, and removes it from Gateway API-key allowlists. Routes left without targets and Gateway keys scoped only to this Provider are deleted rather than allowing dangling routes or accidentally broadening an empty allowlist to all Providers.",
         "security": [
           {
             "managementKey": []
@@ -2788,7 +3129,7 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Add a weighted upstream API key to an endpoint",
+        "summary": "Add a weighted Provider credential to an Endpoint",
         "security": [
           {
             "managementKey": []
@@ -3338,7 +3679,7 @@
             "schema": {
               "type": "string"
             },
-            "description": "Case-insensitive request ID, requested or upstream model, Provider, Endpoint, or safe Gateway API key metadata search."
+            "description": "Case-insensitive request ID, requested or Provider model, Provider, Endpoint, or safe Gateway API key metadata search."
           },
           {
             "name": "status",
@@ -3394,12 +3735,18 @@
     },
     "/admin/activity/recalculate-costs": {
       "post": {
-        "tags": ["Activity"],
+        "tags": [
+          "Activity"
+        ],
         "summary": "Recalculate non-reported Activity costs",
-        "description": "Recalculates existing estimated costs and fills missing costs using the current explicit Global, Provider, and Endpoint pricing. Upstream-reported costs and legacy costs without a cost_source are preserved. An optional request_id limits the operation to one Activity record; source_instance_id disambiguates imported records that share a request ID.",
+        "description": "Recalculates existing estimated costs and fills missing costs using the current explicit Global, Provider, and Endpoint pricing. Outgoing rules win over a Global incoming rule, and a record without a Provider model ID can still be priced through the name the caller sent. Provider-reported costs and legacy costs without a cost_source are preserved. An optional request_id limits the operation to one Activity record; source_instance_id disambiguates imported records that share a request ID.",
         "security": [
-          {"managementKey": []},
-          {"adminSession": []}
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
         ],
         "requestBody": {
           "required": false,
@@ -3426,13 +3773,21 @@
             "description": "Cost refresh counts",
             "content": {
               "application/json": {
-                "schema": {"$ref": "#/components/schemas/CostRecalculationResult"}
+                "schema": {
+                  "$ref": "#/components/schemas/CostRecalculationResult"
+                }
               }
             }
           },
-          "400": {"$ref": "#/components/responses/BadRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "500": {"$ref": "#/components/responses/InternalServerError"}
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
         }
       }
     },
@@ -3508,6 +3863,19 @@
               "minimum": 1,
               "maximum": 336
             }
+          },
+          {
+            "name": "model_dimension",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "incoming",
+                "outgoing"
+              ],
+              "default": "incoming"
+            },
+            "description": "Which model name the by_model breakdown groups by: the name the caller sent (incoming) or the model ID Yabane sent to the Provider (outgoing). Requests recorded without a Provider model ID group under an empty name. Other values are rejected."
           }
         ],
         "responses": {
@@ -3532,7 +3900,8 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Update upstream key weight or enabled state",
+        "summary": "Update a Provider credential name, weight, or enabled state",
+        "description": "Updates any subset of the key name, weight, and enabled state without replacing the secret. Renaming keeps the stable key ID, so model-route destinations and historical records continue to refer to the same credential.",
         "security": [
           {
             "managementKey": []
@@ -3574,6 +3943,10 @@
               "schema": {
                 "type": "object",
                 "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "Display name for the credential. Whitespace-only names are rejected with 400."
+                  },
                   "weight": {
                     "type": "integer",
                     "minimum": 1
@@ -3585,6 +3958,7 @@
                 }
               },
               "example": {
+                "name": "Primary production key",
                 "weight": 200,
                 "enabled": true
               }
@@ -3594,6 +3968,9 @@
         "responses": {
           "204": {
             "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3610,7 +3987,7 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Delete an upstream API key",
+        "summary": "Delete a Provider credential",
         "security": [
           {
             "managementKey": []

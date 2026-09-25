@@ -47,9 +47,9 @@ Options:
 
 Environment:
   YABANE_ACTIVITY_RETENTION_DAYS         Initial Activity retention before a setting is saved [default: 30]
-  YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS Upstream connection deadline [default: 15]
-  YABANE_UPSTREAM_READ_TIMEOUT_SECONDS    Upstream per-read deadline [default: 300]
-  YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS   Upstream total request deadline [default: 28800]
+  YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS Provider connection deadline [default: 15]
+  YABANE_UPSTREAM_READ_TIMEOUT_SECONDS    Provider per-read deadline [default: 300]
+  YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS   Provider total request deadline [default: 28800]
   TURNSTILE_SITE_KEY              Cloudflare Turnstile widget site key
   TURNSTILE_SECRET                Cloudflare Turnstile server secret
   TURNSTILE_HOSTNAMES             Comma-separated accepted hostnames

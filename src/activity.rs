@@ -86,10 +86,20 @@ pub struct RequestLog {
     /// source on old records is interpreted as `reported` when cost is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_source: Option<CostSource>,
+    /// Which configured rules supplied the estimated rates, so an estimate stays
+    /// explainable after pricing changes. Only written for estimated costs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_sources: Option<crate::pricing::PricingSources>,
     /// Upstream protocol's terminal reason or status. Older records may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     pub streaming: bool,
+    /// Whether the Provider response itself streamed. Only a streamed response
+    /// has a generation phase to time, so throughput and first-token latency are
+    /// aggregated from these records instead of being inferred from the caller's
+    /// streaming preference.
+    #[serde(default)]
+    pub upstream_streaming: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -115,7 +125,7 @@ fn cost_counts(log: &RequestLog) -> (usize, usize) {
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub enum CostRecalculationResolution {
-    Available(crate::pricing::ModelPricing),
+    Available(Box<crate::pricing::ResolvedPricing>),
     MissingRoute,
     MissingPricing,
 }
@@ -265,6 +275,25 @@ pub struct Stats {
     pub filter_options: ActivityFilterOptions,
 }
 
+/// Which of a request's two model names the Activity model analysis groups by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelDimension {
+    /// The model name the caller sent, including a public route alias.
+    #[default]
+    Incoming,
+    /// The model ID Yabane sent to the Provider after routing.
+    Outgoing,
+}
+
+fn model_dimension_key(dimension: ModelDimension) -> fn(&RequestLog) -> &str {
+    match dimension {
+        ModelDimension::Incoming => |log| &log.model,
+        // Legacy records without a recorded Provider model remain visible as one unnamed group.
+        ModelDimension::Outgoing => |log| log.upstream_model.as_deref().unwrap_or_default(),
+    }
+}
+
 #[derive(Serialize)]
 pub struct ActivityFilterOptions {
     pub providers: Vec<String>,
@@ -337,6 +366,16 @@ pub struct ActivityBucket {
     cost_units: i128,
     pub latency: u64,
     pub samples: usize,
+    /// Sum of first-byte latency over the samples that measured it and how many
+    /// those were; only responses the Provider streamed have a first byte.
+    pub first_byte: u64,
+    pub first_byte_samples: usize,
+    /// Sum of generation time, of the output tokens produced during it, and the
+    /// matching sample count, so throughput stays a measured ratio instead of an
+    /// average of per-request rates.
+    pub generation: u64,
+    pub generation_tokens: u64,
+    pub generation_samples: usize,
     pub successful: usize,
     pub errors: usize,
 }
@@ -590,8 +629,8 @@ impl ActivityStore {
                 continue;
             }
             let resolution = pricing_for(log);
-            let pricing = match resolution {
-                CostRecalculationResolution::Available(pricing) => pricing,
+            let resolved = match resolution {
+                CostRecalculationResolution::Available(resolved) => *resolved,
                 CostRecalculationResolution::MissingRoute => {
                     result.skipped_missing_route += 1;
                     continue;
@@ -608,13 +647,14 @@ impl ActivityStore {
                 cost: None,
                 finish_reason: None,
             };
-            let Some(cost) = crate::pricing::calculate(&pricing, &usage) else {
+            let Some(cost) = crate::pricing::calculate(&resolved.pricing, &usage) else {
                 result.skipped_missing_pricing += 1;
                 continue;
             };
             let recalculated = log.cost.is_some();
             log.cost = Some(cost);
             log.cost_source = Some(CostSource::Estimated);
+            log.pricing_sources = Some(resolved.sources);
             result.updated += 1;
             if recalculated {
                 result.recalculated += 1;
@@ -759,6 +799,7 @@ impl ActivityStore {
         filters: ActivityFilters<'_>,
         bucket_count: usize,
         until: u64,
+        model_dimension: ModelDimension,
     ) -> Stats {
         let since = since.max(retention_cutoff(self.retention_days()));
         let data = self.inner.lock().await;
@@ -882,6 +923,11 @@ impl ActivityStore {
                 cost_units: 0,
                 latency: 0,
                 samples: 0,
+                first_byte: 0,
+                first_byte_samples: 0,
+                generation: 0,
+                generation_tokens: 0,
+                generation_samples: 0,
                 successful: 0,
                 errors: 0,
             })
@@ -903,6 +949,23 @@ impl ActivityStore {
                 bucket.cost_units = bucket.cost_units.saturating_add(cost_to_units(log.cost));
                 bucket.latency += log.latency_ms;
                 bucket.samples += 1;
+                // Generation quality is only meaningful for a response the Provider
+                // streamed and completed, so a stalled or failed stream cannot dilute
+                // the measured throughput. Failures stay visible in the error rate.
+                if log.upstream_streaming && (200..300).contains(&log.status) {
+                    if let Some(first_byte_ms) = log.first_byte_ms {
+                        bucket.first_byte = bucket.first_byte.saturating_add(first_byte_ms);
+                        bucket.first_byte_samples += 1;
+                    }
+                    if let Some(generation_ms) =
+                        log.generation_ms.filter(|generation| *generation > 0)
+                    {
+                        bucket.generation = bucket.generation.saturating_add(generation_ms);
+                        bucket.generation_tokens =
+                            bucket.generation_tokens.saturating_add(log.output_tokens);
+                        bucket.generation_samples += 1;
+                    }
+                }
                 bucket.successful += usize::from(log.status < 400);
                 bucket.errors += usize::from(log.status >= 400);
             }
@@ -975,7 +1038,7 @@ impl ActivityStore {
             streaming: logs.iter().filter(|log| log.streaming).count(),
             latency_ms: logs.iter().map(|log| log.latency_ms).sum(),
             by_provider: dimensions(|log| &log.provider),
-            by_model: dimensions(|log| &log.model),
+            by_model: dimensions(model_dimension_key(model_dimension)),
             by_api_key,
             buckets,
             provider_buckets: provider_buckets
@@ -1168,8 +1231,10 @@ mod tests {
             cached_tokens: 0,
             cost: None,
             cost_source: None,
+            pricing_sources: None,
             finish_reason: None,
             streaming: false,
+            upstream_streaming: false,
         }
     }
 
@@ -1181,6 +1246,7 @@ mod tests {
         assert_eq!(decoded.upstream_model, None);
         assert_eq!(decoded.finish_reason, None);
         assert_eq!(decoded.gateway_api_key_id, None);
+        assert_eq!(decoded.pricing_sources, None);
     }
 
     #[test]
@@ -1189,7 +1255,7 @@ mod tests {
         log.failure = Some(RequestFailure::new(
             "upstream_response",
             "rate_limited",
-            "Upstream returned HTTP 429",
+            "Provider returned HTTP 429",
         ));
         let encoded = serde_json::to_vec(&log).unwrap();
         let decoded: RequestLog = serde_json::from_slice(&encoded).unwrap();
@@ -1216,13 +1282,16 @@ mod tests {
         ))
     }
 
-    fn complete_pricing() -> crate::pricing::ModelPricing {
-        crate::pricing::ModelPricing {
-            input_per_million: Some(1.0),
-            output_per_million: Some(2.0),
-            cache_read_per_million: Some(0.5),
-            cache_write_per_million: None,
-        }
+    fn complete_pricing() -> Box<crate::pricing::ResolvedPricing> {
+        Box::new(crate::pricing::ResolvedPricing {
+            pricing: crate::pricing::ModelPricing {
+                input_per_million: Some(1.0),
+                output_per_million: Some(2.0),
+                cache_read_per_million: Some(0.5),
+                cache_write_per_million: None,
+            },
+            sources: crate::pricing::PricingSources::default(),
+        })
     }
 
     #[tokio::test]
@@ -1617,7 +1686,9 @@ mod tests {
                 .all(|log| log.provider == "alpha" && log.model == "model-a")
         );
 
-        let stats = store.stats(now - 10, filters, 2, now).await;
+        let stats = store
+            .stats(now - 10, filters, 2, now, ModelDimension::Incoming)
+            .await;
 
         assert_eq!(stats.requests, 2);
         assert_eq!(
@@ -1662,7 +1733,13 @@ mod tests {
         estimated.cost_source = Some(CostSource::Estimated);
         let missing = request(now - 1, "missing", "alpha", 200);
         let stats = store(vec![reported, estimated, missing])
-            .stats(now - 10, ActivityFilters::default(), 2, now)
+            .stats(
+                now - 10,
+                ActivityFilters::default(),
+                2,
+                now,
+                ModelDimension::Incoming,
+            )
             .await;
 
         assert_eq!(stats.requests, 3);
@@ -1716,7 +1793,13 @@ mod tests {
         let mut second = request(now - 1, "second", "alpha", 200);
         second.cost = Some(0.2);
         let stats = store(vec![first, second])
-            .stats(now - 10, ActivityFilters::default(), 1, now)
+            .stats(
+                now - 10,
+                ActivityFilters::default(),
+                1,
+                now,
+                ModelDimension::Incoming,
+            )
             .await;
 
         assert_eq!(stats.cost, 0.3);
@@ -1732,7 +1815,13 @@ mod tests {
             request(now - 1, "alpha-late", "alpha", 200),
             request(now - 1, "beta-late", "beta", 200),
         ])
-        .stats(now - 10, ActivityFilters::default(), 2, now)
+        .stats(
+            now - 10,
+            ActivityFilters::default(),
+            2,
+            now,
+            ModelDimension::Incoming,
+        )
         .await;
 
         assert_eq!(stats.provider_buckets.len(), 2);
@@ -1740,6 +1829,55 @@ mod tests {
         assert_eq!(stats.provider_buckets[0].requests, vec![1, 1]);
         assert_eq!(stats.provider_buckets[1].name, "beta");
         assert_eq!(stats.provider_buckets[1].requests, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn stats_group_the_model_analysis_by_either_model_name() {
+        let now = crate::auth::now();
+        let mut aliased = request(now - 3, "aliased", "alpha", 200);
+        aliased.model = "public-alias".to_owned();
+        aliased.upstream_model = Some("vendor/model-v2".to_owned());
+        let mut unreported = request(now - 2, "unreported", "alpha", 200);
+        unreported.model = "direct-model".to_owned();
+        unreported.upstream_model = None;
+
+        let incoming = store(vec![aliased.clone(), unreported.clone()])
+            .stats(
+                now - 10,
+                ActivityFilters::default(),
+                2,
+                now,
+                ModelDimension::Incoming,
+            )
+            .await;
+        assert_eq!(
+            incoming
+                .by_model
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["direct-model", "public-alias"]
+        );
+
+        let outgoing = store(vec![aliased, unreported])
+            .stats(
+                now - 10,
+                ActivityFilters::default(),
+                2,
+                now,
+                ModelDimension::Outgoing,
+            )
+            .await;
+        // The alias and the model it routes to share one row, and a record without a
+        // recorded Provider model stays visible as one unnamed group instead of disappearing.
+        assert_eq!(
+            outgoing
+                .by_model
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["", "vendor/model-v2"]
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1890,13 @@ mod tests {
         let legacy = request(now - 1, "legacy", "alpha", 500);
 
         let stats = store(vec![attributed, legacy])
-            .stats(now - 10, ActivityFilters::default(), 2, now)
+            .stats(
+                now - 10,
+                ActivityFilters::default(),
+                2,
+                now,
+                ModelDimension::Incoming,
+            )
             .await;
 
         assert_eq!(stats.by_api_key.len(), 2);

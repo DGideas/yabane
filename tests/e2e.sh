@@ -23,7 +23,7 @@ cd "$work"
 version_output=$("$binary" --version)
 [[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
 [[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
-[[ $("$binary" --help) == *"Upstream total request deadline [default: 28800]"* ]]
+[[ $("$binary" --help) == *"Provider total request deadline [default: 28800]"* ]]
 [[ $("$binary" --help) == *"--no-extensions"* ]]
 if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-retention.log 2>&1; then
   echo "invalid activity retention unexpectedly started" >&2; exit 1
@@ -357,11 +357,26 @@ scoped_models=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $model_sco
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"denied/model","messages":[]}') == 403 ]]
 [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $scoped_secret" -H 'content-type: application/json' -d '{"model":"allowed/model","messages":[]}') == 502 ]]
 connection_failure_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
-[[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null and .failure.stage == "upstream_connect" and .failure.category == "connect_failed")] | length') == 1 ]]
+[[ $(printf '%s' "$connection_failure_logs" | jq '[.[] | select(.model == "allowed/model" and .status == 502 and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms == null and .upstream_streaming == false and .failure.stage == "upstream_connect" and .failure.category == "connect_failed")] | length') == 1 ]]
 unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Multi endpoint","expires_at":null,"provider_ids":[]}')
 unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
 unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
+# Renaming an upstream API key keeps its ID, secret, weight, enabled state, and
+# the model-route destination that references it, so routing keeps working.
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"renamed-key-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
+renamed_key_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"renamed-key-route","messages":[]}')
+[[ $(printf '%s' "$renamed_key_call" | jq -r .endpoint) == two ]]
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two/keys/default" -H 'content-type: application/json' -d '{"name":"Regional primary"}' >/dev/null
+providers_json=$(admin -f "$base/admin/providers")
+[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | [.name, (.weight | tostring), (.enabled | tostring)] | join(":")') == Regional\ primary:100:true ]]
+[[ $(jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | .secret' data/providers.json) == two ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "renamed-key-route") | .targets[0].api_key_id') == default ]]
+renamed_key_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"renamed-key-route","messages":[]}')
+[[ $(printf '%s' "$renamed_key_call" | jq -r .endpoint) == two ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/keys/default" -H 'content-type: application/json' -d '{"name":"   "}') == 400 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | .name') == "Regional primary" ]]
+admin -f -X DELETE "$base/admin/routes/renamed-key-route" >/dev/null
 # Upstream safety deadlines release requests that stop making progress, including
 # streams that keep the TCP connection active with comment-only keepalives.
 for timeout_model in timeout-before-headers timeout-idle-stream timeout-keepalive-stream; do
@@ -374,7 +389,7 @@ wait "$timeout_headers_pid" || true
 wait "$timeout_idle_pid" || true
 wait "$timeout_keepalive_pid" || true
 [[ $(<timeout-before-headers.status) == 502 ]]
-[[ $(jq -r '.error.message' timeout-before-headers.json) == "Upstream request timed out" ]]
+[[ $(jq -r '.error.message' timeout-before-headers.json) == "Provider request timed out" ]]
 grep -qi '^x-yabane-error-origin: yabane' timeout-before-headers.headers
 [[ $(<timeout-idle-stream.status) == 200 ]]
 [[ $(<timeout-keepalive-stream.status) == 200 ]]
@@ -395,6 +410,58 @@ admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only" -H 'content-typ
 [[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | (.pricing.models.claude.input_per_million == null and .pricing.models.claude.output_per_million == 2)) == [true]') == true ]]
 admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only/endpoints/messages" -H 'content-type: application/json' -d '{"models":{"claude":{"cache_read_per_million":0.25}}}' >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | .endpoints[0].pricing.models.claude.cache_read_per_million == 0.25) == [true]') == true ]]
+# A price entered for the name the caller sends covers every destination of one alias,
+# while a price for the name Yabane sends still wins field by field.
+priced_alias_target='{"provider_id":"anthropic-only","endpoint_id":"messages","api_key_id":"default","upstream_model":"alias-sent-one","weight":100,"enabled":true}'
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"priced-alias\",\"targets\":[$priced_alias_target]}" >/dev/null
+priced_alias_global='{"models":{"claude*":{"input_per_million":1,"output_per_million":1.5,"cache_read_per_million":0.5}},"incoming_models":{"priced-alias":{"input_per_million":3,"output_per_million":6}}}'
+admin -f -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d "$priced_alias_global" >/dev/null
+[[ $(admin -f "$base/admin/pricing" | jq -r '.incoming_models["priced-alias"].output_per_million == 6') == true ]]
+[[ $(jq -r '.incoming_models["priced-alias"].input_per_million == 3' data/pricing.json) == true ]]
+# One pattern cannot mean both names, caller-facing prices belong to Global scope only,
+# and a pattern that can never match is rejected instead of being stored.
+[[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"both-names":{"input_per_million":1}},"incoming_models":{"both-names":{"input_per_million":2}}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{},"incoming_models":{" priced-alias":{"input_per_million":1}}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing/providers/anthropic-only" -H 'content-type: application/json' -d '{"models":{},"incoming_models":{"claude":{"input_per_million":1}}}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/pricing/providers/anthropic-only/endpoints/messages" -H 'content-type: application/json' -d '{"models":{},"incoming_models":{"claude":{"input_per_million":1}}}') == 400 ]]
+[[ $(admin -f "$base/admin/pricing" | jq -r '.models["claude*"].input_per_million == 1 and (.models["both-names"] == null) and (.incoming_models["priced-alias"].input_per_million == 3)') == true ]]
+# Both destinations are priced by the same caller-facing rule even though the sent model differs.
+priced_alias_request() {
+  local headers=$1
+  curl -sf -D "$headers" -o /dev/null -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"priced-alias","messages":[{"role":"user","content":"hello"}],"max_completion_tokens":64}'
+  grep -i '^x-yabane-request-id:' "$headers" | tr -d '\r' | awk '{print $2}'
+}
+priced_alias_log() {
+  admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq -c --arg id "$1" '.[] | select(.request_id == $id)'
+}
+first_alias_id=$(priced_alias_request alias-one.headers)
+first_alias_log=$(priced_alias_log "$first_alias_id")
+[[ $(printf '%s' "$first_alias_log" | jq -r '.upstream_model') == alias-sent-one ]]
+[[ $(printf '%s' "$first_alias_log" | jq -r '[.cost_source, ((.cost * 1000000) | round), .pricing_sources.input.name, .pricing_sources.input.scope, .pricing_sources.input.pattern, .pricing_sources.output.name] | join(":")') == "estimated:33:incoming:global:priced-alias:incoming" ]]
+admin -f -X PATCH "$base/admin/routes/priced-alias" -H 'content-type: application/json' -d "{\"pattern\":\"priced-alias\",\"targets\":[{\"provider_id\":\"anthropic-only\",\"endpoint_id\":\"messages\",\"api_key_id\":\"default\",\"upstream_model\":\"alias-sent-two\",\"weight\":100,\"enabled\":true}]}" >/dev/null
+second_alias_log=$(priced_alias_log "$(priced_alias_request alias-two.headers)")
+[[ $(printf '%s' "$second_alias_log" | jq -r '[.upstream_model, ((.cost * 1000000) | round), .pricing_sources.input.pattern] | join(":")') == "alias-sent-two:33:priced-alias" ]]
+# A narrower rule for the sent name overrides only the fields it states.
+admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only" -H 'content-type: application/json' -d '{"models":{"claude":{"output_per_million":2},"alias-sent-two":{"output_per_million":9}}}' >/dev/null
+third_alias_log=$(priced_alias_log "$(priced_alias_request alias-three.headers)")
+[[ $(printf '%s' "$third_alias_log" | jq -r '[((.cost * 1000000) | round), .pricing_sources.input.name, .pricing_sources.input.scope, .pricing_sources.output.name, .pricing_sources.output.scope, .pricing_sources.output.pattern] | join(":")') == "39:incoming:global:outgoing:provider:alias-sent-two" ]]
+admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only" -H 'content-type: application/json' -d '{"models":{"claude":{"output_per_million":2}}}' >/dev/null
+# Within one scope the sent name wins as well, and the caller-facing price fills the rest.
+admin -f -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude*":{"input_per_million":1,"output_per_million":1.5,"cache_read_per_million":0.5},"alias-sent-two":{"input_per_million":30}},"incoming_models":{"priced-alias":{"input_per_million":3,"output_per_million":6}}}' >/dev/null
+fourth_alias_log=$(priced_alias_log "$(priced_alias_request alias-four.headers)")
+[[ $(printf '%s' "$fourth_alias_log" | jq -r '[((.cost * 1000000) | round), .pricing_sources.input.name, .pricing_sources.output.name] | join(":")') == "222:outgoing:incoming" ]]
+admin -f -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d "$priced_alias_global" >/dev/null
+# The model analysis groups by the caller's name by default and by the sent model ID on request,
+# so one public route alias appears as one row while the models it fans out to stay separable.
+alias_incoming=$(admin -f "$base/admin/activity/stats?since=0&buckets=4&model_dimension=incoming")
+[[ $(printf '%s' "$alias_incoming" | jq -r '[.by_model[] | select(.name == "priced-alias") | .requests] | add') == 4 ]]
+[[ $(printf '%s' "$alias_incoming" | jq -r '[.by_model[] | select(.name == "alias-sent-one" or .name == "alias-sent-two")] | length') == 0 ]]
+[[ $(admin -f "$base/admin/activity/stats?since=0&buckets=4" | jq -r '[.by_model[] | select(.name == "priced-alias") | .requests] | add') == 4 ]]
+alias_outgoing=$(admin -f "$base/admin/activity/stats?since=0&buckets=4&model_dimension=outgoing")
+[[ $(printf '%s' "$alias_outgoing" | jq -r '[.by_model[] | select(.name == "priced-alias")] | length') == 0 ]]
+[[ $(printf '%s' "$alias_outgoing" | jq -r '[.by_model[] | select(.name == "alias-sent-one") | .requests] | add') == 1 ]]
+[[ $(printf '%s' "$alias_outgoing" | jq -r '[.by_model[] | select(.name == "alias-sent-two") | .requests] | add') == 3 ]]
+[[ $(admin_status "$base/admin/activity/stats?since=0&buckets=4&model_dimension=requested") == 400 ]]
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-chat-only\",\"name\":\"OpenAI Chat only\",\"endpoint\":{\"id\":\"chat\",\"api_type\":\"openai_chat_completions\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"convert\"}}" >/dev/null
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-responses-only\",\"name\":\"OpenAI Responses only\",\"endpoint\":{\"id\":\"responses\",\"api_type\":\"openai_responses\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"responses-stream\"}}" >/dev/null
 chat_converted=$(curl -sf -D conversion.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'OpenAI-Organization: org-caller' -H 'OpenAI-Project: project-caller' -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","messages":[{"role":"system","content":"Be concise"},{"role":"user","content":"hello"}],"max_completion_tokens":64}')
@@ -451,6 +518,8 @@ conversion_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt" and .finish_reason == "completed")] | length') -ge 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-failed" and .status == 502 and .failure.stage == "protocol_conversion" and .failure.category == "invalid_response")] | length') == 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "openai-responses-only/gpt-stream-failed" and .status == 502 and .streaming == true and .failure.stage == "upstream_stream" and .failure.category == "interrupted")] | length') == 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq -r '[.[] | select(.streaming == true and .upstream_streaming == true)] | length') -ge 1 ]]
+[[ $(printf '%s' "$conversion_logs" | jq -r '[.[] | select(.streaming == false and .upstream_streaming == false)] | length') -ge 1 ]]
 [[ $(printf '%s' "$conversion_logs" | jq '[.[] | select(.model == "anthropic-only/claude" and .gateway_ms != null and .upstream_response_ms != null and .first_byte_ms != null and .generation_ms != null and .latency_ms >= .first_byte_ms)] | length') == 1 ]]
 preferred_shared=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/shared","messages":[]}')
 [[ $(printf '%s' "$preferred_shared" | jq -r .endpoint) == two ]]
@@ -579,8 +648,12 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/temporary" >/
 # Deleting a key also removes global-route destinations that refer to that exact endpoint key.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Routed temporary","secret":"routed-temporary","weight":10}' >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":100}]}' >/dev/null
+# A route that keeps other destinations has to keep totaling 100% after the deletion,
+# otherwise the next start refuses to load the file this instance wrote.
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route-shared","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":30}]}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/routed-temporary" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "temporary-route")] | length') == 0 ]]
+[[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "temporary-route-shared") | .targets[] | [.api_key_id, .weight]]') == '[["default",100]]' ]]
 # Explicit cost refresh recalculates estimated values, fills missing values, and preserves
 # both upstream-reported costs and legacy costs without cost_source.
 admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a":{"input_per_million":1,"output_per_million":2}}}' >/dev/null
@@ -589,15 +662,23 @@ cost_refresh_payload=$(jq -cn --argjson at "$cost_refresh_at" '{format:"yabane-a
   {timestamp:$at,request_id:"req-cost-estimated",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:9,cost_source:"estimated",streaming:false},
   {timestamp:$at,request_id:"req-cost-missing",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:null,streaming:false},
   {timestamp:$at,request_id:"req-cost-reported",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:7,cost_source:"reported",streaming:false},
-  {timestamp:$at,request_id:"req-cost-legacy",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:8,streaming:false}
+  {timestamp:$at,request_id:"req-cost-legacy",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:8,streaming:false},
+  {timestamp:$at,request_id:"req-cost-alias",path:"/v1/messages",model:"priced-alias",provider:"anthropic-only",endpoint:"messages",status:200,latency_ms:1,input_tokens:1000,output_tokens:0,cached_tokens:0,cost:null,streaming:false}
 ]}')
-[[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$cost_refresh_payload" | jq -r .imported) == 4 ]]
+[[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$cost_refresh_payload" | jq -r .imported) == 5 ]]
 cost_collision_payload=$(jq -cn --argjson at "$cost_refresh_at" '{format:"yabane-activity",version:1,instance_id:"cost-refresh-collision",records:[
   {timestamp:$at,request_id:"req-cost-estimated",path:"/v1/chat/completions",model:"multi/model-a",upstream_model:"model-a",provider:"multi",endpoint:"one",status:200,latency_ms:1,input_tokens:1000,output_tokens:1000,cached_tokens:0,cost:11,cost_source:"estimated",streaming:false}
 ]}')
 [[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$cost_collision_payload" | jq -r .imported) == 1 ]]
 cost_recalculated=$(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-estimated","source_instance_id":"cost-refresh-test"}')
 [[ $(printf '%s' "$cost_recalculated" | jq -r '[.updated,.filled,.recalculated,.reported_preserved] | join(":")') == 1:0:1:0 ]]
+# A record without a Provider model ID is still priced by the name the caller sent.
+cost_alias_filled=$(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-alias","source_instance_id":"cost-refresh-test"}')
+[[ $(printf '%s' "$cost_alias_filled" | jq -r '[.updated,.filled,.skipped_missing_route] | join(":")') == 1:1:0 ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq -r 'any(.[]; .request_id == "req-cost-alias" and .source_instance_id == "cost-refresh-test" and .upstream_model == null and .cost == 0.003 and .cost_source == "estimated" and .pricing_sources.input.name == "incoming" and .pricing_sources.input.scope == "global" and .pricing_sources.input.pattern == "priced-alias")') == true ]]
+# A record without a Provider model ID stays visible, grouped on its own under the sent-model view.
+[[ $(admin -f "$base/admin/activity/stats?since=0&buckets=4&model_dimension=outgoing" | jq -r '[.by_model[] | select(.name == "") | .requests] | add') == 1 ]]
+[[ $(admin -f "$base/admin/activity/stats?since=0&buckets=4&model_dimension=incoming" | jq -r '[.by_model[] | select(.name == "priced-alias") | .requests] | add') == 5 ]]
 cost_filled=$(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-missing","source_instance_id":"cost-refresh-test"}')
 [[ $(printf '%s' "$cost_filled" | jq -r '[.updated,.filled,.recalculated] | join(":")') == 1:1:0 ]]
 [[ $(admin -f -X POST "$base/admin/activity/recalculate-costs" -H 'content-type: application/json' -d '{"request_id":"req-cost-reported","source_instance_id":"cost-refresh-test"}' | jq -r '[.updated,.reported_preserved] | join(":")') == 0:1 ]]
@@ -615,22 +696,32 @@ admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: applic
 # Deleting an endpoint removes its keys, discovery availability, and exact route destinations.
 admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-shared","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":30}]}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
 admin -f -X PATCH "$base/admin/pricing/providers/multi/endpoints/two" -H 'content-type: application/json' -d '{"models":{"model-b*":{"input_per_million":0.2,"output_per_million":0.8}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two")] | length') == 0 ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | has("model_endpoints") and (.model_endpoints | has("model-b") | not)') == true ]]
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "endpoint-deletion-route")] | length') == 0 ]]
+[[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "endpoint-deletion-shared") | .targets[] | [.endpoint_id, .weight]]') == '[["one",100]]' ]]
 [[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r '[.config.provider_id, .config.endpoint_id] | join(":")') == : ]]
 [[ $(admin_status -X PATCH "$base/admin/pricing/providers/multi/endpoints/two" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
 [[ $(jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .pricing] | length' data/providers.json) == 0 ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/missing") == 404 ]]
 # Deleting a Provider removes every route destination that refers to it.
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
+denied_endpoint=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "denied") | .endpoints[0].id')
+allowed_endpoint=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "allowed") | .endpoints[0].id')
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"provider-deletion-shared\",\"targets\":[{\"provider_id\":\"allowed\",\"endpoint_id\":\"$allowed_endpoint\",\"api_key_id\":\"\",\"upstream_model\":\"model-a\",\"weight\":70},{\"provider_id\":\"denied\",\"endpoint_id\":\"$denied_endpoint\",\"api_key_id\":\"\",\"upstream_model\":\"model-b\",\"weight\":30}]}" >/dev/null
 admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a*":{"input_per_million":0.3,"output_per_million":0.9}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/denied" >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "provider-deletion-route")] | length') == 0 ]]
+[[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "provider-deletion-shared") | .targets[] | [.provider_id, .weight]]') == '[["allowed",100]]' ]]
+# Every route on disk still describes how one request splits across the destinations
+# that exist, so deleting a Provider, Endpoint, or key cannot leave a file that fails
+# to load after a restart.
+[[ -z $(jq -r '.[] | select((.targets | map(.weight) | add) != 100) | .pattern' data/routes.json) ]]
 [[ $(admin_status -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
 [[ $(jq '[.[] | select(.id == "multi") | .pricing] | length' data/providers.json) == 0 ]]
 [[ $(admin -f "$base/admin/pricing" | jq -r '.models["claude*"].input_per_million == 1') == true ]]
@@ -668,6 +759,9 @@ grep -q 'id="pricing-view"' "$work/model-pricing.html"
 [[ $(printf '%s' "$stats" | jq -r .input_tokens) -ge 4800 ]]
 [[ $(printf '%s' "$stats" | jq -r '.buckets | length') == 24 ]]
 [[ $(printf '%s' "$stats" | jq -r '[.buckets[] | select(.tokens != (.input + .output))] | length') == 0 ]]
+[[ $(printf '%s' "$stats" | jq -r '[.buckets[] | select(.first_byte_samples > .samples or .generation_samples > .first_byte_samples or .generation_tokens > .output)] | length') == 0 ]]
+[[ $(printf '%s' "$stats" | jq -r '[.buckets[] | select(.samples > 0 and .first_byte > .latency)] | length') == 0 ]]
+[[ $(printf '%s' "$stats" | jq -r '(.buckets | map(.generation_tokens) | add) as $generated | (.buckets | map(.output) | add) as $output | $generated <= $output') == true ]]
 [[ $(printf '%s' "$stats" | jq -r '.filter_options.providers | index("multi") != null') == true ]]
 [[ $(printf '%s' "$stats" | jq -r --arg id "$unrestricted_id" --arg prefix "$unrestricted_prefix" '[.filter_options.api_keys[] | select(.id == $id and .prefix == $prefix)] | length') == 1 ]]
 ! printf '%s' "$stats" | grep -Fq "$unrestricted_secret"

@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn yabane_owned_headers_name_the_author_and_can_be_narrowed() {
-        let mut response = api_error(StatusCode::BAD_GATEWAY, "Could not connect to upstream");
+        let mut response = api_error(StatusCode::BAD_GATEWAY, "Could not connect to the Provider");
         attach_request_id(&mut response, "req-01");
         default_error_origin(&mut response, ErrorOrigin::Yabane);
         assert_eq!(response.headers()[&REQUEST_ID_HEADER], "req-01");

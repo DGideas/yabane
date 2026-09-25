@@ -32,6 +32,65 @@ pub struct ModelRoute {
 }
 
 impl ModelRoute {
+    /// Keeps the destinations that still exist and hands their share to the survivors.
+    ///
+    /// Traffic shares describe how one request splits across the destinations that
+    /// exist, so a deletion has to redistribute the removed share: a route whose
+    /// remaining weights no longer add up to 100% would be rejected the next time the
+    /// stored configuration is loaded. A route left without a usable destination has
+    /// no valid share to persist, so the caller drops it.
+    pub fn prune_targets(&mut self, keep: impl Fn(&RouteTarget) -> bool) {
+        self.targets.retain(keep);
+        let total: u64 = self
+            .targets
+            .iter()
+            .filter(|target| target.enabled && target.weight > 0)
+            .map(|target| u64::from(target.weight))
+            .sum();
+        // Without a destination that can receive traffic there is no share to hand out,
+        // and no weight total the stored file would accept: the caller drops this route.
+        if total == 0 {
+            for target in &mut self.targets {
+                target.weight = 0;
+            }
+            return;
+        }
+        let shares: Vec<u32> = self
+            .targets
+            .iter()
+            .map(|target| {
+                if target.enabled && target.weight > 0 {
+                    (u64::from(target.weight) * 100 / total) as u32
+                } else {
+                    // A destination that receives no traffic also adds nothing to the
+                    // 100% a request has to distribute.
+                    0
+                }
+            })
+            .collect();
+        let remainder = 100 - shares.iter().map(|share| u64::from(*share)).sum::<u64>();
+        let largest = shares
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, share)| (**share, std::cmp::Reverse(*index)))
+            .map(|(index, _)| index);
+        for (target, share) in self.targets.iter_mut().zip(shares) {
+            target.weight = share;
+        }
+        if let Some(target) = largest.and_then(|index| self.targets.get_mut(index)) {
+            // Rounding down cannot reach 100% on its own; the largest survivor takes the
+            // remainder so the stored route keeps the invariant it is validated against.
+            target.weight += remainder as u32;
+        }
+    }
+
+    /// True while at least one destination can still receive a request.
+    pub fn has_usable_target(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target.enabled && target.weight > 0)
+    }
+
     pub fn select_target(&self) -> Option<&RouteTarget> {
         let divisor = self
             .targets
@@ -117,7 +176,7 @@ fn validate_route_identities(routes: &[ModelRoute]) -> Result<(), String> {
                 != 100
         {
             return Err(format!(
-                "parse {ROUTES_FILE}: model route '{}' must have non-empty targets, valid upstream models, and traffic totaling 100",
+                "parse {ROUTES_FILE}: model route '{}' must have non-empty targets, valid Provider model IDs, and traffic totaling 100",
                 route.pattern
             ));
         }
@@ -197,6 +256,95 @@ mod tests {
 
         let invalid = route("invalid", "", 100);
         assert!(super::validate_route_identities(&[invalid]).is_err());
+    }
+
+    fn target(provider_id: &str, model: &str, weight: u32, enabled: bool) -> RouteTarget {
+        RouteTarget {
+            provider_id: provider_id.to_owned(),
+            endpoint_id: "endpoint".to_owned(),
+            api_key_id: "key".to_owned(),
+            upstream_model: model.to_owned(),
+            weight,
+            enabled,
+        }
+    }
+
+    fn split(weights: &[(&str, u32, bool)]) -> ModelRoute {
+        ModelRoute {
+            pattern: "split".to_owned(),
+            targets: weights
+                .iter()
+                .map(|(provider_id, weight, enabled)| {
+                    target(provider_id, "model", *weight, *enabled)
+                })
+                .collect(),
+            cursor: Default::default(),
+        }
+    }
+
+    fn shares(route: &ModelRoute) -> Vec<u32> {
+        route.targets.iter().map(|target| target.weight).collect()
+    }
+
+    #[test]
+    fn dropping_a_destination_gives_its_share_to_the_survivors() {
+        // Removing one destination must leave a route that still passes the same
+        // validation the stored file is read with, or the next start rejects it.
+        let mut route = split(&[("gone", 70, true), ("stays", 30, true)]);
+        assert!(super::validate_route_identities(&[route.clone()]).is_ok());
+        route.prune_targets(|target| target.provider_id != "gone");
+        assert_eq!(shares(&route), [100]);
+        assert!(super::validate_route_identities(&[route]).is_ok());
+
+        // Rounding down cannot reach 100%, so the largest survivor takes the remainder.
+        let mut route = split(&[("gone", 30, true), ("first", 40, true), ("second", 30, true)]);
+        route.prune_targets(|target| target.provider_id != "gone");
+        assert_eq!(shares(&route), [58, 42]);
+        assert!(super::validate_route_identities(&[route]).is_ok());
+
+        // Surviving destinations that already split evenly keep their shares equal.
+        let mut route = split(&[("gone", 40, true), ("first", 30, true), ("second", 30, true)]);
+        route.prune_targets(|target| target.provider_id != "gone");
+        assert_eq!(shares(&route), [50, 50]);
+        assert!(super::validate_route_identities(&[route]).is_ok());
+
+        // A destination that receives no traffic must not add to the 100% a request
+        // distributes, so it stays at zero while the live share is scaled up.
+        let mut route = split(&[("gone", 50, true), ("stays", 25, true), ("paused", 25, false)]);
+        route.prune_targets(|target| target.provider_id != "gone");
+        assert_eq!(shares(&route), [100, 0]);
+        assert!(super::validate_route_identities(&[route]).is_ok());
+    }
+
+    #[test]
+    fn pruning_the_last_usable_destination_leaves_the_route_droppable() {
+        let mut route = split(&[("gone", 60, true), ("paused", 40, false)]);
+        route.prune_targets(|target| target.provider_id != "gone");
+        assert_eq!(shares(&route), [0]);
+        assert!(!route.has_usable_target());
+        assert!(route.select_target().is_none());
+    }
+
+    #[test]
+    fn survivor_shares_always_total_one_hundred() {
+        for weights in [
+            vec![1, 99],
+            vec![33, 33, 34],
+            vec![1, 1, 1],
+            vec![10, 20, 30, 40],
+            vec![99, 1, 0],
+        ] {
+            let mut route = split(&[("gone", 1, true)]);
+            route.targets.extend(
+                weights
+                    .iter()
+                    .map(|weight| target("stays", "model", *weight, true)),
+            );
+            route.prune_targets(|target| target.provider_id != "gone");
+            assert_eq!(shares(&route).iter().sum::<u32>(), 100, "{weights:?}");
+            assert!(shares(&route).iter().all(|weight| *weight <= 100));
+            assert!(super::validate_route_identities(&[route]).is_ok());
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 [package]
 name = "yabane-extension-request-defaults"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Provider and Endpoint request defaults extension for Yabane"
 license = "MIT"

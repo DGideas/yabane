@@ -80,14 +80,14 @@ impl StreamConverter {
         let mut output = Vec::new();
         while let Some((end, delimiter)) = next_frame(&self.buffer) {
             if end > MAX_SSE_FRAME_SIZE {
-                return Err("Upstream SSE frame exceeds the 8 MiB conversion limit".to_owned());
+                return Err("Provider SSE frame exceeds the 8 MiB conversion limit".to_owned());
             }
             let frame = self.buffer[..end].to_vec();
             self.buffer.drain(..end + delimiter);
             self.convert_frame(&frame, &mut output)?;
         }
         if self.buffer.len() > MAX_SSE_FRAME_SIZE {
-            return Err("Upstream SSE frame exceeds the 8 MiB conversion limit".to_owned());
+            return Err("Provider SSE frame exceeds the 8 MiB conversion limit".to_owned());
         }
         Ok(output)
     }
@@ -115,10 +115,10 @@ impl StreamConverter {
             return Err("Stream converter was not configured for response aggregation".to_owned());
         }
         if self.state.truncated {
-            return Err("Upstream stream ended before a terminal event".to_owned());
+            return Err("Provider stream ended before a terminal event".to_owned());
         }
         if let Some(message) = &self.state.failure {
-            return Err(format!("Upstream stream failed: {message}"));
+            return Err(format!("Provider stream failed: {message}"));
         }
         let value = match self.target {
             Protocol::OpenAiResponses => completed_response(&self.state),
@@ -185,7 +185,7 @@ impl StreamConverter {
             return self.render(Event::Done, output);
         }
         let value: Value = serde_json::from_slice(&data).map_err(|_| {
-            "Upstream SSE data must be valid JSON for protocol conversion".to_owned()
+            "Provider SSE data must be valid JSON for protocol conversion".to_owned()
         })?;
         let events = match self.source {
             Protocol::OpenAiChat => self.parse_chat(&value),
@@ -340,7 +340,7 @@ impl StreamConverter {
                     response
                         .pointer("/error/message")
                         .and_then(Value::as_str)
-                        .unwrap_or("Upstream response failed")
+                        .unwrap_or("Provider response failed")
                         .to_owned(),
                 ),
                 Event::Done,
@@ -394,7 +394,7 @@ impl StreamConverter {
     }
 
     fn render_truncation(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
-        let message = "Upstream stream ended before a terminal event";
+        let message = "Provider stream ended before a terminal event";
         match self.target {
             Protocol::OpenAiChat => emit_data(
                 output,

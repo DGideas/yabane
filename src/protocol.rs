@@ -45,7 +45,7 @@ pub fn convert_response(
         return Ok(body.to_vec());
     }
     let value: Value = serde_json::from_slice(body).map_err(|_| {
-        "Upstream response body must be valid JSON for protocol conversion".to_owned()
+        "Provider response body must be valid JSON for protocol conversion".to_owned()
     })?;
     let response = CanonicalResponse::parse(value, source)?;
     serde_json::to_vec(&response.render(target))
@@ -81,7 +81,7 @@ impl CanonicalResponse {
                 .and_then(Value::as_str)
                 .unwrap_or("OpenAI Responses result failed");
             return Err(format!(
-                "Upstream OpenAI Responses result failed: {message}"
+                "Provider OpenAI Responses result failed: {message}"
             ));
         }
         match protocol {

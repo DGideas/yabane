@@ -191,6 +191,7 @@ struct CreateApiKey {
 
 #[derive(Deserialize)]
 struct UpdateApiKey {
+    name: Option<String>,
     weight: Option<u32>,
     enabled: Option<bool>,
 }
@@ -579,7 +580,7 @@ async fn save_global_route(
             return api_error(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Upstream model ID must not include Yabane provider prefix '{}/'",
+                    "Provider model ID must not include Yabane Provider prefix '{}/'",
                     target.provider_id
                 ),
             );
@@ -669,6 +670,7 @@ struct ActivityQuery {
     api_keys: Option<String>,
     buckets: Option<usize>,
     until: Option<u64>,
+    model_dimension: Option<crate::activity::ModelDimension>,
 }
 
 struct OwnedActivityFilters {
@@ -774,6 +776,7 @@ async fn activity_stats(
                 filters.borrowed(),
                 query.buckets.unwrap_or(24),
                 query.until.unwrap_or_else(now),
+                query.model_dimension.unwrap_or_default(),
             )
             .await,
     )
@@ -810,9 +813,6 @@ async fn recalculate_activity_costs(
     let result = state
         .activity
         .recalculate_non_reported_costs(record, |log| {
-            let Some(upstream_model) = log.upstream_model.as_deref() else {
-                return crate::activity::CostRecalculationResolution::MissingRoute;
-            };
             let Some(provider) = providers.get(&log.provider) else {
                 return crate::activity::CostRecalculationResolution::MissingRoute;
             };
@@ -823,8 +823,18 @@ async fn recalculate_activity_costs(
             else {
                 return crate::activity::CostRecalculationResolution::MissingRoute;
             };
-            match crate::pricing::effective_pricing(&global, provider, endpoint, upstream_model) {
-                Some(pricing) => crate::activity::CostRecalculationResolution::Available(pricing),
+            // A record without a recorded Provider model ID can still be priced
+            // through the Global rule for the name the caller sent.
+            match crate::pricing::effective_pricing(
+                &global,
+                provider,
+                endpoint,
+                &log.model,
+                log.upstream_model.as_deref().unwrap_or_default(),
+            ) {
+                Some(resolved) => {
+                    crate::activity::CostRecalculationResolution::Available(Box::new(resolved))
+                }
                 None => crate::activity::CostRecalculationResolution::MissingPricing,
             }
         })
@@ -1127,10 +1137,10 @@ async fn update_global_pricing(
     State(state): State<AppState>,
     axum::Json(mut pricing): axum::Json<crate::pricing::PricingTable>,
 ) -> Response {
-    if let Err(message) = crate::pricing::validate_table(&pricing, "Global pricing") {
+    if let Err(message) = crate::pricing::validate_table(&pricing, "Global pricing", true) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
-    pricing.updated_at = if pricing.models.is_empty() { 0 } else { now() };
+    pricing.updated_at = if pricing.is_empty() { 0 } else { now() };
     let mut current = state.pricing.write().await;
     if let Err(error) = crate::pricing::save(&pricing).await {
         error!(%error, "failed to persist global pricing");
@@ -1149,7 +1159,7 @@ async fn update_provider_pricing(
     axum::Json(pricing): axum::Json<crate::pricing::PricingTable>,
 ) -> Response {
     if let Err(message) =
-        crate::pricing::validate_table(&pricing, &format!("Provider '{provider_id}'"))
+        crate::pricing::validate_table(&pricing, &format!("Provider '{provider_id}'"), false)
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -1171,9 +1181,11 @@ async fn update_endpoint_pricing(
     Path((provider_id, endpoint_id)): Path<(String, String)>,
     axum::Json(pricing): axum::Json<crate::pricing::PricingTable>,
 ) -> Response {
-    if let Err(message) =
-        crate::pricing::validate_table(&pricing, &format!("Endpoint '{provider_id}/{endpoint_id}'"))
-    {
+    if let Err(message) = crate::pricing::validate_table(
+        &pricing,
+        &format!("Endpoint '{provider_id}/{endpoint_id}'"),
+        false,
+    ) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     let mut providers = state.providers.write().await;
@@ -1320,7 +1332,8 @@ async fn update_provider_options(
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     if let Some(pricing) = &input.pricing
-        && let Err(message) = crate::pricing::validate_table(pricing, &format!("Provider '{id}'"))
+        && let Err(message) =
+            crate::pricing::validate_table(pricing, &format!("Provider '{id}'"), false)
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -1372,7 +1385,7 @@ async fn update_provider_options(
 fn normalize_pricing(
     mut pricing: crate::pricing::PricingTable,
 ) -> Option<crate::pricing::PricingTable> {
-    if pricing.models.is_empty() {
+    if pricing.is_empty() {
         None
     } else {
         pricing.updated_at = now();
@@ -1492,7 +1505,7 @@ async fn create_provider(
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     if let Some(pricing) = &input.endpoint.pricing
-        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint")
+        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint", false)
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -1600,10 +1613,7 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
 
     let mut routes = state.routes.0.write().await;
     let mut updated_routes = routes.clone();
-    for route in &mut updated_routes {
-        route.targets.retain(|target| target.provider_id != id);
-    }
-    updated_routes.retain(|route| !route.targets.is_empty());
+    prune_route_targets(&mut updated_routes, |target| target.provider_id != id);
 
     let mut auth = state.auth.write().await;
     let mut updated_auth = auth.clone();
@@ -1683,7 +1693,7 @@ async fn create_endpoint(
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     if let Some(pricing) = &input.pricing
-        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint")
+        && let Err(message) = crate::pricing::validate_table(pricing, "Endpoint", false)
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
@@ -1755,6 +1765,7 @@ async fn update_endpoint(
         && let Err(message) = crate::pricing::validate_table(
             pricing,
             &format!("Endpoint '{}/{}'", provider_id, endpoint_id),
+            false,
         )
     {
         return api_error(StatusCode::BAD_REQUEST, message);
@@ -1975,12 +1986,9 @@ async fn delete_endpoint(
 
     let mut routes = state.routes.0.write().await;
     let mut updated_routes = routes.clone();
-    for route in &mut updated_routes {
-        route.targets.retain(|target| {
-            target.provider_id != provider_id || target.endpoint_id != endpoint_id
-        });
-    }
-    updated_routes.retain(|route| !route.targets.is_empty());
+    prune_route_targets(&mut updated_routes, |target| {
+        target.provider_id != provider_id || target.endpoint_id != endpoint_id
+    });
     #[cfg(feature = "extension-traffic-capture")]
     if let Some((_, config)) = &capture_update
         && let Err(err) = state.traffic_capture.configure(config.clone()).await
@@ -2128,6 +2136,11 @@ async fn update_api_key(
     if input.weight == Some(0) {
         return api_error(StatusCode::BAD_REQUEST, "API key weight must be positive");
     }
+    // Renaming keeps the stable key ID and therefore every model-route reference.
+    let name = input.name.as_deref().map(str::trim);
+    if name == Some("") {
+        return api_error(StatusCode::BAD_REQUEST, "API key name is required");
+    }
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
     let Some(provider) = updated.get_mut(&provider_id) else {
@@ -2143,6 +2156,9 @@ async fn update_api_key(
     let Some(key) = endpoint.api_keys.iter_mut().find(|key| key.id == key_id) else {
         return api_error(StatusCode::NOT_FOUND, "API key not found");
     };
+    if let Some(name) = name {
+        key.name = name.to_owned();
+    }
     if key.enabled && input.enabled == Some(false) {
         let routes = state.routes.0.read().await;
         if routes.iter().any(|route| {
@@ -2194,14 +2210,11 @@ async fn delete_api_key(
     }
     let mut routes = state.routes.0.write().await;
     let mut updated = routes.clone();
-    for route in &mut updated {
-        route.targets.retain(|target| {
-            target.provider_id != provider_id
-                || target.endpoint_id != endpoint_id
-                || target.api_key_id != key_id
-        });
-    }
-    updated.retain(|route| !route.targets.is_empty());
+    prune_route_targets(&mut updated, |target| {
+        target.provider_id != provider_id
+            || target.endpoint_id != endpoint_id
+            || target.api_key_id != key_id
+    });
     if let Err(err) = save_provider_and_routes(&updated_providers, &updated).await {
         error!(%err, "failed to persist provider and route mutation");
         return api_error(
@@ -2212,6 +2225,20 @@ async fn delete_api_key(
     *providers = updated_providers;
     *routes = updated;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Removes destinations that a deletion invalidated and redistributes their traffic
+/// shares, dropping routes that lost every usable destination. Dedicated removal keeps
+/// every route's remaining shares adding up to the 100% the stored file is validated
+/// against, so the next start still accepts the routes this instance wrote.
+fn prune_route_targets(
+    routes: &mut Vec<routes::ModelRoute>,
+    keep: impl Fn(&routes::RouteTarget) -> bool,
+) {
+    for route in routes.iter_mut() {
+        route.prune_targets(&keep);
+    }
+    routes.retain(routes::ModelRoute::has_usable_target);
 }
 
 fn remove_endpoint_discovery(provider: &mut Provider, endpoint_id: &str) {
@@ -2449,13 +2476,14 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..crate::pricing::PricingTable::default()
         };
         let normalized = super::normalize_pricing(table).unwrap();
         assert!(normalized.updated_at > 1);
         assert!(
             super::normalize_pricing(crate::pricing::PricingTable {
                 updated_at: 99,
-                models: HashMap::new(),
+                ..crate::pricing::PricingTable::default()
             })
             .is_none()
         );

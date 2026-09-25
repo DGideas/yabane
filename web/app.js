@@ -1,7 +1,7 @@
 let providers = [];
 let authSettings = {enabled: true, api_keys: []};
 let modelRoutes = [];
-let globalPricing = {updated_at: 0, models: {}};
+let globalPricing = {updated_at: 0, models: {}, incoming_models: {}};
 let pricingActivityModels = [];
 let pricingEditTarget = null;
 let modelsDevCatalogPromise = null;
@@ -26,6 +26,7 @@ const LIVE_REFRESH_INTERVAL_MS = 30000;
 const ACTIVITY_PAGE_SIZE = 100;
 let activityLoadPromise = null;
 let activityLogsLimit = 0;
+let activityModelDimension = 'incoming';
 let activityPage = 0;
 let activityPageTotal = 0;
 let activityPageRequest = 0;
@@ -520,7 +521,7 @@ function renderProviderPage() {
         : `<div><h4>Reconnect required</h4><p>${escapeHtml(credentialDetail)}</p></div><span class="renewal-status attention">Not connected</span>`;
       return `<article class="endpoint-card subscription-endpoint"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">OpenAI subscription</span></div><code>ChatGPT Plus / Pro · Responses API</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${endpoint.subscription_connected ? 'Connected' : 'Disconnected'}</strong> account</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit endpoint</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys subscription-credential"><div class="endpoint-keys-head">${renewal}</div></section></article>`;
     }
-    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Upstream API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
+    return `<article class="endpoint-card"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${formatType(endpoint.api_type)}</span></div><code>${escapeHtml(endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span><span><strong>${enabledKeys.length}</strong> of ${endpoint.api_keys.length} keys enabled</span>${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys"><div class="endpoint-keys-head"><div><h4>Provider API keys</h4><p>Credentials below belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is split between enabled keys.</p></div><div class="endpoint-key-actions">${enabledKeys.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}<button class="button secondary add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add key</button></div></div><div class="key-list">${endpoint.api_keys.length ? endpoint.api_keys.map(key => `<div class="key-row"><span class="status ${key.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(key.name)}</strong><small>${key.enabled ? 'Enabled for traffic' : 'Disabled'}</small></span><span class="traffic-share"><strong>${key.enabled ? `${shares.get(key.id)}%` : '—'}</strong><small>${key.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="key-rename text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" aria-label="Rename API key ${escapeHtml(key.name)}">Rename</button><button class="key-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button><button class="key-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-key="${key.id}" data-name="${escapeHtml(key.name)}" aria-label="Delete API key ${escapeHtml(key.name)}">Delete</button></div>`).join('') : `<div class="endpoint-key-empty"><p>No API keys belong to this endpoint yet.</p><button class="text-link add-key" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Add the first key</button></div>`}</div></section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
@@ -531,13 +532,13 @@ function renderProviderPage() {
   const defaultsScope = provider.defaults_endpoint_ids?.length ? `${provider.defaults_endpoint_ids.length} selected endpoint${provider.defaults_endpoint_ids.length === 1 ? '' : 's'}` : 'All endpoints';
   const requestDefaultsExtension = extensions.find(extension => extension.id === 'request-defaults');
   const defaultsAvailability = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'Extension enabled' : 'Extension disabled') : 'Extension not included';
-  const defaultsDescription = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'Add default headers and JSON fields to upstream requests.' : 'Saved defaults are retained but are not currently applied to requests.') : 'Rebuild Yabane with the Request Defaults Extension to configure these values.';
+  const defaultsDescription = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'Add default headers and JSON fields to Provider requests.' : 'Saved defaults are retained but are not currently applied to requests.') : 'Rebuild Yabane with the Request Defaults Extension to configure these values.';
   const defaultsStateClass = requestDefaultsExtension ? (requestDefaultsExtension.enabled ? 'defaults-enabled' : 'defaults-disabled') : 'defaults-unavailable';
   const defaultsEnableGuidance = requestDefaultsExtension?.runtime_configurable ? 'Enable it from Extensions to apply them again.' : 'Restart Yabane without --no-extensions to apply them again.';
-  const defaultsNotice = requestDefaultsExtension && !requestDefaultsExtension.enabled ? `<div class="defaults-disabled-notice" role="status"><span class="defaults-disabled-mark" aria-hidden="true">!</span><span><strong>Request defaults are off</strong><small>No saved headers or body fields will be added to upstream requests. ${defaultsEnableGuidance}</small></span></div>` : '';
+  const defaultsNotice = requestDefaultsExtension && !requestDefaultsExtension.enabled ? `<div class="defaults-disabled-notice" role="status"><span class="defaults-disabled-mark" aria-hidden="true">!</span><span><strong>Request defaults are off</strong><small>No saved headers or body fields will be added to Provider requests. ${defaultsEnableGuidance}</small></span></div>` : '';
   const defaultsAction = requestDefaultsExtension ? '<button class="button secondary edit-provider-options">Configure</button>' : '<button class="button secondary include-request-defaults-extension" type="button">How to include</button>';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section><section class="card provider-pricing-card"><div class="card-head"><div><span class="section-kicker">Provider default</span><h2>Cost estimation</h2><p>Yabane uses these rates when an Endpoint has no override. This setting is separate from Request Defaults.</p></div><button class="button secondary edit-provider-pricing" data-provider="${provider.id}" type="button">Configure pricing</button></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each endpoint is an upstream connection. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an upstream API endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} Provider credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section><section class="card provider-pricing-card"><div class="card-head"><div><span class="section-kicker">Provider default</span><h2>Cost estimation</h2><p>Yabane uses these rates when an Endpoint has no override. This setting is separate from Request Defaults.</p></div><button class="button secondary edit-provider-pricing" data-provider="${provider.id}" type="button">Configure pricing</button></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each Endpoint is a connection to the Provider. API keys or OAuth subscriptions belong only to their configured Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an Endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -654,7 +655,7 @@ function bindProviderActions() {
     if (revokedKeys) keyActions.push(`revokes ${revokedKeys} Gateway API key${revokedKeys === 1 ? '' : 's'} scoped only to this Provider`);
     if (updatedKeys) keyActions.push(`removes this Provider from ${updatedKeys} other key allowlist${updatedKeys === 1 ? '' : 's'}`);
     const keyImpact = keyActions.length ? ` It ${keyActions.join(' and ')}.` : '';
-    const message = `Delete provider “${provider.name}”?\n\nThis permanently deletes its ${provider.endpoints.length} Endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} upstream credential${credentialCount(provider) === 1 ? '' : 's'}. ${routeImpact}${keyImpact}`;
+    const message = `Delete provider “${provider.name}”?\n\nThis permanently deletes its ${provider.endpoints.length} Endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} Provider credential${credentialCount(provider) === 1 ? '' : 's'}. ${routeImpact}${keyImpact}`;
     if (!confirm(message)) return;
     const response = await fetch(`/admin/providers/${provider.id}`, {method: 'DELETE'});
     if (!response.ok) return showApiError(response, null);
@@ -682,6 +683,7 @@ function bindProviderActions() {
   }));
   $$('.add-key').forEach(button => button.addEventListener('click', () => openKeyDialog(button.dataset.provider, button.dataset.endpoint)));
   $$('.edit-traffic').forEach(button => button.addEventListener('click', () => openTrafficDialog(button.dataset.provider, button.dataset.endpoint)));
+  $$('.key-rename').forEach(button => button.addEventListener('click', () => openKeyNameDialog(button.dataset.provider, button.dataset.endpoint, button.dataset.key)));
   $$('.key-toggle').forEach(button => button.addEventListener('click', async () => {
     await patchKey(button.dataset.provider, button.dataset.endpoint, button.dataset.key, {enabled: button.dataset.enabled !== 'true'});
   }));
@@ -723,22 +725,30 @@ async function patchKey(providerId, endpointId, keyId, update) {
   await loadProviders();
 }
 
+function emptyPricingTable() { return {updated_at: 0, models: {}, incoming_models: {}}; }
+function pricingTargetName() { return $('#central-pricing-form [name="price_name"]:checked')?.value === 'incoming' ? 'incoming' : 'outgoing'; }
 function pricingTable(scope, providerId = null, endpointId = null) {
   if (scope === 'global') return globalPricing;
   const provider = providers.find(item => item.id === providerId);
-  if (scope === 'provider') return provider?.pricing || {updated_at: 0, models: {}};
-  return provider?.endpoints.find(item => item.id === endpointId)?.pricing || {updated_at: 0, models: {}};
+  if (scope === 'provider') return provider?.pricing || emptyPricingTable();
+  return provider?.endpoints.find(item => item.id === endpointId)?.pricing || emptyPricingTable();
 }
 
 function pricingEntries() {
-  const entries = Object.entries(globalPricing.models || {}).map(([model, rates]) => ({scope: 'global', providerId: null, endpointId: null, model, rates, updatedAt: globalPricing.updated_at}));
+  const entries = [];
+  const add = (scope, name, providerId, endpointId, models, updatedAt) => {
+    for (const [model, rates] of Object.entries(models || {})) entries.push({scope, name, providerId, endpointId, model, rates, updatedAt});
+  };
+  add('global', 'outgoing', null, null, globalPricing.models, globalPricing.updated_at);
+  add('global', 'incoming', null, null, globalPricing.incoming_models, globalPricing.updated_at);
   for (const provider of providers) {
-    for (const [model, rates] of Object.entries(provider.pricing?.models || {})) entries.push({scope: 'provider', providerId: provider.id, endpointId: null, model, rates, updatedAt: provider.pricing.updated_at});
-    for (const endpoint of provider.endpoints) for (const [model, rates] of Object.entries(endpoint.pricing?.models || {})) entries.push({scope: 'endpoint', providerId: provider.id, endpointId: endpoint.id, model, rates, updatedAt: endpoint.pricing.updated_at});
+    add('provider', 'outgoing', provider.id, null, provider.pricing?.models, provider.pricing?.updated_at);
+    for (const endpoint of provider.endpoints) add('endpoint', 'outgoing', provider.id, endpoint.id, endpoint.pricing?.models, endpoint.pricing?.updated_at);
   }
   return entries.sort((a, b) => a.model.localeCompare(b.model) || a.scope.localeCompare(b.scope) || (a.providerId || '').localeCompare(b.providerId || '') || (a.endpointId || '').localeCompare(b.endpointId || ''));
 }
 
+function pricingNameLabel(name) { return name === 'incoming' ? 'Incoming' : 'Outgoing'; }
 function pricingScopeText(entry) {
   if (entry.scope === 'global') return {label: 'Global', detail: 'All Providers'};
   if (entry.scope === 'provider') return {label: 'Provider', detail: entry.providerId};
@@ -753,17 +763,25 @@ function renderPricingPage() {
   $('#pricing-provider-count').textContent = entries.filter(entry => entry.scope === 'provider').length.toLocaleString();
   $('#pricing-endpoint-count').textContent = entries.filter(entry => entry.scope === 'endpoint').length.toLocaleString();
   const query = $('#pricing-search').value.trim().toLowerCase(); const scope = $('#pricing-scope-filter').value;
-  const filtered = entries.filter(entry => (!scope || entry.scope === scope) && (!query || `${entry.model} ${entry.scope} ${entry.providerId || ''} ${entry.endpointId || ''}`.toLowerCase().includes(query)));
+  const filtered = entries.filter(entry => (!scope || entry.scope === scope) && (!query || `${entry.model} ${entry.name} ${pricingNameLabel(entry.name)} ${entry.scope} ${entry.providerId || ''} ${entry.endpointId || ''}`.toLowerCase().includes(query)));
   $('#pricing-list-empty').hidden = entries.length > 0;
   $('#pricing-table-wrap').hidden = entries.length === 0;
   $('#pricing-table-body').innerHTML = filtered.length ? filtered.map((entry, index) => {
     const scopeText = pricingScopeText(entry); const incomplete = entry.rates.input_per_million == null || entry.rates.output_per_million == null;
-    return `<tr><td><code>${escapeHtml(entry.model)}</code>${incomplete ? '<small class="pricing-incomplete">Incomplete effective rate</small>' : ''}</td><td><span class="pricing-scope-badge ${entry.scope}">${scopeText.label}</span><small>${escapeHtml(scopeText.detail)}</small></td><td>${formatPricingRate(entry.rates.input_per_million)}</td><td>${formatPricingRate(entry.rates.output_per_million)}</td><td>${formatPricingRate(entry.rates.cache_read_per_million)}</td><td>${entry.updatedAt ? escapeHtml(new Date(entry.updatedAt * 1000).toLocaleDateString()) : '—'}</td><td><button class="text-link edit-pricing-entry" type="button" data-pricing-index="${index}">Edit</button></td></tr>`;
+    const incompleteText = entry.name === 'incoming' ? 'Incomplete fallback rate' : 'Incomplete effective rate';
+    return `<tr><td><code>${escapeHtml(entry.model)}</code><span class="pricing-name-chip ${entry.name}" title="${entry.name === 'incoming' ? 'Matched against the model name the caller sends' : 'Matched against the model ID Yabane sends to the Provider'}">${pricingNameLabel(entry.name)}</span>${incomplete ? `<small class="pricing-incomplete">${incompleteText}</small>` : ''}</td><td><span class="pricing-scope-badge ${entry.scope}">${scopeText.label}</span><small>${escapeHtml(scopeText.detail)}</small></td><td>${formatPricingRate(entry.rates.input_per_million)}</td><td>${formatPricingRate(entry.rates.output_per_million)}</td><td>${formatPricingRate(entry.rates.cache_read_per_million)}</td><td>${entry.updatedAt ? escapeHtml(new Date(entry.updatedAt * 1000).toLocaleDateString()) : '—'}</td><td><button class="text-link edit-pricing-entry" type="button" data-pricing-index="${index}">Edit</button></td></tr>`;
   }).join('') : '<tr><td colspan="7"><div class="activity-empty">No prices match this search.</div></td></tr>';
   $$('.edit-pricing-entry').forEach(button => button.addEventListener('click', () => openCentralPricingEditor(filtered[Number(button.dataset.pricingIndex)])));
 }
 
-function pricingSuggestions(scope, providerId, endpointId) {
+function pricingSuggestions(scope, providerId, endpointId, name = 'outgoing') {
+  if (name === 'incoming') {
+    // These rules are Global-only, and the caller's name is what routes accept.
+    const names = new Set(Object.keys(globalPricing.incoming_models || {}));
+    for (const route of modelRoutes) if (route.pattern) names.add(route.pattern);
+    for (const activity of pricingActivityModels) if (activity.incomingModel) names.add(activity.incomingModel);
+    return [...names].filter(Boolean).sort();
+  }
   const models = new Set(Object.keys(globalPricing.models || {}));
   const provider = providers.find(item => item.id === providerId);
   const candidates = scope === 'global' ? providers : provider ? [provider] : [];
@@ -790,22 +808,65 @@ function updatePricingEndpoints() {
   select.replaceChildren(...(provider?.endpoints || []).map(endpoint => new Option(endpoint.id, endpoint.id)));
   if ([...select.options].some(option => option.value === previous)) select.value = previous;
 }
+function pricingRouteMatches(routePattern, pricePattern) {
+  if (!routePattern) return false;
+  if (pricePattern.endsWith('*')) {
+    const prefix = pricePattern.slice(0, -1);
+    return routePattern.startsWith(prefix) || routePattern === prefix;
+  }
+  return routePattern === pricePattern || routePattern.endsWith('*') && pricePattern.startsWith(routePattern.slice(0, -1));
+}
+function renderPricingRouteExample(name, value) {
+  const container = $('#pricing-route-example');
+  const pattern = value.replace(/\*$/, '');
+  const routes = name === 'incoming' && value.length >= 2 ? modelRoutes.filter(route => pricingRouteMatches(route.pattern || '', value)) : [];
+  const destinations = routes.flatMap(route => route.targets.map(target => `<code>${escapeHtml(target.provider_id)}/${escapeHtml(target.endpoint_id)}</code> as <code>${escapeHtml(target.upstream_model || 'the requested name')}</code>`));
+  if (!destinations.length) { container.hidden = true; container.replaceChildren(); return; }
+  const list = destinations.length === 1 ? destinations[0] : `${destinations.slice(0, -1).join(', ')} and ${destinations.at(-1)}`;
+  container.innerHTML = `<p>Requests for <code>${escapeHtml(pattern)}</code> reach ${list}.</p><p>This price applies to each of those destinations that has no outgoing price of its own.</p>`;
+  container.hidden = false;
+}
+function updatePricingTargetFields() {
+  const incoming = pricingTargetName() === 'incoming';
+  $$('#central-pricing-form .pricing-override-badge').forEach(badge => { badge.textContent = incoming ? 'Optional' : 'Optional override'; });
+  for (const field of ['input_per_million', 'output_per_million']) $('#central-pricing-form [name="' + field + '"]').placeholder = incoming ? 'Not set' : 'Inherit';
+  // A caller-side name belongs to no single connection, so its price is always Global.
+  const locked = Boolean(pricingEditTarget?.originalModel);
+  const globalScope = $('#central-pricing-form [name="scope"][value="global"]');
+  const narrowedScope = incoming && !globalScope.checked;
+  if (narrowedScope) globalScope.checked = true;
+  $$('#central-pricing-form [name="scope"]').forEach(input => {
+    const unavailable = incoming && input.value !== 'global';
+    input.disabled = locked || unavailable;
+    input.closest('label').classList.toggle('locked', (locked && !input.checked) || unavailable);
+  });
+  $('#pricing-scope-hint').textContent = incoming
+    ? 'This price applies to every Provider, so there is nothing left to narrow.'
+    : 'Start with a Global rule and add a narrower override only where a Provider or Endpoint has different rates.';
+  $('#pricing-incoming-scope-note').hidden = !incoming;
+  // A forced Global scope still has to hide the Provider/Endpoint fields and refresh suggestions.
+  if (narrowedScope) updatePricingScopeFields();
+}
 function updatePricingModelSuggestions() {
-  const scope = $('#central-pricing-form [name="scope"]:checked').value;
-  const suggestions = pricingSuggestions(scope, $('#pricing-provider').value, $('#pricing-endpoint').value);
+  const scope = $('#central-pricing-form [name="scope"]:checked').value; const name = pricingTargetName();
+  const suggestions = pricingSuggestions(scope, $('#pricing-provider').value, $('#pricing-endpoint').value, name);
   $('#pricing-model-suggestions').replaceChildren(...suggestions.map(model => new Option(model)));
   $('#pricing-model').setAttribute('list', 'pricing-model-suggestions');
   const value = $('#pricing-model').value.trim();
   const validPattern = value && /^[^*]+\*?$/.test(value);
+  const outgoing = name !== 'incoming';
   $('#pricing-model-notice').textContent = !value
-    ? `${suggestions.length} model pattern${suggestions.length === 1 ? '' : 's'} available as suggestions. Custom patterns are allowed.`
+    ? `${suggestions.length} known ${outgoing ? 'Provider model pattern' : 'incoming model name'}${suggestions.length === 1 ? '' : 's'} available as suggestions. Custom patterns are allowed.`
     : !validPattern
-      ? 'Use an exact model ID or one trailing * for a prefix match.'
+      ? 'Enter an exact model ID or one trailing * for a prefix match.'
       : value.endsWith('*')
-        ? `Matches every upstream model beginning with "${value.slice(0, -1)}". Exact rules still take priority.`
+        ? outgoing
+          ? `Matches every Provider model beginning with "${value.slice(0, -1)}". Exact rules still take priority.`
+          : `Matches every incoming model beginning with "${value.slice(0, -1)}". Destinations with their own outgoing price keep it.`
         : !suggestions.includes(value)
-          ? 'Custom exact model ID — it was not discovered or used by a route, but it will still be saved as entered.'
-          : 'Exact model ID.';
+          ? `Custom ${outgoing ? 'Provider model ID' : 'incoming model name'} — it was not discovered or used by a route, but it will still be saved as entered.`
+          : outgoing ? 'Exact model ID.' : 'Matches requests carrying this name where the destination has no outgoing price.';
+  renderPricingRouteExample(name, value);
   scheduleModelsDevReference(value);
 }
 
@@ -878,22 +939,31 @@ function scheduleModelsDevReference(value) {
 }
 function updatePricingScopeFields() {
   const scope = $('#central-pricing-form [name="scope"]:checked').value;
-  $('#pricing-resource-fields').hidden = scope === 'global';
+  const incoming = $('#central-pricing-form [name="price_name"][value="incoming"]');
+  const global = scope === 'global';
+  incoming.disabled = !global;
+  if (!global && incoming.checked) $('#central-pricing-form [name="price_name"][value="outgoing"]').checked = true;
+  incoming.closest('label').classList.toggle('locked', !global);
+  $('#pricing-resource-fields').hidden = global;
   $('#pricing-endpoint-field').hidden = scope !== 'endpoint';
-  $('#pricing-provider').required = scope !== 'global';
+  $('#pricing-provider').required = !global;
   $('#pricing-endpoint').required = scope === 'endpoint';
-  updatePricingEndpoints(); updatePricingModelSuggestions();
+  updatePricingEndpoints(); updatePricingTargetFields(); updatePricingModelSuggestions();
 }
 function openCentralPricingEditor(options = {}) {
   const form = $('#central-pricing-form'); form.reset(); $('#central-pricing-error').textContent = '';
   const scope = options.scope || 'global'; const providerId = options.providerId || options.provider_id || providers[0]?.id || ''; const endpointId = options.endpointId || options.endpoint_id || '';
   const model = options.model || options.modelId || '';
-  const existing = Boolean(options.rates) || Boolean(model && pricingTable(scope, providerId, endpointId).models?.[model]);
-  const rates = options.rates || pricingTable(scope, providerId, endpointId).models?.[model] || {};
-  pricingEditTarget = {scope, providerId, endpointId, originalModel: existing ? model : null};
+  const table = pricingTable(scope, providerId, endpointId);
+  const incomingModel = Boolean(model && table.incoming_models?.[model]);
+  const name = options.name || (incomingModel ? 'incoming' : 'outgoing');
+  const existing = Boolean(options.rates) || Boolean(model && (table.models?.[model] || table.incoming_models?.[model]));
+  const rates = options.rates || table.models?.[model] || table.incoming_models?.[model] || {};
+  pricingEditTarget = {scope, providerId, endpointId, originalModel: existing ? model : null, originalName: existing ? name : null};
   $('#pricing-provider').replaceChildren(...providers.map(provider => new Option(provider.name, provider.id)));
   if (providerId && [...$('#pricing-provider').options].some(option => option.value === providerId)) $('#pricing-provider').value = providerId;
   form.elements.scope.value = scope;
+  form.elements.price_name.value = name;
   $$('#central-pricing-form [name="scope"]').forEach(input => { input.disabled = existing; input.closest('label').classList.toggle('locked', existing && !input.checked); });
   updatePricingEndpoints();
   if (endpointId && [...$('#pricing-endpoint').options].some(option => option.value === endpointId)) $('#pricing-endpoint').value = endpointId;
@@ -901,7 +971,7 @@ function openCentralPricingEditor(options = {}) {
   for (const field of ['input_per_million', 'output_per_million', 'cache_read_per_million']) form.elements[field].value = rates[field] ?? '';
   $('#pricing-editor-title').textContent = existing ? `Edit ${model}` : 'Add model price';
   $('#pricing-editor-breadcrumb').textContent = existing ? 'Edit price' : 'Add price';
-  $('#pricing-editor-description').textContent = existing ? 'Update this explicit rule. Historical Activity values remain unchanged.' : 'Create an explicit global default or a narrower upstream override.';
+  $('#pricing-editor-description').textContent = existing ? 'Update this explicit rule. Activity history keeps the rate it recorded at request time.' : 'Price the model name the caller sends, or the model ID Yabane sends to the Provider.';
   $('#delete-pricing-rule').hidden = !existing;
   $('#pricing-list-page').hidden = true; $('#pricing-editor-page').hidden = false;
   updatePricingScopeFields(); $('#pricing-model').focus();
@@ -931,6 +1001,7 @@ $$('#central-pricing-form [name="scope"]').forEach(input => input.addEventListen
 $('#pricing-provider').addEventListener('change', () => { updatePricingEndpoints(); updatePricingModelSuggestions(); });
 $('#pricing-endpoint').addEventListener('change', updatePricingModelSuggestions);
 $('#pricing-model').addEventListener('input', updatePricingModelSuggestions);
+$$('#central-pricing-form [name="price_name"]').forEach(input => input.addEventListener('change', () => { updatePricingTargetFields(); updatePricingModelSuggestions(); }));
 $('#pricing-reference-results').addEventListener('click', event => {
   const button = event.target.closest('.use-reference-rates');
   if (!button) return;
@@ -943,24 +1014,31 @@ $('#pricing-reference-results').addEventListener('click', event => {
   $('#central-pricing-error').textContent = '';
 });
 $('#central-pricing-form').addEventListener('submit', async event => {
-  event.preventDefault(); const form = event.currentTarget; const scope = form.elements.scope.value; const providerId = form.elements.provider_id.value; const endpointId = form.elements.endpoint_id.value; const model = form.elements.model.value.trim();
+  event.preventDefault(); const form = event.currentTarget; const scope = form.elements.scope.value; const providerId = form.elements.provider_id.value; const endpointId = form.elements.endpoint_id.value;
+  const name = pricingTargetName(); const model = form.elements.model.value.trim(); const outgoing = name !== 'incoming';
   if (!/^[^*]+\*?$/.test(model)) return ($('#central-pricing-error').textContent = 'Use an exact model ID or one trailing * for a prefix match.');
   const values = ['input_per_million', 'output_per_million', 'cache_read_per_million'].map(field => form.elements[field].value === '' ? null : Number(form.elements[field].value));
   if (values.every(value => value == null)) return ($('#central-pricing-error').textContent = 'Enter at least one rate.');
   if (values.some(value => value != null && (!Number.isFinite(value) || value < 0))) return ($('#central-pricing-error').textContent = 'Rates must be finite, non-negative numbers.');
-  const table = structuredClone(pricingTable(scope, providerId, endpointId)); table.models ||= {};
-  const oldModel = pricingEditTarget?.originalModel;
-  const preservedCacheWrite = oldModel ? table.models[oldModel]?.cache_write_per_million ?? null : null;
-  if (oldModel && oldModel !== model) delete table.models[oldModel];
-  if (!oldModel && table.models[model]) return ($('#central-pricing-error').textContent = 'A price already exists for this model pattern in the selected scope. Edit the existing rule instead.');
-  table.models[model] = {input_per_million: values[0], output_per_million: values[1], cache_read_per_million: values[2], cache_write_per_million: preservedCacheWrite};
+  const table = structuredClone(pricingTable(scope, providerId, endpointId)); table.models ||= {}; table.incoming_models ||= {};
+  const {originalModel: oldModel = null, originalName: oldName = null} = pricingEditTarget || {};
+  const normalized = name === 'incoming' ? table.incoming_models : table.models;
+  const other = name === 'incoming' ? table.models : table.incoming_models;
+  const oldMap = oldName === 'incoming' ? table.incoming_models : table.models;
+  const preservedCacheWrite = oldModel && oldName === name ? oldMap[oldModel]?.cache_write_per_million ?? null : null;
+  if (oldModel) delete oldMap[oldModel];
+  if (normalized[model]) return ($('#central-pricing-error').textContent = `A ${outgoing ? 'outgoing' : 'incoming'} price already exists for this model pattern in the selected scope. Edit the existing rule instead.`);
+  if (other[model]) return ($('#central-pricing-error').textContent = `This pattern is already priced as ${outgoing ? 'an incoming' : 'an outgoing'} name in this scope. Prices for the two names must be separate patterns.`);
+  normalized[model] = {input_per_million: values[0], output_per_million: values[1], cache_read_per_million: values[2], cache_write_per_million: preservedCacheWrite};
   const response = await savePricingScope(scope, providerId, endpointId, table);
   if (!response.ok) return showApiError(response, $('#central-pricing-error'));
   await refreshPricingConfiguration(); showPricingList();
 });
 $('#delete-pricing-rule').addEventListener('click', async () => {
-  if (!pricingEditTarget?.originalModel || !confirm(`Delete the explicit price for “${pricingEditTarget.originalModel}”?\n\nHistorical Activity values will not change.`)) return;
-  const {scope, providerId, endpointId, originalModel} = pricingEditTarget; const table = structuredClone(pricingTable(scope, providerId, endpointId)); delete table.models[originalModel];
+  const {scope, providerId, endpointId, originalModel, originalName} = pricingEditTarget || {};
+  if (!originalModel || !confirm(`Delete the ${originalName === 'incoming' ? 'incoming' : 'outgoing'} price for “${originalModel}”?\n\nActivity records keep the cost they recorded at request time.`)) return;
+  const table = structuredClone(pricingTable(scope, providerId, endpointId)); table.incoming_models ||= {};
+  delete (originalName === 'incoming' ? table.incoming_models : table.models)[originalModel];
   const response = await savePricingScope(scope, providerId, endpointId, table);
   if (!response.ok) return showApiError(response, $('#central-pricing-error'));
   await refreshPricingConfiguration(); showPricingList();
@@ -973,7 +1051,7 @@ function openEndpointDialog(providerId, endpointId = null) {
   if (!endpoint) form.elements.id.value = availableEndpointId(provider, form.elements.api_type.value);
   form.elements.api_type.querySelector('option[value="openai_codex"]').disabled = Boolean(endpoint && endpoint.api_type !== 'openai_codex');
   $('#endpoint-dialog h2').textContent = endpoint ? `Edit ${endpoint.id}` : 'Add API endpoint';
-  $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update this Endpoint ID or the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this upstream connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
+  $('#endpoint-dialog .dialog-head p').textContent = endpoint?.api_type === 'openai_codex' ? 'Update this Endpoint ID or the proxy used for OpenAI sign-in, token refresh, and inference.' : endpoint ? 'Update this Provider connection. Existing API keys are managed separately.' : 'Models discovered here remain accessible through the same provider prefix.';
   $('#endpoint-dialog button[type="submit"]').textContent = endpoint ? 'Save changes' : 'Add endpoint';
   const editing = Boolean(endpoint);
   form.elements.id.disabled = false;
@@ -1037,7 +1115,7 @@ function openKeyDialog(providerId, endpointId = null) {
   $('#key-endpoint').replaceChildren(...provider.endpoints.filter(endpoint => endpoint.api_type !== 'openai_codex').map(endpoint => new Option(`${endpoint.id} · ${formatType(endpoint.api_type)}`, endpoint.id)));
   if (endpointId) $('#key-endpoint').value = endpointId;
   $('#key-dialog-title').textContent = endpointId ? `Add key to ${endpointId}` : 'Add API key';
-  $('#key-dialog-description').textContent = `Add an upstream credential under ${provider.name}${endpointId ? ` / ${endpointId}` : ''}.`;
+  $('#key-dialog-description').textContent = `Add a Provider credential under ${provider.name}${endpointId ? ` / ${endpointId}` : ''}.`;
   keyDialog.showModal();
 }
 $$('.close-key').forEach(button => button.addEventListener('click', () => keyDialog.close()));
@@ -1047,6 +1125,34 @@ $('#key-form').addEventListener('submit', async event => {
   const response = await fetch(`/admin/providers/${providerId}/keys`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, null);
   keyDialog.close(); await loadProviders();
+});
+
+const keyNameDialog = $('#key-name-dialog');
+function openKeyNameDialog(providerId, endpointId, keyId) {
+  const provider = providers.find(item => item.id === providerId);
+  const endpoint = provider?.endpoints.find(item => item.id === endpointId);
+  const key = endpoint?.api_keys.find(item => item.id === keyId);
+  if (!key) return;
+  const form = $('#key-name-form');
+  form.reset();
+  form.elements.provider_id.value = providerId;
+  form.elements.endpoint_id.value = endpointId;
+  form.elements.key_id.value = keyId;
+  form.elements.name.value = key.name;
+  $('#key-name-description').textContent = `Rename this credential under ${provider.name} / ${endpoint.id}. Model routes keep using the same key.`;
+  $('#key-name-error').textContent = '';
+  keyNameDialog.showModal();
+  form.elements.name.focus();
+  form.elements.name.select();
+}
+$$('.close-key-name').forEach(button => button.addEventListener('click', () => keyNameDialog.close()));
+$('#key-name-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.target;
+  const response = await fetch(`/admin/providers/${form.elements.provider_id.value}/endpoints/${form.elements.endpoint_id.value}/keys/${form.elements.key_id.value}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({name: form.elements.name.value})});
+  if (!response.ok) return showApiError(response, $('#key-name-error'));
+  keyNameDialog.close();
+  await Promise.all([loadProviders(), loadRoutes()]);
 });
 
 const trafficDialog = $('#traffic-dialog');
@@ -1290,7 +1396,7 @@ function addRouteTargetEditor(target = null) {
 function openRouteDialog(route = null) {
   const form = $('#route-form'); form.reset(); $('#route-error').textContent = ''; editingRoutePattern = route?.pattern || null;
   routeDialog.querySelector('h2').textContent = route ? 'Edit model route' : 'Add model route';
-  routeDialog.querySelector('.dialog-head p').textContent = route ? 'Update the public alias and its destination.' : 'Create a short alias for an upstream model.';
+  routeDialog.querySelector('.dialog-head p').textContent = route ? 'Update the public alias and its destination.' : 'Create a short alias for a Provider model.';
   $('#save-route').textContent = route ? 'Save changes' : 'Save route';
   const editors = $$('#route-targets .route-target-editor'); editors.slice(1).forEach(editor => editor.remove());
   if (route) {
@@ -1449,7 +1555,7 @@ function updateHelpGuide(preferredProviderId = null) {
   const context = helpDialog.dataset.context || 'general';
   const title = context === 'provider' && provider ? `Connect clients to ${provider.name}` : context === 'access' ? 'Connect clients to Yabane' : 'Connect your Agent to Yabane';
   helpDialog.querySelector('h2').textContent = title;
-  $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an Endpoint and upstream credential'}</small></span>`;
+  $('#help-provider-check').innerHTML = `<b>${providers.length ? icon('check') : '1'}</b><span><strong>Connect a Provider</strong><small>${providers.length ? `${providers.length} configured` : 'Add an Endpoint and Provider credential'}</small></span>`;
   $('#help-key-check').innerHTML = `<b>${authSettings.api_keys.length ? icon('check') : '2'}</b><span><strong>Generate a Gateway key</strong><small>${authSettings.api_keys.length ? `${authSettings.api_keys.length} available` : 'Required while authentication is enabled'}</small></span>`;
   $('#help-model-check').innerHTML = `<b>${models.length ? icon('check') : '3'}</b><span><strong>Select a model</strong><small>${models.length ? `${models.length} available` : 'Refresh Provider model discovery'}</small></span>`;
   $('#help-pi-code').textContent = JSON.stringify({providers: {yabane: {baseUrl, api: 'openai-completions', apiKey: '$YABANE_API_KEY', models: [{id: model, name: model}]} }}, null, 2);
@@ -1566,6 +1672,7 @@ $('#edit-gateway-key-form').addEventListener('submit', async event => {
 function renderAuth() {
   $('#auth-enabled').checked = authSettings.enabled;
   $('.switch-status').textContent = authSettings.enabled ? 'Enabled' : 'Disabled';
+  $('#models-example-code').textContent = `curl '${location.origin}/v1/models' \\\n  -H 'Authorization: Bearer sk-your-yabane-key'`;
   $('#gateway-keys-empty').hidden = authSettings.api_keys.length > 0; $('#gateway-keys-table').hidden = authSettings.api_keys.length === 0;
   $('#gateway-keys').replaceChildren(...authSettings.api_keys.map(key => {
     const row = document.createElement('tr'); const expired = key.expires_at && key.expires_at * 1000 <= Date.now(); const expiry = key.expires_at ? new Date(key.expires_at * 1000).toLocaleString() : 'Never'; const access = key.provider_ids.length ? key.provider_ids.join(', ') : 'All providers';
@@ -1603,9 +1710,9 @@ async function loadManagementKeys() { const response = await fetch('/admin/manag
 const searchItems = [
   {label: 'Home', description: 'Gateway status and usage overview', view: 'home'},
   {label: 'Providers', description: 'Manage LLM providers', view: 'providers'},
-  {label: 'Model routing', description: 'Route model IDs to upstream credentials', view: 'models'},
+  {label: 'Model routing', description: 'Route model IDs to Provider credentials', view: 'models'},
   {label: 'Provider models', description: 'Discover models from providers', view: 'models'},
-  {label: 'Model pricing', description: 'Global model rates and upstream overrides', view: 'pricing'},
+  {label: 'Model pricing', description: 'Global model rates with Provider and Endpoint overrides', view: 'pricing'},
   {label: 'Extensions', description: 'Compiled request Hooks and capabilities', view: 'extensions'},
   {label: 'API access', description: 'Authentication and gateway keys', view: 'access'},
   {label: 'Generate Gateway API key', description: 'Create an inference credential', view: 'access', action: () => $('#open-gateway-key').click()},
@@ -1619,7 +1726,7 @@ function extensionSearchItems() {
   return extensions.map(extension => ({
     label: `${extension.name} extension`,
     description: extension.description,
-    keywords: `${extension.id} ${extension.hooks.join(' ')}`,
+    keywords: `${extension.id} ${extension.hooks.join(' ')} ${extension.hooks.map(extensionHookLabel).join(' ')}`,
     view: extension.id === 'traffic-capture' && extension.enabled ? 'capture' : 'extensions'
   }));
 }
@@ -1733,12 +1840,18 @@ function activityBucketLabel(bucket, seconds, full = false) {
   const endLabel = seconds <= 86400 ? end.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : end.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
   return `${startLabel} – ${endLabel}`;
 }
-function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'latency' ? (bucket.samples ? bucket.latency / bucket.samples : 0) : bucket.requests; }
+function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'requests' ? bucket.requests : (bucket.samples ? bucket.latency / bucket.samples : null); }
+function activityFirstByteValue(bucket) { return bucket.first_byte_samples ? bucket.first_byte / bucket.first_byte_samples : null; }
+function activityThroughputValue(bucket) { return bucket.generation && bucket.generation_tokens ? bucket.generation_tokens * 1000 / bucket.generation : null; }
 function activityTokenValues(bucket) {
   const input = bucket.input ?? Math.max((bucket.tokens || 0) - (bucket.output || 0), 0); const output = bucket.output || 0;
   return {input, output, cacheRate: input ? Math.min(100, bucket.cached * 100 / input) : 0};
 }
-function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'latency' ? formatDuration(Math.round(value)) : Math.round(value).toLocaleString(); }
+function activityMetricLabel(value, metric) { return metric === 'tokens' ? compactNumber(value) : metric === 'requests' ? Math.round(value).toLocaleString() : formatDuration(Math.round(value)); }
+function activityThroughputLabel(value) { return value == null ? 'Not available' : `${value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1)} tok/s`; }
+// The right axis names the unit in the legend instead of repeating it, so a long label
+// cannot run past the plot on narrow screens.
+function activityThroughputAxisLabel(value) { return value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1); }
 function formatTrackedCost(cost, coverage) { return coverage ? formatCost(cost) : '—'; }
 function pricedRequestCount(stats) {
   const explicit = Number.isFinite(stats.priced_requests) ? stats.priced_requests : 0;
@@ -1767,25 +1880,44 @@ function inspectActivityBucket(index) {
   $$('.chart-column').forEach(column => column.classList.toggle('selected', Number(column.dataset.chartIndex) === index));
   $('#chart-inspector-time').textContent = activityBucketLabel(bucket, activityChartSeconds, true);
   const averageLatency = bucket.samples ? Math.round(bucket.latency / bucket.samples) : null;
+  const firstByteLatency = bucket.first_byte_samples ? Math.round(bucket.first_byte / bucket.first_byte_samples) : null;
+  const throughput = bucket.generation && bucket.generation_tokens ? bucket.generation_tokens * 1000 / bucket.generation : null;
   const successRate = bucket.requests ? (bucket.successful * 100 / bucket.requests).toFixed(1) + '%' : '—';
   const tokenValues = activityTokenValues(bucket);
   const pricedRequests = pricedRequestCount(bucket);
-  $('#chart-inspector-values').innerHTML = [['Requests', bucket.requests.toLocaleString()], ['Input', compactNumber(tokenValues.input)], ['Output', compactNumber(tokenValues.output)], ['Cache hit', `${tokenValues.cacheRate.toFixed(1)}%`], ['Success', successRate], ['Avg latency', formatDuration(averageLatency)], ['Cached input', compactNumber(bucket.cached)], ['Usage value', formatTrackedCost(bucket.cost, pricedRequests)]].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+  $('#chart-inspector-values').innerHTML = [
+    ['Requests', bucket.requests.toLocaleString()],
+    ['Input', compactNumber(tokenValues.input)],
+    ['Output', compactNumber(tokenValues.output)],
+    ['Cached input', compactNumber(bucket.cached)],
+    ['Cache hit', `${tokenValues.cacheRate.toFixed(1)}%`],
+    ['Success', successRate],
+    ['Avg latency', formatDuration(averageLatency)],
+    ['Time to first token', formatDuration(firstByteLatency)],
+    ['Throughput', throughput == null ? 'Not available' : activityThroughputLabel(throughput)],
+    ['Usage value', formatTrackedCost(bucket.cost, pricedRequests)],
+  ].map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
 }
 function selectActivityChartSeries(column, clientY) {
-  if (!Number.isFinite(clientY) || !['requests', 'tokens'].includes(activityChartMetric)) return;
+  if (!Number.isFinite(clientY)) return;
   const chartBox = $('#activity-chart').getBoundingClientRect();
   const pointerY = (clientY - chartBox.top) * 250 / chartBox.height;
   const candidates = activityChartMetric === 'tokens' ? [
     {name: 'input', label: 'Input', y: Number(column.dataset.inputY), value: column.dataset.inputValue, color: '#7c4dff'},
     {name: 'output', label: 'Output', y: Number(column.dataset.outputY), value: column.dataset.outputValue, color: '#0b57d0'},
     {name: 'cache', label: 'Cache hit', y: Number(column.dataset.cacheY), value: column.dataset.cacheValue, color: '#00897b'},
+  ] : activityChartMetric === 'performance' ? [
+    {name: 'throughput', label: 'Throughput', y: Number(column.dataset.throughputY), value: column.dataset.throughputValue, color: '#7c4dff'},
+    {name: 'first-byte', label: 'Time to first token', y: Number(column.dataset.firstByteY), value: column.dataset.firstByteValue, color: '#168c9a'},
+    {name: 'latency', label: 'Average latency', y: Number(column.dataset.latencyY), value: column.dataset.latencyValue, color: '#0b57d0'},
   ] : [
     {name: 'requests', label: 'Requests', y: Number(column.dataset.requestsY), value: column.dataset.requestsValue, color: '#0b57d0'},
     {name: 'error-rate', label: 'Error rate', y: Number(column.dataset.errorY), value: column.dataset.errorValue, color: '#b86f67'},
   ];
-  const series = candidates.reduce((nearest, candidate) => Math.abs(candidate.y - pointerY) < Math.abs(nearest.y - pointerY) ? candidate : nearest);
+  const series = candidates.filter(candidate => Number.isFinite(candidate.y)).reduce((nearest, candidate) => !nearest || Math.abs(candidate.y - pointerY) < Math.abs(nearest.y - pointerY) ? candidate : nearest, null);
+  if (!series) return;
   column.dataset.activeSeries = series.name;
+  delete column.dataset.measured;
   column.style.setProperty('--point-y', `${series.y}px`);
   column.style.setProperty('--point-color', series.color);
   column.querySelector('.chart-value').textContent = `${series.label} ${series.value}`;
@@ -1811,22 +1943,38 @@ function smoothActivityPath(points) {
     return `${path} C${firstControl} ${secondControl} ${point.x.toFixed(1)},${point.y.toFixed(1)}`;
   }, `M${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`);
 }
+// Measured series such as Provider throughput and first-token latency only exist
+// for intervals that streamed a response, so a missing measurement breaks the
+// line instead of drawing a zero that never happened.
+function smoothActivitySegments(values, points) {
+  const segments = []; let segment = [];
+  const flush = () => { if (segment.length) segments.push(smoothActivityPath(segment)); segment = []; };
+  values.forEach((value, index) => { if (value == null) flush(); else segment.push(points[index]); });
+  flush();
+  return segments.join(' ');
+}
 function renderActivityChart(buckets = activityChartBuckets, seconds = activityChartSeconds) {
   activityChartBuckets = buckets; activityChartSeconds = seconds;
   const chart = $('#activity-chart'); const measuredWidth = Math.round(chart.clientWidth);
   if (!measuredWidth) return;
   activityChartRenderWidth = measuredWidth;
-  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const tokenMode = activityChartMetric === 'tokens'; const requestMode = activityChartMetric === 'requests';
+  const values = buckets.map(bucket => activityMetricValue(bucket, activityChartMetric)); const tokenMode = activityChartMetric === 'tokens'; const requestMode = activityChartMetric === 'requests'; const performanceMode = activityChartMetric === 'performance';
   const tokenSeries = buckets.map(activityTokenValues); const max = tokenMode ? Math.max(...tokenSeries.flatMap(value => [value.input, value.output]), 1) : Math.max(...values, 1);
+  const firstByteValues = performanceMode ? buckets.map(activityFirstByteValue) : [];
+  const throughputValues = performanceMode ? buckets.map(activityThroughputValue) : [];
+  const leftMax = performanceMode ? Math.max(...values, ...firstByteValues, 1) : max;
+  const throughputMax = performanceMode ? Math.max(...throughputValues, 1) : 1;
   const errorRates = requestMode ? buckets.map(bucket => bucket.requests ? Math.min(100, bucket.errors * 100 / bucket.requests) : 0) : [];
   const errorScaleMax = requestMode ? Math.min(100, Math.max(1, Math.ceil(Math.max(...errorRates, 0)))) : 100;
-  const average = values.reduce((sum, value) => sum + value, 0) / Math.max(values.length, 1);
-  const width = Math.max(measuredWidth, 320); const height = 250; const left = 48; const right = tokenMode || requestMode ? 42 : 16; const top = 18; const bottom = 38; const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const pointsFor = (series, scale) => series.map((value, index) => ({x: left + (index + .5) * plotWidth / Math.max(series.length, 1), y: top + (1 - value / scale) * plotHeight}));
-  const primaryValues = tokenMode ? tokenSeries.map(value => value.input) : values; const points = pointsFor(primaryValues, max); const line = smoothActivityPath(points);
+  const measured = values.filter(value => value != null);
+  const average = measured.length ? measured.reduce((sum, value) => sum + value, 0) / measured.length : null;
+  const width = Math.max(measuredWidth, 320); const height = 250; const left = 48; const right = tokenMode || requestMode || performanceMode ? 42 : 16; const top = 18; const bottom = 38; const plotWidth = width - left - right; const plotHeight = height - top - bottom;
+  const pointsFor = (series, scale) => series.map((value, index) => ({x: left + (index + .5) * plotWidth / Math.max(series.length, 1), y: value == null ? null : top + (1 - value / scale) * plotHeight}));
+  const primaryValues = tokenMode ? tokenSeries.map(value => value.input) : values; const points = pointsFor(primaryValues, leftMax); const line = performanceMode ? smoothActivitySegments(primaryValues, points) : smoothActivityPath(points);
   const inputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.input), max) : []; const outputPoints = tokenMode ? pointsFor(tokenSeries.map(value => value.output), max) : []; const cachePoints = tokenMode ? pointsFor(tokenSeries.map(value => value.cacheRate), 100) : [];
+  const firstBytePoints = performanceMode ? pointsFor(firstByteValues, leftMax) : []; const throughputPoints = performanceMode ? pointsFor(throughputValues, throughputMax) : [];
   const errorPoints = requestMode ? pointsFor(errorRates, errorScaleMax) : [];
-  const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = max * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
+  const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = leftMax * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
   const labelBudget = Math.max(4, Math.min(8, Math.floor(width / 110)));
   const intervalEvery = Math.max(1, Math.ceil(buckets.length / labelBudget));
   const columnLabels = buckets.map(bucket => activityBucketLabel(bucket, seconds));
@@ -1839,13 +1987,13 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
     shownLabels.push(show ? label : '');
   });
   const overlays = buckets.map((bucket, index) => {
-    const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatTrackedCost(bucket.cost, pricedRequestCount(bucket))}`; const label = columnLabels[index]; const pointLabel = tokenMode ? `Input ${compactNumber(primaryValues[index])}` : requestMode ? `Requests ${activityMetricLabel(values[index], activityChartMetric)}` : activityMetricLabel(values[index], activityChartMetric);
+    const detail = `${bucket.requests} requests, ${compactNumber(bucket.tokens)} tokens, ${bucket.errors} errors, ${formatTrackedCost(bucket.cost, pricedRequestCount(bucket))}`; const label = columnLabels[index]; const pointLabel = tokenMode ? `Input ${compactNumber(primaryValues[index])}` : requestMode ? `Requests ${activityMetricLabel(values[index], activityChartMetric)}` : values[index] == null ? 'Not available' : activityMetricLabel(values[index], activityChartMetric);
     const seriesData = tokenMode
       ? ` data-input-y="${inputPoints[index].y}" data-output-y="${outputPoints[index].y}" data-cache-y="${cachePoints[index].y}" data-input-value="${compactNumber(tokenSeries[index].input)}" data-output-value="${compactNumber(tokenSeries[index].output)}" data-cache-value="${tokenSeries[index].cacheRate.toFixed(1)}%" data-active-series="input"`
       : requestMode
         ? ` data-requests-y="${points[index].y}" data-error-y="${errorPoints[index].y}" data-requests-value="${activityMetricLabel(values[index], activityChartMetric)}" data-error-value="${errorRates[index].toFixed(1)}%" data-active-series="requests"`
-        : '';
-    return `<button class="chart-column" type="button" style="--point-y:${points[index].y}px" data-chart-index="${index}"${seriesData} aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${pointLabel}</span><small>${shownLabels[index]}</small></button>`;
+        : ` data-latency-y="${points[index].y ?? NaN}" data-first-byte-y="${firstBytePoints[index].y ?? NaN}" data-throughput-y="${throughputPoints[index].y ?? NaN}" data-latency-value="${values[index] == null ? 'Not available' : activityMetricLabel(values[index], activityChartMetric)}" data-first-byte-value="${firstByteValues[index] == null ? 'Not available' : activityMetricLabel(firstByteValues[index], activityChartMetric)}" data-throughput-value="${activityThroughputLabel(throughputValues[index])}" data-active-series="latency"`;
+    return `<button class="chart-column" type="button" data-measured="${points[index].y == null ? 'false' : 'true'}" style="--point-y:${points[index].y ?? 0}px" data-chart-index="${index}"${seriesData} aria-label="${escapeHtml(`${label}: ${detail}`)}"><span class="chart-value">${pointLabel}</span><small>${shownLabels[index]}</small></button>`;
   }).join('');
   let seriesMarkup;
   if (tokenMode) {
@@ -1855,22 +2003,27 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
     const rightAxis = [0, .5, 1].map(ratio => `<text class="traffic-axis-right token-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${Math.round((1 - ratio) * 100)}%</text>`).join('');
     seriesMarkup = `<path class="traffic-glow token-input-glow" d="${inputLine}"></path><path class="traffic-line token-input-line" d="${inputLine}"></path><path class="traffic-line token-output-line" d="${outputLine}"></path><path class="traffic-line token-cache-line" d="${cacheLine}"></path>${rightAxis}`;
   } else {
-    const averageY = top + (1 - average / max) * plotHeight;
+    const averageY = average == null ? null : top + (1 - average / leftMax) * plotHeight;
     const showPointMarkers = plotWidth / Math.max(points.length, 1) >= 12;
-    const primarySeries = `<line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line><path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${showPointMarkers ? points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('') : ''}</g>`;
+    const averageLine = averageY == null ? '' : `<line class="traffic-average" x1="${left}" y1="${averageY}" x2="${width - right}" y2="${averageY}"></line>`;
+    const primarySeries = `${averageLine}<path class="traffic-glow" d="${line}"></path><path class="traffic-line" d="${line}"></path><g class="traffic-points">${showPointMarkers ? points.map((point, index) => values[index] ? `<circle cx="${point.x}" cy="${point.y}" r="2.5"></circle>` : '').join('') : ''}</g>`;
     if (requestMode) {
       const errorLine = smoothActivityPath(errorPoints);
       const rightAxis = [0, .5, 1].map(ratio => { const value = errorScaleMax * (1 - ratio); const label = Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1); return `<text class="traffic-axis-right error-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${label}%</text>`; }).join('');
       seriesMarkup = `${primarySeries}<path class="error-rate-line" d="${errorLine}"></path>${rightAxis}`;
+    } else if (performanceMode) {
+      const firstByteLine = smoothActivitySegments(firstByteValues, firstBytePoints); const throughputLine = smoothActivitySegments(throughputValues, throughputPoints);
+      const rightAxis = [0, .5, 1].map(ratio => `<text class="traffic-axis-right performance-axis" x="${width - right + 9}" y="${top + ratio * plotHeight + 3}">${escapeHtml(activityThroughputAxisLabel(throughputMax * (1 - ratio)))}</text>`).join('');
+      seriesMarkup = `${primarySeries}<path class="first-byte-line" d="${firstByteLine}"></path><path class="throughput-line" d="${throughputLine}"></path>${rightAxis}`;
     } else seriesMarkup = primarySeries;
   }
   $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g>${seriesMarkup}</svg><div class="chart-bars" style="--activity-buckets:${buckets.length};--chart-right:${right}px;--point-color:${tokenMode ? '#7c4dff' : '#0b57d0'}">${overlays}</div>`;
   const legend = $('#activity-chart-legend');
-  legend.hidden = activityChartMetric === 'latency';
-  legend.innerHTML = tokenMode ? '<span><i class="token-input"></i>Input</span><span><i class="token-output"></i>Output</span><span><i class="token-cache"></i>Cache hit rate</span>' : requestMode ? '<span><i class="request-volume"></i>Requests</span><span><i class="request-errors"></i>Error rate</span>' : '';
+  legend.hidden = false;
+  legend.innerHTML = tokenMode ? '<span><i class="token-input"></i>Input</span><span><i class="token-output"></i>Output</span><span><i class="token-cache"></i>Cache hit rate</span>' : requestMode ? '<span><i class="request-volume"></i>Requests</span><span><i class="request-errors"></i>Error rate</span>' : '<span><i class="performance-throughput"></i>Throughput tok/s</span><span><i class="performance-first-byte"></i>Time to first token</span><span><i class="performance-latency"></i>Average latency</span>';
   const trend = activityTrend(buckets); const signal = $('#activity-trend-signal'); signal.textContent = trend.label; signal.className = `trend-signal ${trend.tone}`; $('#stat-request-trend').textContent = trend.short;
   const bucketSeconds = seconds / Math.max(buckets.length, 1); const interval = bucketSeconds < 3600 ? Math.round(bucketSeconds / 60) + '-minute' : bucketSeconds < 86400 ? Math.round(bucketSeconds / 3600) + '-hour' : Math.round(bucketSeconds / 86400) + '-day';
-  $('#traffic-granularity').textContent = `${interval} intervals · ${tokenMode ? 'input, output, and cache hit rate' : requestMode ? 'requests with error rate overlay' : `line shows ${activityChartMetric}`}`;
+  $('#traffic-granularity').textContent = `${interval} intervals · ${tokenMode ? 'input, output, and cache hit rate' : requestMode ? 'requests with error rate overlay' : 'generation throughput in tok/s, time to first token, and average latency'}`;
   const nonEmpty = buckets.reduce((last, bucket, index) => bucket.requests ? index : last, -1); inspectActivityBucket(nonEmpty >= 0 ? nonEmpty : buckets.length - 1);
 }
 function renderProviderStats(target, items, totalRequests) {
@@ -1885,9 +2038,16 @@ function renderApiKeyStats(target, items, totalRequests) {
   }).join('') : '<div class="activity-empty">No API key activity in this period.</div>';
 }
 function modelSuccessTone(successRate) { return successRate >= 99 ? 'model-healthy' : successRate >= 95 ? 'model-warning' : 'model-critical'; }
+function renderModelDimensionCopy() {
+  const outgoing = activityModelDimension === 'outgoing';
+  $('#model-dimension-column').textContent = outgoing ? 'Outgoing model' : 'Incoming model';
+  $('#model-analysis-note').textContent = outgoing
+    ? 'Usage efficiency and estimated or reported value grouped by the model ID Yabane sent to the Provider. Requests without a recorded model ID are grouped as Not recorded.'
+    : 'Usage efficiency and estimated or reported value grouped by the model name clients requested.';
+}
 function renderModelStats(target, items, totalRequests) {
   $('#model-count').textContent = `${items.length.toLocaleString()} model${items.length === 1 ? '' : 's'}`;
-  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = pricedRequestCount(item); return `<tr><td data-label="Model"><code>${escapeHtml(item.name)}</code><small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Usage value"><strong>${formatTrackedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg · ` : ''}${costCoverageLabel(item)}</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
+  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = pricedRequestCount(item); return `<tr><td data-label="${activityModelDimension === 'outgoing' ? 'Outgoing model' : 'Incoming model'}">${item.name ? `<code>${escapeHtml(item.name)}</code>` : '<span class="activity-model-unavailable">Not recorded</span>'}<small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Usage value"><strong>${formatTrackedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg · ` : ''}${costCoverageLabel(item)}</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
 }
 function statusBadge(status) { const success = status >= 200 && status < 400; return `<span class="status-badge ${success ? 'success' : 'failure'}"><i></i>${status}</span>`; }
 function failureLabel(log) { return log.failure?.message || (log.status >= 400 ? `HTTP ${log.status}` : ''); }
@@ -1898,16 +2058,32 @@ function activityModelCell(log, detailed) {
     ? '<span class="activity-model-unavailable">Not recorded</span>'
     : upstreamModel === log.model
       ? '<span class="activity-model-unchanged">Same model ID</span>'
-      : `<code title="Model sent to Provider">${escapeHtml(upstreamModel)}</code>`;
-  return `<span class="activity-model activity-model-route"><span class="activity-model-leg"><b>Client</b><code title="Model requested by client">${escapeHtml(log.model)}</code></span><span class="activity-model-leg activity-upstream-model"><b>Provider</b>${providerValue}</span>${detailed ? `<small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small>` : ''}</span>`;
+      : `<code title="Model sent to the Provider">${escapeHtml(upstreamModel)}</code>`;
+  return `<span class="activity-model activity-model-route"><span class="activity-model-leg"><b>Incoming</b><code title="Model name sent by the caller">${escapeHtml(log.model)}</code></span><span class="activity-model-leg activity-upstream-model"><b>Outgoing</b>${providerValue}</span>${detailed ? `<small title="${escapeHtml(log.request_id)}">${escapeHtml(log.request_id)}</small>` : ''}</span>`;
 }
 function activityRow(log, detailed = false, index = -1) {
   const tokens = log.input_tokens + log.output_tokens; const time = new Date(log.timestamp * 1000);
   const conversion = log.caller_protocol && log.upstream_protocol && log.caller_protocol !== log.upstream_protocol ? ` · ${log.caller_protocol.replace('openai_', '').replace('_completions', '')} → ${log.upstream_protocol.replace('openai_', '').replace('_completions', '')}` : '';
   const modelCell = activityModelCell(log, detailed);
   const costSource = log.cost == null ? '' : log.cost_source === 'estimated' ? ' · estimated' : ' · reported';
-  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td><span class="activity-status-cell">${statusBadge(log.status)}${log.failure ? `<small title="${escapeHtml(failureLabel(log))}">${escapeHtml(failureLabel(log))}</small>` : ''}</span></td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number" title="${log.cost == null ? 'No cost available' : log.cost_source === 'estimated' ? 'Yabane estimated usage value' : 'Reported by upstream'}">${formatCost(log.cost)}${costSource}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
+  const row = detailed ? `<td><span class="activity-time"><strong>${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}</strong><small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)} <i>→</i> ${escapeHtml(log.endpoint)}</strong><small>Provider to Endpoint</small></span></td><td><span class="api-kind">${escapeHtml(compactPath(log.path))}${log.streaming ? ' · stream' : ''}${escapeHtml(conversion)}</span></td><td><span class="activity-status-cell">${statusBadge(log.status)}${log.failure ? `<small title="${escapeHtml(failureLabel(log))}">${escapeHtml(failureLabel(log))}</small>` : ''}</span></td><td><strong class="activity-number">${formatDuration(log.latency_ms)}</strong></td><td><span class="activity-number">${compactNumber(log.input_tokens)}</span></td><td><span class="activity-number activity-output">${compactNumber(log.output_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number">${compactNumber(log.cached_tokens)}</span></td><td class="activity-secondary-column"><span class="activity-number" title="${log.cost == null ? 'No cost available' : log.cost_source === 'estimated' ? 'Yabane estimated usage value' : 'Reported by the Provider'}">${formatCost(log.cost)}${costSource}</span></td>` : `<td><span class="activity-time">${time.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'})}<small>${time.toLocaleDateString()}</small></span></td><td>${modelCell}</td><td><span class="route-cell"><strong>${escapeHtml(log.provider)}</strong><small>${escapeHtml(log.endpoint)} · ${escapeHtml(compactPath(log.path))}${escapeHtml(conversion)}</small></span></td><td>${statusBadge(log.status)}</td><td>${log.latency_ms.toLocaleString()} ms</td><td><strong>${compactNumber(tokens)}</strong><small class="token-detail">${compactNumber(log.input_tokens)} in · ${compactNumber(log.output_tokens)} out</small></td>`;
   return `<tr class="activity-request-row" data-activity-index="${index}" tabindex="0" aria-label="Open details for ${escapeHtml(log.model)} request">${row}</tr>`;
+}
+function pricingSourceText(source) {
+  const scope = {global: 'Global', provider: 'Provider', endpoint: 'Endpoint'}[source.scope] || source.scope;
+  return `${scope} ${source.name === 'incoming' ? 'incoming' : 'outgoing'} rule “${source.pattern}”`;
+}
+function pricingSourceSummary(sources) {
+  if (!sources) return '';
+  const grouped = new Map();
+  for (const [field, label] of [['input', 'Input'], ['output', 'Output'], ['cache_read', 'Cache read']]) {
+    const source = sources[field];
+    if (!source) continue;
+    const key = `${source.scope}|${source.name}|${source.pattern}`;
+    if (!grouped.has(key)) grouped.set(key, {source, fields: []});
+    grouped.get(key).fields.push(label);
+  }
+  return [...grouped.values()].map(({source, fields}) => `${fields.length > 2 ? `${fields.slice(0, -1).join(', ')}, and ${fields.at(-1)}` : fields.join(' and ')} from the ${pricingSourceText(source)}`).join('; ');
 }
 function formatDuration(milliseconds) { return milliseconds == null ? 'Not available' : milliseconds >= 1000 ? `${(milliseconds / 1000).toFixed(milliseconds >= 10000 ? 1 : 2)} s` : `${milliseconds.toLocaleString()} ms`; }
 function protocolLabel(protocol) {
@@ -1922,9 +2098,9 @@ function openActivityDetail(log) {
   $('#activity-detail-model').textContent = log.model; $('#activity-detail-time').textContent = new Date(log.timestamp * 1000).toLocaleString(); $('#activity-detail-status').innerHTML = statusBadge(log.status);
   $('#activity-detail-route').textContent = `Provider ${log.provider} · Endpoint ${log.endpoint}`; $('#activity-detail-api').textContent = `Client API ${protocolLabel(log.caller_protocol)}${log.streaming ? ' · Streaming' : ''}`; $('#activity-detail-total').textContent = formatDuration(total);
   const upstreamModel = log.upstream_model || 'Not available (older record)'; const modelUnchanged = log.upstream_model && log.model === log.upstream_model;
-  $('#activity-detail-model-route').innerHTML = `<div><span>Client requested</span><code>${escapeHtml(log.model)}</code><small>Model ID received by Yabane</small></div><span class="activity-model-route-arrow" aria-hidden="true">${icon('arrow-right')}</span><div><span>Sent to Provider</span><code id="activity-detail-upstream-model">${escapeHtml(upstreamModel)}</code><small>Final model ID in the Provider request</small></div>`;
+  $('#activity-detail-model-route').innerHTML = `<div><span>Incoming model</span><code>${escapeHtml(log.model)}</code><small>Model name received by Yabane</small></div><span class="activity-model-route-arrow" aria-hidden="true">${icon('arrow-right')}</span><div><span>Outgoing model</span><code id="activity-detail-upstream-model">${escapeHtml(upstreamModel)}</code><small>Model ID Yabane sent to the Provider</small></div>`;
   const modelOutcome = $('#activity-detail-model-outcome');
-  modelOutcome.textContent = !log.upstream_model ? 'Provider model not recorded' : modelUnchanged ? 'Model ID unchanged' : 'Model ID changed';
+  modelOutcome.textContent = !log.upstream_model ? 'Outgoing model not recorded' : modelUnchanged ? 'Model ID unchanged' : 'Model ID changed';
   modelOutcome.className = `activity-model-outcome ${!log.upstream_model ? 'unavailable' : modelUnchanged ? 'unchanged' : 'changed'}`;
   const clientProtocol = protocolLabel(log.caller_protocol); const providerProtocol = protocolLabel(log.upstream_protocol); const protocolUnchanged = log.caller_protocol && log.caller_protocol === log.upstream_protocol;
   $('#activity-detail-api-route').innerHTML = `<div><span>Client API</span><strong>${escapeHtml(clientProtocol)}</strong><small>Format received by Yabane</small></div><div><span>Provider API</span><strong>${escapeHtml(providerProtocol)}</strong><small class="activity-routing-result ${protocolUnchanged ? 'unchanged' : ''}">${protocolUnchanged ? 'No API conversion' : log.upstream_protocol ? 'Converted by Yabane' : 'Not recorded'}</small></div>`;
@@ -1932,20 +2108,23 @@ function openActivityDetail(log) {
   const failure = $('#activity-detail-failure'); const failureMessage = log.failure?.message; const failureCategory = log.failure?.category; failure.hidden = !failureMessage; failure.querySelector('p').textContent = failureMessage || ''; failure.querySelector('small').textContent = failureCategory === 'proxy_connect_failed' ? 'Check that the proxy is reachable. If HTTPS works with socks5h but not socks5, let the proxy resolve target hostnames.' : 'Use the request ID below to match this failure with server logs if more detail is needed.';
   const stages = [];
   if (gateway != null) stages.push({label: 'Gateway processing', detail: 'Route and prepare request', start: 0, duration: gateway, color: '#0b57d0', icon: 'route'});
-  if (upstreamHeaders != null) stages.push({label: 'Upstream response', detail: 'Connect and await headers', start: gateway || 0, duration: upstreamHeaders, color: '#009b84', icon: 'provider'});
+  if (upstreamHeaders != null) stages.push({label: 'Provider response', detail: 'Connect and await headers', start: gateway || 0, duration: upstreamHeaders, color: '#009b84', icon: 'provider'});
   if (firstByte != null && headersAt != null && firstByte > headersAt) stages.push({label: 'First body byte', detail: 'Wait after response headers', start: headersAt, duration: firstByte - headersAt, color: '#168c9a', icon: 'pulse'});
   if (generation != null) stages.push({label: 'Generation', detail: 'Read response body', start: firstByte ?? Math.max(total - generation, 0), duration: generation, color: '#7c4dff', icon: 'arrow-right'});
   const accountedUntil = stages.reduce((end, stage) => Math.max(end, stage.start + stage.duration), 0);
   if (accountedUntil < total) stages.push({label: 'Response completion', detail: 'Remaining response processing', start: accountedUntil, duration: total - accountedUntil, color: '#697386', icon: 'clock'});
   $('#activity-detail-timing').innerHTML = `<div class="timeline-axis"><span>Stage</span><div class="timeline-scale"><span>0</span><span>${escapeHtml(formatDuration(total / 2))}</span><span>${escapeHtml(formatDuration(total))}</span></div><span>Duration</span></div>${stages.map(stage => { const left = Math.min(100, stage.start * 100 / Math.max(total, 1)); const width = Math.max(0, Math.min(100 - left, stage.duration * 100 / Math.max(total, 1))); return `<div class="timeline-stage"><div class="timeline-stage-label"><span class="timeline-stage-icon" style="--stage-color:${stage.color}">${icon(stage.icon)}</span><div><strong>${escapeHtml(stage.label)}</strong><small>${escapeHtml(stage.detail)}</small></div></div><div class="timeline-track" aria-hidden="true"><span class="timeline-stage-bar" style="--stage-left:${left}%;--stage-width:${width}%;--stage-color:${stage.color}"></span></div><strong>${escapeHtml(formatDuration(stage.duration))}</strong></div>`; }).join('')}`;
-  const costLabel = log.cost_source === 'estimated' ? 'Estimated usage value' : log.cost == null ? 'Cost' : 'Upstream reported cost';
-  const canEditPricing = log.cost == null && log.upstream_model && providers.some(provider => provider.id === log.provider && provider.endpoints.some(endpoint => endpoint.id === log.endpoint));
-  const canRefreshCost = log.cost_source === 'estimated' || (log.cost == null && log.upstream_model);
+  const costLabel = log.cost_source === 'estimated' ? 'Estimated usage value' : log.cost == null ? 'Cost' : 'Provider-reported cost';
+  const rateSource = log.cost_source === 'estimated' ? pricingSourceSummary(log.pricing_sources) : '';
+  const canEditPricing = log.cost == null;
+  const canRefreshCost = log.cost_source === 'estimated' || log.cost == null;
   const costActions = [canEditPricing ? '<button type="button" class="text-link edit-activity-pricing">Set price</button>' : '', canRefreshCost ? '<button type="button" class="text-link refresh-activity-cost">Refresh cost</button>' : ''].filter(Boolean).join(' ');
-  $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], [costLabel, formatCost(log.cost), costActions], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value, action = '']) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${action}</div>`).join('');
+  $('#activity-detail-usage').innerHTML = [['Input tokens', compactNumber(log.input_tokens)], ['Output tokens', compactNumber(log.output_tokens)], ['Cached tokens', compactNumber(log.cached_tokens)], ['Throughput', generation && log.output_tokens ? `${(log.output_tokens * 1000 / generation).toFixed(1)} tok/s` : '—'], [costLabel, formatCost(log.cost), costActions], ['Total tokens', compactNumber(log.input_tokens + log.output_tokens)]].map(([label, value, action = '']) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong>${action}</div>`).join('') + (rateSource ? `<div class="activity-pricing-source"><span>Rate source</span><strong>${escapeHtml(rateSource)}</strong><small>Each estimate follows the rules saved at request time; changing prices does not rewrite existing values.</small></div>` : '');
   $('#activity-detail-usage .edit-activity-pricing')?.addEventListener('click', () => {
     dialog.close();
-    openPricingEditor(log.provider, log.endpoint, log.upstream_model);
+    showView('pricing');
+    // The caller's model name is always recorded, and one such price covers every destination of an alias.
+    openCentralPricingEditor({scope: 'global', name: 'incoming', model: log.model, providerId: log.provider, endpointId: log.endpoint});
   });
   $('#activity-detail-usage .refresh-activity-cost')?.addEventListener('click', async () => {
     dialog.close();
@@ -1991,7 +2170,7 @@ async function loadActivity(requestedLogLimit) {
   }
   activityLoadPromise = (async () => {
     const range = selectedActivityRange(); const {seconds, since, until, bucketCount, pageUntil} = range; activityPageSince = since; activityPageUntil = pageUntil;
-    const statsParams = addActivityFilterParams(new URLSearchParams({since, until, buckets: bucketCount}));
+    const statsParams = addActivityFilterParams(new URLSearchParams({since, until, buckets: bucketCount, model_dimension: activityModelDimension}));
     const logsParams = addActivityFilterParams(new URLSearchParams({since, until: pageUntil, limit: logLimit}));
     const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?${statsParams}`).then(response => response.json()), fetch(`/admin/activity/logs?${logsParams}`).then(response => response.json())]);
     activityOverviewLogs = logs; activityLogsLimit = logLimit;
@@ -2000,7 +2179,7 @@ async function loadActivity(requestedLogLimit) {
     $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
     $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = formatTrackedCost(totals.cost, totals.priced); $('#stat-cost-coverage').textContent = costCoverageLabel(totals, requests); $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
     $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
-    renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelStats($('#model-stats'), stats.by_model, requests);
+    renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelDimensionCopy(); renderModelStats($('#model-stats'), stats.by_model, requests);
     $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
     activityFilterOptions = stats.filter_options || {providers: [], models: [], api_keys: []};
     renderActivityFilterOptions();
@@ -2023,7 +2202,7 @@ $('#activity-search').addEventListener('input', () => { clearTimeout(activitySea
 $('#activity-status-filter').addEventListener('change', () => { activityPage = 0; loadActivityPage(); });
 $('#activity-page-previous').addEventListener('click', () => { if (activityPage > 0) { activityPage--; loadActivityPage(); } });
 $('#activity-page-next').addEventListener('click', () => { if ((activityPage + 1) * ACTIVITY_PAGE_SIZE < activityPageTotal) { activityPage++; loadActivityPage(); } });
-$('.chart-metric-picker').addEventListener('click', event => { const button = event.target.closest('[data-chart-metric]'); if (!button) return; activityChartMetric = button.dataset.chartMetric; $$('.chart-metric-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); renderActivityChart(); });
+$('#chart-metric-picker').addEventListener('click', event => { const button = event.target.closest('[data-chart-metric]'); if (!button) return; activityChartMetric = button.dataset.chartMetric; $$('#chart-metric-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); }); renderActivityChart(); });
 $('#activity-chart').addEventListener('pointerover', event => { const column = event.target.closest('.chart-column'); if (column) { inspectActivityBucket(Number(column.dataset.chartIndex)); selectActivityChartSeries(column, event.clientY); } });
 $('#activity-chart').addEventListener('pointermove', event => { const column = event.target.closest('.chart-column'); if (column) selectActivityChartSeries(column, event.clientY); });
 $('#activity-chart').addEventListener('focusin', event => { const column = event.target.closest('.chart-column'); if (column) inspectActivityBucket(Number(column.dataset.chartIndex)); });
@@ -2090,8 +2269,8 @@ async function recalculateActivityCosts(requestId = null, sourceInstanceId = nul
   const button = $('#refresh-missing-costs');
   const status = $('#activity-cost-refresh-status');
   const message = requestId
-    ? 'Recalculate this Activity cost using current explicit pricing? Official upstream costs will not change.'
-    : 'Recalculate every retained non-reported Activity cost using current explicit pricing? Official upstream costs will not change.';
+    ? 'Recalculate this Activity cost using current explicit pricing? Official Provider costs will not change.'
+    : 'Recalculate every retained non-reported Activity cost using current explicit pricing? Official Provider costs will not change.';
   if (!confirm(message)) return;
   if (button) button.disabled = true;
   if (status) status.textContent = 'Refreshing costs…';
@@ -2118,6 +2297,15 @@ async function recalculateActivityCosts(requestId = null, sourceInstanceId = nul
 }
 
 async function resetAndLoadActivity() { if (activityLoadPromise) await activityLoadPromise; activityLogsLimit = 0; activityPage = 0; activityPageSince = 0; activityPageUntil = 0; return loadActivity(); }
+async function reloadActivityOverview() { if (activityLoadPromise) await activityLoadPromise; activityLogsLimit = 0; return loadActivity(); }
+$('#model-dimension-picker').addEventListener('click', event => {
+  const button = event.target.closest('[data-model-dimension]');
+  if (!button || button.dataset.modelDimension === activityModelDimension) return;
+  activityModelDimension = button.dataset.modelDimension;
+  $$('#model-dimension-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
+  renderModelDimensionCopy();
+  reloadActivityOverview();
+});
 $('#refresh-activity').addEventListener('click', resetAndLoadActivity);
 $('#refresh-missing-costs').addEventListener('click', () => recalculateActivityCosts());
 const activityDataDialog = $('#activity-data-dialog');
@@ -2234,7 +2422,7 @@ async function loadDashboard() {
       item.addEventListener('click', () => { selectedProviderId = providerStat.name; showView('providers'); }); return item;
     });
     if (providerItems.length) $('#home-providers').replaceChildren(...providerItems);
-    else $('#home-providers').innerHTML = `<div class="home-providers-empty">${icon('provider')}<strong>No provider traffic</strong><p>Connect an upstream Endpoint or send a request to populate this view.</p><button class="button secondary" type="button">Manage providers</button></div>`;
+    else $('#home-providers').innerHTML = `<div class="home-providers-empty">${icon('provider')}<strong>No provider traffic</strong><p>Connect an Endpoint or send a request to populate this view.</p><button class="button secondary" type="button">Manage providers</button></div>`;
     $('#home-providers .home-providers-empty .button')?.addEventListener('click', () => openHomeView('providers'));
     const keyItems = (stats.by_api_key || []).slice(0, 4);
     $('#home-api-keys').innerHTML = keyItems.length ? keyItems.map(item => `<div class="home-key"><span>${icon('key')}</span><div><strong>${escapeHtml(item.name)}</strong><code>${escapeHtml(item.prefix || 'Unattributed')}</code></div><b>${item.requests.toLocaleString()}</b></div>`).join('') : '<div class="home-keys-empty">No API key traffic in the last 24 hours.</div>';
@@ -2270,6 +2458,9 @@ $$('.copy-extension-command').forEach(button => button.addEventListener('click',
   setTimeout(() => { button.textContent = original; }, 1200);
 }));
 
+const extensionHookNames = {upstream_request: 'Provider request', upstream_headers: 'Provider headers', upstream_exchange: 'Provider exchange'};
+function extensionHookLabel(hook) { return extensionHookNames[hook] || hook.replaceAll('_', ' '); }
+
 function renderExtensions() {
   const list = $('#extensions-list');
   if (!extensions.length) { list.innerHTML = '<section class="card empty extensions-empty"><h3>No extensions in this build</h3><p>The commands above show how to include bundled Extensions in the next build.</p></section>'; return; }
@@ -2279,7 +2470,7 @@ function renderExtensions() {
     const subscriptionEndpoints = extension.id === 'openai-subscription' ? providers.reduce((count, provider) => count + provider.endpoints.filter(endpoint => endpoint.api_type === 'openai_codex').length, 0) : 0;
     const configured = extension.id === 'request-defaults' ? `${configuredProviders.length} Provider${configuredProviders.length === 1 ? '' : 's'}` : extension.id === 'openai-subscription' ? `${subscriptionEndpoints} Endpoint${subscriptionEndpoints === 1 ? '' : 's'}` : 'On demand';
     const footer = extension.id === 'request-defaults' ? `<footer><div><strong>Configured in Provider context</strong><p>Header and body defaults remain next to the Provider and Endpoint resources they affect.${extension.enabled ? '' : ' They are retained while this Extension is disabled.'}</p></div>${configuredProviders.length ? `<div class="extension-provider-links">${configuredProviders.map(provider => `<button class="text-link" type="button" data-extension-provider="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</button>`).join('')}</div>` : '<button class="button secondary extension-open-providers" type="button">Choose a Provider</button>'}</footer>` : extension.id === 'traffic-capture' ? `<footer><div><strong>Sensitive diagnostic data</strong><p>Capture is stopped by default. Credentials are always redacted and content remains separate from Activity.</p></div><button class="button secondary open-traffic-capture" type="button" ${extension.enabled ? '' : 'disabled'}>Configure capture</button></footer>` : '';
-    return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(hook => hook.replaceAll('_', ' ')).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
+    return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(extensionHookLabel).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
   }).join('');
   $$('[data-extension-toggle]').forEach(toggle => toggle.addEventListener('change', async () => {
     const extensionId = toggle.dataset.extensionToggle;
@@ -2331,7 +2522,7 @@ function renderTrafficCapture() {
   [...form.elements].forEach(element => { element.disabled = active; }); form.querySelector('[type="submit"]').hidden = active; form.classList.toggle('capture-form-locked', active); renderCaptureScopeSummary();
   $('#stop-capture').hidden = !active; $('#capture-count').textContent = trafficCaptureStatus.retained; $('#capture-dropped').textContent = trafficCaptureStatus.dropped;
   $('#captures-empty').hidden = trafficCaptures.length > 0; $('#capture-list-head').hidden = trafficCaptures.length === 0; $('#delete-all-captures').disabled = !trafficCaptures.length;
-  $('#captures-list').innerHTML = trafficCaptures.map(capture => { const failed = capture.status == null || capture.status >= 400 || capture.outcome !== 'complete' || capture.truncated; return `<button class="capture-row${failed ? ' capture-row-attention' : ''}" type="button" data-capture-id="${escapeHtml(capture.request_id)}"><span><strong>${escapeHtml(capture.public_model)}</strong><code>${escapeHtml(capture.request_id)}</code><small>${new Date(capture.timestamp * 1000).toLocaleString()}</small></span><span>${escapeHtml(capture.provider_id)} → ${escapeHtml(capture.endpoint_id)}</span>${captureStatus(capture)}<span title="Upstream duration"><strong>${capture.duration_ms == null ? '—' : escapeHtml(formatDuration(capture.duration_ms))}</strong><small>${Math.ceil(capture.bytes / 1024).toLocaleString()} KiB</small></span></button>`; }).join('');
+  $('#captures-list').innerHTML = trafficCaptures.map(capture => { const failed = capture.status == null || capture.status >= 400 || capture.outcome !== 'complete' || capture.truncated; return `<button class="capture-row${failed ? ' capture-row-attention' : ''}" type="button" data-capture-id="${escapeHtml(capture.request_id)}"><span><strong>${escapeHtml(capture.public_model)}</strong><code>${escapeHtml(capture.request_id)}</code><small>${new Date(capture.timestamp * 1000).toLocaleString()}</small></span><span>${escapeHtml(capture.provider_id)} → ${escapeHtml(capture.endpoint_id)}</span>${captureStatus(capture)}<span title="Provider duration"><strong>${capture.duration_ms == null ? '—' : escapeHtml(formatDuration(capture.duration_ms))}</strong><small>${Math.ceil(capture.bytes / 1024).toLocaleString()} KiB</small></span></button>`; }).join('');
 }
 async function loadTrafficCapture() {
   const [statusResponse, capturesResponse] = await Promise.all([fetch('/admin/extensions/traffic-capture/status'), fetch('/admin/extensions/traffic-capture/captures')]);
@@ -2458,7 +2649,7 @@ function renderCaptureBody(body, protocol, canAssemble) {
 }
 function renderCaptureDetail(direction) {
   const response = direction === 'response'; $$('.capture-direction-tabs button').forEach(button => { const active = button.dataset.captureDirection === direction; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
-  $('#capture-detail-headers-title').textContent = `${response ? 'Received from upstream' : 'Sent to upstream'} · Headers`; $('#capture-detail-body-title').textContent = `${response ? 'Received from upstream' : 'Sent to upstream'} · Body`;
+  $('#capture-detail-headers-title').textContent = `${response ? 'Received from Provider' : 'Sent to Provider'} · Headers`; $('#capture-detail-body-title').textContent = `${response ? 'Received from Provider' : 'Sent to Provider'} · Body`;
   const headers = response ? selectedCapture.response_headers : selectedCapture.request_headers; const body = captureBytes(response ? selectedCapture.response_body : selectedCapture.request_body); const truncated = response ? selectedCapture.response_truncated : selectedCapture.request_truncated;
   $('#capture-detail-headers').innerHTML = headers.map(header => `<span class="syntax-key">${escapeHtml(header.name)}</span>: ${escapeHtml(header.value)}`).join('\n') || '(none)'; $('#capture-detail-truncated').hidden = !truncated; renderCaptureBody(body, selectedCapture.upstream_protocol, response && !truncated && selectedCapture.outcome === 'complete'); resetCaptureDetailScroll();
 }
@@ -2468,7 +2659,7 @@ async function copyCaptureText(button, text) {
 }
 async function openCaptureDetail(requestId) {
   const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(requestId)}`); if (!response.ok) return;
-  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} upstream`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
+  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} at the Provider`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
 }
 $('#captures-list').addEventListener('click', event => { const row = event.target.closest('[data-capture-id]'); if (row) openCaptureDetail(row.dataset.captureId); });
 $$('.capture-direction-tabs button').forEach(button => button.addEventListener('click', () => renderCaptureDetail(button.dataset.captureDirection)));
@@ -2490,8 +2681,8 @@ async function loadPricing() {
   ]);
   globalPricing = await pricingResponse.json();
   if (activityResponse.ok) pricingActivityModels = (await activityResponse.json())
-    .filter(log => log.upstream_model)
-    .map(log => ({model: log.upstream_model, providerId: log.provider, endpointId: log.endpoint}));
+    .filter(log => log.upstream_model || log.model)
+    .map(log => ({model: log.upstream_model || '', incomingModel: log.model || '', providerId: log.provider, endpointId: log.endpoint}));
   if (!$('#pricing-view').hidden) renderPricingPage();
 }
 async function loadRoutes() { const response = await fetch('/admin/routes'); modelRoutes = await response.json(); renderRoutes(); if (!$('#pricing-view').hidden) renderPricingPage(); }

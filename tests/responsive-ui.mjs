@@ -115,6 +115,13 @@ for (const project of projects) {
         provider: 'ui-subscription', endpoint: 'chatgpt', caller_protocol: 'anthropic_messages', upstream_protocol: 'openai_responses',
         status: 200, latency_ms: 120, gateway_ms: 4, upstream_response_ms: 20, first_byte_ms: 30, generation_ms: 90,
         input_tokens: 120, output_tokens: 40, cached_tokens: 20, cost: null, finish_reason: 'completed', streaming: false,
+      }, {
+        timestamp: Math.floor(Date.now() / 1000) - 2, request_id: `ui-priced-alias-${project.name}`,
+        path: '/v1/messages', model: 'priced-alias', upstream_model: 'alias-sent-two',
+        provider: 'ui-subscription', endpoint: 'chatgpt', caller_protocol: 'anthropic_messages', upstream_protocol: 'anthropic_messages',
+        status: 200, latency_ms: 90, gateway_ms: 3, upstream_response_ms: 15, first_byte_ms: 20, generation_ms: 70,
+        input_tokens: 1000, output_tokens: 100, cached_tokens: 0, cost: 0.0033, cost_source: 'estimated', finish_reason: 'end_turn', streaming: false,
+        pricing_sources: {input: {scope: 'global', pattern: 'priced-alias', name: 'incoming'}, output: {scope: 'provider', pattern: 'alias-sent-two', name: 'outgoing'}},
       });
       await route.fulfill({response, json: body});
     });
@@ -127,6 +134,21 @@ for (const project of projects) {
 
     await page.goto(`${base}/docs`, {waitUntil: 'domcontentloaded'});
     await page.locator('.docs-op').first().waitFor();
+    await assertNoUpstreamCopy(page, project.name, 'API docs');
+    const specUpstreamCopy = await page.evaluate(async () => {
+      const spec = await (await fetch('/openapi.json')).json();
+      const found = [];
+      const walk = value => {
+        if (typeof value === 'string') { if (/\bupstream\b/i.test(value)) found.push(value.replace(/\s+/g, ' ').trim().slice(0, 120)); return; }
+        if (Array.isArray(value)) { value.forEach(walk); return; }
+        if (value && typeof value === 'object') Object.values(value).forEach(walk);
+      };
+      walk(spec);
+      return [...new Set(found)];
+    });
+    // The rendered reference shows one operation at a time, so scan every spec string
+    // value (descriptions, summaries, examples) instead of only the initially visible page.
+    if (specUpstreamCopy.length) throw new Error(`${project.name}: OpenAPI prose still shows ambiguous "upstream" wording: ${JSON.stringify(specUpstreamCopy)}`);
     await assertNoPageOverflow(page, project.name, 'API docs');
     if (project.width > 900) {
       const docsScroll = await page.locator('#docs-nav').evaluate(nav => {
@@ -167,6 +189,7 @@ for (const project of projects) {
       if (authAnimations.some(name => name !== 'none')) throw new Error(`${project.name}: authentication background ignores reduced-motion preference`);
       await page.emulateMedia({ reducedMotion: 'no-preference' });
       await assertNoPageOverflow(page, project.name, 'login page');
+      await assertNoUpstreamCopy(page, project.name, 'login page');
       console.log(`${project.name}: login layout checked (authenticated dialog checks skipped)`);
       await context.close();
       continue;
@@ -244,6 +267,7 @@ for (const project of projects) {
     }
     await page.evaluate(() => document.querySelector('[data-view="extensions"]').click());
     if (await page.locator('.extension-build-commands code').allTextContents().then(values => !values.includes('cargo build --release') || !values.includes('cargo build --release --no-default-features'))) throw new Error(`${project.name}: Extensions page omits build instructions`);
+    await assertCodeChipsHugContent(page, '.extension-build-commands code', project.name, 'Extension build commands');
     const developmentLink = page.locator('.extension-development-link');
     if (!(await developmentLink.isVisible()) || await developmentLink.getAttribute('href') !== 'https://github.com/DGideas/yabane/blob/master/.agents/skills/yabane-extensions/SKILL.md') throw new Error(`${project.name}: Extensions page omits the development guide link`);
     const requestDefaultsExtension = page.locator('.extension-card').filter({hasText: 'request-defaults'});
@@ -292,7 +316,7 @@ for (const project of projects) {
     ]);
     await page.waitForFunction(() => !document.querySelector('#refresh-captures').disabled);
     if (!project.mobile) {
-      for (const heading of ['Capture', 'Route', 'Status', 'Upstream time / size']) {
+      for (const heading of ['Capture', 'Route', 'Status', 'Provider time / size']) {
         if (!(await page.locator('#capture-list-head').getByText(heading, {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture list lacks the ${heading} heading`);
       }
     }
@@ -321,7 +345,8 @@ for (const project of projects) {
       if (!dialogBox || dialogBox.width < project.width * .8 || dialogBox.height < project.height * .8) throw new Error(`${project.name}: Traffic Capture detail is still too small for captured payloads`);
     }
     await captureDialog.getByRole('tab', {name: 'Response'}).click();
-    if (!(await captureDialog.getByText(/17.7 s upstream/).isVisible()) || !(await page.locator('[data-capture-id="ui-capture"]').getByText('17.7 s', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not show upstream duration in its list and detail`);
+    if (!(await captureDialog.getByText(/17.7 s at the Provider/).isVisible()) || !(await page.locator('[data-capture-id="ui-capture"]').getByText('17.7 s', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not show Provider duration in its list and detail`);
+    await assertNoUpstreamCopy(page, project.name, 'Traffic Capture');
     const assembledTab = captureDialog.getByRole('tab', {name: 'Assembled'});
     if (!(await assembledTab.isVisible()) || await assembledTab.getAttribute('aria-selected') !== 'true') throw new Error(`${project.name}: streaming response does not default to its assembled non-streaming structure`);
     const assembledBody = captureDialog.locator('#capture-detail-body');
@@ -387,14 +412,7 @@ for (const project of projects) {
     const providerActivity = page.locator('#providers .provider-list-activity').first();
     if (!(await providerActivity.isVisible()) || !(await providerActivity.getByText(/requests · 24h/).isVisible())) throw new Error(`${project.name}: Provider list does not show its 24-hour activity sparkline`);
     if (!await providerActivity.getAttribute('aria-label').then(label => /requests? in the last 24 hours/.test(label || ''))) throw new Error(`${project.name}: Provider activity sparkline lacks an accessible request summary`);
-    const stretchedProviderLabels = await page.locator('.provider-list-main code').evaluateAll(labels => labels.filter(label => {
-      const range = document.createRange();
-      range.selectNodeContents(label);
-      const style = getComputedStyle(label);
-      const contentWidth = range.getBoundingClientRect().width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
-      return label.getBoundingClientRect().width > contentWidth + 1;
-    }).map(label => label.textContent));
-    if (stretchedProviderLabels.length) throw new Error(`${project.name}: Provider model labels stretch past their content (${stretchedProviderLabels.join(', ')})`);
+    await assertCodeChipsHugContent(page, '.provider-list-main code', project.name, 'Provider model labels');
     await page.evaluate(() => document.querySelector('[data-view="home"]').click());
     const homeCommand = page.locator('#home-view .home-command');
     if (!(await homeCommand.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its operational header or traffic visualization`);
@@ -407,18 +425,27 @@ for (const project of projects) {
       const width = chart.clientWidth;
       const expectedColumns = width >= 768 ? 48 : width >= 400 ? 24 : 12;
       const columns = [...chart.querySelectorAll('.home-chart-column')];
+      const measuredBars = columns.map(column => { const columnBox = column.getBoundingClientRect(); const barBox = column.querySelector('span').getBoundingClientRect(); return {width: barBox.width, offset: (barBox.left + barBox.width / 2) - (columnBox.left + columnBox.width / 2)}; });
       return {
         width,
         expectedColumns,
         columns: columns.length,
         representedRequests: columns.reduce((total, column) => total + Number(column.title.match(/: (\d+) request/)?.[1] || 0), 0),
         description: document.querySelector('#home-traffic-description').textContent,
+        barWidths: measuredBars.map(bar => bar.width),
+        barCenterOffsets: measuredBars.map(bar => bar.offset),
       };
     });
     if (homeChartResult.columns !== homeChartResult.expectedColumns) throw new Error(`${project.name}: ${homeChartResult.width}px Home chart renders ${homeChartResult.columns} bars instead of ${homeChartResult.expectedColumns}`);
     if (homeChartResult.representedRequests !== 48) throw new Error(`${project.name}: responsive Home chart aggregation changes the represented request total`);
     const expectedInterval = homeChartResult.expectedColumns === 48 ? '30-minute' : homeChartResult.expectedColumns === 24 ? 'Hourly' : '2-hour';
     if (!homeChartResult.description.startsWith(expectedInterval)) throw new Error(`${project.name}: responsive Home chart does not describe its ${expectedInterval} intervals`);
+    const barWidths = homeChartResult.barWidths;
+    const widestBar = Math.max(...barWidths);
+    const narrowestBar = Math.min(...barWidths);
+    if (widestBar - narrowestBar > 0.5) throw new Error(`${project.name}: Home chart bars differ in width (${narrowestBar.toFixed(2)}px to ${widestBar.toFixed(2)}px), so axis labels widen their own intervals`);
+    const misalignedBars = homeChartResult.barCenterOffsets.map(offset => Math.abs(offset)).filter(offset => offset > 0.5);
+    if (misalignedBars.length) throw new Error(`${project.name}: ${misalignedBars.length} Home chart bars are not centered on their interval (up to ${Math.max(...misalignedBars).toFixed(2)}px off)`);
 
     if (testLiveRefresh) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
@@ -427,6 +454,8 @@ for (const project of projects) {
     }
 
     await page.evaluate(() => document.querySelector('[data-view="access"]').click());
+    const modelsExample = await page.locator('#models-example-code').textContent();
+    if (modelsExample !== `curl '${base}/v1/models' \\\n  -H 'Authorization: Bearer sk-your-yabane-key'`) throw new Error(`${project.name}: GET /v1/models example does not use the current console origin as a single runnable shell command`);
     const editGatewayKey = page.locator('.edit-gateway-key').first();
     if (await editGatewayKey.isVisible()) {
       const firstKey = await page.evaluate(async () => (await (await fetch('/admin/auth')).json()).api_keys[0]);
@@ -605,6 +634,15 @@ for (const project of projects) {
       await page.locator('#endpoint-form [name="api_type"]').selectOption('openai_codex');
       if (await page.locator('#endpoint-form [name="base_url"]').isVisible()) throw new Error(`${project.name}: additional subscription Endpoint setup exposes Base URL`);
       await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      const renameKey = page.locator('.key-rename').first();
+      if (await renameKey.count()) {
+        await renameKey.click();
+        await assertDialog(page, '#key-name-dialog', project.name);
+        if (!await page.locator('#key-name-form [name="name"]').inputValue()) throw new Error(`${project.name}: Provider key rename does not prefill the current name`);
+        if (!(await page.locator('#key-name-form .field-help').textContent()).includes('model-route references')) throw new Error(`${project.name}: Provider key rename does not explain which references stay unchanged`);
+        await assertNoUpstreamCopy(page, project.name, 'Provider detail');
+        await page.locator('#key-name-dialog .close-key-name').first().click();
+      }
     }
     if (project.name === 'desktop-chrome') {
       const providerFixture = {
@@ -637,7 +675,7 @@ for (const project of projects) {
         page.waitForResponse(response => response.request().method() === 'GET' && response.url().endsWith('/admin/routes')),
         page.locator('.delete-provider').click(),
       ]);
-      if (!confirmation.includes('1 Endpoint') || !confirmation.includes('1 upstream credential') || !confirmation.includes('1 model-route destination') || !confirmation.includes('deletes 1 route left without a destination') || !confirmation.includes('revokes 1 Gateway API key scoped only to this Provider')) throw new Error(`${project.name}: Provider deletion does not explain its cascading route, credential, and Gateway key impact`);
+      if (!confirmation.includes('1 Endpoint') || !confirmation.includes('1 Provider credential') || !confirmation.includes('1 model-route destination') || !confirmation.includes('deletes 1 route left without a destination') || !confirmation.includes('revokes 1 Gateway API key scoped only to this Provider')) throw new Error(`${project.name}: Provider deletion does not explain its cascading route, credential, and Gateway key impact`);
       if (await page.locator('#routes').getByText('ui-delete-route', {exact: true}).count()) throw new Error(`${project.name}: Provider deletion leaves stale model routes rendered in the console`);
       await page.evaluate(() => document.querySelector('[data-view="pricing"]').click());
       const deletedPricingText = await page.locator('#pricing-list-page').textContent();
@@ -661,6 +699,7 @@ for (const project of projects) {
     }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
+    await assertNoUpstreamCopy(page, project.name, 'Model routing');
     const keylessDestination = page.locator('#route-targets .route-target option', {hasText: 'UI keyless fixture · local · No API key'});
     if (await keylessDestination.count() !== 1) throw new Error(`${project.name}: route editor omits an Endpoint configured without an API key`);
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
@@ -687,13 +726,35 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('[data-view="pricing"]').click());
     await page.locator('#pricing-view').waitFor({state: 'visible'});
     if (!(await page.locator('#pricing-list-page').isVisible()) || !(await page.locator('#open-pricing-editor').isVisible())) throw new Error(`${project.name}: Model pricing lacks a dedicated top-level management entry`);
+    await assertCodeChipsHugContent(page, '#pricing-table-body td:first-child code', project.name, 'Pricing model patterns');
+    const incomingChip = await page.evaluate(() => {
+      if (!Object.keys(globalPricing.incoming_models || {}).length) return null;
+      return document.querySelector('#pricing-table-body .pricing-name-chip.incoming')?.textContent.trim() || '';
+    });
+    if (incomingChip === '') throw new Error(`${project.name}: the pricing list does not mark prices for the caller's model name as Incoming`);
     await page.locator('#open-pricing-editor').click();
     if (!(await page.locator('#pricing-editor-page').isVisible()) || !(await page.locator('#pricing-list-page').isHidden())) throw new Error(`${project.name}: price editing does not use the full pricing workspace`);
     const suggestedModels = await page.locator('#pricing-model-suggestions option').evaluateAll(options => options.map(option => option.value));
     if (!suggestedModels.includes('gpt-fixture')) throw new Error(`${project.name}: pricing model input does not suggest runtime-discovered model IDs`);
     if (!suggestedModels.includes('activity-only-model')) throw new Error(`${project.name}: pricing model input does not suggest historical Activity upstream model IDs`);
     await page.locator('#pricing-model').fill('model-family-*');
-    if (!(await page.locator('#pricing-model-notice').textContent()).includes('Matches every upstream model beginning with')) throw new Error(`${project.name}: pricing model input does not explain prefix wildcard matching`);
+    if (!(await page.locator('#pricing-model-notice').textContent()).includes('Matches every Provider model beginning with')) throw new Error(`${project.name}: pricing model input does not explain prefix wildcard matching`);
+    const pricingStepHeadings = await page.locator('#central-pricing-form .pricing-editor-section h2').allTextContents();
+    if (pricingStepHeadings[0] !== 'Which model name should this price match?' || pricingStepHeadings[1] !== 'Application scope') throw new Error(`${project.name}: pricing editor asks where a price applies before which model name it prices (${JSON.stringify(pricingStepHeadings)})`);
+    const pricingFirstStep = await page.locator('#central-pricing-form').textContent();
+    if (!pricingFirstStep.includes('Outgoing model') || !pricingFirstStep.includes('Incoming model')) throw new Error(`${project.name}: pricing editor does not ask which of the two model names a price matches`);
+    if (!(await page.locator('#pricing-route-example').isHidden())) throw new Error(`${project.name}: a price for the outgoing name shows a route example that belongs to the caller's name`);
+    await page.locator('#central-pricing-form [name="price_name"][value="incoming"]').check();
+    const incomingSuggestions = await page.locator('#pricing-model-suggestions option').evaluateAll(options => options.map(option => option.value));
+    if (!incomingSuggestions.includes('activity-only-model')) throw new Error(`${project.name}: prices for the caller's model name do not suggest names recorded in Activity`);
+    await page.evaluate(() => modelRoutes.push({pattern: 'ui-incoming-route', targets: [{provider_id: 'ui-subscription', endpoint_id: 'chatgpt', api_key_id: null, upstream_model: 'gpt-fixture', weight: 100, enabled: true}]}));
+    await page.locator('#pricing-model').fill('ui-incoming-route');
+    const routeExample = await page.locator('#pricing-route-example').textContent();
+    if (!routeExample.includes('gpt-fixture') || !routeExample.includes('ui-subscription/chatgpt')) throw new Error(`${project.name}: a price for the caller's model name does not show where that name is routed (${routeExample})`);
+    if (!(await page.locator('#pricing-model-notice').textContent()).includes('no outgoing price')) throw new Error(`${project.name}: a price for the caller's model name does not explain that it only fills missing provider prices`);
+    await page.evaluate(() => modelRoutes.pop());
+    await page.locator('#central-pricing-form [name="price_name"][value="outgoing"]').check();
+    await assertNoUpstreamCopy(page, project.name, 'Model pricing');
     if (await page.locator('[name="cache_write_per_million"]').count()) throw new Error(`${project.name}: pricing editor exposes a cache-write rate that current usage cannot apply`);
     const rateInputModes = await page.locator('.pricing-money-input input').evaluateAll(inputs => inputs.map(input => ({type: input.type, inputMode: input.inputMode})));
     if (rateInputModes.some(input => input.type !== 'number' || input.inputMode !== 'decimal')) throw new Error(`${project.name}: pricing rates do not preserve validated numeric input and the mobile decimal keyboard hint`);
@@ -718,10 +779,17 @@ for (const project of projects) {
     } else if (!(await page.locator('#models-dev-reference').isHidden())) throw new Error(`${project.name}: models.dev reference panel crowds a narrow pricing editor`);
     await page.locator('#pricing-model').fill('arbitrary/vendor-model');
     if (!(await page.locator('#pricing-model-notice').textContent()).includes('will still be saved as entered')) throw new Error(`${project.name}: pricing model input does not explicitly permit arbitrary exact IDs`);
+    await page.locator('#central-pricing-form [name="price_name"][value="incoming"]').check();
+    if (!(await page.locator('#central-pricing-form [name="scope"][value="global"]').isChecked()) || !(await page.locator('#pricing-incoming-scope-note').isVisible()) || !(await page.locator('#pricing-scope-hint').textContent()).includes('nothing left to narrow') || !(await page.locator('#central-pricing-form [name="scope"][value="provider"]').isDisabled()) || !(await page.locator('#central-pricing-form [name="scope"][value="endpoint"]').isDisabled())) throw new Error(`${project.name}: picking the caller's model name first does not keep the rule Global with the reason visible`);
+    await page.locator('#central-pricing-form [name="price_name"][value="outgoing"]').check();
+    if (await page.locator('#pricing-incoming-scope-note').isVisible() || !(await page.locator('#pricing-scope-hint').textContent()).includes('narrower override') || await page.locator('#central-pricing-form [name="scope"][value="provider"]').isDisabled() || await page.locator('#central-pricing-form [name="scope"][value="endpoint"]').isDisabled()) throw new Error(`${project.name}: pricing scope stays narrowed or explained after switching to the outgoing model name`);
     await page.locator('#central-pricing-form [name="scope"][value="endpoint"]').check();
     await page.locator('#pricing-provider').selectOption('ui-subscription');
     await page.locator('#pricing-endpoint').selectOption('chatgpt');
     if (!(await page.locator('#pricing-resource-fields').isVisible()) || !(await page.locator('#pricing-endpoint-field').isVisible())) throw new Error(`${project.name}: centralized pricing cannot select an Endpoint override`);
+    if (!(await page.locator('#central-pricing-form [name="price_name"][value="incoming"]').isDisabled())) throw new Error(`${project.name}: Provider and Endpoint scopes still offer prices for the caller's model name`);
+    if (!(await page.locator('.pricing-target-options').textContent()).includes('Global only')) throw new Error(`${project.name}: the pricing editor does not explain that caller-facing prices are Global only`);
+    if (!(await page.locator('#central-pricing-form [name="price_name"][value="outgoing"]').isChecked())) throw new Error(`${project.name}: narrowing the scope leaves the unavailable price target selected`);
     await assertNoPageOverflow(page, project.name, 'Model pricing editor');
     const [cancelBox, saveBox] = await Promise.all([
       page.locator('#cancel-pricing-edit').boundingBox(),
@@ -841,13 +909,62 @@ for (const project of projects) {
       return {series: column.dataset.activeSeries, label: column.querySelector('.chart-value').textContent, pointY: column.style.getPropertyValue('--point-y'), pointColor: column.style.getPropertyValue('--point-color')};
     });
     if (outputTooltip.series !== 'output' || !outputTooltip.label.startsWith('Output ') || outputTooltip.pointY !== '180px' || outputTooltip.pointColor !== '#0b57d0') throw new Error(`${project.name}: Token timeline does not select the Output tooltip nearest the pointer (${JSON.stringify(outputTooltip)})`);
-    await page.locator('[data-chart-metric="latency"]').click();
-    if (await page.locator('[data-chart-metric="latency"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Activity timeline metric cannot be changed`);
-    if (!(await page.locator('#chart-inspector-values').getByText('Avg latency', {exact: true}).isVisible())) throw new Error(`${project.name}: Activity timeline inspector omits latency`);
+    await page.locator('[data-chart-metric="performance"]').click();
+    if (await page.locator('[data-chart-metric="performance"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Activity timeline metric cannot be changed`);
+    if (!(await page.locator('#chart-inspector-values').getByText('Avg latency', {exact: true}).isVisible()) || await page.locator('#activity-chart .first-byte-line').count() !== 1 || await page.locator('#activity-chart .throughput-line').count() !== 1) throw new Error(`${project.name}: Performance timeline omits its latency series or inspector value`);
+    if (await page.locator('#activity-chart .traffic-axis-right.performance-axis').count() !== 3 || !(await page.locator('#activity-chart-legend').textContent()).includes('tok/s') || !(await page.locator('#traffic-granularity').textContent()).includes('throughput in tok/s')) throw new Error(`${project.name}: Performance timeline does not name its throughput scale and unit`);
+    for (const label of ['Time to first token', 'Throughput']) if (!(await page.locator('#chart-inspector-values').getByText(label, {exact: true}).isVisible())) throw new Error(`${project.name}: Performance timeline inspector omits ${label}`);
+    const inspectorLabels = await page.locator('#chart-inspector-values span').allTextContents();
+    if (inspectorLabels.join(',') !== 'Requests,Input,Output,Cached input,Cache hit,Success,Avg latency,Time to first token,Throughput,Usage value') throw new Error(`${project.name}: interval details no longer group token, health, and performance values in reading order (${inspectorLabels.join(',')})`);
+    const inspectorGrid = await page.locator('#chart-inspector-values').evaluate(grid => {
+      const cells = [...grid.children].map(cell => ({box: cell.getBoundingClientRect(), bottom: getComputedStyle(cell).borderBottomWidth, right: getComputedStyle(cell).borderRightWidth}));
+      const rows = [...new Set(cells.map(cell => Math.round(cell.box.top)))].sort((first, second) => first - second);
+      return {
+        count: cells.length,
+        rows: rows.length,
+        columns: cells.filter(cell => Math.round(cell.box.top) === rows[0]).length,
+        cellsWithoutRowLine: cells.filter(cell => cell.bottom === '0px').length,
+        cellsWithoutColumnLine: cells.filter(cell => cell.right === '0px').length,
+        gridEdges: [getComputedStyle(grid).borderTopWidth, getComputedStyle(grid).borderLeftWidth].join(','),
+      };
+    });
+    const expectedColumns = project.mobile ? 2 : 5;
+    if (inspectorGrid.count !== 10 || inspectorGrid.rows * inspectorGrid.columns !== inspectorGrid.count || inspectorGrid.columns !== expectedColumns || inspectorGrid.cellsWithoutRowLine || inspectorGrid.cellsWithoutColumnLine || inspectorGrid.gridEdges !== '1px,1px') throw new Error(`${project.name}: interval details wrap into rows without their own separators (${JSON.stringify(inspectorGrid)})`);
+    const performanceTooltips = await page.locator('#activity-chart .chart-column').first().evaluate(column => {
+      column.dataset.throughputY = '30'; column.dataset.firstByteY = '120'; column.dataset.latencyY = '210';
+      const chartBox = column.closest('#activity-chart').getBoundingClientRect();
+      const inspectAt = y => {
+        column.dispatchEvent(new PointerEvent('pointerover', {bubbles: true, clientY: chartBox.top + chartBox.height * y / 250}));
+        return {series: column.dataset.activeSeries, label: column.querySelector('.chart-value').textContent, pointY: column.style.getPropertyValue('--point-y'), pointColor: column.style.getPropertyValue('--point-color')};
+      };
+      return {throughput: inspectAt(30), firstByte: inspectAt(120), latency: inspectAt(210)};
+    });
+    if (performanceTooltips.throughput.series !== 'throughput' || !performanceTooltips.throughput.label.startsWith('Throughput ') || performanceTooltips.throughput.pointY !== '30px' || performanceTooltips.throughput.pointColor !== '#7c4dff') throw new Error(`${project.name}: Performance timeline does not select the Throughput tooltip nearest the pointer (${JSON.stringify(performanceTooltips.throughput)})`);
+    if (performanceTooltips.firstByte.series !== 'first-byte' || !performanceTooltips.firstByte.label.startsWith('Time to first token ') || performanceTooltips.firstByte.pointY !== '120px' || performanceTooltips.firstByte.pointColor !== '#168c9a') throw new Error(`${project.name}: Performance timeline does not select the Time to first token tooltip nearest the pointer (${JSON.stringify(performanceTooltips.firstByte)})`);
+    if (performanceTooltips.latency.series !== 'latency' || !performanceTooltips.latency.label.startsWith('Average latency ') || performanceTooltips.latency.pointY !== '210px' || performanceTooltips.latency.pointColor !== '#0b57d0') throw new Error(`${project.name}: Performance timeline does not select the Average latency tooltip nearest the pointer (${JSON.stringify(performanceTooltips.latency)})`);
+    // A series the Provider never measured must break instead of plotting a zero.
+    const unmeasured = await page.evaluate(() => {
+      activityChartBuckets = [{start: 0, requests: 0, tokens: 0, input: 0, output: 0, cached: 0, cost: 0, latency: 0, samples: 0, first_byte: 0, first_byte_samples: 0, generation: 0, generation_tokens: 0, generation_samples: 0, successful: 0, errors: 0, priced_requests: 0, reported_requests: 0, estimated_requests: 0}, {start: 1800, requests: 2, tokens: 120, input: 20, output: 100, cached: 0, cost: 0, latency: 4000, samples: 2, first_byte: 800, first_byte_samples: 2, generation: 2400, generation_tokens: 100, generation_samples: 2, successful: 2, errors: 0, priced_requests: 0, reported_requests: 0, estimated_requests: 0}];
+      renderActivityChart(activityChartBuckets, 3600);
+      const chart = document.querySelector('#activity-chart');
+      const columns = [...chart.querySelectorAll('.chart-column')];
+      return {
+        firstByteGap: (chart.querySelector('.first-byte-line').getAttribute('d').match(/M/g) || []).length,
+        throughputGap: (chart.querySelector('.throughput-line').getAttribute('d').match(/M/g) || []).length,
+        latencyPath: chart.querySelector('.traffic-line').getAttribute('d'),
+        emptyMeasured: columns[0].dataset.measured,
+        emptyThroughput: columns[0].dataset.throughputValue,
+        emptyHasMarker: getComputedStyle(columns[0], '::after').display,
+        filledThroughput: columns[1].dataset.throughputValue,
+      };
+    });
+    if (unmeasured.firstByteGap !== 1 || unmeasured.throughputGap !== 1 || unmeasured.latencyPath.includes(' C')) throw new Error(`${project.name}: Performance timeline draws a line for an interval the Provider never measured (${JSON.stringify(unmeasured)})`);
+    if (unmeasured.emptyMeasured !== 'false' || unmeasured.emptyThroughput !== 'Not available' || unmeasured.emptyHasMarker !== 'none') throw new Error(`${project.name}: Performance timeline reports a fabricated value or marker for an unmeasured interval (${JSON.stringify(unmeasured)})`);
+    if (!unmeasured.filledThroughput.startsWith('41.7') || !unmeasured.filledThroughput.endsWith('tok/s')) throw new Error(`${project.name}: Performance timeline does not report measured generation throughput (${unmeasured.filledThroughput})`);
     const successTones = await page.evaluate(() => [modelSuccessTone(99.4), modelSuccessTone(97), modelSuccessTone(94.9)]);
     if (successTones.join(',') !== 'model-healthy,model-warning,model-critical') throw new Error(`${project.name}: model success-rate severity does not distinguish healthy, warning, and critical rates`);
     const modelTable = page.locator('.model-analysis-table');
-    if (!(await modelTable.locator('th', {hasText: 'Input cache hit'}).count()) || !(await modelTable.locator('th', {hasText: 'Usage value'}).count())) throw new Error(`${project.name}: per-model analysis omits cache efficiency or usage value`);
+    if (!(await modelTable.locator('th', {hasText: 'Input cache hit'}).count()) || !(await modelTable.locator('th', {hasText: 'Usage value'}).count()) || !(await modelTable.locator('th', {hasText: 'Incoming model'}).count())) throw new Error(`${project.name}: per-model analysis omits cache efficiency, usage value, or the incoming model name`);
     if (!(await page.locator('.api-key-analysis-panel').isVisible())) throw new Error(`${project.name}: Activity overview omits Gateway API key analytics`);
     const modelRow = page.locator('#model-stats tr').first();
     if (await modelRow.count()) {
@@ -858,6 +975,25 @@ for (const project of projects) {
       const modelLayout = await page.locator('.model-analysis-wrap').evaluate(element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth}));
       if (modelLayout.scrollWidth > modelLayout.clientWidth + 1) throw new Error(`${project.name}: per-model analysis hides metrics behind horizontal scrolling`);
     }
+    const modelDimensionPicker = page.locator('#model-dimension-picker');
+    if (!(await modelDimensionPicker.isVisible()) || await page.locator('#model-dimension-column').textContent() !== 'Incoming model' || !(await page.locator('#model-analysis-note').textContent()).includes('clients requested')) throw new Error(`${project.name}: Model analysis does not offer grouping by the incoming or outgoing model name`);
+    if (await modelDimensionPicker.locator('[data-model-dimension="incoming"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Model analysis does not start grouped by the model name clients requested`);
+    const outgoingStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?') && response.url().includes('model_dimension=outgoing'));
+    await modelDimensionPicker.locator('[data-model-dimension="outgoing"]').click();
+    await outgoingStats;
+    await page.waitForFunction(() => document.querySelector('#model-dimension-column')?.textContent === 'Outgoing model');
+    if (await modelDimensionPicker.locator('[data-model-dimension="incoming"]').getAttribute('aria-pressed') !== 'false' || !(await page.locator('#model-analysis-note').textContent()).includes('sent to the Provider')) throw new Error(`${project.name}: Model analysis does not explain grouping by the model sent to the Provider`);
+    const outgoingRows = await page.locator('#model-stats tr').allTextContents();
+    if (outgoingRows.some(row => row.includes('priced-alias')) || outgoingRows.filter(row => row.includes('alias-sent')).length < 1) throw new Error(`${project.name}: grouping by the sent model keeps the caller-only name or loses the sent model (${JSON.stringify(outgoingRows)})`);
+    if (await page.locator('#model-stats tr').count() && !(await page.locator('#model-stats [data-label="Outgoing model"]').count())) throw new Error(`${project.name}: model cells do not carry the selected grouping label`);
+    if (project.mobile) {
+      const toolsLayout = await page.locator('.activity-model-panel .activity-card-tools').evaluate(element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth}));
+      if (toolsLayout.scrollWidth > toolsLayout.clientWidth + 1) throw new Error(`${project.name}: the model grouping control overflows its card on mobile`);
+    }
+    const incomingStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?') && response.url().includes('model_dimension=incoming'));
+    await modelDimensionPicker.locator('[data-model-dimension="incoming"]').click();
+    await incomingStats;
+    await page.waitForFunction(() => document.querySelector('#model-dimension-column')?.textContent === 'Incoming model');
     if (!project.mobile) {
       await page.locator('[data-activity-tab="requests"]').click();
       const sevenDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=168'));
@@ -923,10 +1059,11 @@ for (const project of projects) {
     if (await recentActivityRows.count()) {
       if (!(await activityRow.count()) || !(await mappedActivityRow.count())) throw new Error(`${project.name}: Activity model routing fixtures are missing from recent requests`);
       const routingVisibility = await activityRow.locator('.activity-model').evaluate(element => [...element.querySelectorAll('.activity-model-leg b, .activity-model-unchanged')].map(item => { const box = item.getBoundingClientRect(); const style = getComputedStyle(item); return {text: item.textContent, width: box.width, height: box.height, display: style.display, visibility: style.visibility, overflow: style.overflow}; }));
-      if (!(await activityRow.getByText('Client', {exact: true}).isVisible()) || !(await activityRow.getByText('Provider', {exact: true}).isVisible()) || !(await activityRow.getByText('Same model ID', {exact: true}).isVisible())) throw new Error(`${project.name}: unchanged Activity model routing is not explicitly identified by client and Provider side (${JSON.stringify(routingVisibility)})`);
+      if (!(await activityRow.getByText('Incoming', {exact: true}).isVisible()) || !(await activityRow.getByText('Outgoing', {exact: true}).isVisible()) || !(await activityRow.getByText('Same model ID', {exact: true}).isVisible())) throw new Error(`${project.name}: unchanged Activity model routing is not explicitly identified by incoming and outgoing side (${JSON.stringify(routingVisibility)})`);
       if (!(await mappedActivityRow.getByText('ui-subscription/gpt-fixture', {exact: true}).isVisible()) || !(await mappedActivityRow.getByText('activity-only-model', {exact: true}).isVisible()) || await mappedActivityRow.getByText('Same model ID', {exact: true}).count()) throw new Error(`${project.name}: mapped Activity model routing does not show both distinct model IDs`);
       await activityRow.click();
       await assertDialog(page, '#activity-detail-dialog', project.name);
+      await assertNoUpstreamCopy(page, project.name, 'Activity details');
       if (!project.mobile) {
         const drawerBox = await page.locator('#activity-detail-dialog').boundingBox();
         const viewport = page.viewportSize();
@@ -957,7 +1094,7 @@ for (const project of projects) {
       if (requestMetadataLayout.rows !== requestMetadataLayout.items) throw new Error(`${project.name}: request metadata still places multiple facts on one row (${JSON.stringify(requestMetadataLayout)})`);
       if (project.width > 600 && (requestMetadataLayout.columnsPerItem.some(count => count !== 2) || requestMetadataLayout.valueLines.some(count => count !== 1))) throw new Error(`${project.name}: desktop request metadata does not keep each label and value together on one full-width row (${JSON.stringify(requestMetadataLayout)})`);
       if (project.width <= 600 && requestMetadataLayout.columnsPerItem.some(count => count !== 1)) throw new Error(`${project.name}: narrow request metadata does not stack labels over full-width values (${JSON.stringify(requestMetadataLayout)})`);
-      if (!(await page.locator('#activity-detail-model-route').getByText('Client requested', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-model-route').getByText('Sent to Provider', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not name the client and Provider sides of model routing`);
+      if (!(await page.locator('#activity-detail-model-route').getByText('Incoming model', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-model-route').getByText('Outgoing model', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not name the incoming and outgoing sides of model routing`);
       if (!(await page.locator('#activity-detail-model-outcome').getByText('Model ID unchanged', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain identical client and Provider model IDs`);
       if (!(await page.locator('#activity-detail-api-route').getByText('Client API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('Provider API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('No API conversion', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain the client and Provider API formats`);
       if (!(await page.locator('#activity-detail-destination').getByText('Provider', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-destination').getByText('Endpoint', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not group Provider and Endpoint under the routing destination`);
@@ -1005,14 +1142,22 @@ for (const project of projects) {
       await assertDialog(page, '#activity-detail-dialog', project.name);
       const editActivityPricing = page.locator('#activity-detail-usage .edit-activity-pricing');
       if (!(await editActivityPricing.count())) throw new Error(`${project.name}: missing-cost Activity detail does not offer a price action`);
-      const upstreamModel = await page.locator('#activity-detail-upstream-model').textContent();
+      const incomingModel = await page.locator('#activity-detail-model').textContent();
       await editActivityPricing.click();
       await page.locator('#pricing-view').waitFor({state: 'visible'});
       if (!(await page.locator('#pricing-editor-page').isVisible())) throw new Error(`${project.name}: Activity price action does not open the centralized pricing editor`);
-      if (await page.locator('#pricing-model').inputValue() !== upstreamModel) throw new Error(`${project.name}: Activity pricing action does not prefill the exact upstream model`);
-      if (!(await page.locator('#central-pricing-form [name="scope"][value="global"]').isChecked())) throw new Error(`${project.name}: a new Activity price does not default to the global scope`);
+      if (await page.locator('#pricing-model').inputValue() !== incomingModel) throw new Error(`${project.name}: Activity pricing action does not prefill the model name the caller sent`);
+      if (!(await page.locator('#central-pricing-form [name="scope"][value="global"]').isChecked()) || !(await page.locator('#central-pricing-form [name="price_name"][value="incoming"]').isChecked())) throw new Error(`${project.name}: a new Activity price does not default to a global price for the caller's model name`);
       await page.locator('#cancel-pricing-edit').click();
       await page.evaluate(() => document.querySelector('[data-view="activity"]').click());
+      const pricedActivityRow = recentActivityRows.filter({hasText: 'alias-sent-two'}).first();
+      if (await pricedActivityRow.count()) {
+        await pricedActivityRow.click();
+        await assertDialog(page, '#activity-detail-dialog', project.name);
+        const rateSource = await page.locator('#activity-detail-usage .activity-pricing-source').textContent();
+        if (!rateSource.includes('Global incoming rule') || !rateSource.includes('priced-alias') || !rateSource.includes('Provider outgoing rule') || !rateSource.includes('alias-sent-two')) throw new Error(`${project.name}: an estimated cost does not explain which pricing rules supplied each rate (${rateSource})`);
+        await page.locator('#activity-detail-dialog').evaluate(dialog => dialog.close());
+      }
     }
     await page.locator('#manage-activity-data').click();
     await assertDialog(page, '#activity-data-dialog', project.name);
@@ -1031,6 +1176,12 @@ for (const project of projects) {
     await page.getByRole('button', { name: 'Import 1 new records' }).waitFor();
     await page.locator('[data-activity-data-tab="storage"]').click();
     await page.locator('#activity-data-dialog .close-activity-data').first().click();
+    const consoleViews = await page.locator('#console-sidebar [data-view]').evaluateAll(nodes => [...new Set(nodes.map(node => node.dataset.view))]);
+    for (const view of consoleViews) {
+      await page.evaluate(view => document.querySelector(`[data-view="${view}"]`).click(), view);
+      await page.waitForTimeout(250);
+      await assertNoUpstreamCopy(page, project.name, `console view ${view}`);
+    }
     await assertNoPageOverflow(page, project.name, 'console');
     console.log(`${project.name}: responsive console and dialogs passed`);
     await context.close();
@@ -1044,6 +1195,33 @@ async function assertNoPageOverflow(page, name, surface) {
   if (overflow) throw new Error(`${name}: ${surface} has horizontal overflow`);
 }
 
+async function assertCodeChipsHugContent(page, selector, name, surface) {
+  const stretched = await page.locator(selector).evaluateAll(labels => labels.filter(label => {
+    const style = getComputedStyle(label);
+    if (style.backgroundColor === 'rgba(0, 0, 0, 0)') return false;
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const contentWidth = range.getBoundingClientRect().width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    return label.getBoundingClientRect().width > contentWidth + 1;
+  }).map(label => label.textContent));
+  if (stretched.length) throw new Error(`${name}: ${surface} stretch past their content (${stretched.join(', ')})`);
+}
+
+async function assertNoUpstreamCopy(page, name, label) {
+  const matches = await page.evaluate(() => {
+    const found = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {acceptNode: node => node.parentElement && !node.parentElement.closest('script,style') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT});
+    while (walker.nextNode()) { const text = walker.currentNode.nodeValue; if (/\bupstream\b/i.test(text)) found.push(text.replace(/\s+/g, ' ').trim().slice(0, 120)); }
+    for (const element of document.querySelectorAll('[title],[placeholder],[aria-label]')) {
+      for (const attribute of ['title', 'placeholder', 'aria-label']) {
+        const value = element.getAttribute(attribute);
+        if (value && /\bupstream\b/i.test(value)) found.push(`${attribute}="${value.replace(/\s+/g, ' ').trim().slice(0, 100)}"`);
+      }
+    }
+    return [...new Set(found)];
+  });
+  if (matches.length) throw new Error(`${name}: ${label} still shows ambiguous "upstream" wording: ${JSON.stringify(matches)}`);
+}
 async function assertDialog(page, selector, name) {
   const dialog = page.locator(selector);
   await dialog.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {}))));

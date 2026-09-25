@@ -252,7 +252,7 @@ fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
     let mut provider_ids = std::collections::HashSet::new();
     for provider in providers {
         if let Some(pricing) = &provider.pricing {
-            crate::pricing::validate_table(pricing, &format!("Provider '{}'", provider.id))?;
+            crate::pricing::validate_table(pricing, &format!("Provider '{}'", provider.id), false)?;
         }
         if provider.id.is_empty() || !provider_ids.insert(provider.id.as_str()) {
             return Err(format!(
@@ -265,6 +265,7 @@ fn validate_provider_identities(providers: &[Provider]) -> Result<(), String> {
                 crate::pricing::validate_table(
                     pricing,
                     &format!("Endpoint '{}/{}'", provider.id, endpoint.id),
+                    false,
                 )?;
             }
             if endpoint.id.is_empty() || !endpoint_ids.insert(endpoint.id.as_str()) {

@@ -341,13 +341,16 @@ struct ProxyActivity {
     upstream_model: Option<String>,
     provider: String,
     endpoint: String,
-    pricing: Option<pricing::ModelPricing>,
+    pricing: Option<pricing::ResolvedPricing>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
     upstream_protocol: Protocol,
     started: Instant,
     gateway_ms: u64,
     upstream_response_ms: u64,
+    /// Whether the Provider response is an event stream, so the recorded
+    /// generation time describes an actual generation instead of a body download.
+    upstream_streaming: bool,
 }
 
 impl ProxyActivity {
@@ -433,8 +436,16 @@ impl ProxyActivity {
                 cached_tokens: usage.cached,
                 cost_source,
                 cost,
+                pricing_sources: match cost_source {
+                    Some(CostSource::Estimated) => self
+                        .pricing
+                        .as_ref()
+                        .map(|resolved| resolved.sources.clone()),
+                    _ => None,
+                },
                 finish_reason: usage.finish_reason,
                 streaming,
+                upstream_streaming: self.upstream_streaming,
             })
             .await;
     }
@@ -445,7 +456,7 @@ impl ProxyActivity {
         }
         self.pricing
             .as_ref()
-            .and_then(|pricing| pricing::calculate(pricing, usage))
+            .and_then(|resolved| pricing::calculate(&resolved.pricing, usage))
             .map(|cost| (Some(cost), Some(CostSource::Estimated)))
             .unwrap_or((None, None))
     }
@@ -717,8 +728,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     cached_tokens: 0,
                     cost_source: None,
                     cost: None,
+                    pricing_sources: None,
                     finish_reason: None,
                     streaming: requested_streaming,
+                    upstream_streaming: false,
                 })
                 .await;
             return api_error(StatusCode::BAD_GATEWAY, &failure.message);
@@ -750,8 +763,8 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     );
     let activity_pricing = {
         let global_pricing = state.pricing.read().await;
-        sent_upstream_model.as_deref().and_then(|model| {
-            pricing::effective_pricing(&global_pricing, &provider, &endpoint, model)
+        sent_upstream_model.as_deref().and_then(|model_id| {
+            pricing::effective_pricing(&global_pricing, &provider, &endpoint, &model, model_id)
         })
     };
     let activity = ProxyActivity {
@@ -769,6 +782,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         started,
         gateway_ms: upstream_started.duration_since(started).as_millis() as u64,
         upstream_response_ms,
+        upstream_streaming: event_stream,
     };
     let converting = status.is_success() && caller_protocol != upstream_protocol;
 
@@ -822,7 +836,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         };
         let (usage, protocol_failed) = usage.finish();
         if failure.is_none() && protocol_failed {
-            failure = Some("Upstream stream reported a failure".to_owned());
+            failure = Some("Provider stream reported a failure".to_owned());
         }
         if let Some(err) = failure {
             activity
@@ -903,7 +917,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                         RequestFailure::new(
                             "protocol_conversion",
                             "invalid_response",
-                            "Could not convert the upstream response",
+                            "Could not convert the Provider response",
                         ),
                     )
                     .await;
@@ -919,7 +933,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 RequestFailure::new(
                     "upstream_response",
                     "protocol_failure",
-                    "Upstream response reported a failure",
+                    "Provider response reported a failure",
                 )
             } else {
                 upstream_http_failure(status)
@@ -1039,7 +1053,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 RequestFailure::new(
                     "upstream_stream",
                     "interrupted",
-                    "Upstream stream ended or could not be converted",
+                    "Provider stream ended or could not be converted",
                 ),
             ).await;
         } else if protocol_failed {
@@ -1056,9 +1070,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     },
                     "protocol_failure",
                     if requested_streaming || event_stream {
-                        "Upstream stream reported a failure"
+                        "Provider stream reported a failure"
                     } else {
-                        "Upstream response reported a failure"
+                        "Provider response reported a failure"
                     },
                 ),
             ).await;
@@ -1350,13 +1364,13 @@ fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) ->
             (
                 "upstream_connect",
                 "connect_timeout",
-                format!("Could not connect to upstream{route} before the deadline"),
+                format!("Could not connect to the Provider{route} before the deadline"),
             )
         } else {
             (
                 "upstream_response",
                 "timeout",
-                format!("Upstream request{route} timed out"),
+                format!("Provider request{route} timed out"),
             )
         };
         return RequestFailure::new(stage, category, message);
@@ -1372,7 +1386,7 @@ fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) ->
             "upstream_connect",
             category,
             format!(
-                "Could not connect to upstream{route}{}",
+                "Could not connect to the Provider{route}{}",
                 detail.unwrap_or_default()
             ),
         );
@@ -1381,7 +1395,7 @@ fn upstream_transport_failure(err: &reqwest::Error, using_socks5_proxy: bool) ->
         "upstream_transport",
         "request_failed",
         format!(
-            "Upstream request{route} failed{}",
+            "Provider request{route} failed{}",
             detail.unwrap_or_default()
         ),
     )
@@ -1396,7 +1410,7 @@ fn upstream_read_failure(err: &reqwest::Error, streaming: bool) -> RequestFailur
                 "upstream_response"
             },
             "timeout",
-            "Upstream response timed out",
+            "Provider response timed out",
         );
     }
     RequestFailure::new(
@@ -1411,9 +1425,9 @@ fn upstream_read_failure(err: &reqwest::Error, streaming: bool) -> RequestFailur
             "read_failed"
         },
         if streaming {
-            "Upstream stream ended or could not be converted"
+            "Provider stream ended or could not be converted"
         } else {
-            "Could not read the upstream response"
+            "Could not read the Provider response"
         },
     )
 }
@@ -1429,7 +1443,7 @@ fn upstream_http_failure(status: StatusCode) -> RequestFailure {
     RequestFailure::new(
         "upstream_response",
         category,
-        format!("Upstream returned HTTP {}", status.as_u16()),
+        format!("Provider returned HTTP {}", status.as_u16()),
     )
 }
 
@@ -1438,25 +1452,25 @@ fn stream_failure(message: &str) -> RequestFailure {
         (
             "protocol_conversion",
             "frame_too_large",
-            "Upstream stream exceeded the conversion limit",
+            "Provider stream exceeded the conversion limit",
         )
     } else if message.contains("valid JSON") || message.contains("convert") {
         (
             "protocol_conversion",
             "invalid_response",
-            "Could not convert the upstream stream",
+            "Could not convert the Provider stream",
         )
     } else if message.contains("terminal event") {
         (
             "upstream_stream",
             "truncated",
-            "Upstream stream ended before completion",
+            "Provider stream ended before completion",
         )
     } else {
         (
             "upstream_stream",
             "failed",
-            "Upstream stream reported a failure",
+            "Provider stream reported a failure",
         )
     };
     RequestFailure::new(stage, category, safe_message)
