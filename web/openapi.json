@@ -204,20 +204,14 @@
       },
       "EndpointView": {
         "type": "object",
-        "description": "A Provider Endpoint. OAuth tokens and account IDs are never included.",
+        "description": "A Provider Endpoint, including the words and sign-in flows its Endpoint type declares. Tokens and account IDs are never included.",
         "properties": {
           "id": {
             "type": "string"
           },
           "api_type": {
             "type": "string",
-            "enum": [
-              "openai_compatible",
-              "openai_chat_completions",
-              "openai_responses",
-              "openai_codex",
-              "anthropic"
-            ]
+            "description": "Endpoint type identifier, either one Core implements or one an Extension declares."
           },
           "base_url": {
             "type": "string"
@@ -244,21 +238,34 @@
             ],
             "description": "Outgoing overrides for exact or trailing-wildcard Provider model patterns; omitted fields inherit from the selected Provider and Global rules, and these rules win over a Global rule for the caller-facing name."
           },
-          "requires_api_key": {
+          "requires_credential": {
             "type": "boolean"
           },
-          "api_keys": {
+          "rate_limit_cooldown": {
+            "$ref": "#/components/schemas/RateLimitCooldown"
+          },
+          "credentials": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/CredentialView"
             }
           },
-          "subscription_connected": {
-            "type": "boolean"
+          "endpoint_type_label": {
+            "type": "string",
+            "description": "Present when an Extension owns this Endpoint type: the Endpoint type's own name."
           },
-          "subscription_expires_at": {
-            "type": "integer",
-            "nullable": true
+          "fixed_base_url": {
+            "type": "string",
+            "description": "Present when the Endpoint type fixes the base URL, in which case only the proxy and rate-limit policy can be edited in place."
+          },
+          "sign_in": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EndpointTypeSignIn"
+              }
+            ],
+            "description": "Present when the Endpoint type connects accounts through its own sign-in flow."
           }
         }
       },
@@ -302,6 +309,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "endpoint_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtensionEndpointTypeView"
+            },
+            "description": "Endpoint types this Extension declares; an Extension that declares none leaves this empty."
           }
         }
       },
@@ -388,67 +402,6 @@
                 }
               }
             }
-          }
-        }
-      },
-      "OpenAiBrowserFlow": {
-        "type": "object",
-        "required": [
-          "id",
-          "authorization_url",
-          "expires_at"
-        ],
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "authorization_url": {
-            "type": "string",
-            "format": "uri"
-          },
-          "expires_at": {
-            "type": "integer"
-          }
-        }
-      },
-      "OpenAiDeviceFlow": {
-        "type": "object",
-        "required": [
-          "id",
-          "status",
-          "user_code",
-          "verification_uri",
-          "interval_seconds",
-          "expires_at"
-        ],
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "complete",
-              "failed"
-            ]
-          },
-          "user_code": {
-            "type": "string"
-          },
-          "verification_uri": {
-            "type": "string",
-            "format": "uri"
-          },
-          "interval_seconds": {
-            "type": "integer"
-          },
-          "expires_at": {
-            "type": "integer"
-          },
-          "error": {
-            "type": "string",
-            "nullable": true
           }
         }
       },
@@ -663,6 +616,11 @@
           },
           "endpoint": {
             "type": "string"
+          },
+          "upstream_credential_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Stable ID of the Endpoint credential that carried the request. Null for Endpoints without credentials and for records created before this metadata was introduced. Provider secrets are never recorded."
           },
           "caller_protocol": {
             "type": "string",
@@ -1319,6 +1277,235 @@
             ]
           }
         }
+      },
+      "CredentialView": {
+        "type": "object",
+        "description": "An identity Yabane uses when sending a request to a Provider, described with the vocabulary of the Endpoint type that declares its kind. Secrets, refresh tokens, and account IDs are never included.",
+        "required": [
+          "id",
+          "name",
+          "weight",
+          "enabled",
+          "kind",
+          "kind_label"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable within its Endpoint; model-route destinations refer to it."
+          },
+          "name": {
+            "type": "string"
+          },
+          "weight": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "kind": {
+            "type": "string",
+            "description": "Identity kind identifier declared by this Endpoint's type."
+          },
+          "subscription_expires_at": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Present for OpenAI subscription credentials; the access token renews automatically shortly before this time."
+          },
+          "cooldown_seconds_remaining": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Present only while the credential is cooling down after a Provider rate-limit response."
+          },
+          "kind_label": {
+            "type": "string",
+            "description": "How this Endpoint's type names one identity of this kind."
+          }
+        }
+      },
+      "RateLimitCooldown": {
+        "type": "object",
+        "description": "Explicit policy that turns a 429 from the Provider for one credential into a cooldown during which that credential is not selected.",
+        "required": [
+          "seconds",
+          "honor_retry_after"
+        ],
+        "properties": {
+          "seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2592000,
+            "default": 0,
+            "description": "0 disables the policy. Otherwise the credential stays out of selection for this many seconds after the Provider answers 429."
+          },
+          "honor_retry_after": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace the configured duration with the Provider Retry-After header when it carries an integer number of seconds, capped at 30 days."
+          }
+        }
+      },
+      "CredentialKindView": {
+        "type": "object",
+        "description": "One identity kind declared by an Endpoint type. The Endpoint type owns this identifier, its label, and whether it holds a pasted secret or a signed-in account.",
+        "required": [
+          "id",
+          "label",
+          "flow"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Identifier persisted with each credential of this kind."
+          },
+          "label": {
+            "type": "string",
+            "description": "How this Endpoint type names one identity, for example its console wording."
+          },
+          "flow": {
+            "type": "string",
+            "enum": [
+              "secret",
+              "subscription"
+            ],
+            "description": "`secret` identities carry a pasted secret; `subscription` identities carry a signed-in account's tokens and expiry."
+          }
+        }
+      },
+      "EndpointTypeSignIn": {
+        "type": "object",
+        "description": "Sign-in flows this Endpoint type offers. Address sign-in requests by Endpoint type, not by Provider.",
+        "required": [
+          "device_code",
+          "browser"
+        ],
+        "properties": {
+          "device_code": {
+            "type": "boolean"
+          },
+          "browser": {
+            "type": "boolean"
+          }
+        }
+      },
+      "EndpointTypeView": {
+        "type": "object",
+        "description": "An Endpoint type this process can offer: one Core implements, or one a compiled and enabled Extension declares. Core never infers these properties from the identifier.",
+        "required": [
+          "id",
+          "label",
+          "description",
+          "default_endpoint_id",
+          "credential_kinds",
+          "native"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Value used as an Endpoint's `api_type`."
+          },
+          "label": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "default_endpoint_id": {
+            "type": "string",
+            "description": "Suggested Endpoint ID for a new Endpoint of this type."
+          },
+          "fixed_base_url": {
+            "type": "string",
+            "nullable": true,
+            "description": "Present when the declaration fixes the base URL, in which case the connection cannot be edited in place."
+          },
+          "credential_kinds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CredentialKindView"
+            }
+          },
+          "sign_in": {
+            "nullable": true,
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EndpointTypeSignIn"
+              }
+            ]
+          },
+          "native": {
+            "type": "boolean",
+            "description": "True when Core implements this Endpoint type rather than an Extension."
+          }
+        }
+      },
+      "ExtensionEndpointTypeView": {
+        "type": "object",
+        "description": "An Endpoint type this Extension declares. Configured Endpoints of this type become unavailable while the Extension is disabled.",
+        "required": [
+          "id",
+          "label",
+          "default_endpoint_id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "default_endpoint_id": {
+            "type": "string"
+          }
+        }
+      },
+      "EndpointSignInState": {
+        "type": "object",
+        "description": "Progress of one Endpoint-type sign-in. Device-code fields are present for the device-code flow; the browser flow exposes its authorization URL instead. Tokens, authorization codes, and PKCE verifiers are never returned.",
+        "required": [
+          "id",
+          "status",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "complete",
+              "failed"
+            ]
+          },
+          "user_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "verification_uri": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "authorization_url": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
       }
     },
     "responses": {
@@ -1347,6 +1534,26 @@
       },
       "NotFound": {
         "description": "Resource not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The request is understood but conflicts with the current state of another resource.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InternalServerError": {
+        "description": "Yabane could not complete the operation.",
         "content": {
           "application/json": {
             "schema": {
@@ -2242,256 +2449,6 @@
         }
       }
     },
-    "/admin/openai-subscriptions/device-code": {
-      "post": {
-        "tags": [
-          "Providers"
-        ],
-        "summary": "Start OpenAI subscription device sign-in",
-        "description": "Starts OpenAI device-code OAuth for a new Provider or a new Endpoint on an existing Provider. When socks5_proxy is set, device authorization, token exchange, refresh, and inference use that proxy. OAuth tokens are never returned by this API.",
-        "security": [
-          {
-            "managementKey": []
-          },
-          {
-            "adminSession": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "provider_id"
-                ],
-                "properties": {
-                  "provider_id": {
-                    "type": "string"
-                  },
-                  "provider_name": {
-                    "type": "string",
-                    "nullable": true
-                  },
-                  "endpoint_id": {
-                    "type": "string",
-                    "nullable": true
-                  },
-                  "socks5_proxy": {
-                    "type": "string",
-                    "nullable": true,
-                    "pattern": "^socks5h?://"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Device sign-in started",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAiDeviceFlow"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "502": {
-            "description": "OpenAI OAuth service unavailable"
-          }
-        }
-      }
-    },
-    "/admin/openai-subscriptions/device-code/{id}": {
-      "get": {
-        "tags": [
-          "Providers"
-        ],
-        "summary": "Poll OpenAI subscription device sign-in",
-        "description": "Returns pending status or completes OAuth and atomically creates the connected subscription Endpoint.",
-        "security": [
-          {
-            "managementKey": []
-          },
-          {
-            "adminSession": []
-          }
-        ],
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Current device sign-in state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAiDeviceFlow"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          }
-        }
-      }
-    },
-    "/admin/openai-subscriptions/oauth": {
-      "post": {
-        "tags": [
-          "Providers"
-        ],
-        "summary": "Start OpenAI subscription browser OAuth",
-        "description": "Starts pi-ai-compatible Authorization Code with PKCE as an explicit alternative when an organization disables device sign-in. The registered callback is http://localhost:1455/auth/callback; Yabane does not listen there and the administrator pastes the resulting complete callback URL into the completion operation.",
-        "security": [
-          {
-            "managementKey": []
-          },
-          {
-            "adminSession": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "provider_id"
-                ],
-                "properties": {
-                  "provider_id": {
-                    "type": "string"
-                  },
-                  "provider_name": {
-                    "type": "string",
-                    "nullable": true
-                  },
-                  "endpoint_id": {
-                    "type": "string",
-                    "nullable": true
-                  },
-                  "socks5_proxy": {
-                    "type": "string",
-                    "nullable": true,
-                    "pattern": "^socks5h?://"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Browser OAuth started",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OpenAiBrowserFlow"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "409": {
-            "description": "OpenAI Subscription Extension unavailable"
-          }
-        }
-      }
-    },
-    "/admin/openai-subscriptions/oauth/{id}/complete": {
-      "post": {
-        "tags": [
-          "Providers"
-        ],
-        "summary": "Complete OpenAI subscription browser OAuth",
-        "description": "Validates the complete pasted localhost callback URL and its state, exchanges its one-time authorization code with the server-held PKCE verifier, and atomically creates the connected subscription Endpoint. Callback URLs, authorization codes, verifier, and OAuth tokens are not returned or persisted as flow history.",
-        "security": [
-          {
-            "managementKey": []
-          },
-          {
-            "adminSession": []
-          }
-        ],
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "redirect_url"
-                ],
-                "properties": {
-                  "redirect_url": {
-                    "type": "string",
-                    "format": "uri",
-                    "description": "Complete http://localhost:1455/auth/callback URL returned by OpenAI."
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "204": {
-            "$ref": "#/components/responses/NoContent"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "409": {
-            "description": "OpenAI Subscription Extension unavailable"
-          },
-          "500": {
-            "description": "Connected credential could not be persisted"
-          },
-          "502": {
-            "description": "OpenAI token exchange failed"
-          }
-        }
-      }
-    },
     "/admin/extensions": {
       "get": {
         "tags": [
@@ -2841,7 +2798,7 @@
                       "id",
                       "api_type",
                       "base_url",
-                      "requires_api_key"
+                      "requires_credential"
                     ],
                     "properties": {
                       "id": {
@@ -2868,12 +2825,21 @@
                       "pricing": {
                         "$ref": "#/components/schemas/PricingTable"
                       },
-                      "requires_api_key": {
-                        "type": "boolean"
+                      "requires_credential": {
+                        "type": "boolean",
+                        "description": "When true the Endpoint sends every request with one of its own credentials; when false requests are sent without an identity."
                       },
-                      "api_key": {
+                      "credential_name": {
                         "type": "string",
-                        "nullable": true
+                        "description": "Display name of the credential created together with the Endpoint. Defaults to \"Default\"."
+                      },
+                      "credential_secret": {
+                        "type": "string",
+                        "nullable": true,
+                        "description": "Secret of the credential created together with the Endpoint. Required while requires_credential is true."
+                      },
+                      "rate_limit_cooldown": {
+                        "$ref": "#/components/schemas/RateLimitCooldown"
                       }
                     }
                   }
@@ -2887,8 +2853,12 @@
                   "api_type": "openai_compatible",
                   "base_url": "https://api.example.com/v1",
                   "socks5_proxy": null,
-                  "requires_api_key": true,
-                  "api_key": "sk-…"
+                  "requires_credential": true,
+                  "credential_secret": "sk-…",
+                  "rate_limit_cooldown": {
+                    "seconds": 3600,
+                    "honor_retry_after": true
+                  }
                 }
               }
             }
@@ -3066,7 +3036,7 @@
                 "required": [
                   "api_type",
                   "base_url",
-                  "requires_api_key"
+                  "requires_credential"
                 ],
                 "properties": {
                   "id": {
@@ -3091,12 +3061,21 @@
                   "pricing": {
                     "$ref": "#/components/schemas/PricingTable"
                   },
-                  "requires_api_key": {
-                    "type": "boolean"
+                  "requires_credential": {
+                    "type": "boolean",
+                    "description": "When true the Endpoint sends every request with one of its own credentials; when false requests are sent without an identity."
                   },
-                  "api_key": {
+                  "credential_name": {
                     "type": "string",
-                    "nullable": true
+                    "description": "Display name of the credential created together with the Endpoint. Defaults to \"Default\"."
+                  },
+                  "credential_secret": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "Secret of the credential created together with the Endpoint. Required while requires_credential is true."
+                  },
+                  "rate_limit_cooldown": {
+                    "$ref": "#/components/schemas/RateLimitCooldown"
                   }
                 }
               },
@@ -3105,8 +3084,12 @@
                 "api_type": "openai_compatible",
                 "base_url": "https://api.example.com/v1",
                 "socks5_proxy": null,
-                "requires_api_key": true,
-                "api_key": "sk-…"
+                "requires_credential": true,
+                "credential_secret": "sk-…",
+                "rate_limit_cooldown": {
+                  "seconds": 3600,
+                  "honor_retry_after": true
+                }
               }
             }
           }
@@ -3121,10 +3104,11 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           }
-        }
+        },
+        "description": "Adds an Endpoint to an existing Provider. The request supplies connection settings for Endpoint types that accept them; an Endpoint type whose declaration owns its base URL or sign-in flow is created through its sign-in operation instead."
       }
     },
-    "/admin/providers/{id}/keys": {
+    "/admin/providers/{provider_id}/credentials": {
       "post": {
         "tags": [
           "Providers"
@@ -3140,7 +3124,7 @@
         ],
         "parameters": [
           {
-            "name": "id",
+            "name": "provider_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3178,7 +3162,7 @@
               },
               "example": {
                 "endpoint_id": "openai",
-                "name": "Production key",
+                "name": "Account A",
                 "secret": "sk-…",
                 "weight": 100
               }
@@ -3304,10 +3288,6 @@
                         "endpoint_id": {
                           "type": "string"
                         },
-                        "api_key_id": {
-                          "type": "string",
-                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint or an Endpoint configured without authentication."
-                        },
                         "upstream_model": {
                           "type": "string"
                         },
@@ -3321,6 +3301,10 @@
                           "type": "boolean",
                           "default": true,
                           "description": "Optional compatibility field. False sets the target's effective share to 0; a 0% weight is always inactive."
+                        },
+                        "credential_id": {
+                          "type": "string",
+                          "description": "Optional credential ID to pin. Omit or use an empty string to keep the Endpoint credential policy, which selects among enabled credentials and skips ones that are cooling down. A pinned credential is always used exactly as configured."
                         }
                       }
                     }
@@ -3333,10 +3317,10 @@
                   {
                     "provider_id": "my-provider",
                     "endpoint_id": "openai",
-                    "api_key_id": "default",
                     "upstream_model": "model-id",
                     "weight": 100,
-                    "enabled": true
+                    "enabled": true,
+                    "credential_id": "default"
                   }
                 ]
               }
@@ -3417,10 +3401,6 @@
                         "endpoint_id": {
                           "type": "string"
                         },
-                        "api_key_id": {
-                          "type": "string",
-                          "description": "Required for key-based Endpoints; omit or use an empty string for an OpenAI subscription Endpoint or an Endpoint configured without authentication."
-                        },
                         "upstream_model": {
                           "type": "string"
                         },
@@ -3434,6 +3414,10 @@
                           "type": "boolean",
                           "default": true,
                           "description": "Optional compatibility field. False sets the target's effective share to 0; a 0% weight is always inactive."
+                        },
+                        "credential_id": {
+                          "type": "string",
+                          "description": "Optional credential ID to pin. Omit or use an empty string to keep the Endpoint credential policy, which selects among enabled credentials and skips ones that are cooling down. A pinned credential is always used exactly as configured."
                         }
                       }
                     }
@@ -3895,13 +3879,13 @@
         }
       }
     },
-    "/admin/providers/{provider_id}/endpoints/{endpoint_id}/keys/{key_id}": {
+    "/admin/providers/{provider_id}/endpoints/{endpoint_id}/credentials/{credential_id}": {
       "patch": {
         "tags": [
           "Providers"
         ],
         "summary": "Update a Provider credential name, weight, or enabled state",
-        "description": "Updates any subset of the key name, weight, and enabled state without replacing the secret. Renaming keeps the stable key ID, so model-route destinations and historical records continue to refer to the same credential.",
+        "description": "Updates any subset of the credential name, weight, and enabled state without replacing its secret. Renaming keeps the stable credential ID, so model-route destinations and historical records continue to refer to the same identity.",
         "security": [
           {
             "managementKey": []
@@ -3928,7 +3912,7 @@
             }
           },
           {
-            "name": "key_id",
+            "name": "credential_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -3953,12 +3937,12 @@
                   },
                   "enabled": {
                     "type": "boolean",
-                    "description": "A key referenced by a retained model-route target cannot be disabled until that target is updated or deleted."
+                    "description": "A credential pinned by a retained model-route target cannot be disabled until that target is updated or deleted."
                   }
                 }
               },
               "example": {
-                "name": "Primary production key",
+                "name": "Account A",
                 "weight": 200,
                 "enabled": true
               }
@@ -4014,7 +3998,61 @@
             }
           },
           {
-            "name": "key_id",
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/providers/{provider_id}/endpoints/{endpoint_id}/credentials/{credential_id}/cooldown": {
+      "delete": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Forget a credential rate-limit cooldown",
+        "description": "Returns a cooling credential to selection immediately. Health is runtime state only, so restarting Yabane forgets every cooldown as well.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "provider_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "endpoint_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "credential_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -4187,8 +4225,8 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Set traffic distribution across enabled endpoint API keys",
-        "description": "Set one positive integer percentage for every enabled key. Percentages must total 100.",
+        "summary": "Set traffic distribution across enabled endpoint credentials",
+        "description": "Set one positive integer percentage for every enabled credential. Percentages must total 100. Credentials that hit a configured rate-limit cooldown are skipped until their cooldown ends.",
         "security": [
           {
             "managementKey": []
@@ -4231,11 +4269,11 @@
                     "items": {
                       "type": "object",
                       "required": [
-                        "key_id",
+                        "credential_id",
                         "weight"
                       ],
                       "properties": {
-                        "key_id": {
+                        "credential_id": {
                           "type": "string"
                         },
                         "weight": {
@@ -4244,18 +4282,18 @@
                         }
                       }
                     },
-                    "description": "Every enabled key exactly once; integer weights must total 100."
+                    "description": "Every enabled credential exactly once; integer weights must total 100."
                   }
                 }
               },
               "example": {
                 "weights": [
                   {
-                    "key_id": "primary",
+                    "credential_id": "account",
                     "weight": 75
                   },
                   {
-                    "key_id": "secondary",
+                    "credential_id": "account-2",
                     "weight": 25
                   }
                 ]
@@ -4853,6 +4891,325 @@
             "adminSession": []
           }
         ]
+      }
+    },
+    "/admin/endpoint-types": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "List Endpoint types",
+        "description": "Lists every Endpoint type this process can offer with the words, identity kinds, and sign-in flows its declaration provides. The console builds its choices from this list instead of a list of its own.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Endpoint types Core implements and Endpoint types compiled Extensions declare",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EndpointTypeView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/endpoint-types/{endpoint_type}/sign-in/device-code": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Start device-code sign-in for an Endpoint type",
+        "description": "Starts device authorization for an Endpoint type that declares it, for a new Provider or a new Endpoint on an existing Provider. Tokens are never returned by this API.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "endpoint_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "provider_id"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "description": "Provider that will own the Endpoint."
+                  },
+                  "provider_name": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "endpoint_id": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true,
+                    "pattern": "^socks5h?://",
+                    "description": "When set, sign-in, token refresh, and inference use this proxy."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Device sign-in started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndpointSignInState"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/admin/endpoint-types/{endpoint_type}/sign-in/device-code/{id}": {
+      "get": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Poll an Endpoint-type sign-in",
+        "description": "Returns pending status, or completes sign-in and atomically creates the connected Endpoint.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "endpoint_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current sign-in state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndpointSignInState"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/endpoint-types/{endpoint_type}/sign-in/oauth": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Start browser sign-in for an Endpoint type",
+        "description": "Starts an Authorization Code with PKCE sign-in for an Endpoint type that declares browser sign-in, for organizations that disable device authorization. The registered callback is http://localhost:1455/auth/callback; Yabane does not listen there and the administrator pastes the resulting complete callback URL into the completion operation.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "endpoint_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "provider_id"
+                ],
+                "properties": {
+                  "provider_id": {
+                    "type": "string",
+                    "description": "Provider that will own the Endpoint."
+                  },
+                  "provider_name": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "endpoint_id": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "socks5_proxy": {
+                    "type": "string",
+                    "nullable": true,
+                    "pattern": "^socks5h?://",
+                    "description": "When set, sign-in, token refresh, and inference use this proxy."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Browser sign-in started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EndpointSignInState"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/admin/endpoint-types/{endpoint_type}/sign-in/oauth/{id}/complete": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Complete Endpoint-type browser sign-in",
+        "description": "Validates the complete pasted localhost callback URL and its state, exchanges its one-time authorization code with the server-held PKCE verifier, and atomically creates the connected Endpoint. Callback URLs, authorization codes, verifiers, and tokens are not returned or persisted as flow history.",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "endpoint_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "redirect_url"
+                ],
+                "properties": {
+                  "redirect_url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "Complete localhost callback URL returned by the sign-in page."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
       }
     }
   }

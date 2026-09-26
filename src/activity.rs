@@ -60,6 +60,10 @@ pub struct RequestLog {
     pub upstream_model: Option<String>,
     pub provider: String,
     pub endpoint: String,
+    /// Stable ID of the identity the request left with, when its Endpoint uses
+    /// one. The credential itself is never recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_credential_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1208,6 +1212,7 @@ mod tests {
         RequestLog {
             timestamp,
             request_id: id.to_owned(),
+            upstream_credential_id: None,
             source_instance_id: None,
             gateway_api_key_id: None,
             gateway_api_key_note: None,

@@ -13,11 +13,12 @@ mod admin_user;
 mod auth;
 mod config;
 mod control;
+mod endpoint_signin;
 mod error;
 mod extensions;
 mod gateway;
+mod health;
 mod models;
-mod openai_subscription;
 mod pricing;
 mod protocol;
 mod protocol_stream;
@@ -180,6 +181,14 @@ async fn main() {
         .await
         .expect("load authentication configuration");
     {
+        // Identity kinds are declared by Endpoint types, which Extensions own, so
+        // the configuration is checked against the registry rather than against a
+        // list of names kept here.
+        config::validate_provider_declarations(
+            &providers.values().cloned().collect::<Vec<_>>(),
+            &extensions,
+        )
+        .expect("validate provider declarations");
         let loaded_routes = routes.0.read().await;
         validate_configuration_references(&providers, &auth, &loaded_routes)
             .expect("validate configuration references");
@@ -199,10 +208,11 @@ async fn main() {
         auth: Arc::new(RwLock::new(auth)),
         activity,
         routes,
+        credential_health: crate::health::CredentialHealth::default(),
         extensions: Arc::new(extensions),
         #[cfg(feature = "extension-traffic-capture")]
         traffic_capture: Arc::new(traffic_capture),
-        openai_oauth: openai_subscription::OAuthState::default(),
+        sign_in: endpoint_signin::SignInState::default(),
         admin: admin_user::AdminState {
             user: Arc::new(RwLock::new(admin)),
             ..admin_user::AdminState::default()

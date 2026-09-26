@@ -35,7 +35,7 @@ fi
 grep -q 'YABANE_UPSTREAM_READ_TIMEOUT_SECONDS must be an integer between 1 and 86400' invalid-upstream-timeout.log
 mkdir -p data
 cat >data/providers.json <<'JSON'
-[{"id":"subscription-fixture","name":"Subscription fixture","extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[],"endpoints":[{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","socks5_proxy":null,"extra_headers":{},"extra_body":{},"requires_api_key":false,"api_keys":[],"openai_subscription":{"access_token":"fixture","refresh_token":"fixture","expires_at":4102444800,"account_id":"fixture"}}],"discovered_models":[],"model_endpoints":{},"model_endpoint_preferences":[],"models_discovered_at":null,"model_discovery_error":null}]
+[{"id":"subscription-fixture","name":"Subscription fixture","extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[],"endpoints":[{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","socks5_proxy":null,"extra_headers":{},"extra_body":{},"requires_credential":true,"credentials":[{"id":"account","name":"OpenAI account","weight":100,"enabled":true,"kind":"openai_subscription","access_token":"fixture","refresh_token":"fixture","expires_at":4102444800,"account_id":"fixture"},{"id":"account-2","name":"OpenAI account 2","weight":100,"enabled":true,"kind":"openai_subscription","access_token":"fixture-two","refresh_token":"fixture-two","expires_at":4102444800,"account_id":"fixture-two"}],"rate_limit_cooldown":{"seconds":0,"honor_retry_after":false}}],"discovered_models":[],"model_endpoints":{},"model_endpoint_preferences":[],"models_discovered_at":null,"model_discovery_error":null}]
 JSON
 # Simulate crashes after multi-file replacements but before their rollback
 # journals were removed. Startup must restore each complete old file set before
@@ -110,7 +110,11 @@ import sys
 import time
 
 class Handler(BaseHTTPRequestHandler):
+    posts = 0
     def do_GET(self):
+        if self.path == '/count':
+            body = str(Handler.posts).encode()
+            self.send_response(200); self.send_header('content-type', 'text/plain'); self.end_headers(); self.wfile.write(body); return
         endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
         if self.path not in ['/v1/models', '/nested/v1/models']:
             self.send_response(404); self.end_headers(); return
@@ -120,8 +124,12 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps({'object': 'list', 'data': [{'id': model} for model in models]}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
     def do_POST(self):
+        Handler.posts += 1
         length = int(self.headers.get('content-length', 0)); request = json.loads(self.rfile.read(length))
         endpoint = self.headers.get('authorization', '').removeprefix('Bearer ') or self.headers.get('x-api-key', 'unknown')
+        if endpoint == 'throttled':
+            body = json.dumps({'error': {'message': 'quota exhausted', 'type': 'rate_limit_error'}}).encode()
+            self.send_response(429); self.send_header('content-type', 'application/json'); self.send_header('retry-after', '120'); self.end_headers(); self.wfile.write(body); return
         if request.get('model') == 'timeout-before-headers':
             time.sleep(2)
             try:
@@ -217,22 +225,51 @@ extensions=$(admin -f "$base/admin/extensions")
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, (.api_version | tostring), (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "traffic-capture") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:upstream_exchange:true ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
+# Identity kinds belong to the Endpoint type that declares them, so the console
+# and the API describe a credential with the declaration's own words.
+[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai_codex") | [.label, .native, (.sign_in.device_code | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'OpenAI subscription|false|true|openai_subscription:subscription' ]]
+[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "anthropic") | [.label, (.native | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'Anthropic|true|secret:secret' ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].endpoint_type_label, .endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'OpenAI subscription|https://chatgpt.com/backend-api|true|OAuth account' ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.endpoint_types[].id] | join(",")') == openai_codex ]]
+# An Endpoint type that owns its own identity refuses pasted secrets, and one
+# that owns its own sign-in cannot be created through the plain Endpoint API.
+[[ $(admin_status -X POST "$base/admin/providers/subscription-fixture/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"chatgpt","name":"Pasted key","secret":"sk-not-subscription","weight":100}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI subscription accounts are connected through sign-in, not created here" ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"pasted-subscription","name":"Pasted subscription","endpoint":{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","requires_credential":true,"credential_secret":"sk-test"}}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI subscription accounts are connected through that Endpoint type's sign-in flow, not created here" ]]
+# Connecting an account is addressed by Endpoint type: a native type has no
+# sign-in flow, while a type no enabled Extension provides is reported as such.
+[[ $(admin_status -X POST "$base/admin/endpoint-types/anthropic/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint type 'anthropic' has no sign-in flow" ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/mystery_provider/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint type 'mystery_provider' is not available because its Extension is not enabled" ]]
 # Provider Endpoint Extensions remain independently switchable. Their configured
 # resources are retained but unavailable until the implementation is enabled again.
 [[ $(admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":false}' | jq -r .enabled) == false ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | .endpoints[0].id') == chatgpt ]]
-[[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 409 ]]
-[[ $(jq -r '.error.message' response.json) == "OpenAI Subscription Extension is not enabled" ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].credentials[] | .kind] | join(",")') == openai_subscription,openai_subscription ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].credentials[] | .name] | join(",")') == OpenAI\ account,OpenAI\ account\ 2 ]]
+[[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "subscription-fixture") | .endpoints[0].credentials[] | [has("access_token"), has("refresh_token"), has("account_id")]] | add | any') == false ]]
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
 [[ $(status -X POST "$base/v1/responses" -H 'content-type: application/json' -d '{"model":"subscription-fixture/gpt-5.2","input":"test"}') == 400 ]]
-[[ $(jq -r '.error.message' response.json) == "OpenAI Subscription Extension is not enabled" ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint type 'openai_codex' is not available because its Extension is not enabled" ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"disabled-endpoint-type","name":"Disabled","endpoint":{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","requires_credential":true,"credential_secret":"sk-test"}}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint type 'openai_codex' is not available because its Extension is not enabled" ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint type 'openai_codex' is not available because its Extension is not enabled" ]]
 # Automatic routing can bypass the unavailable Extension-owned Endpoint when
 # another configured Endpoint remains eligible for a model.
-admin -f -X POST "$base/admin/providers/subscription-fixture/endpoints" -H 'content-type: application/json' -d "{\"id\":\"fallback\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}" >/dev/null
+admin -f -X POST "$base/admin/providers/subscription-fixture/endpoints" -H 'content-type: application/json' -d "{\"id\":\"fallback\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"credential_secret\":\"one\"}" >/dev/null
+# The Endpoint was just added, so its models are still being discovered. Wait for
+# the catalog before asking for a model that only the fallback Endpoint serves.
+for _ in $(seq 1 100); do
+  admin -f "$base/admin/providers" | jq -e '.[] | select(.id == "subscription-fixture") | .model_endpoints | has("custom-model")' >/dev/null && break
+  sleep .05
+done
 fallback_response=$(curl -sf -X POST "$base/v1/responses" -H 'content-type: application/json' -d '{"model":"subscription-fixture/custom-model","input":"test"}')
 [[ $(printf '%s' "$fallback_response" | jq -r .endpoint) == one ]]
-[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"disabled-subscription","targets":[{"provider_id":"subscription-fixture","endpoint_id":"chatgpt","api_key_id":"","upstream_model":"gpt-5.2","weight":100,"enabled":true}]}') == 409 ]]
-[[ $(jq -r '.error.message' response.json) == "Enable the OpenAI Subscription Extension before routing to this Endpoint" ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"disabled-subscription","targets":[{"provider_id":"subscription-fixture","endpoint_id":"chatgpt","credential_id":"","upstream_model":"gpt-5.2","weight":100,"enabled":true}]}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Enable the Extension that provides Endpoint type 'openai_codex' before routing to this Endpoint" ]]
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/openai-subscription" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/subscription-fixture" >/dev/null
@@ -276,39 +313,39 @@ sleep 2
 # Editing an expired key to remove expiry reactivates the same secret.
 admin -f -X PATCH "$base/admin/auth/keys/$expiring_id" -H 'content-type: application/json' -d '{"note":"Reactivated","expires_at":null,"provider_ids":[]}' >/dev/null
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $expiring_secret") == 200 ]]
-[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_api_key":false,"api_key":null}}') == 400 ]]
-[[ $(admin_status -X POST "$base/admin/openai-subscriptions/device-code" -H 'content-type: application/json' -d '{"provider_id":"bad-subscription-proxy","provider_name":"Bad subscription proxy","endpoint_id":"chatgpt","socks5_proxy":"http://127.0.0.1:1080"}') == 400 ]]
-[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth" -H 'content-type: application/json' -d '{"provider_id":"bad-oauth-proxy","provider_name":"Bad OAuth proxy","endpoint_id":"chatgpt","socks5_proxy":"https://127.0.0.1:1080"}') == 400 ]]
-browser_oauth=$(admin -f -X POST "$base/admin/openai-subscriptions/oauth" -H 'content-type: application/json' -d '{"provider_id":"browser-oauth","provider_name":"Browser OAuth","endpoint_id":"chatgpt"}')
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-proxy","name":"Bad proxy","endpoint":{"api_type":"openai_compatible","base_url":"http://127.0.0.1:1/v1","socks5_proxy":"http://127.0.0.1:1080","requires_credential":false,"credential_secret":null}}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"bad-subscription-proxy","provider_name":"Bad subscription proxy","endpoint_id":"chatgpt","socks5_proxy":"http://127.0.0.1:1080"}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth" -H 'content-type: application/json' -d '{"provider_id":"bad-oauth-proxy","provider_name":"Bad OAuth proxy","endpoint_id":"chatgpt","socks5_proxy":"https://127.0.0.1:1080"}') == 400 ]]
+browser_oauth=$(admin -f -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth" -H 'content-type: application/json' -d '{"provider_id":"browser-oauth","provider_name":"Browser OAuth","endpoint_id":"chatgpt"}')
 browser_oauth_id=$(printf '%s' "$browser_oauth" | jq -r .id)
 browser_oauth_url=$(printf '%s' "$browser_oauth" | jq -r .authorization_url)
 [[ -n $browser_oauth_id && $browser_oauth_url == https://auth.openai.com/oauth/authorize\?* ]]
 [[ $browser_oauth_url == *client_id=app_EMoamEEZ73f0CkXaXp7hrann* ]]
 [[ $browser_oauth_url == *redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback* ]]
 [[ $browser_oauth_url == *code_challenge_method=S256* ]]
-[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://127.0.0.1:1455/auth/callback?code=code&state=state"}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://127.0.0.1:1455/auth/callback?code=code&state=state"}') == 400 ]]
 [[ $(jq -r '.error.message' response.json) == "Callback URL must start with http://localhost:1455/auth/callback" ]]
-[[ $(admin_status -X POST "$base/admin/openai-subscriptions/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=wrong"}') == 400 ]]
-[[ $(jq -r '.error.message' response.json) == "OpenAI callback state does not match this sign-in" ]]
-[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_api_key":false,"api_key":null}}') == 400 ]]
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=wrong"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "The callback state does not match this sign-in" ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"bad-operation-url","name":"Bad operation URL","endpoint":{"api_type":"openai_compatible","base_url":"https://example.com/v1/responses","requires_credential":false,"credential_secret":null}}') == 400 ]]
 # Nested OpenAI-compatible roots, including OpenCode Go's /zen/go/v1 shape, append /models at that shared root.
-[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"nested-root\",\"name\":\"Nested root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/nested/v1\",\"requires_api_key\":true,\"api_key\":\"nested\"}}") == 204 ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"nested-root\",\"name\":\"Nested root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/nested/v1\",\"requires_credential\":true,\"credential_secret\":\"nested\"}}") == 204 ]]
 admin -f -X POST "$base/admin/providers/nested-root/models/refresh" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "nested-root") | .discovered_models[0]') == nested-model ]]
 admin -f -X DELETE "$base/admin/providers/nested-root" >/dev/null
 for provider in allowed denied; do
-  admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"$provider\",\"name\":\"$provider\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:1/v1\",\"requires_api_key\":false,\"api_key\":null}}" >/dev/null
+  admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"$provider\",\"name\":\"$provider\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:1/v1\",\"requires_credential\":false,\"credential_secret\":null}}" >/dev/null
 done
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}}" >/dev/null
-admin -f -X POST "$base/admin/providers/multi/endpoints" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"two\"}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"credential_secret\":\"one\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers/multi/endpoints" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"credential_secret\":\"two\"}" >/dev/null
 admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"id":"multi","name":"Renamed provider"}' >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | [.id, .name] | join(":")') == multi:Renamed\ provider ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"id":"renamed"}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"name":"  "}') == 400 ]]
-admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1/\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1/\",\"socks5_proxy\":null,\"requires_credential\":true}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .base_url') == "http://127.0.0.1:$upstream_port/v1" ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 409 ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"Bad ID\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true}") == 409 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"Bad ID\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true}") == 400 ]]
 # The mock identifies endpoints from their bearer credentials.
 # Discovery and inference must map unique models to the endpoint that reported them.
 admin -f -X POST "$base/admin/providers/multi/models/refresh" >/dev/null
@@ -328,19 +365,19 @@ providers_json=$(admin -f "$base/admin/providers")
 # Renaming an Endpoint keeps credentials attached and atomically rewrites every current
 # reference without invalidating model discovery when connection settings are unchanged.
 admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"x-provider":"yes"},"extra_body":{"extra":"provider"},"defaults_endpoint_ids":["two"]}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"rename-fixture","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"rename-fixture","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
-admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"regional\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two" -H 'content-type: application/json' -d "{\"id\":\"regional\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true}" >/dev/null
 providers_json=$(admin -f "$base/admin/providers")
-[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "regional") | .api_keys[0].id') == default ]]
+[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "regional") | .credentials[0].id') == default ]]
 [[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | [.model_endpoints["model-b"][0], .model_endpoint_preferences[0].endpoint_id, .defaults_endpoint_ids[0]] | join(":")') == regional:regional:regional ]]
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "rename-fixture") | .targets[0].endpoint_id') == regional ]]
 [[ $(admin -f "$base/admin/extensions/traffic-capture/status" | jq -r .config.endpoint_id) == regional ]]
 active_rename_expiry=$(($(date +%s) + 600))
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d "{\"active\":true,\"remaining\":1,\"expires_at\":$active_rename_expiry,\"provider_id\":\"multi\",\"endpoint_id\":\"regional\",\"model\":\"\",\"body_limit\":1024,\"retention_days\":1,\"redacted_headers\":[]}" >/dev/null
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"blocked-while-capturing\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}") == 409 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"blocked-while-capturing\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true}") == 409 ]]
 admin -f -X POST "$base/admin/extensions/traffic-capture/stop" >/dev/null
-admin -f -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true}" >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/regional" -H 'content-type: application/json' -d "{\"id\":\"two\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true}" >/dev/null
 admin -f -X DELETE "$base/admin/routes/rename-fixture" >/dev/null
 admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{},"extra_body":{},"defaults_endpoint_ids":[]}' >/dev/null
 scoped=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"Scoped","expires_at":null,"provider_ids":["allowed"]}')
@@ -364,23 +401,23 @@ unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
 # Renaming an upstream API key keeps its ID, secret, weight, enabled state, and
 # the model-route destination that references it, so routing keeps working.
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"renamed-key-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"renamed-key-route","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
 renamed_key_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"renamed-key-route","messages":[]}')
 [[ $(printf '%s' "$renamed_key_call" | jq -r .endpoint) == two ]]
-admin -f -X PATCH "$base/admin/providers/multi/endpoints/two/keys/default" -H 'content-type: application/json' -d '{"name":"Regional primary"}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two/credentials/default" -H 'content-type: application/json' -d '{"name":"Regional primary"}' >/dev/null
 providers_json=$(admin -f "$base/admin/providers")
-[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | [.name, (.weight | tostring), (.enabled | tostring)] | join(":")') == Regional\ primary:100:true ]]
-[[ $(jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | .secret' data/providers.json) == two ]]
-[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "renamed-key-route") | .targets[0].api_key_id') == default ]]
+[[ $(printf '%s' "$providers_json" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .credentials[] | select(.id == "default") | [.name, (.weight | tostring), (.enabled | tostring)] | join(":")') == Regional\ primary:100:true ]]
+[[ $(jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .credentials[] | select(.id == "default") | .secret' data/providers.json) == two ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "renamed-key-route") | .targets[0].credential_id') == default ]]
 renamed_key_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"renamed-key-route","messages":[]}')
 [[ $(printf '%s' "$renamed_key_call" | jq -r .endpoint) == two ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/keys/default" -H 'content-type: application/json' -d '{"name":"   "}') == 400 ]]
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .api_keys[] | select(.id == "default") | .name') == "Regional primary" ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/credentials/default" -H 'content-type: application/json' -d '{"name":"   "}') == 400 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .credentials[] | select(.id == "default") | .name') == "Regional primary" ]]
 admin -f -X DELETE "$base/admin/routes/renamed-key-route" >/dev/null
 # Upstream safety deadlines release requests that stop making progress, including
 # streams that keep the TCP connection active with comment-only keepalives.
 for timeout_model in timeout-before-headers timeout-idle-stream timeout-keepalive-stream; do
-  admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"$timeout_model\",\"targets\":[{\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"api_key_id\":\"default\",\"upstream_model\":\"$timeout_model\",\"weight\":100}]}" >/dev/null
+  admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"$timeout_model\",\"targets\":[{\"provider_id\":\"multi\",\"endpoint_id\":\"one\",\"credential_id\":\"default\",\"upstream_model\":\"$timeout_model\",\"weight\":100}]}" >/dev/null
 done
 curl -sS -D timeout-before-headers.headers -o timeout-before-headers.json -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"timeout-before-headers","messages":[]}' >timeout-before-headers.status & timeout_headers_pid=$!
 curl -sS -o timeout-idle-stream.body -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"timeout-idle-stream","messages":[],"stream":true}' >timeout-idle-stream.status & timeout_idle_pid=$!
@@ -398,7 +435,7 @@ timeout_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$timeout_logs" | jq '[.[] | select(.model == "timeout-idle-stream" and .status == 502 and .failure.stage == "upstream_stream" and .failure.category == "timeout")] | length') == 1 ]]
 [[ $(printf '%s' "$timeout_logs" | jq '[.[] | select(.model == "timeout-keepalive-stream" and .status == 502 and .failure.stage == "upstream_stream" and .failure.category == "timeout")] | length') == 1 ]]
 # Cross-protocol adapters let every caller surface use providers with a different native API.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"anthropic\",\"pricing\":{\"models\":{\"endpoint-create-check\":{\"input_per_million\":3,\"output_per_million\":4}}}}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"anthropic-only\",\"name\":\"Anthropic only\",\"endpoint\":{\"id\":\"messages\",\"api_type\":\"anthropic\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"anthropic\",\"pricing\":{\"models\":{\"endpoint-create-check\":{\"input_per_million\":3,\"output_per_million\":4}}}}}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | (.endpoints[0].pricing.updated_at > 0 and .endpoints[0].pricing.models["endpoint-create-check"].output_per_million == 4)) == [true]') == true ]]
 [[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude":{"input_per_million":-1,"output_per_million":2}}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d '{"models":{"claude*-invalid":{"input_per_million":1,"output_per_million":2}}}') == 400 ]]
@@ -412,7 +449,7 @@ admin -f -X PATCH "$base/admin/pricing/providers/anthropic-only/endpoints/messag
 [[ $(admin -f "$base/admin/providers" | jq -r 'map(select(.id == "anthropic-only") | .endpoints[0].pricing.models.claude.cache_read_per_million == 0.25) == [true]') == true ]]
 # A price entered for the name the caller sends covers every destination of one alias,
 # while a price for the name Yabane sends still wins field by field.
-priced_alias_target='{"provider_id":"anthropic-only","endpoint_id":"messages","api_key_id":"default","upstream_model":"alias-sent-one","weight":100,"enabled":true}'
+priced_alias_target='{"provider_id":"anthropic-only","endpoint_id":"messages","credential_id":"default","upstream_model":"alias-sent-one","weight":100,"enabled":true}'
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"priced-alias\",\"targets\":[$priced_alias_target]}" >/dev/null
 priced_alias_global='{"models":{"claude*":{"input_per_million":1,"output_per_million":1.5,"cache_read_per_million":0.5}},"incoming_models":{"priced-alias":{"input_per_million":3,"output_per_million":6}}}'
 admin -f -X PATCH "$base/admin/pricing" -H 'content-type: application/json' -d "$priced_alias_global" >/dev/null
@@ -438,7 +475,7 @@ first_alias_id=$(priced_alias_request alias-one.headers)
 first_alias_log=$(priced_alias_log "$first_alias_id")
 [[ $(printf '%s' "$first_alias_log" | jq -r '.upstream_model') == alias-sent-one ]]
 [[ $(printf '%s' "$first_alias_log" | jq -r '[.cost_source, ((.cost * 1000000) | round), .pricing_sources.input.name, .pricing_sources.input.scope, .pricing_sources.input.pattern, .pricing_sources.output.name] | join(":")') == "estimated:33:incoming:global:priced-alias:incoming" ]]
-admin -f -X PATCH "$base/admin/routes/priced-alias" -H 'content-type: application/json' -d "{\"pattern\":\"priced-alias\",\"targets\":[{\"provider_id\":\"anthropic-only\",\"endpoint_id\":\"messages\",\"api_key_id\":\"default\",\"upstream_model\":\"alias-sent-two\",\"weight\":100,\"enabled\":true}]}" >/dev/null
+admin -f -X PATCH "$base/admin/routes/priced-alias" -H 'content-type: application/json' -d "{\"pattern\":\"priced-alias\",\"targets\":[{\"provider_id\":\"anthropic-only\",\"endpoint_id\":\"messages\",\"credential_id\":\"default\",\"upstream_model\":\"alias-sent-two\",\"weight\":100,\"enabled\":true}]}" >/dev/null
 second_alias_log=$(priced_alias_log "$(priced_alias_request alias-two.headers)")
 [[ $(printf '%s' "$second_alias_log" | jq -r '[.upstream_model, ((.cost * 1000000) | round), .pricing_sources.input.pattern] | join(":")') == "alias-sent-two:33:priced-alias" ]]
 # A narrower rule for the sent name overrides only the fields it states.
@@ -462,8 +499,8 @@ alias_outgoing=$(admin -f "$base/admin/activity/stats?since=0&buckets=4&model_di
 [[ $(printf '%s' "$alias_outgoing" | jq -r '[.by_model[] | select(.name == "alias-sent-one") | .requests] | add') == 1 ]]
 [[ $(printf '%s' "$alias_outgoing" | jq -r '[.by_model[] | select(.name == "alias-sent-two") | .requests] | add') == 3 ]]
 [[ $(admin_status "$base/admin/activity/stats?since=0&buckets=4&model_dimension=requested") == 400 ]]
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-chat-only\",\"name\":\"OpenAI Chat only\",\"endpoint\":{\"id\":\"chat\",\"api_type\":\"openai_chat_completions\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"convert\"}}" >/dev/null
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-responses-only\",\"name\":\"OpenAI Responses only\",\"endpoint\":{\"id\":\"responses\",\"api_type\":\"openai_responses\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"responses-stream\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-chat-only\",\"name\":\"OpenAI Chat only\",\"endpoint\":{\"id\":\"chat\",\"api_type\":\"openai_chat_completions\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"convert\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"openai-responses-only\",\"name\":\"OpenAI Responses only\",\"endpoint\":{\"id\":\"responses\",\"api_type\":\"openai_responses\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"responses-stream\"}}" >/dev/null
 chat_converted=$(curl -sf -D conversion.headers -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'OpenAI-Organization: org-caller' -H 'OpenAI-Project: project-caller' -H 'content-type: application/json' -d '{"model":"anthropic-only/claude","messages":[{"role":"system","content":"Be concise"},{"role":"user","content":"hello"}],"max_completion_tokens":64}')
 [[ $(printf '%s' "$chat_converted" | jq -r '.choices[0].message.content') == from-anthropic ]]
 grep -qi '^x-yabane-protocol-conversion: anthropic_messages->openai_chat_completions' conversion.headers
@@ -536,27 +573,36 @@ admin -f -X PATCH "$base/admin/providers/multi" -H 'content-type: application/js
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"chatgpt-account-id":"unsafe"},"extra_body":{}}') == 400 ]]
 [[ $(admin_status -X PATCH "$base/admin/providers/multi" -H 'content-type: application/json' -d '{"extra_headers":{"bad header":"unsafe"},"extra_body":{}}') == 400 ]]
 # Routes can explicitly target an Endpoint that is configured not to require authentication.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"keyless\",\"name\":\"Keyless local\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":false,\"api_key\":null}}" >/dev/null
-keyless_route_payload='{"pattern":"local-alias","targets":[{"provider_id":"keyless","endpoint_id":"local","api_key_id":"","upstream_model":"local-model","weight":100}]}'
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"keyless\",\"name\":\"Keyless local\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false,\"credential_secret\":null}}" >/dev/null
+keyless_route_payload='{"pattern":"local-alias","targets":[{"provider_id":"keyless","endpoint_id":"local","credential_id":"","upstream_model":"local-model","weight":100}]}'
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$keyless_route_payload" >/dev/null
-[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "local-alias") | .targets[0].api_key_id') == "" ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "local-alias") | .targets[0].credential_id') == "" ]]
 keyless_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"local-alias","messages":[]}')
 [[ $(printf '%s' "$keyless_response" | jq -r .endpoint) == unknown ]]
 [[ $(printf '%s' "$keyless_response" | jq -r .model) == local-model ]]
-[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-keyless-route","targets":[{"provider_id":"keyless","endpoint_id":"local","api_key_id":"invented","upstream_model":"local-model","weight":100}]}') == 400 ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/keyless/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true}") == 409 ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-keyless-route","targets":[{"provider_id":"keyless","endpoint_id":"local","credential_id":"invented","upstream_model":"local-model","weight":100}]}') == 400 ]]
+# Requiring credentials can be turned on for an Endpoint whose route keeps the Endpoint
+# policy, and requests fail visibly with 409 until a credential exists.
+admin -f -X PATCH "$base/admin/providers/keyless/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true}" >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"local-alias","messages":[]}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint 'local' has no enabled credential" ]]
+admin -f -X POST "$base/admin/providers/keyless/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"local","name":"Follow-up key","secret":"keyless-follow-up","weight":100}' >/dev/null
+keyless_pool=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"local-alias","messages":[]}')
+[[ $(printf '%s' "$keyless_pool" | jq -r .endpoint) == keyless-follow-up ]]
+# An Endpoint that does not require credentials rejects one instead of storing an unused secret.
+[[ $(admin_status -X POST "$base/admin/providers/allowed/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"openai","name":"Rejected","secret":"rejected","weight":100}') == 400 ]]
 # Removing an Endpoint's authentication requirement atomically clears route credential references.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"auth-switch\",\"name\":\"Authentication switch\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":true,\"api_key\":\"switch-secret\"}}" >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"auth-switch-alias","targets":[{"provider_id":"auth-switch","endpoint_id":"local","api_key_id":"default","upstream_model":"switch-model","weight":100}]}' >/dev/null
-admin -f -X PATCH "$base/admin/providers/auth-switch/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_api_key\":false}" >/dev/null
-[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "auth-switch-alias") | .targets[0].api_key_id') == "" ]]
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"auth-switch\",\"name\":\"Authentication switch\",\"endpoint\":{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"switch-secret\"}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"auth-switch-alias","targets":[{"provider_id":"auth-switch","endpoint_id":"local","credential_id":"default","upstream_model":"switch-model","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/auth-switch/endpoints/local" -H 'content-type: application/json' -d "{\"id\":\"local\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false}" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "auth-switch-alias") | .targets[0].credential_id') == "" ]]
 auth_switch_response=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"auth-switch-alias","messages":[]}')
 [[ $(printf '%s' "$auth_switch_response" | jq -r .model) == switch-model ]]
-route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":50},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":50}]}'
-[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
+route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":50},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":50}]}'
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"bad-prefixed-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"multi/model-a","weight":1}]}') == 400 ]]
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$route_payload" >/dev/null
 # Existing routes can be edited, including renaming the public pattern and replacing destinations.
-admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model-edited","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"custom-model-not-discovered","weight":100}]}' >/dev/null
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model-edited","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"custom-model-not-discovered","weight":100}]}' >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model-edited") | .targets[0].upstream_model') == custom-model-not-discovered ]]
 [[ $(admin_status -X PATCH "$base/admin/routes/missing-route" -H 'content-type: application/json' -d "$route_payload") == 404 ]]
 admin -f -X PATCH "$base/admin/routes/friendly-model-edited" -H 'content-type: application/json' -d "$route_payload" >/dev/null
@@ -623,37 +669,115 @@ admin -f -X POST "$base/admin/extensions/traffic-capture/stop" >/dev/null
 # Request Defaults is an extension-owned policy; Endpoint-level values override Provider defaults inside its own crate.
 # Yabane's E2E only confirms that the compiled extension is wired into the Hook pipeline and scoped routing context.
 # Disabled route targets remain configured and receive no traffic, enabling an instant A/B cutover.
-disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
+disabled_route_payload='{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}'
 admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d "$disabled_route_payload" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model") | [.targets[].enabled] | join(",")') == false,true ]]
 for _ in $(seq 1 4); do
   switched=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"friendly-model","messages":[]}')
   [[ $(printf '%s' "$switched" | jq -r .endpoint) == two ]]
 done
-[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":0,"enabled":false}]}') == 400 ]]
-admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":0,"enabled":true},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}' >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":0,"enabled":false},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":0,"enabled":false}]}') == 400 ]]
+admin -f -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":0,"enabled":true},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":100,"enabled":true}]}' >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "friendly-model") | [.targets[0].weight, .targets[0].enabled] | join(",")') == 0,false ]]
-[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":60,"enabled":true},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":30,"enabled":true}]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/routes/friendly-model" -H 'content-type: application/json' -d '{"pattern":"friendly-model","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":60,"enabled":true},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":30,"enabled":true}]}') == 400 ]]
 # A key referenced by any retained route target cannot be disabled, including a disabled target kept for cutover.
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/default" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/credentials/default" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
 # Endpoint identity is part of an upstream-key mutation, because key IDs are only endpoint-local.
-admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Temporary","secret":"temporary","weight":10}' >/dev/null
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/keys/temporary" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
-admin -f -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"key_id":"default","weight":75},{"key_id":"temporary","weight":25}]}' >/dev/null
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | [.api_keys[] | .weight] | sort | join(",")') == 25,75 ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"key_id":"default","weight":60},{"key_id":"temporary","weight":30}]}') == 400 ]]
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"key_id":"missing","weight":100}]}') == 400 ]]
-admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/temporary" >/dev/null
-[[ $(admin_status -X PATCH "$base/admin/providers/multi/keys/default" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
+admin -f -X POST "$base/admin/providers/multi/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Temporary","secret":"temporary","weight":10}' >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/one/credentials/temporary" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
+admin -f -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"credential_id":"default","weight":75},{"credential_id":"temporary","weight":25}]}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | [.credentials[] | .weight] | sort | join(",")') == 25,75 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"credential_id":"default","weight":60},{"credential_id":"temporary","weight":30}]}') == 400 ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/endpoints/two/traffic" -H 'content-type: application/json' -d '{"weights":[{"credential_id":"missing","weight":100}]}') == 400 ]]
+admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/credentials/temporary" >/dev/null
+[[ $(admin_status -X PATCH "$base/admin/providers/multi/credentials/default" -H 'content-type: application/json' -d '{"enabled":false}') == 404 ]]
 # Deleting a key also removes global-route destinations that refer to that exact endpoint key.
-admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Routed temporary","secret":"routed-temporary","weight":10}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/providers/multi/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Routed temporary","secret":"routed-temporary","weight":10}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"routed-temporary","upstream_model":"model-b","weight":100}]}' >/dev/null
 # A route that keeps other destinations has to keep totaling 100% after the deletion,
 # otherwise the next start refuses to load the file this instance wrote.
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route-shared","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"routed-temporary","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"two","api_key_id":"default","upstream_model":"model-b","weight":30}]}' >/dev/null
-admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/keys/routed-temporary" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"temporary-route-shared","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"routed-temporary","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":30}]}' >/dev/null
+admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/credentials/routed-temporary" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "temporary-route")] | length') == 0 ]]
-[[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "temporary-route-shared") | .targets[] | [.api_key_id, .weight]]') == '[["default",100]]' ]]
+[[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "temporary-route-shared") | .targets[] | [.credential_id, .weight]]') == '[["default",100]]' ]]
+# A credential pool survives quota exhaustion without editing routes by hand: the
+# Provider's 429 reaches the caller verbatim, later requests skip that identity, and
+# the identity returns only when its cooldown ends or an administrator clears it.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"pool\",\"name\":\"Credential pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Throttled account\",\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":true}}}" >/dev/null
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"bad-cooldown\",\"name\":\"Bad cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false,\"rate_limit_cooldown\":{\"seconds\":2592001,\"honor_retry_after\":false}}}") == 400 ]]
+admin -f -X POST "$base/admin/providers/pool/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Healthy account","secret":"healthy","weight":100}' >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | [.endpoints[0].credentials[] | .id] | join(",")') == default,healthy-account ]]
+pool_route='{"pattern":"pool-model","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"","upstream_model":"pool-model","weight":100}]}'
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$pool_route" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "pool-model") | .targets[0].credential_id') == "" ]]
+pool_posts_before=$(curl -sS "http://127.0.0.1:$upstream_port/count")
+pool_throttled_status=$(curl -sS -D pool-throttled.headers -o pool-throttled.body -w '%{http_code}' -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"pool-model","messages":[]}')
+[[ $pool_throttled_status == 429 ]]
+# One caller request becomes exactly one Provider request, even when it is rate limited.
+[[ $(( $(curl -sS "http://127.0.0.1:$upstream_port/count") - pool_posts_before )) -eq 1 ]]
+[[ $(jq -r '.error.message' pool-throttled.body) == "quota exhausted" ]]
+[[ $(tr -d '\r' <pool-throttled.headers | awk -F': ' 'tolower($1) == "x-yabane-error-origin" {print $2}') == upstream ]]
+[[ $(tr -d '\r' <pool-throttled.headers | awk -F': ' 'tolower($1) == "retry-after" {print $2}') == 120 ]]
+pool_cooling=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].credentials[] | select(.id == "default") | .cooldown_seconds_remaining')
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].credentials[] | select(.id == "healthy-account") | has("cooldown_seconds_remaining")') == false ]]
+[[ $pool_cooling =~ ^[0-9]+$ && $pool_cooling -gt 0 && $pool_cooling -le 120 ]]
+# The credential that exhausted its quota stays out of selection for as many requests
+# as the pool receives, so no manual route or credential edit is needed.
+for _ in $(seq 1 3); do
+  pool_healthy=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"pool-model","messages":[]}')
+  [[ $(printf '%s' "$pool_healthy" | jq -r .endpoint) == healthy ]]
+done
+# Activity explains which identity carried each request without storing any secret.
+pool_activity=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "default" and .status == 429)] | length') -ge 1 ]]
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "healthy-account" and .status == 200)] | length') -ge 1 ]]
+# A pinned destination keeps using the identity it names, cooldown or not.
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-pinned","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"default","upstream_model":"pool-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"pool-pinned","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+# A destination is validated against the identities of the Endpoint it names.
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-missing-pin","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"missing-account","upstream_model":"pool-model","weight":100}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Route target credential was not found" ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-borrowed-pin","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"healthy-account","upstream_model":"model-b","weight":100}]}') == 400 ]]
+admin -f -X PATCH "$base/admin/providers/pool/endpoints/main/credentials/healthy-account" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-disabled-pin","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"healthy-account","upstream_model":"pool-model","weight":100}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Route target credential is disabled" ]]
+# A pinned identity cannot be switched off while a destination keeps using it.
+[[ $(admin_status -X PATCH "$base/admin/providers/pool/endpoints/main/credentials/default" -H 'content-type: application/json' -d '{"enabled":false}') == 409 ]]
+admin -f -X PATCH "$base/admin/providers/pool/endpoints/main/credentials/healthy-account" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null
+# Clearing the cooldown returns the identity to selection immediately.
+[[ $(admin_status -X DELETE "$base/admin/providers/pool/endpoints/main/credentials/default/cooldown") == 204 ]]
+[[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "pool") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
+[[ $(admin_status -X DELETE "$base/admin/providers/pool/endpoints/main/credentials/missing/cooldown") == 404 ]]
+# When every pool member is cooling down Yabane still sends the request, so the
+# Provider's own answer reaches the caller instead of an invented gateway failure.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"solo-pool\",\"name\":\"Solo pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"honor_retry_after\":false}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"solo-model","targets":[{"provider_id":"solo-pool","endpoint_id":"main","credential_id":"","upstream_model":"solo-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"solo-model","messages":[]}') == 429 ]]
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"solo-model","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.type' response.json) == rate_limit_error ]]
+grep -q 'every credential is cooling down' server.log
+# Without an explicit policy a 429 only reaches the caller: Yabane never infers exhaustion.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"no-cooldown\",\"name\":\"No cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\"}}" >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "no-cooldown") | .endpoints[0].rate_limit_cooldown | [.seconds, .honor_retry_after] | join(",")') == 0,false ]]
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"no-cooldown-model","targets":[{"provider_id":"no-cooldown","endpoint_id":"main","credential_id":"","upstream_model":"no-cooldown-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"no-cooldown-model","messages":[]}') == 429 ]]
+[[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "no-cooldown") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
+# Runtime health follows the Endpoint it was observed on: renaming an Endpoint
+# clears its cooldown instead of leaving a key that another Endpoint could inherit.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"restart-pool\",\"name\":\"Restart pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":false}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"restart-model","targets":[{"provider_id":"restart-pool","endpoint_id":"main","credential_id":"","upstream_model":"restart-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"restart-model","messages":[]}') == 429 ]]
+restart_cooling() { admin -f "$base/admin/providers" | jq --arg id restart-pool '[.[] | select(.id == $id) | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any'; }
+[[ $(restart_cooling) == true ]]
+admin -f -X PATCH "$base/admin/providers/restart-pool/endpoints/main" -H 'content-type: application/json' -d "{\"id\":\"rotating\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":false}}" >/dev/null
+[[ $(restart_cooling) == false ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "restart-model") | .targets[0].endpoint_id') == rotating ]]
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"restart-model","messages":[]}') == 429 ]]
+[[ $(restart_cooling) == true ]]
+# Converting an Endpoint into a subscription Endpoint is rejected instead of guessing.
+[[ $(admin_status -X POST "$base/admin/providers/multi/endpoints" -H 'content-type: application/json' -d "{\"id\":\"codex\",\"api_type\":\"openai_codex\",\"base_url\":\"https://chatgpt.com/backend-api\",\"requires_credential\":true,\"credential_secret\":\"secret\"}") == 400 ]]
+
 # Explicit cost refresh recalculates estimated values, fills missing values, and preserves
 # both upstream-reported costs and legacy costs without cost_source.
 admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a":{"input_per_million":1,"output_per_million":2}}}' >/dev/null
@@ -694,9 +818,9 @@ admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: applic
 [[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq -r 'any(.[]; .request_id == "req-cost-estimated" and .source_instance_id == "cost-refresh-test" and .cost == 0.006 and .cost_source == "estimated")') == true ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/activity/recalculate-costs"].post.responses | has("500")') == true ]]
 # Deleting an endpoint removes its keys, discovery availability, and exact route destinations.
-admin -f -X POST "$base/admin/providers/multi/keys" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-shared","targets":[{"provider_id":"multi","endpoint_id":"two","api_key_id":"endpoint-deletion-route","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":30}]}' >/dev/null
+admin -f -X POST "$base/admin/providers/multi/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"two","name":"Endpoint deletion route","secret":"endpoint-deletion-route","weight":10}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"endpoint-deletion-route","upstream_model":"model-b","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"endpoint-deletion-shared","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"endpoint-deletion-route","upstream_model":"model-b","weight":70},{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":30}]}' >/dev/null
 admin -f -X PATCH "$base/admin/extensions/traffic-capture/status" -H 'content-type: application/json' -d '{"active":false,"remaining":0,"expires_at":null,"provider_id":"multi","endpoint_id":"two","model":"","body_limit":1024,"retention_days":1,"redacted_headers":[]}' >/dev/null
 admin -f -X PATCH "$base/admin/pricing/providers/multi/endpoints/two" -H 'content-type: application/json' -d '{"models":{"model-b*":{"input_per_million":0.2,"output_per_million":0.8}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
@@ -709,10 +833,10 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two" >/dev/null
 [[ $(jq '[.[] | select(.id == "multi") | .endpoints[] | select(.id == "two") | .pricing] | length' data/providers.json) == 0 ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/multi/endpoints/missing") == 404 ]]
 # Deleting a Provider removes every route destination that refers to it.
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","api_key_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"provider-deletion-route","targets":[{"provider_id":"multi","endpoint_id":"one","credential_id":"default","upstream_model":"model-a","weight":100}]}' >/dev/null
 denied_endpoint=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "denied") | .endpoints[0].id')
 allowed_endpoint=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "allowed") | .endpoints[0].id')
-admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"provider-deletion-shared\",\"targets\":[{\"provider_id\":\"allowed\",\"endpoint_id\":\"$allowed_endpoint\",\"api_key_id\":\"\",\"upstream_model\":\"model-a\",\"weight\":70},{\"provider_id\":\"denied\",\"endpoint_id\":\"$denied_endpoint\",\"api_key_id\":\"\",\"upstream_model\":\"model-b\",\"weight\":30}]}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d "{\"pattern\":\"provider-deletion-shared\",\"targets\":[{\"provider_id\":\"allowed\",\"endpoint_id\":\"$allowed_endpoint\",\"credential_id\":\"\",\"upstream_model\":\"model-a\",\"weight\":70},{\"provider_id\":\"denied\",\"endpoint_id\":\"$denied_endpoint\",\"credential_id\":\"\",\"upstream_model\":\"model-b\",\"weight\":30}]}" >/dev/null
 admin -f -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{"model-a*":{"input_per_million":0.3,"output_per_million":0.9}}}' >/dev/null
 admin -f -X DELETE "$base/admin/providers/denied" >/dev/null
 admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
@@ -732,7 +856,7 @@ admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $model_scoped_secret") == 401 ]]
 [[ $(admin -f "$base/admin/auth" | jq -r --arg id "$multi_provider_scoped_id" '.api_keys[] | select(.id == $id) | .provider_ids | join(",")') == allowed ]]
 # Recreate the Provider needed by the remaining Activity checks.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_api_key\":true,\"api_key\":\"one\"}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"credential_secret\":\"one\"}}" >/dev/null
 # A completed batch is appended in groups of ten without depending on earlier Activity totals.
 before_batch_count=$(wc -l < data/activity.jsonl | tr -d ' ')
 after_batch_count=$before_batch_count
@@ -900,6 +1024,9 @@ pid=
 "$binary" --no-extensions --addr "127.0.0.1:$port" >no-extensions.log 2>&1 & pid=$!
 for _ in $(seq 1 50); do curl -sf "$base/healthz" >/dev/null && break; sleep .1; done
 [[ $(curl -sS -c "$cookie" -o /dev/null -w '%{http_code}' -X POST "$base/admin/login" -H 'content-type: application/json' -d '{"username":"owner","email":null,"password":"password123","turnstile_token":""}') == 204 ]]
+# Credential health is runtime state only: a restart starts with every identity
+# eligible instead of resurrecting a cooldown that may no longer apply.
+[[ $(restart_cooling) == false ]]
 cli_extension=$(admin -f "$base/admin/extensions" | jq -c '.[] | select(.id == "request-defaults")')
 [[ $(printf '%s' "$cli_extension" | jq -r '.enabled') == false ]]
 [[ $(printf '%s' "$cli_extension" | jq -r '.runtime_configurable') == false ]]
@@ -927,7 +1054,7 @@ pid=
 # a manually corrupted route file to survive until an inference request fails.
 cp data/routes.json data/routes.valid.json
 cat >data/routes.json <<'JSON'
-[{"pattern":"dangling-startup","targets":[{"provider_id":"missing-provider","endpoint_id":"missing-endpoint","api_key_id":"missing-key","upstream_model":"model","weight":100,"enabled":true}]}]
+[{"pattern":"dangling-startup","targets":[{"provider_id":"missing-provider","endpoint_id":"missing-endpoint","credential_id":"missing-key","upstream_model":"model","weight":100,"enabled":true}]}]
 JSON
 "$binary" --addr "127.0.0.1:$port" >dangling-configuration.log 2>&1 & pid=$!
 for _ in $(seq 1 50); do

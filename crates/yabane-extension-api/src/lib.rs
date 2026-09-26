@@ -160,25 +160,72 @@ pub trait UpstreamExchangeHook: ExtensionHook {
     ) -> Option<Box<dyn UpstreamExchangeObserver>>;
 }
 
+/// The material shape of an identity. Core stores both shapes without knowing
+/// what the fields mean to a particular Provider; the Extension decides which
+/// shape its Endpoint type accepts and how the material reaches the wire.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderEndpointKind {
+pub enum CredentialFlow {
+    /// A secret the caller pastes. Core puts it in the Provider's own header.
+    Secret,
+    /// A signed-in account that expires and is refreshed by its Extension.
     Subscription,
+}
+
+/// One kind of identity an Endpoint type accepts. The identifier and the label
+/// belong to the Extension that declares them: Core only stores and displays
+/// them, and never decides which kinds exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderCredentialKind {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub flow: CredentialFlow,
+}
+
+/// The sign-in flows an Endpoint type offers for connecting an account.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderSignIn {
+    pub device_code: bool,
+    pub browser: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderEndpointType {
     pub id: &'static str,
     pub display_name: &'static str,
+    /// One line describing this Endpoint type, shown wherever a configured
+    /// Endpoint names it.
+    pub description: &'static str,
     pub default_endpoint_id: &'static str,
     pub fixed_base_url: Option<&'static str>,
-    pub kind: ProviderEndpointKind,
     pub upstream_protocol: Protocol,
     pub always_event_stream: bool,
+    /// Caller protocols this Endpoint type can serve. Core consults this instead
+    /// of inferring capability from an API type name.
+    pub surfaces: &'static [Protocol],
+    /// Identity kinds an Endpoint of this type may own. An empty slice means the
+    /// type carries no Extension-owned identity, so Core's own `secret` kind
+    /// applies.
+    pub credential_kinds: &'static [ProviderCredentialKind],
+    pub sign_in: Option<ProviderSignIn>,
+}
+
+/// The identity material Core hands to an Endpoint implementation for one
+/// request. Core stores these shapes and never interprets them further; the
+/// Extension decides how they reach the wire.
+pub enum ProviderEndpointMaterial<'a> {
+    Secret {
+        secret: &'a str,
+    },
+    Subscription {
+        access_token: &'a str,
+        account_id: &'a str,
+    },
 }
 
 pub struct ProviderEndpointCredential<'a> {
-    pub access_token: &'a str,
-    pub account_id: &'a str,
+    /// The kind identifier declared by the Endpoint type that owns this identity.
+    pub kind: &'a str,
+    pub material: ProviderEndpointMaterial<'a>,
 }
 
 pub struct ProviderEndpointRequest<'a> {

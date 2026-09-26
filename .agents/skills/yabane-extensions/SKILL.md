@@ -224,6 +224,28 @@ let hooks = RequestHooks {
 
 框架已提供实现级运行时启停：在构造任何实例或 Hook 快照前调用 `state.extensions.is_enabled(extension_id)`，禁用时不得构造或加入 Hook。通用配置实例和运行时排序仍不受支持；这些需求应先扩展框架和持久化模型。
 
+## 声明 Provider Endpoint 类型
+
+实现 `ProviderEndpoint` 的 Extension 不只是接管一个 Endpoint 的 wire request，还要声明这个 Endpoint 类型的全部对外语义。`ProviderEndpointType` 是唯一权威来源：
+
+| 字段 | 谁定义 | Core 如何使用 |
+|---|---|---|
+| `id`、`display_name`、`description`、`default_endpoint_id` | Extension | 作为 Endpoint 的 `api_type`，并在控制台、管理 API 和错误消息里原样使用 |
+| `fixed_base_url` | Extension | 非空时是实际请求目标的权威来源，并让该 Endpoint 只能改代理与限流策略，不能改连接 |
+| `upstream_protocol`、`surfaces`、`always_event_stream` | Extension | 决定上游 wire protocol、允许的调用方协议，以及响应是否按事件流解析 |
+| `models()` | Extension | 该 Endpoint 类型的模型目录，替代网络发现 |
+| `credential_kinds` | Extension | 该 Endpoint 类型允许保存的身份种类：`id` 是持久化值，`label` 是界面与错误消息里的称呼，`flow` 说明这是粘贴的密钥（`Secret`）还是被 Extension 刷新的登录账号（`Subscription`） |
+| `sign_in` | Extension | 是否提供 device code / browser 登录流程；Core 只按 Endpoint 类型转发请求，不知道厂商 |
+
+规则：
+
+- Core 只保存身份的通用形状和 `kind` 标识。身份的名称、材料解析、刷新、登录流程和文案都归声明它的 Extension，Core 不得按标识猜语义，也不得在代码或文案里写死某个 Extension 的类型名或身份名。
+- 身份材料按 `flow` 传递：`Secret` 交给 Extension 的是原始密钥，`Subscription` 交给 Extension 的是登录后的 access/refresh token 与过期时间。
+- 登录流程的地址是 `/admin/endpoint-types/{endpoint_type}/sign-in/*`。未声明登录流程的类型必须被明确拒绝，不能猜测或回退到别的 Extension。
+- 未启用的 Extension 不发布任何 Endpoint 类型：它的 Endpoint 配置保持原样、不再校验，使用时报错并点出 Endpoint 类型名，而不是静默换一个含义或回退到其他 Provider。
+- 一个 Extension 不得在声明里冒用另一个 Extension 的类型标识；类型标识是全局唯一的资源寻址方式。
+- 新增一类登录账号只需要加 Extension 与声明，不应要求修改 Core 或控制台；如果必须改 Core 才能让它工作，说明语义漏到了 Core。
+
 ## Header 安全边界
 
 Header Hook 不能新增、修改或删除以下 Core-managed Header：

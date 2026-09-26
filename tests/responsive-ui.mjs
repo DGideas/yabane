@@ -55,21 +55,36 @@ for (const project of projects) {
       if (route.request().method() !== 'GET') return route.continue();
       await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(captureFixture)});
     });
-    await page.route('**/admin/openai-subscriptions/device-code', async route => {
+    const deviceCodeBodies = [];
+    await page.route('**/admin/endpoint-types/openai_codex/sign-in/device-code', async route => {
       if (route.request().method() !== 'POST') return route.continue();
+      deviceCodeBodies.push(route.request().postDataJSON());
       await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'device-flow', status: 'pending', user_code: 'ABCD-EFGH', verification_uri: 'https://auth.openai.com/codex/device', interval_seconds: 60, expires_at: 4102444800})});
     });
-    await page.route('**/admin/openai-subscriptions/device-code/device-flow', async route => {
+    await page.route('**/admin/endpoint-types/openai_codex/sign-in/device-code/device-flow', async route => {
       await route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({id: 'device-flow', status: 'pending', user_code: 'ABCD-EFGH', verification_uri: 'https://auth.openai.com/codex/device', interval_seconds: 60, expires_at: 4102444800})});
     });
-    await page.route('**/admin/openai-subscriptions/oauth', async route => {
+    await page.route('**/admin/endpoint-types/openai_codex/sign-in/oauth', async route => {
       if (route.request().method() !== 'POST') return route.continue();
       await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'browser-flow', authorization_url: 'https://auth.openai.com/oauth/authorize?state=browser-state', expires_at: 4102444800})});
     });
-    await page.route('**/admin/openai-subscriptions/oauth/browser-flow/complete', async route => {
+    await page.route('**/admin/endpoint-types/openai_codex/sign-in/oauth/browser-flow/complete', async route => {
       const body = route.request().postDataJSON();
       if (body.redirect_url !== 'http://localhost:1455/auth/callback?code=oauth-code&state=browser-state') throw new Error(`${project.name}: browser OAuth did not submit the complete callback URL`);
       await route.fulfill({status: 204});
+    });
+    await page.route('**/admin/endpoint-types', async route => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const response = await route.fetch();
+      if (!response.ok()) return route.fulfill({response});
+      const body = await response.json();
+      body.push({
+        id: 'acme_plan', label: 'Acme plan', description: 'Acme plan Endpoints', default_endpoint_id: 'acme',
+        fixed_base_url: 'https://api.acme.test/plan', native: false,
+        credential_kinds: [{id: 'acme_account', label: 'Acme account', flow: 'subscription'}],
+        sign_in: {device_code: false, browser: true},
+      });
+      await route.fulfill({response, json: body});
     });
     await page.route('**/admin/providers', async route => {
       if (route.request().method() !== 'GET') return route.continue();
@@ -79,9 +94,10 @@ for (const project of projects) {
       body.push({
         id: 'ui-subscription', name: 'UI subscription fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
         endpoints: [{
-          id: 'chatgpt', api_type: 'openai_codex', base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
-          extra_headers: {}, extra_body: {}, requires_api_key: false, api_keys: [], subscription_connected: true,
-          subscription_expires_at: 1,
+          id: 'chatgpt', api_type: 'openai_codex', endpoint_type_label: 'OpenAI subscription', fixed_base_url: 'https://chatgpt.com/backend-api',
+          sign_in: {device_code: true, browser: true}, base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, honor_retry_after: true},
+          credentials: [{id: 'account', name: 'OpenAI account', weight: 100, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, cooldown_seconds_remaining: 90}],
         }],
         discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
@@ -89,8 +105,7 @@ for (const project of projects) {
         id: 'ui-keyless', name: 'UI keyless fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
         endpoints: [{
           id: 'local', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
-          extra_headers: {}, extra_body: {}, requires_api_key: false, api_keys: [], subscription_connected: false,
-          subscription_expires_at: null,
+          extra_headers: {}, extra_body: {}, requires_credential: false, credentials: [], rate_limit_cooldown: {seconds: 120, honor_retry_after: false},
         }],
         discovered_models: ['local-model'], model_endpoints: {'local-model': ['local']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
@@ -132,6 +147,14 @@ for (const project of projects) {
     const testLiveRefresh = project.name === 'desktop-chrome';
     if (testLiveRefresh) await page.clock.install();
 
+    if (project.name === 'desktop-chrome' && sessionCookie) {
+      // A direct link renders the Provider page before the Extensions list arrives; the
+      // Request defaults card must catch up instead of claiming the Extension is absent.
+      await page.goto(`${base}/providers/ui-keyless`, {waitUntil: 'domcontentloaded'});
+      await page.locator('.defaults-card .section-kicker').waitFor();
+      await page.waitForFunction(() => /Extension (enabled|disabled)/.test(document.querySelector('.defaults-card .section-kicker')?.textContent || ''), undefined, {timeout: 15000});
+      await page.goto(base, {waitUntil: 'domcontentloaded'});
+    }
     await page.goto(`${base}/docs`, {waitUntil: 'domcontentloaded'});
     await page.locator('.docs-op').first().waitFor();
     await assertNoUpstreamCopy(page, project.name, 'API docs');
@@ -280,7 +303,7 @@ for (const project of projects) {
       page.once('dialog', async dialog => { disableWarning = dialog.message(); await dialog.dismiss(); });
       await openAiSubscriptionExtension.locator('[data-extension-toggle="openai-subscription"]').evaluate(input => input.click());
       await page.waitForFunction(() => document.querySelector('[data-extension-toggle="openai-subscription"]').checked);
-      if (!disableWarning.includes('1 configured OpenAI subscription Endpoint') || !disableWarning.includes('routing, model discovery, sign-in, token refresh, and inference')) throw new Error(`${project.name}: disabling OpenAI Subscription does not confirm the impact on configured Endpoints`);
+      if (!disableWarning.includes('Disable OpenAI Subscription?') || !disableWarning.includes('1 configured Endpoint') || !disableWarning.includes('everything this Extension provides stops')) throw new Error(`${project.name}: disabling an Extension-owned Endpoint type does not confirm the impact on configured Endpoints`);
     }
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);
@@ -517,36 +540,55 @@ for (const project of projects) {
     const providerFieldOrder = await page.locator('#provider-form [data-step="2"] > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('input, select')?.name));
     if (providerFieldOrder.join('|') !== 'endpoint_id|api_type|base_url') throw new Error(`${project.name}: initial Endpoint setup does not ask for API type before Base URL`);
     await page.locator('#api-type-choices input[value="openai_codex"]').check();
-    await assertDialog(page, '#provider-dialog', project.name);
+    // Every Endpoint type the API publishes is offered by the console without a
+    // console change, together with its own words and its fixed connection.
+    const acmeChoice = page.locator('#api-type-choices label.choice').filter({has: page.locator('input[value="acme_plan"]')});
+    if (await acmeChoice.count() !== 1 || !(await acmeChoice.innerText()).includes('Acme plan')) throw new Error(`${project.name}: an Extension-declared Endpoint type is missing from the console`);
+    await page.locator('#api-type-choices input[value="acme_plan"]').check();
+    if (await page.locator('#base-url').isVisible()) throw new Error(`${project.name}: an Endpoint type with a fixed connection exposes Base URL`);
+    if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: an Endpoint type that signs in accounts exposes API key input`);
+    if (await page.locator('#initial-endpoint-id').inputValue() !== 'acme') throw new Error(`${project.name}: an Extension-declared Endpoint type does not suggest its own Endpoint ID`);
+    if (await page.locator('#create-provider').textContent() !== 'Connect account') throw new Error(`${project.name}: an Endpoint type that signs in accounts does not offer to connect one`);
+    await page.locator('#api-type-choices input[value="openai_codex"]').check();
     if (await page.locator('#initial-endpoint-id').inputValue() !== 'chatgpt') throw new Error(`${project.name}: first endpoint does not expose the API-type default ID`);
     if (await page.locator('#base-url').isVisible()) throw new Error(`${project.name}: subscription setup exposes Base URL`);
     if (!(await page.locator('#provider-form [name="socks5_proxy"]').isVisible())) throw new Error(`${project.name}: subscription setup hides SOCKS5 proxy`);
     await page.locator('#provider-form [name="socks5_proxy"]').fill('socks5h://127.0.0.1:1080');
     if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: subscription setup exposes API key input`);
-    if (await page.locator('#create-provider').textContent() !== 'Connect OpenAI') throw new Error(`${project.name}: subscription setup has the wrong primary action`);
+    if (await page.locator('#create-provider').textContent() !== 'Connect account') throw new Error(`${project.name}: sign-in Endpoint setup has the wrong primary action`);
     await page.locator('#create-provider').click();
-    await page.locator('#openai-subscription-dialog').waitFor({state: 'visible'});
-    if (!(await page.locator('#openai-device-signin').isVisible()) || await page.locator('#openai-oauth-signin').isVisible()) throw new Error(`${project.name}: OpenAI subscription does not default to device-code sign-in`);
-    if (await page.locator('#openai-subscription-code').textContent() !== 'ABCD-EFGH') throw new Error(`${project.name}: device-code sign-in does not show its one-time code`);
-    await page.locator('#openai-use-oauth').click();
-    await page.locator('#openai-oauth-signin').waitFor({state: 'visible'});
-    if (await page.locator('#openai-device-signin').isVisible()) throw new Error(`${project.name}: browser OAuth did not replace the device-code instructions`);
-    const oauthWarning = page.locator('#openai-oauth-signin .oauth-expected-warning');
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'visible'});
+    if (!(await page.locator('#sign-in-device').isVisible()) || await page.locator('#sign-in-browser').isVisible()) throw new Error(`${project.name}: a signed-in Endpoint type does not default to device-code sign-in`);
+    if (await page.locator('#sign-in-code').textContent() !== 'ABCD-EFGH') throw new Error(`${project.name}: device-code sign-in does not show its one-time code`);
+    await page.locator('#sign-in-use-oauth').click();
+    await page.locator('#sign-in-browser').waitFor({state: 'visible'});
+    if (await page.locator('#sign-in-device').isVisible()) throw new Error(`${project.name}: browser sign-in did not replace the device-code instructions`);
+    const oauthWarning = page.locator('#sign-in-browser .oauth-expected-warning');
     if (!(await oauthWarning.isVisible()) || !(await oauthWarning.getByText('A localhost error page is expected', {exact: true}).isVisible())) throw new Error(`${project.name}: browser OAuth does not prominently prepare users for the localhost error page`);
     const warningText = await oauthWarning.textContent();
     if (!warningText.includes('This does not mean OAuth failed') || !warningText.includes('localhost:1455')) throw new Error(`${project.name}: browser OAuth warning does not explain that the localhost failure is intentional`);
-    const oauthSteps = await page.locator('#openai-oauth-signin .oauth-steps li strong').allTextContents();
-    if (oauthSteps.join('|') !== 'Sign in with OpenAI|Expect the localhost error|Return and paste once') throw new Error(`${project.name}: browser OAuth steps do not describe the expected failure before launch`);
-    if (await page.locator('#openai-oauth-link').textContent() !== 'I understand — open OpenAI sign-in') throw new Error(`${project.name}: browser OAuth launch does not require an explicit acknowledgement`);
-    if (await page.locator('#openai-oauth-link').getAttribute('href') !== 'https://auth.openai.com/oauth/authorize?state=browser-state') throw new Error(`${project.name}: browser OAuth does not expose the Extension authorization URL`);
-    await page.locator('#openai-oauth-callback').fill('http://localhost:1455/auth/callback?code=oauth-code&state=browser-state');
-    await page.locator('#openai-oauth-signin [type="submit"]').click();
-    await page.locator('#openai-subscription-dialog').waitFor({state: 'hidden'});
+    const oauthSteps = await page.locator('#sign-in-browser .oauth-steps li strong').allTextContents();
+    if (oauthSteps.join('|') !== 'Sign in with the Provider|Expect the localhost error|Return and paste once') throw new Error(`${project.name}: browser sign-in steps do not describe the expected failure before launch`);
+    if (await page.locator('#sign-in-browser-link').textContent() !== 'I understand — open sign-in page') throw new Error(`${project.name}: browser sign-in launch does not require an explicit acknowledgement`);
+    if (await page.locator('#sign-in-browser-link').getAttribute('href') !== 'https://auth.openai.com/oauth/authorize?state=browser-state') throw new Error(`${project.name}: browser sign-in does not expose the Extension authorization URL`);
+    await page.locator('#sign-in-callback').fill('http://localhost:1455/auth/callback?code=oauth-code&state=browser-state');
+    await page.locator('#sign-in-browser [type="submit"]').click();
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'hidden'});
     await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
     const subscriptionProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-subscription/model-id'})});
     await subscriptionProvider.click();
     const credential = page.locator('.subscription-credential');
     await credential.waitFor({state: 'visible'});
+    // Adding an account to an Endpoint that already exists works from the card
+    // itself, and addresses sign-in by the Endpoint type the Endpoint reports.
+    deviceCodeBodies.length = 0;
+    await credential.locator('.connect-account').click();
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'visible'});
+    if (await page.locator('#sign-in-code').textContent() !== 'ABCD-EFGH') throw new Error(`${project.name}: connecting another account does not show a device code`);
+    const connectBody = JSON.stringify(deviceCodeBodies.at(-1));
+    if (connectBody !== JSON.stringify({endpoint_type: 'openai_codex', provider_id: 'ui-subscription', endpoint_id: 'chatgpt'})) throw new Error(`${project.name}: connecting another account does not address the Endpoint type and its Endpoint (${connectBody})`);
+    await page.locator('#endpoint-sign-in-dialog .close-sign-in').first().click();
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'hidden'});
     await page.evaluate(() => {
       window.__helpTestKeys = authSettings.api_keys;
       authSettings.api_keys = [
@@ -561,15 +603,36 @@ for (const project of projects) {
     if (await page.locator('#help-key').inputValue() !== 'sk-matching-provider') throw new Error(`${project.name}: Provider guide does not default to a non-expired Gateway key authorized for that Provider`);
     await page.locator('#help-dialog .close-help').first().click();
     await page.evaluate(() => { authSettings.api_keys = window.__helpTestKeys; delete window.__helpTestKeys; });
-    if (await credential.getByText('Automatic renewal enabled', {exact: true}).count() !== 1) throw new Error(`${project.name}: connected OpenAI subscription does not present automatic renewal as its primary state`);
+    if (await credential.getByText('Automatic renewal enabled', {exact: true}).count() !== 1) throw new Error(`${project.name}: a connected account does not present automatic renewal as its primary state`);
+    if (!(await credential.innerText()).includes('the Provider revokes access')) throw new Error(`${project.name}: automatic renewal names a vendor instead of the Provider`);
     if (await credential.getByText(/^Token expires /).count()) throw new Error(`${project.name}: OpenAI subscription still presents access-token expiry as its primary state`);
     const details = credential.locator('.credential-details');
     if (await details.count() !== 1 || await details.getAttribute('open') !== null) throw new Error(`${project.name}: OpenAI access-token details are missing or expanded by default`);
     await details.locator('summary').click();
     const detailText = await details.locator('p').textContent();
     if (!detailText.includes('current access token') || !detailText.includes('next request')) throw new Error(`${project.name}: elapsed OpenAI access-token detail does not explain lazy renewal`);
+    const cooldown = credential.locator('.credential-cooldown');
+    if (await cooldown.count() !== 1 || !(await cooldown.textContent()).includes('Cooling down')) throw new Error(`${project.name}: a cooling credential does not state that it is out of selection`);
+    if (await cooldown.locator('.clear-cooldown').count() !== 1) throw new Error(`${project.name}: a cooling credential offers no explicit action that returns it to selection`);
+    const endpointFacts = await page.locator('.endpoint-facts').first().textContent();
+    if (!endpointFacts.includes('Rate-limit cooldown') || !endpointFacts.includes('honors Retry-After')) throw new Error(`${project.name}: Endpoint facts do not state the configured rate-limit cooldown policy in readable units (${endpointFacts})`);
     await page.locator('#back-to-providers').click();
     await page.locator('#provider-list-page').waitFor({state: 'visible'});
+    // A cooldown duration that the console does not offer as a shortcut keeps its
+    // exact configured value instead of being rewritten to a nearby option.
+    const keylessProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-keyless/model-id'})});
+    if (await keylessProvider.count()) {
+      await keylessProvider.click();
+      await page.locator('.endpoint-edit').first().click();
+      await assertDialog(page, '#endpoint-dialog', project.name);
+      const cooldownSelect = page.locator('#endpoint-form [name="cooldown_seconds"]');
+      if (await cooldownSelect.inputValue() !== '120') throw new Error(`${project.name}: editing an Endpoint silently replaces a cooldown duration the console does not offer (${await cooldownSelect.inputValue()})`);
+      if (!(await cooldownSelect.locator('option:checked').textContent()).includes('2 minutes')) throw new Error(`${project.name}: a custom cooldown duration is not labeled in readable units`);
+      if (await page.locator('#endpoint-form [name="requires_credential"]').isChecked()) throw new Error(`${project.name}: keyless Endpoint does not keep its credential requirement unchecked`);
+      await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      await page.locator('#back-to-providers').click();
+      await page.locator('#provider-list-page').waitFor({state: 'visible'});
+    }
     const firstProvider = page.locator('#providers .provider-list-item').first();
     if (await firstProvider.count()) {
       await firstProvider.click();
@@ -631,27 +694,38 @@ for (const project of projects) {
       if (!(await page.locator('#endpoint-id-help').textContent()).includes('can be changed later')) throw new Error(`${project.name}: new Endpoint ID does not explain that it remains editable`);
       const endpointFieldOrder = await page.locator('#endpoint-form .form-body > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('.field-label')?.childNodes[0]?.textContent.trim()));
       if (endpointFieldOrder.join('|') !== 'Endpoint ID|API type|Base URL') throw new Error(`${project.name}: additional Endpoint setup does not ask for API type before Base URL`);
+      if (!(await page.locator('#endpoint-form [name="api_type"] option[value="acme_plan"]').count())) throw new Error(`${project.name}: the Endpoint dialog omits an Extension-declared Endpoint type`);
       await page.locator('#endpoint-form [name="api_type"]').selectOption('openai_codex');
       if (await page.locator('#endpoint-form [name="base_url"]').isVisible()) throw new Error(`${project.name}: additional subscription Endpoint setup exposes Base URL`);
       await page.locator('#endpoint-dialog .close-endpoint').first().click();
-      const renameKey = page.locator('.key-rename').first();
+      const addCredential = page.locator('.add-credential').first();
+      if (await addCredential.count()) {
+        await addCredential.click();
+        await assertDialog(page, '#credential-dialog', project.name);
+        if (!(await page.locator('#credential-endpoint option').count())) throw new Error(`${project.name}: credential dialog offers no Endpoint to attach the identity to`);
+        if (!(await page.locator('#credential-dialog').textContent()).includes('weighted selection')) throw new Error(`${project.name}: credential dialog does not explain how the identity is used`);
+        if (!(await page.locator('#credential-form .toggle-key').isVisible())) throw new Error(`${project.name}: credential dialog does not offer to reveal the secret it is about to store`);
+        await page.locator('#credential-dialog .close-credential').first().click();
+        await page.locator('#credential-dialog').waitFor({state: 'hidden'});
+      }
+      const renameKey = page.locator('.credential-rename').first();
       if (await renameKey.count()) {
         await renameKey.click();
-        await assertDialog(page, '#key-name-dialog', project.name);
-        if (!await page.locator('#key-name-form [name="name"]').inputValue()) throw new Error(`${project.name}: Provider key rename does not prefill the current name`);
-        if (!(await page.locator('#key-name-form .field-help').textContent()).includes('model-route references')) throw new Error(`${project.name}: Provider key rename does not explain which references stay unchanged`);
+        await assertDialog(page, '#credential-name-dialog', project.name);
+        if (!await page.locator('#credential-name-form [name="name"]').inputValue()) throw new Error(`${project.name}: credential rename does not prefill the current name`);
+        if (!(await page.locator('#credential-name-form .field-help').textContent()).includes('model-route references')) throw new Error(`${project.name}: credential rename does not explain which references stay unchanged`);
         await assertNoUpstreamCopy(page, project.name, 'Provider detail');
-        await page.locator('#key-name-dialog .close-key-name').first().click();
+        await page.locator('#credential-name-dialog .close-credential-name').first().click();
       }
     }
     if (project.name === 'desktop-chrome') {
       const providerFixture = {
         id: 'ui-delete-provider', name: 'UI delete provider', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
         pricing: {updated_at: 1, models: {'ui-provider-price*': {input_per_million: 1, output_per_million: 2}}},
-        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, pricing: {updated_at: 1, models: {'ui-endpoint-price*': {output_per_million: 3}}}, requires_api_key: true, api_keys: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true}], subscription_connected: false, subscription_expires_at: null}],
+        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, pricing: {updated_at: 1, models: {'ui-endpoint-price*': {output_per_million: 3}}}, requires_credential: true, credentials: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true, kind: 'secret'}], rate_limit_cooldown: {seconds: 0, honor_retry_after: false}}],
         discovered_models: [], model_endpoints: {}, model_endpoint_preferences: [], models_discovered_at: null, model_discovery_error: null,
       };
-      const routeFixture = {pattern: 'ui-delete-route', targets: [{provider_id: providerFixture.id, endpoint_id: 'deletable', api_key_id: 'delete-key', upstream_model: 'upstream-delete-model', weight: 100, enabled: true}]};
+      const routeFixture = {pattern: 'ui-delete-route', targets: [{provider_id: providerFixture.id, endpoint_id: 'deletable', credential_id: 'delete-key', upstream_model: 'upstream-delete-model', weight: 100, enabled: true}]};
       await page.route('**/admin/providers/ui-delete-provider', async route => {
         if (route.request().method() !== 'DELETE') return route.continue();
         await route.fulfill({status: 204});
@@ -696,12 +770,20 @@ for (const project of projects) {
       if (!(await routeModelCell.locator('small').textContent()).includes('destination')) throw new Error(`${project.name}: route destination count is missing from the public model summary`);
       const routeOverflow = await page.locator('#routes-table').evaluate(element => element.scrollWidth > element.clientWidth + 1);
       if (routeOverflow) throw new Error(`${project.name}: structured route summary overflows its table viewport`);
+      const policyRoute = page.locator('#routes .route-destination').filter({has: page.locator('.route-upstream', {hasText: 'ui-subscription/'})}).first();
+      if (await policyRoute.count()) {
+        const identity = await policyRoute.locator('.route-destination-meta').textContent();
+        if (!identity.includes('Endpoint policy')) throw new Error(`${project.name}: a destination that uses the Endpoint credential policy does not say so (${identity})`);
+        if (/Credential (No credential|Endpoint policy)/.test(identity)) throw new Error(`${project.name}: route destination identity repeats the credential label (${identity})`);
+      }
     }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
     await assertNoUpstreamCopy(page, project.name, 'Model routing');
-    const keylessDestination = page.locator('#route-targets .route-target option', {hasText: 'UI keyless fixture · local · No API key'});
-    if (await keylessDestination.count() !== 1) throw new Error(`${project.name}: route editor omits an Endpoint configured without an API key`);
+    const keylessDestination = page.locator('#route-targets .route-target option', {hasText: 'UI keyless fixture · local · No credential'});
+    if (await keylessDestination.count() !== 1) throw new Error(`${project.name}: route editor omits an Endpoint configured without a credential`);
+    const policyDestination = page.locator('#route-targets .route-target option', {hasText: 'UI subscription fixture · chatgpt · Endpoint policy'});
+    if (await policyDestination.count() !== 1) throw new Error(`${project.name}: route editor does not offer the Endpoint credential policy as a destination`);
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
     await page.locator('#add-route-target').click();
     await page.locator('#route-split-head').waitFor({ state: 'visible' });
@@ -747,7 +829,7 @@ for (const project of projects) {
     await page.locator('#central-pricing-form [name="price_name"][value="incoming"]').check();
     const incomingSuggestions = await page.locator('#pricing-model-suggestions option').evaluateAll(options => options.map(option => option.value));
     if (!incomingSuggestions.includes('activity-only-model')) throw new Error(`${project.name}: prices for the caller's model name do not suggest names recorded in Activity`);
-    await page.evaluate(() => modelRoutes.push({pattern: 'ui-incoming-route', targets: [{provider_id: 'ui-subscription', endpoint_id: 'chatgpt', api_key_id: null, upstream_model: 'gpt-fixture', weight: 100, enabled: true}]}));
+    await page.evaluate(() => modelRoutes.push({pattern: 'ui-incoming-route', targets: [{provider_id: 'ui-subscription', endpoint_id: 'chatgpt', credential_id: '', upstream_model: 'gpt-fixture', weight: 100, enabled: true}]}));
     await page.locator('#pricing-model').fill('ui-incoming-route');
     const routeExample = await page.locator('#pricing-route-example').textContent();
     if (!routeExample.includes('gpt-fixture') || !routeExample.includes('ui-subscription/chatgpt')) throw new Error(`${project.name}: a price for the caller's model name does not show where that name is routed (${routeExample})`);

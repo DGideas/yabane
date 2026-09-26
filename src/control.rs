@@ -5,7 +5,7 @@ use axum::{
     http::{StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use tracing::error;
@@ -14,10 +14,13 @@ use crate::{
     admin_user,
     auth::{self, GatewayApiKey, GatewayApiKeyView, generate_secret, hash_secret, now, save_auth},
     config::{
-        ApiEndpoint, ApiKey, ApiType, AppState, ModelEndpointPreference, Provider, save_providers,
+        ApiEndpoint, ApiType, AppState, Credential, CredentialMaterial, ModelEndpointPreference,
+        Provider, RateLimitCooldown, save_providers,
     },
+    endpoint_signin,
     error::api_error,
-    models, openai_subscription, routes,
+    health::credential_key,
+    models, routes,
     storage::{AtomicWrite, CONFIG_TRANSACTION_FILE, write_transaction},
 };
 
@@ -48,21 +51,22 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/admin/pricing/providers/{provider_id}/endpoints/{endpoint_id}",
             patch(update_endpoint_pricing),
         )
+        .route("/admin/endpoint-types", get(list_endpoint_types))
         .route(
-            "/admin/openai-subscriptions/device-code",
-            post(start_openai_subscription),
+            "/admin/endpoint-types/{endpoint_type}/sign-in/device-code",
+            post(start_endpoint_sign_in),
         )
         .route(
-            "/admin/openai-subscriptions/device-code/{id}",
-            get(poll_openai_subscription),
+            "/admin/endpoint-types/{endpoint_type}/sign-in/device-code/{id}",
+            get(poll_endpoint_sign_in),
         )
         .route(
-            "/admin/openai-subscriptions/oauth",
-            post(start_openai_subscription_oauth),
+            "/admin/endpoint-types/{endpoint_type}/sign-in/oauth",
+            post(start_endpoint_sign_in_oauth),
         )
         .route(
-            "/admin/openai-subscriptions/oauth/{id}/complete",
-            post(complete_openai_subscription_oauth),
+            "/admin/endpoint-types/{endpoint_type}/sign-in/oauth/{id}/complete",
+            post(complete_endpoint_sign_in_oauth),
         )
         .route("/admin/extensions", get(list_extensions))
         .route("/admin/extensions/{id}", patch(update_extension));
@@ -138,10 +142,17 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/admin/providers/{provider_id}/endpoints/{endpoint_id}/traffic",
             patch(update_endpoint_traffic),
         )
-        .route("/admin/providers/{id}/keys", post(create_api_key))
         .route(
-            "/admin/providers/{provider_id}/endpoints/{endpoint_id}/keys/{key_id}",
-            patch(update_api_key).delete(delete_api_key),
+            "/admin/providers/{id}/credentials",
+            post(create_credential),
+        )
+        .route(
+            "/admin/providers/{provider_id}/endpoints/{endpoint_id}/credentials/{credential_id}",
+            patch(update_credential).delete(delete_credential),
+        )
+        .route(
+            "/admin/providers/{provider_id}/endpoints/{endpoint_id}/credentials/{credential_id}/cooldown",
+            delete(clear_credential_cooldown),
         )
         .route_layer(middleware::from_fn_with_state(
             state,
@@ -167,8 +178,13 @@ struct CreateEndpoint {
     #[serde(default)]
     extra_body: serde_json::Map<String, serde_json::Value>,
     pricing: Option<crate::pricing::PricingTable>,
-    requires_api_key: bool,
-    api_key: Option<String>,
+    requires_credential: bool,
+    /// Secret for the Endpoint's first credential, when it needs one.
+    credential_secret: Option<String>,
+    #[serde(default)]
+    credential_name: Option<String>,
+    #[serde(default)]
+    rate_limit_cooldown: RateLimitCooldown,
 }
 
 #[derive(Deserialize)]
@@ -177,12 +193,14 @@ struct UpdateEndpoint {
     api_type: ApiType,
     base_url: String,
     socks5_proxy: Option<String>,
-    requires_api_key: bool,
+    requires_credential: bool,
     pricing: Option<crate::pricing::PricingTable>,
+    #[serde(default)]
+    rate_limit_cooldown: Option<RateLimitCooldown>,
 }
 
 #[derive(Deserialize)]
-struct CreateApiKey {
+struct CreateCredential {
     endpoint_id: String,
     name: String,
     secret: String,
@@ -190,7 +208,7 @@ struct CreateApiKey {
 }
 
 #[derive(Deserialize)]
-struct UpdateApiKey {
+struct UpdateCredential {
     name: Option<String>,
     weight: Option<u32>,
     enabled: Option<bool>,
@@ -198,12 +216,12 @@ struct UpdateApiKey {
 
 #[derive(Deserialize)]
 struct UpdateEndpointTraffic {
-    weights: Vec<ApiKeyWeight>,
+    weights: Vec<CredentialWeight>,
 }
 
 #[derive(Deserialize)]
-struct ApiKeyWeight {
-    key_id: String,
+struct CredentialWeight {
+    credential_id: String,
     weight: u32,
 }
 
@@ -274,23 +292,41 @@ struct ProviderView {
 struct EndpointView {
     id: String,
     api_type: ApiType,
+    /// The Endpoint type's own words, when an Extension owns this Endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint_type_label: Option<&'static str>,
+    /// Base URL the declaration fixes, when it fixes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_base_url: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sign_in: Option<crate::extensions::SignInView>,
     base_url: String,
     socks5_proxy: Option<String>,
     extra_headers: std::collections::HashMap<String, String>,
     extra_body: serde_json::Map<String, serde_json::Value>,
     pricing: Option<crate::pricing::PricingTable>,
-    requires_api_key: bool,
-    api_keys: Vec<ApiKeyView>,
-    subscription_connected: bool,
-    subscription_expires_at: Option<u64>,
+    requires_credential: bool,
+    credentials: Vec<CredentialView>,
+    rate_limit_cooldown: RateLimitCooldown,
 }
 
 #[derive(Serialize)]
-struct ApiKeyView {
+struct CredentialView {
     id: String,
     name: String,
     weight: u32,
     enabled: bool,
+    kind: String,
+    /// How the Endpoint type that owns this kind describes it.
+    kind_label: String,
+    /// Subscription expiry; the access token itself and the account ID stay
+    /// inside the private Provider configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription_expires_at: Option<u64>,
+    /// Whole seconds this credential stays out of selection, when it is cooling
+    /// down under its Endpoint's configured policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cooldown_seconds_remaining: Option<u64>,
 }
 
 async fn get_auth_settings(State(state): State<AppState>) -> impl IntoResponse {
@@ -521,47 +557,41 @@ async fn save_global_route(
                 "Route target Endpoint was not found",
             );
         };
-        let key = if endpoint.api_type == ApiType::OpenaiCodex {
-            if state.extensions.provider_endpoint("openai_codex").is_none() {
-                return api_error(
-                    StatusCode::CONFLICT,
-                    "Enable the OpenAI Subscription Extension before routing to this Endpoint",
-                );
-            }
-            if !target.api_key_id.is_empty() {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "OpenAI subscription route targets must not specify an API key",
-                );
-            }
-            if endpoint.openai_subscription.is_none() {
+        if let Some(endpoint_type) = endpoint.extension_endpoint_type()
+            && state.extensions.provider_endpoint(endpoint_type).is_none()
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "Enable the Extension that provides Endpoint type '{endpoint_type}' before routing to this Endpoint"
+                ),
+            );
+        }
+        if !endpoint.requires_credential {
+            if !target.credential_id.is_empty() {
                 return api_error(
                     StatusCode::BAD_REQUEST,
-                    "Route target OpenAI subscription is not connected",
+                    "Route targets for Endpoints without credentials must not pin an identity",
                 );
             }
-            None
-        } else if !endpoint.requires_api_key {
-            if !target.api_key_id.is_empty() {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "Route targets for Endpoints without authentication must not specify an API key",
-                );
-            }
-            None
-        } else {
-            let Some(key) = endpoint
-                .api_keys
+        } else if !target.credential_id.is_empty() {
+            let Some(credential) = endpoint
+                .credentials
                 .iter()
-                .find(|key| key.id == target.api_key_id)
+                .find(|credential| credential.id == target.credential_id)
             else {
                 return api_error(
                     StatusCode::BAD_REQUEST,
-                    "Route target API key was not found",
+                    "Route target credential was not found",
                 );
             };
-            Some(key)
-        };
+            if !credential.enabled {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "Route target credential is disabled",
+                );
+            }
+        }
         let upstream_model = target.upstream_model.trim();
         if upstream_model
             .strip_prefix(&format!("{}/", target.provider_id))
@@ -584,9 +614,6 @@ async fn save_global_route(
                     target.provider_id
                 ),
             );
-        }
-        if key.is_some_and(|key| !key.enabled) {
-            return api_error(StatusCode::BAD_REQUEST, "Route target API key is disabled");
         }
     }
     // Keep the Provider snapshot locked until the route is persisted. Provider
@@ -994,11 +1021,11 @@ async fn update_extension(
     Path(id): Path<String>,
     axum::Json(input): axum::Json<ExtensionUpdate>,
 ) -> Response {
-    #[cfg(feature = "extension-openai-subscription")]
-    if id == yabane_extension_openai_subscription::ID && !input.enabled {
-        // OAuth completion takes the same lock and rechecks the Extension before
-        // attaching an Endpoint. Holding it through disablement makes the switch
-        // a clean boundary without coupling enabled state to saved resources.
+    if !input.enabled && state.extensions.owns_sign_in_endpoints(&id) {
+        // Completing a sign-in takes the same lock and rechecks the Extension
+        // before attaching an account. Holding it through disablement makes the
+        // switch a clean boundary without coupling enabled state to saved
+        // resources.
         let _providers = state.providers.write().await;
         return set_extension_enabled(&state, &id, false).await;
     }
@@ -1210,12 +1237,25 @@ async fn update_endpoint_pricing(
 
 async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
     let providers = state.providers.read().await;
-    let mut providers: Vec<_> = providers.values().map(provider_view).collect();
+    let mut providers: Vec<_> = providers
+        .values()
+        .map(|provider| provider_view(&state.credential_health, &state.extensions, provider))
+        .collect();
     providers.sort_by(|a, b| a.name.cmp(&b.name));
     axum::Json(providers)
 }
 
-fn provider_view(provider: &Provider) -> ProviderView {
+/// The Endpoint types this process can offer, so the console can build its
+/// choices from declarations instead of a list of its own.
+async fn list_endpoint_types(State(state): State<AppState>) -> impl IntoResponse {
+    axum::Json(state.extensions.endpoint_types())
+}
+
+fn provider_view(
+    health: &crate::health::CredentialHealth,
+    extensions: &crate::extensions::ExtensionRegistry,
+    provider: &Provider,
+) -> ProviderView {
     ProviderView {
         id: provider.id.clone(),
         name: provider.name.clone(),
@@ -1229,25 +1269,50 @@ fn provider_view(provider: &Provider) -> ProviderView {
             .map(|endpoint| EndpointView {
                 id: endpoint.id.clone(),
                 api_type: endpoint.api_type,
+                endpoint_type_label: extensions
+                    .endpoint_declaration(endpoint.api_type)
+                    .map(|declaration| declaration.display_name),
+                fixed_base_url: extensions
+                    .endpoint_declaration(endpoint.api_type)
+                    .and_then(|declaration| declaration.fixed_base_url),
+                sign_in: extensions
+                    .endpoint_declaration(endpoint.api_type)
+                    .and_then(|declaration| declaration.sign_in)
+                    .map(|sign_in| crate::extensions::SignInView {
+                        device_code: sign_in.device_code,
+                        browser: sign_in.browser,
+                    }),
                 base_url: endpoint.base_url.clone(),
                 socks5_proxy: endpoint.socks5_proxy.clone(),
                 extra_headers: endpoint.extra_headers.clone(),
                 extra_body: endpoint.extra_body.clone(),
                 pricing: endpoint.pricing.clone(),
-                requires_api_key: endpoint.requires_api_key,
-                subscription_connected: endpoint.openai_subscription.is_some(),
-                subscription_expires_at: endpoint
-                    .openai_subscription
-                    .as_ref()
-                    .map(|credential| credential.expires_at),
-                api_keys: endpoint
-                    .api_keys
+                requires_credential: endpoint.requires_credential,
+                rate_limit_cooldown: endpoint.rate_limit_cooldown,
+                credentials: endpoint
+                    .credentials
                     .iter()
-                    .map(|key| ApiKeyView {
-                        id: key.id.clone(),
-                        name: key.name.clone(),
-                        weight: key.weight,
-                        enabled: key.enabled,
+                    .map(|credential| CredentialView {
+                        id: credential.id.clone(),
+                        name: credential.name.clone(),
+                        weight: credential.weight,
+                        enabled: credential.enabled,
+                        kind: credential.kind.clone(),
+                        kind_label: extensions
+                            .credential_kinds(endpoint.api_type)
+                            .unwrap_or_default()
+                            .iter()
+                            .find(|kind| kind.id == credential.kind)
+                            .map(|kind| kind.label.to_owned())
+                            .unwrap_or_else(|| credential.kind.clone()),
+                        subscription_expires_at: credential
+                            .subscription()
+                            .map(|subscription| subscription.expires_at),
+                        cooldown_seconds_remaining: health.remaining_seconds(&credential_key(
+                            &provider.id,
+                            &endpoint.id,
+                            &credential.id,
+                        )),
                     })
                     .collect(),
             })
@@ -1393,84 +1458,104 @@ fn normalize_pricing(
     }
 }
 
-async fn start_openai_subscription(
-    State(state): State<AppState>,
-    axum::Json(input): axum::Json<openai_subscription::StartSubscription>,
-) -> Response {
-    if state.extensions.provider_endpoint("openai_codex").is_none() {
-        return api_error(
+/// Only an Endpoint type that declares a sign-in flow can be signed into, and
+/// the declaration is what tells Core so.
+fn sign_in_flow(
+    state: &AppState,
+    endpoint_type: &str,
+) -> Result<&'static yabane_extension_api::ProviderEndpointType, Box<Response>> {
+    match state.extensions.endpoint_type_declaration(endpoint_type) {
+        Some(declaration) if declaration.sign_in.is_some() => Ok(declaration),
+        Some(_) => Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Endpoint type '{endpoint_type}' has no sign-in flow"),
+        ))),
+        // A native Endpoint type is always available and simply connects no
+        // accounts, so it is refused as a plain unsupported request instead of
+        // being reported as a missing Extension.
+        None if crate::config::ApiType::native(endpoint_type).is_some() => {
+            Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                format!("Endpoint type '{endpoint_type}' has no sign-in flow"),
+            )))
+        }
+        None => Err(Box::new(api_error(
             StatusCode::CONFLICT,
-            "OpenAI Subscription Extension is not enabled",
-        );
+            format!(
+                "Endpoint type '{endpoint_type}' is not available because its Extension is not enabled"
+            ),
+        ))),
     }
-    match openai_subscription::start(&state, input).await {
+}
+
+async fn start_endpoint_sign_in(
+    State(state): State<AppState>,
+    Path(endpoint_type): Path<String>,
+    axum::Json(input): axum::Json<endpoint_signin::StartSubscription>,
+) -> Response {
+    if let Err(response) = sign_in_flow(&state, &endpoint_type) {
+        return *response;
+    }
+    match endpoint_signin::start(&state, &endpoint_type, input).await {
         Ok(flow) => (StatusCode::CREATED, axum::Json(flow)).into_response(),
-        Err(openai_subscription::StartError::Invalid(message)) => {
+        Err(endpoint_signin::StartError::Invalid(message)) => {
             api_error(StatusCode::BAD_REQUEST, message)
         }
-        Err(openai_subscription::StartError::Upstream(message)) => {
+        Err(endpoint_signin::StartError::Upstream(message)) => {
             api_error(StatusCode::BAD_GATEWAY, message)
         }
     }
 }
 
-async fn start_openai_subscription_oauth(
+async fn start_endpoint_sign_in_oauth(
     State(state): State<AppState>,
-    axum::Json(input): axum::Json<openai_subscription::StartSubscription>,
+    Path(endpoint_type): Path<String>,
+    axum::Json(input): axum::Json<endpoint_signin::StartSubscription>,
 ) -> Response {
-    if state.extensions.provider_endpoint("openai_codex").is_none() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "OpenAI Subscription Extension is not enabled",
-        );
+    if let Err(response) = sign_in_flow(&state, &endpoint_type) {
+        return *response;
     }
-    match openai_subscription::start_browser(&state, input).await {
+    match endpoint_signin::start_browser(&state, &endpoint_type, input).await {
         Ok(flow) => (StatusCode::CREATED, axum::Json(flow)).into_response(),
-        Err(openai_subscription::StartError::Invalid(message)) => {
+        Err(endpoint_signin::StartError::Invalid(message)) => {
             api_error(StatusCode::BAD_REQUEST, message)
         }
-        Err(openai_subscription::StartError::Upstream(message)) => {
+        Err(endpoint_signin::StartError::Upstream(message)) => {
             api_error(StatusCode::BAD_GATEWAY, message)
         }
     }
 }
 
-async fn complete_openai_subscription_oauth(
+async fn complete_endpoint_sign_in_oauth(
     State(state): State<AppState>,
-    Path(id): Path<String>,
-    axum::Json(input): axum::Json<openai_subscription::CompleteBrowserAuthorization>,
+    Path((endpoint_type, id)): Path<(String, String)>,
+    axum::Json(input): axum::Json<endpoint_signin::CompleteBrowserAuthorization>,
 ) -> Response {
-    if state.extensions.provider_endpoint("openai_codex").is_none() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "OpenAI Subscription Extension is not enabled",
-        );
+    if let Err(response) = sign_in_flow(&state, &endpoint_type) {
+        return *response;
     }
-    match openai_subscription::complete_browser(&state, &id, input).await {
+    match endpoint_signin::complete_browser(&state, &endpoint_type, &id, input).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(openai_subscription::CompleteError::Invalid(message)) => {
+        Err(endpoint_signin::CompleteError::Invalid(message)) => {
             api_error(StatusCode::BAD_REQUEST, message)
         }
-        Err(openai_subscription::CompleteError::Upstream(message)) => {
+        Err(endpoint_signin::CompleteError::Upstream(message)) => {
             api_error(StatusCode::BAD_GATEWAY, message)
         }
-        Err(openai_subscription::CompleteError::Internal(message)) => {
+        Err(endpoint_signin::CompleteError::Internal(message)) => {
             api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
         }
     }
 }
 
-async fn poll_openai_subscription(
+async fn poll_endpoint_sign_in(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Path((endpoint_type, id)): Path<(String, String)>,
 ) -> Response {
-    if state.extensions.provider_endpoint("openai_codex").is_none() {
-        return api_error(
-            StatusCode::CONFLICT,
-            "OpenAI Subscription Extension is not enabled",
-        );
+    if let Err(response) = sign_in_flow(&state, &endpoint_type) {
+        return *response;
     }
-    match openai_subscription::poll(&state, &id).await {
+    match endpoint_signin::poll(&state, &id).await {
         Ok(flow) => axum::Json(flow).into_response(),
         Err(message) => api_error(StatusCode::NOT_FOUND, message),
     }
@@ -1480,10 +1565,16 @@ async fn create_provider(
     State(state): State<AppState>,
     axum::Json(input): axum::Json<CreateProvider>,
 ) -> Response {
-    if input.endpoint.api_type == ApiType::OpenaiCodex {
+    if let Err(message) = validate_endpoint_type(&state, input.endpoint.api_type) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    if let Some(declaration) = sign_in_endpoint_type(&state, input.endpoint.api_type) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Connect an OpenAI subscription with the device sign-in endpoint",
+            format!(
+                "{} accounts are connected through that Endpoint type's sign-in flow, not created here",
+                declaration.display_name
+            ),
         );
     }
     if input.id.trim().is_empty()
@@ -1509,13 +1600,21 @@ async fn create_provider(
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
-    if input.endpoint.requires_api_key
-        && input.endpoint.api_key.as_deref().is_none_or(str::is_empty)
+    if input.endpoint.requires_credential
+        && endpoint_type_accepts_secret(&state, input.endpoint.api_type)
+        && input
+            .endpoint
+            .credential_secret
+            .as_deref()
+            .is_none_or(str::is_empty)
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "API key is required for this endpoint",
+            "A credential secret is required for this endpoint",
         );
+    }
+    if let Err(message) = validate_rate_limit_cooldown(&input.endpoint.rate_limit_cooldown) {
+        return api_error(StatusCode::BAD_REQUEST, message);
     }
 
     let endpoint_id = input
@@ -1525,11 +1624,24 @@ async fn create_provider(
     if !valid_id(&endpoint_id) {
         return api_error(StatusCode::BAD_REQUEST, "Endpoint ID must be a URL slug");
     }
-    let api_keys = input
+    let credentials = input
         .endpoint
-        .api_key
+        .credential_secret
         .filter(|secret| !secret.is_empty())
-        .map(|secret| vec![new_api_key("default", "Default", secret, 100)])
+        .map(|secret| {
+            vec![new_secret_credential(
+                "default",
+                input
+                    .endpoint
+                    .credential_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Default"),
+                secret,
+                100,
+            )]
+        })
         .unwrap_or_default();
     let provider = Provider {
         id: input.id.trim().to_owned(),
@@ -1551,8 +1663,9 @@ async fn create_provider(
             extra_headers: input.endpoint.extra_headers,
             extra_body: input.endpoint.extra_body,
             pricing: input.endpoint.pricing.and_then(normalize_pricing),
-            requires_api_key: input.endpoint.requires_api_key,
-            api_keys,
+            requires_credential: input.endpoint.requires_credential,
+            credentials,
+            rate_limit_cooldown: input.endpoint.rate_limit_cooldown,
             ..ApiEndpoint::default()
         }],
         discovered_models: Vec::new(),
@@ -1607,9 +1720,19 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
         }
     };
     let mut updated_providers = providers.clone();
-    if updated_providers.remove(&id).is_none() {
+    let Some(removed) = updated_providers.remove(&id) else {
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
-    }
+    };
+    let removed_cooldowns: Vec<String> = removed
+        .endpoints
+        .iter()
+        .flat_map(|endpoint| {
+            endpoint
+                .credentials
+                .iter()
+                .map(|credential| credential_key(&removed.id, &endpoint.id, &credential.id))
+        })
+        .collect();
 
     let mut routes = state.routes.0.write().await;
     let mut updated_routes = routes.clone();
@@ -1657,6 +1780,9 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
             "Could not delete Provider and its dependent configuration",
         );
     }
+    for key in removed_cooldowns {
+        state.credential_health.clear(&key);
+    }
     *auth = updated_auth;
     *providers = updated_providers;
     *routes = updated_routes;
@@ -1668,10 +1794,16 @@ async fn create_endpoint(
     Path(provider_id): Path<String>,
     axum::Json(input): axum::Json<CreateEndpoint>,
 ) -> Response {
-    if input.api_type == ApiType::OpenaiCodex {
+    if let Err(message) = validate_endpoint_type(&state, input.api_type) {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
+    if let Some(declaration) = sign_in_endpoint_type(&state, input.api_type) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Connect an OpenAI subscription with the device sign-in endpoint",
+            format!(
+                "{} accounts are connected through that Endpoint type's sign-in flow, not created here",
+                declaration.display_name
+            ),
         );
     }
     if input.base_url.trim().is_empty() {
@@ -1697,11 +1829,17 @@ async fn create_endpoint(
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
-    if input.requires_api_key && input.api_key.as_deref().is_none_or(str::is_empty) {
+    if input.requires_credential
+        && endpoint_type_accepts_secret(&state, input.api_type)
+        && input.credential_secret.as_deref().is_none_or(str::is_empty)
+    {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "API key is required for this endpoint",
+            "A credential secret is required for this endpoint",
         );
+    }
+    if let Err(message) = validate_rate_limit_cooldown(&input.rate_limit_cooldown) {
+        return api_error(StatusCode::BAD_REQUEST, message);
     }
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
@@ -1715,10 +1853,22 @@ async fn create_endpoint(
     {
         return api_error(StatusCode::CONFLICT, "Endpoint ID already exists");
     }
-    let api_keys = input
-        .api_key
+    let credentials = input
+        .credential_secret
         .filter(|secret| !secret.is_empty())
-        .map(|secret| vec![new_api_key("default", "Default", secret, 100)])
+        .map(|secret| {
+            vec![new_secret_credential(
+                "default",
+                input
+                    .credential_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Default"),
+                secret,
+                100,
+            )]
+        })
         .unwrap_or_default();
     provider.endpoints.push(ApiEndpoint {
         id: endpoint_id,
@@ -1728,8 +1878,9 @@ async fn create_endpoint(
         extra_headers: input.extra_headers,
         extra_body: input.extra_body,
         pricing: input.pricing.and_then(normalize_pricing),
-        requires_api_key: input.requires_api_key,
-        api_keys,
+        requires_credential: input.requires_credential,
+        credentials,
+        rate_limit_cooldown: input.rate_limit_cooldown,
         ..ApiEndpoint::default()
     });
     let response = persist_or_error(&updated).await;
@@ -1770,6 +1921,11 @@ async fn update_endpoint(
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
+    if let Some(cooldown) = &input.rate_limit_cooldown
+        && let Err(message) = validate_rate_limit_cooldown(cooldown)
+    {
+        return api_error(StatusCode::BAD_REQUEST, message);
+    }
 
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
@@ -1793,46 +1949,53 @@ async fn update_endpoint(
     }
 
     let endpoint = &provider.endpoints[endpoint_index];
-    let subscription_endpoint = endpoint.api_type == ApiType::OpenaiCodex;
+    let declaration = state.extensions.endpoint_declaration(endpoint.api_type);
+    // An Endpoint type with a fixed connection or a sign-in flow owns those
+    // settings itself, so the console may only change what stays generic.
+    let declared_connection = declaration.is_some_and(|declaration| {
+        declaration.fixed_base_url.is_some() || declaration.sign_in.is_some()
+    });
     let normalized_base_url = input.base_url.trim().trim_end_matches('/').to_owned();
     let normalized_proxy = normalized_socks5_proxy(input.socks5_proxy.as_deref());
-    if subscription_endpoint {
-        if input.api_type != ApiType::OpenaiCodex
+    if declared_connection {
+        if input.api_type != endpoint.api_type
             || normalized_base_url != endpoint.base_url
-            || input.requires_api_key
+            || !input.requires_credential
         {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "OpenAI subscription Endpoints allow ID and SOCKS5 proxy changes only; delete and reconnect to change other settings",
+                format!(
+                    "{} Endpoints allow ID, SOCKS5 proxy, and rate-limit settings changes only; delete and reconnect to change other settings",
+                    declaration
+                        .map(|declaration| declaration.display_name)
+                        .unwrap_or("This")
+                ),
             );
         }
-    } else if input.api_type == ApiType::OpenaiCodex {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            "Connect a new OpenAI subscription instead of converting an existing Endpoint",
-        );
+    } else {
+        if let Err(message) = validate_endpoint_type(&state, input.api_type) {
+            return api_error(StatusCode::BAD_REQUEST, message);
+        }
+        if let Some(declaration) = sign_in_endpoint_type(&state, input.api_type) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Connect a new {} account instead of converting an existing Endpoint",
+                    declaration.display_name
+                ),
+            );
+        }
     }
-    let stopped_requiring_api_key = endpoint.requires_api_key && !input.requires_api_key;
-    let started_requiring_api_key = !endpoint.requires_api_key && input.requires_api_key;
+    // Turning authentication off discards the Endpoint's identity layer, so any
+    // destination that pinned one stops pinning it in the same transaction.
+    let stopped_requiring_credential = endpoint.requires_credential && !input.requires_credential;
     let connection_changed = endpoint.api_type != input.api_type
         || endpoint.base_url != normalized_base_url
         || endpoint.socks5_proxy != normalized_proxy
-        || endpoint.requires_api_key != input.requires_api_key;
+        || endpoint.requires_credential != input.requires_credential;
     let renamed = new_endpoint_id != endpoint_id;
 
     let mut routes = state.routes.0.write().await;
-    if started_requiring_api_key
-        && routes.iter().any(|route| {
-            route.targets.iter().any(|target| {
-                target.provider_id == provider_id && target.endpoint_id == endpoint_id
-            })
-        })
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            "Update or delete model routes targeting this Endpoint before requiring an API key",
-        );
-    }
 
     #[cfg(feature = "extension-traffic-capture")]
     let capture_update = if renamed {
@@ -1861,14 +2024,32 @@ async fn update_endpoint(
         endpoint.api_type = input.api_type;
         endpoint.base_url = normalized_base_url;
         endpoint.socks5_proxy = normalized_proxy;
-        endpoint.requires_api_key = input.requires_api_key;
+        endpoint.requires_credential = input.requires_credential;
+        if stopped_requiring_credential || renamed {
+            // Runtime health belongs to the Endpoint it was observed on. A discarded
+            // identity layer or a rename must not leave its key behind, where a later
+            // Endpoint reusing that ID would inherit a stale exhaustion.
+            for credential in &endpoint.credentials {
+                state.credential_health.clear(&credential_key(
+                    &provider_id,
+                    &endpoint_id,
+                    &credential.id,
+                ));
+            }
+            if stopped_requiring_credential {
+                endpoint.credentials.clear();
+            }
+        }
         if let Some(pricing) = input.pricing {
             endpoint.pricing = normalize_pricing(pricing);
+        }
+        if let Some(cooldown) = input.rate_limit_cooldown {
+            endpoint.rate_limit_cooldown = cooldown;
         }
         endpoint.proxy_client = Default::default();
     }
 
-    if connection_changed && !subscription_endpoint {
+    if connection_changed && !declared_connection {
         remove_endpoint_discovery(provider, &endpoint_id);
     } else if renamed {
         rename_endpoint_references(provider, &endpoint_id, &new_endpoint_id);
@@ -1888,8 +2069,8 @@ async fn update_endpoint(
                 if renamed {
                     target.endpoint_id = new_endpoint_id.clone();
                 }
-                if stopped_requiring_api_key {
-                    target.api_key_id.clear();
+                if stopped_requiring_credential {
+                    target.credential_id.clear();
                 }
             }
         }
@@ -1928,7 +2109,7 @@ async fn update_endpoint(
     };
     drop(routes);
     drop(providers);
-    if response.status().is_success() && connection_changed && !subscription_endpoint {
+    if response.status().is_success() && connection_changed && !declared_connection {
         spawn_provider_refresh(state, provider_id);
     }
     response
@@ -1966,6 +2147,17 @@ async fn delete_endpoint(
         return api_error(StatusCode::NOT_FOUND, "Provider not found");
     };
     let original_count = provider.endpoints.len();
+    let removed_cooldowns: Vec<String> = provider
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.id == endpoint_id)
+        .flat_map(|endpoint| {
+            endpoint
+                .credentials
+                .iter()
+                .map(|credential| credential_key(&provider_id, &endpoint.id, &credential.id))
+        })
+        .collect();
     provider
         .endpoints
         .retain(|endpoint| endpoint.id != endpoint_id);
@@ -2013,6 +2205,9 @@ async fn delete_endpoint(
             "Could not delete API endpoint",
         );
     }
+    for key in removed_cooldowns {
+        state.credential_health.clear(&key);
+    }
     *providers = updated_providers;
     *routes = updated_routes;
     StatusCode::NO_CONTENT.into_response()
@@ -2034,16 +2229,16 @@ async fn update_endpoint_traffic(
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Enabled API key traffic percentages must total 100",
+            "Enabled credential traffic percentages must total 100",
         );
     }
     let mut seen = std::collections::HashSet::new();
     if input
         .weights
         .iter()
-        .any(|item| !seen.insert(item.key_id.as_str()))
+        .any(|item| !seen.insert(item.credential_id.as_str()))
     {
-        return api_error(StatusCode::BAD_REQUEST, "API key IDs must be unique");
+        return api_error(StatusCode::BAD_REQUEST, "Credential IDs must be unique");
     }
 
     let mut providers = state.providers.write().await;
@@ -2058,24 +2253,24 @@ async fn update_endpoint_traffic(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
-    let enabled_key_ids: std::collections::HashSet<_> = endpoint
-        .api_keys
+    let enabled_credential_ids: std::collections::HashSet<_> = endpoint
+        .credentials
         .iter()
-        .filter(|key| key.enabled)
-        .map(|key| key.id.as_str())
+        .filter(|credential| credential.enabled)
+        .map(|credential| credential.id.as_str())
         .collect();
-    if seen != enabled_key_ids {
+    if seen != enabled_credential_ids {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Traffic distribution must include every enabled API key exactly once",
+            "Traffic distribution must include every enabled credential exactly once",
         );
     }
     for item in &input.weights {
         endpoint
-            .api_keys
+            .credentials
             .iter_mut()
-            .find(|key| key.id == item.key_id)
-            .expect("validated API key")
+            .find(|credential| credential.id == item.credential_id)
+            .expect("validated credential")
             .weight = item.weight;
     }
     let response = persist_or_error(&updated).await;
@@ -2085,15 +2280,15 @@ async fn update_endpoint_traffic(
     response
 }
 
-async fn create_api_key(
+async fn create_credential(
     State(state): State<AppState>,
     Path(provider_id): Path<String>,
-    axum::Json(input): axum::Json<CreateApiKey>,
+    axum::Json(input): axum::Json<CreateCredential>,
 ) -> Response {
     if input.name.trim().is_empty() || input.secret.is_empty() || input.weight == 0 {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Key name, secret and positive weight are required",
+            "Credential name, secret and positive weight are required",
         );
     }
     let mut providers = state.providers.write().await;
@@ -2108,14 +2303,28 @@ async fn create_api_key(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
-    if endpoint.api_type == ApiType::OpenaiCodex {
+    if !endpoint.requires_credential {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "OpenAI subscription Endpoints use OAuth instead of API keys",
+            "This Endpoint does not use credentials",
         );
     }
-    let id = unique_key_id(endpoint, &slugify(&input.name));
-    endpoint.api_keys.push(new_api_key(
+    if let Some(declaration) = state.extensions.endpoint_declaration(endpoint.api_type)
+        && !declaration
+            .credential_kinds
+            .iter()
+            .any(|kind| kind.flow == yabane_extension_api::CredentialFlow::Secret)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} accounts are connected through sign-in, not created here",
+                declaration.display_name
+            ),
+        );
+    }
+    let id = unique_credential_id(endpoint, &slugify(&input.name));
+    endpoint.credentials.push(new_secret_credential(
         &id,
         input.name.trim(),
         input.secret,
@@ -2128,18 +2337,21 @@ async fn create_api_key(
     response
 }
 
-async fn update_api_key(
+async fn update_credential(
     State(state): State<AppState>,
-    Path((provider_id, endpoint_id, key_id)): Path<(String, String, String)>,
-    axum::Json(input): axum::Json<UpdateApiKey>,
+    Path((provider_id, endpoint_id, credential_id)): Path<(String, String, String)>,
+    axum::Json(input): axum::Json<UpdateCredential>,
 ) -> Response {
     if input.weight == Some(0) {
-        return api_error(StatusCode::BAD_REQUEST, "API key weight must be positive");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Credential weight must be positive",
+        );
     }
-    // Renaming keeps the stable key ID and therefore every model-route reference.
+    // Renaming keeps the stable credential ID and therefore every model-route reference.
     let name = input.name.as_deref().map(str::trim);
     if name == Some("") {
-        return api_error(StatusCode::BAD_REQUEST, "API key name is required");
+        return api_error(StatusCode::BAD_REQUEST, "Credential name is required");
     }
     let mut providers = state.providers.write().await;
     let mut updated = providers.clone();
@@ -2153,32 +2365,36 @@ async fn update_api_key(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
-    let Some(key) = endpoint.api_keys.iter_mut().find(|key| key.id == key_id) else {
-        return api_error(StatusCode::NOT_FOUND, "API key not found");
+    let Some(credential) = endpoint
+        .credentials
+        .iter_mut()
+        .find(|credential| credential.id == credential_id)
+    else {
+        return api_error(StatusCode::NOT_FOUND, "Credential not found");
     };
     if let Some(name) = name {
-        key.name = name.to_owned();
+        credential.name = name.to_owned();
     }
-    if key.enabled && input.enabled == Some(false) {
+    if credential.enabled && input.enabled == Some(false) {
         let routes = state.routes.0.read().await;
         if routes.iter().any(|route| {
             route.targets.iter().any(|target| {
                 target.provider_id == provider_id
                     && target.endpoint_id == endpoint_id
-                    && target.api_key_id == key_id
+                    && target.credential_id == credential_id
             })
         }) {
             return api_error(
                 StatusCode::CONFLICT,
-                "Update or delete model routes targeting this API key before disabling it",
+                "Update or delete model routes pinning this credential before disabling it",
             );
         }
     }
     if let Some(weight) = input.weight {
-        key.weight = weight;
+        credential.weight = weight;
     }
     if let Some(enabled) = input.enabled {
-        key.enabled = enabled;
+        credential.enabled = enabled;
     }
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
@@ -2187,9 +2403,9 @@ async fn update_api_key(
     response
 }
 
-async fn delete_api_key(
+async fn delete_credential(
     State(state): State<AppState>,
-    Path((provider_id, endpoint_id, key_id)): Path<(String, String, String)>,
+    Path((provider_id, endpoint_id, credential_id)): Path<(String, String, String)>,
 ) -> Response {
     let mut providers = state.providers.write().await;
     let mut updated_providers = providers.clone();
@@ -2203,17 +2419,19 @@ async fn delete_api_key(
     else {
         return api_error(StatusCode::NOT_FOUND, "API endpoint not found");
     };
-    let original_count = endpoint.api_keys.len();
-    endpoint.api_keys.retain(|key| key.id != key_id);
-    if endpoint.api_keys.len() == original_count {
-        return api_error(StatusCode::NOT_FOUND, "API key not found");
+    let original_count = endpoint.credentials.len();
+    endpoint
+        .credentials
+        .retain(|credential| credential.id != credential_id);
+    if endpoint.credentials.len() == original_count {
+        return api_error(StatusCode::NOT_FOUND, "Credential not found");
     }
     let mut routes = state.routes.0.write().await;
     let mut updated = routes.clone();
     prune_route_targets(&mut updated, |target| {
         target.provider_id != provider_id
             || target.endpoint_id != endpoint_id
-            || target.api_key_id != key_id
+            || target.credential_id != credential_id
     });
     if let Err(err) = save_provider_and_routes(&updated_providers, &updated).await {
         error!(%err, "failed to persist provider and route mutation");
@@ -2222,8 +2440,42 @@ async fn delete_api_key(
             "Could not save provider and model routes",
         );
     }
+    state
+        .credential_health
+        .clear(&credential_key(&provider_id, &endpoint_id, &credential_id));
     *providers = updated_providers;
     *routes = updated;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Forgets a credential's cooldown so it returns to selection immediately.
+async fn clear_credential_cooldown(
+    State(state): State<AppState>,
+    Path((provider_id, endpoint_id, credential_id)): Path<(String, String, String)>,
+) -> Response {
+    let exists = state
+        .providers
+        .read()
+        .await
+        .get(&provider_id)
+        .and_then(|provider| {
+            provider
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == endpoint_id)
+        })
+        .is_some_and(|endpoint| {
+            endpoint
+                .credentials
+                .iter()
+                .any(|credential| credential.id == credential_id)
+        });
+    if !exists {
+        return api_error(StatusCode::NOT_FOUND, "Credential not found");
+    }
+    state
+        .credential_health
+        .clear(&credential_key(&provider_id, &endpoint_id, &credential_id));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2273,6 +2525,39 @@ fn spawn_provider_refresh(state: AppState, provider_id: String) {
     tokio::spawn(async move {
         let _ = models::refresh_provider(State(state), Path(provider_id)).await;
     });
+}
+
+/// Rejects an Endpoint type this process cannot serve at all.
+fn validate_endpoint_type(state: &AppState, api_type: ApiType) -> Result<(), String> {
+    match api_type.extension_endpoint_type() {
+        Some(endpoint_type) if state.extensions.provider_endpoint(endpoint_type).is_none() => {
+            Err(format!(
+                "Endpoint type '{endpoint_type}' is not available because its Extension is not enabled"
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The declaration of an Endpoint type that connects accounts through sign-in.
+fn sign_in_endpoint_type(
+    state: &AppState,
+    api_type: ApiType,
+) -> Option<&'static yabane_extension_api::ProviderEndpointType> {
+    state
+        .extensions
+        .endpoint_declaration(api_type)
+        .filter(|declaration| declaration.sign_in.is_some())
+}
+
+/// Whether an Endpoint type accepts an identity the console can paste.
+fn endpoint_type_accepts_secret(state: &AppState, api_type: ApiType) -> bool {
+    state
+        .extensions
+        .credential_kinds(api_type)
+        .unwrap_or_default()
+        .iter()
+        .any(|kind| kind.flow == yabane_extension_api::CredentialFlow::Secret)
 }
 
 fn validate_extra_headers(
@@ -2368,24 +2653,45 @@ fn slugify(value: &str) -> String {
         .join("-")
 }
 
-fn new_api_key(id: &str, name: &str, secret: String, weight: u32) -> ApiKey {
-    ApiKey {
+/// Core's own secret kind, used by the Endpoint types Core implements.
+fn new_secret_credential(id: &str, name: &str, secret: String, weight: u32) -> Credential {
+    Credential {
         id: id.to_owned(),
         name: name.to_owned(),
-        secret,
         weight,
         enabled: true,
+        kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
+        material: CredentialMaterial::Secret { secret },
     }
 }
 
-fn unique_key_id(endpoint: &ApiEndpoint, base: &str) -> String {
-    if !endpoint.api_keys.iter().any(|key| key.id == base) {
+fn unique_credential_id(endpoint: &ApiEndpoint, base: &str) -> String {
+    if !endpoint
+        .credentials
+        .iter()
+        .any(|credential| credential.id == base)
+    {
         return base.to_owned();
     }
     (2..)
         .map(|suffix| format!("{base}-{suffix}"))
-        .find(|candidate| !endpoint.api_keys.iter().any(|key| key.id == *candidate))
-        .expect("finite key ID space")
+        .find(|candidate| {
+            !endpoint
+                .credentials
+                .iter()
+                .any(|credential| credential.id == *candidate)
+        })
+        .expect("finite credential ID space")
+}
+
+fn validate_rate_limit_cooldown(cooldown: &RateLimitCooldown) -> Result<(), String> {
+    if cooldown.seconds > RateLimitCooldown::MAX_SECONDS {
+        return Err(format!(
+            "Rate-limit cooldown must not exceed {} seconds",
+            RateLimitCooldown::MAX_SECONDS
+        ));
+    }
+    Ok(())
 }
 
 async fn save_auth_provider_and_routes(
@@ -2443,7 +2749,7 @@ async fn persist_or_error(providers: &std::collections::HashMap<String, Provider
 mod tests {
     use std::collections::HashMap;
 
-    use crate::config::{ApiEndpoint, ApiType, OpenAiSubscription, Provider};
+    use crate::config::{ApiEndpoint, ApiType, Credential, CredentialMaterial, Provider};
 
     #[tokio::test]
     async fn activity_import_persistence_error_is_server_side_and_redacted() {
@@ -2489,8 +2795,15 @@ mod tests {
         );
     }
 
+    /// A management view is assembled against a registry, because declarations
+    /// name the identity kinds and labels a view shows.
+    fn test_registry() -> crate::extensions::ExtensionRegistry {
+        crate::extensions::ExtensionRegistry::for_tests()
+    }
+
     #[test]
     fn provider_view_redacts_subscription_tokens_and_account_id() {
+        let extensions = test_registry();
         let provider = Provider {
             id: "openai".to_owned(),
             name: "OpenAI".to_owned(),
@@ -2500,15 +2813,22 @@ mod tests {
             defaults_endpoint_ids: Vec::new(),
             endpoints: vec![ApiEndpoint {
                 id: "chatgpt".to_owned(),
-                api_type: ApiType::OpenaiCodex,
+                api_type: ApiType::Extension("openai_codex"),
                 base_url: "https://chatgpt.com/backend-api".to_owned(),
-                requires_api_key: false,
-                openai_subscription: Some(OpenAiSubscription {
-                    access_token: "private-access".to_owned(),
-                    refresh_token: "private-refresh".to_owned(),
-                    expires_at: 123,
-                    account_id: "private-account".to_owned(),
-                }),
+                requires_credential: true,
+                credentials: vec![Credential {
+                    id: "account".to_owned(),
+                    name: "Account".to_owned(),
+                    weight: 100,
+                    enabled: true,
+                    kind: "account".to_owned(),
+                    material: CredentialMaterial::Subscription {
+                        access_token: "private-access".to_owned(),
+                        refresh_token: "private-refresh".to_owned(),
+                        expires_at: 123,
+                        account_id: "private-account".to_owned(),
+                    },
+                }],
                 ..ApiEndpoint::default()
             }],
             discovered_models: Vec::new(),
@@ -2518,11 +2838,57 @@ mod tests {
             model_discovery_error: None,
         };
 
-        let json = serde_json::to_string(&super::provider_view(&provider)).unwrap();
+        let json = serde_json::to_string(&super::provider_view(
+            &crate::health::CredentialHealth::default(),
+            &extensions,
+            &provider,
+        ))
+        .unwrap();
         assert!(!json.contains("private-access"));
         assert!(!json.contains("private-refresh"));
         assert!(!json.contains("private-account"));
-        assert!(json.contains("\"subscription_connected\":true"));
+        assert!(json.contains("\"kind\":\"account\""));
         assert!(json.contains("\"subscription_expires_at\":123"));
+    }
+
+    #[test]
+    fn cooling_credentials_are_reported_with_their_remaining_cooldown() {
+        let extensions = test_registry();
+        let health = crate::health::CredentialHealth::default();
+        let provider = Provider {
+            id: "openai".to_owned(),
+            name: "OpenAI".to_owned(),
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            pricing: None,
+            defaults_endpoint_ids: Vec::new(),
+            endpoints: vec![ApiEndpoint {
+                id: "zen".to_owned(),
+                credentials: vec![Credential {
+                    id: "account".to_owned(),
+                    name: "Account".to_owned(),
+                    weight: 100,
+                    enabled: true,
+                    kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
+                    material: CredentialMaterial::Secret {
+                        secret: "private".to_owned(),
+                    },
+                }],
+                ..ApiEndpoint::default()
+            }],
+            discovered_models: Vec::new(),
+            model_endpoints: HashMap::new(),
+            model_endpoint_preferences: Vec::new(),
+            models_discovered_at: None,
+            model_discovery_error: None,
+        };
+        health.cool_down(
+            crate::health::credential_key("openai", "zen", "account"),
+            std::time::Duration::from_secs(90),
+        );
+        let json =
+            serde_json::to_string(&super::provider_view(&health, &extensions, &provider)).unwrap();
+        assert!(json.contains("\"cooldown_seconds_remaining\":"));
+        assert!(!json.contains("private"));
     }
 }

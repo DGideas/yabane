@@ -1,4 +1,7 @@
-use std::{error::Error as StdError, time::Instant};
+use std::{
+    error::Error as StdError,
+    time::{Duration, Instant},
+};
 
 use axum::{
     body::Body,
@@ -8,14 +11,15 @@ use axum::{
 };
 use futures_util::StreamExt;
 use rand::RngCore;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     activity::{ActivityStore, CostSource, RequestFailure, RequestLog},
     auth,
-    config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider},
+    config::{ApiEndpoint, ApiType, AppState, Credential, Provider, RateLimitCooldown},
+    endpoint_signin,
     error::{self, api_error},
-    openai_subscription, pricing,
+    health, pricing,
     protocol::{self, Protocol},
     protocol_stream::StreamConverter,
     usage::{TokenUsage, UsageTracker},
@@ -45,7 +49,23 @@ impl ApiSurface {
         }
     }
 
-    fn supports(self, api_type: ApiType) -> bool {
+    /// Whether an Endpoint type can serve this caller API. A native Endpoint
+    /// type follows Core's own table; an Extension-owned one answers through its
+    /// declaration instead of being inferred from a type name.
+    fn supports(
+        self,
+        api_type: ApiType,
+        extensions: &crate::extensions::ExtensionRegistry,
+    ) -> bool {
+        if let Some(declaration) = extensions.endpoint_declaration(api_type) {
+            return declaration
+                .surfaces
+                .contains(&extension_protocol(self.protocol()));
+        }
+        if api_type.extension_endpoint_type().is_some() {
+            // The Extension is not enabled, so the Endpoint cannot serve at all.
+            return false;
+        }
         matches!(
             (self, api_type),
             (
@@ -53,7 +73,7 @@ impl ApiSurface {
                 ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions
             ) | (
                 Self::OpenAiResponses,
-                ApiType::OpenaiCompatible | ApiType::OpenaiResponses | ApiType::OpenaiCodex
+                ApiType::OpenaiCompatible | ApiType::OpenaiResponses
             ) | (Self::Anthropic, ApiType::Anthropic)
         )
     }
@@ -61,9 +81,9 @@ impl ApiSurface {
     fn upstream_protocol(self, api_type: ApiType) -> Protocol {
         match api_type {
             ApiType::Anthropic => Protocol::AnthropicMessages,
-            ApiType::OpenaiCodex | ApiType::OpenaiResponses => Protocol::OpenAiResponses,
+            ApiType::OpenaiResponses => Protocol::OpenAiResponses,
             ApiType::OpenaiChatCompletions => Protocol::OpenAiChat,
-            ApiType::OpenaiCompatible => match self {
+            ApiType::OpenaiCompatible | ApiType::Extension(_) => match self {
                 Self::OpenAiResponses => Protocol::OpenAiResponses,
                 Self::OpenAiChat | Self::Anthropic => Protocol::OpenAiChat,
             },
@@ -114,42 +134,56 @@ async fn route_proxied(
         .ok()
         .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
-    let (provider, endpoint, api_key, model, upstream_model, body) =
+    let (provider, endpoint, credential, model, upstream_model, body) =
         match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
             Ok(resolved) => resolved,
             Err(err) => return api_error(err.status, err.message),
         };
 
-    let upstream_protocol = if endpoint.api_type == ApiType::OpenaiCodex {
-        match state.extensions.provider_endpoint("openai_codex") {
-            Some(implementation) => {
-                protocol_from_extension(implementation.endpoint_type().upstream_protocol)
-            }
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "OpenAI Subscription Extension is not enabled",
-                );
-            }
+    let upstream_protocol = match state.extensions.endpoint_declaration(endpoint.api_type) {
+        Some(declaration) => protocol_from_extension(declaration.upstream_protocol),
+        None if endpoint.extension_endpoint_type().is_some() => {
+            return endpoint_type_unavailable(&endpoint.id);
         }
-    } else {
-        surface.upstream_protocol(endpoint.api_type)
+        None => surface.upstream_protocol(endpoint.api_type),
     };
     let body = match protocol::convert_request(&body, surface.protocol(), upstream_protocol) {
         Ok(body) => body,
         Err(err) => return api_error(StatusCode::BAD_REQUEST, err),
     };
 
-    let endpoint = if endpoint.api_type == ApiType::OpenaiCodex {
-        match openai_subscription::refreshed_endpoint(&state, &provider.id, &endpoint.id).await {
-            Ok(endpoint) => endpoint,
+    // A signed-in account is refreshed per request when its Endpoint type
+    // declares accounts that expire; a pasted secret is used as configured.
+    let endpoint_declaration = state.extensions.endpoint_declaration(endpoint.api_type);
+    let endpoint_declares_account = endpoint_declaration.is_some_and(|declaration| {
+        declaration
+            .credential_kinds
+            .iter()
+            .any(|kind| kind.flow == yabane_extension_api::CredentialFlow::Subscription)
+    });
+    let credential = if endpoint_declares_account {
+        let Some(credential) = credential else {
+            return api_error(
+                StatusCode::CONFLICT,
+                missing_identity_message(&endpoint, endpoint_declaration),
+            );
+        };
+        match endpoint_signin::refreshed_credential(
+            &state,
+            &provider.id,
+            &endpoint.id,
+            &credential.id,
+        )
+        .await
+        {
+            Ok(credential) => Some(credential),
             Err(err) => {
-                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "OpenAI subscription authentication failed");
+                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "the Endpoint type could not refresh its account");
                 return api_error(StatusCode::BAD_GATEWAY, err);
             }
         }
     } else {
-        endpoint
+        credential
     };
 
     forward(
@@ -158,7 +192,7 @@ async fn route_proxied(
             request_id,
             provider,
             endpoint,
-            api_key,
+            credential,
             gateway_api_key,
             model,
             upstream_model,
@@ -182,7 +216,7 @@ async fn resolve_provider(
     (
         Provider,
         ApiEndpoint,
-        Option<ApiKey>,
+        Option<Credential>,
         String,
         String,
         Vec<u8>,
@@ -243,15 +277,19 @@ async fn resolve_provider(
     } else {
         let discovered = provider.model_endpoints.get(upstream_model);
         let endpoint_available = |endpoint: &ApiEndpoint| {
-            endpoint.api_type != ApiType::OpenaiCodex
-                || state.extensions.provider_endpoint("openai_codex").is_some()
+            match endpoint.extension_endpoint_type() {
+                // An Extension-owned Endpoint serves only while its Extension is
+                // enabled; Core reads that from the registry, not from a name.
+                Some(endpoint_type) => state.extensions.provider_endpoint(endpoint_type).is_some(),
+                None => true,
+            }
         };
         let endpoint = provider
             .endpoints
             .iter()
             .find(|endpoint| {
                 endpoint_available(endpoint)
-                    && surface.supports(endpoint.api_type)
+                    && surface.supports(endpoint.api_type, &state.extensions)
                     && provider.preferred_endpoint_id(upstream_model, endpoint.api_type)
                         == Some(endpoint.id.as_str())
                     && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
@@ -259,7 +297,7 @@ async fn resolve_provider(
             .or_else(|| {
                 provider.endpoints.iter().find(|endpoint| {
                     endpoint_available(endpoint)
-                        && surface.supports(endpoint.api_type)
+                        && surface.supports(endpoint.api_type, &state.extensions)
                         && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
                 })
             })
@@ -271,13 +309,14 @@ async fn resolve_provider(
             });
         if endpoint.is_none()
             && provider.endpoints.iter().any(|endpoint| {
-                endpoint.api_type == ApiType::OpenaiCodex
+                endpoint.extension_endpoint_type().is_some()
+                    && !endpoint_available(endpoint)
                     && discovered.is_none_or(|endpoint_ids| endpoint_ids.contains(&endpoint.id))
             })
         {
             return Err(RoutingError {
                 status: StatusCode::BAD_REQUEST,
-                message: "OpenAI Subscription Extension is not enabled".to_owned(),
+                message: unavailable_endpoint_type_message(&provider.endpoints, state),
             });
         }
         endpoint
@@ -286,39 +325,66 @@ async fn resolve_provider(
         status: StatusCode::BAD_REQUEST,
         message: format!("Provider '{provider_id}' has no endpoint for model '{upstream_model}'"),
     })?;
-    let api_key = if endpoint.api_type == ApiType::OpenaiCodex || !endpoint.requires_api_key {
+    let credential = if !endpoint.requires_credential {
         None
     } else if let Some(target) = &route_target {
-        let key = endpoint
-            .api_keys
-            .iter()
-            .find(|key| key.id == target.api_key_id)
-            .ok_or_else(|| RoutingError {
-                status: StatusCode::CONFLICT,
-                message: format!("Model route for '{model}' refers to a missing API key"),
-            })?;
-        if !key.enabled {
-            return Err(RoutingError {
-                status: StatusCode::CONFLICT,
-                message: format!("Model route for '{model}' has no enabled API key"),
-            });
+        if target.credential_id.is_empty() {
+            // An omitted identity means the Endpoint owns credential selection.
+            select_endpoint_credential(state, endpoint, provider_id)?
+        } else {
+            let credential = endpoint
+                .credentials
+                .iter()
+                .find(|credential| credential.id == target.credential_id)
+                .ok_or_else(|| RoutingError {
+                    status: StatusCode::CONFLICT,
+                    message: format!("Model route for '{model}' refers to a missing credential"),
+                })?;
+            if !credential.enabled {
+                return Err(RoutingError {
+                    status: StatusCode::CONFLICT,
+                    message: format!("Model route for '{model}' has no enabled credential"),
+                });
+            }
+            // A pinned identity is used as configured: it does not take part in
+            // cooldown avoidance, so an exhausted pin fails visibly.
+            Some(credential.clone())
         }
-        Some(key.clone())
     } else {
-        endpoint.select_api_key().cloned()
+        select_endpoint_credential(state, endpoint, provider_id)?
     };
-    if endpoint.requires_api_key && api_key.is_none() {
-        return Err(RoutingError {
-            status: StatusCode::CONFLICT,
-            message: format!("Endpoint '{}' has no enabled API key", endpoint.id),
-        });
-    }
 
     let endpoint = endpoint.clone();
     let upstream_model = upstream_model.to_owned();
     payload["model"] = serde_json::Value::String(upstream_model.clone());
     let body = serde_json::to_vec(&payload).expect("serialize validated request body");
-    Ok((provider, endpoint, api_key, model, upstream_model, body))
+    Ok((provider, endpoint, credential, model, upstream_model, body))
+}
+
+/// Applies the Endpoint's credential policy. Every usable credential that is not
+/// cooling down is a candidate; when none is left the pool still serves an
+/// exhausted credential so the Provider's own answer reaches the caller.
+fn select_endpoint_credential(
+    state: &AppState,
+    endpoint: &ApiEndpoint,
+    provider_id: &str,
+) -> Result<Option<Credential>, RoutingError> {
+    match endpoint.select_credential(&state.credential_health, provider_id) {
+        Some(choice) => {
+            if choice.all_exhausted {
+                warn!(
+                    provider_id,
+                    endpoint = %endpoint.id,
+                    "every credential is cooling down; serving the request from an exhausted identity"
+                );
+            }
+            Ok(Some(choice.credential))
+        }
+        None => Err(RoutingError {
+            status: StatusCode::CONFLICT,
+            message: format!("Endpoint '{}' has no enabled credential", endpoint.id),
+        }),
+    }
 }
 
 fn request_id() -> String {
@@ -341,6 +407,8 @@ struct ProxyActivity {
     upstream_model: Option<String>,
     provider: String,
     endpoint: String,
+    /// The identity the request actually left with, when the Endpoint uses one.
+    credential_id: Option<String>,
     pricing: Option<pricing::ResolvedPricing>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
@@ -421,6 +489,7 @@ impl ProxyActivity {
                 upstream_model: self.upstream_model.clone(),
                 provider: self.provider.clone(),
                 endpoint: self.endpoint.clone(),
+                upstream_credential_id: self.credential_id.clone(),
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
                 upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
                 status: status.as_u16(),
@@ -466,7 +535,7 @@ struct ForwardRequest {
     request_id: String,
     provider: Provider,
     endpoint: ApiEndpoint,
-    api_key: Option<ApiKey>,
+    credential: Option<Credential>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     model: String,
     upstream_model: String,
@@ -483,7 +552,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         request_id,
         provider,
         endpoint,
-        api_key,
+        credential,
         gateway_api_key,
         model,
         upstream_model: resolved_upstream_model,
@@ -563,12 +632,18 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             Err(failure) => return crate::extensions::execution_error(failure),
         };
     }
-    apply_core_upstream_headers(
-        &mut request_headers,
-        endpoint.api_type,
-        (caller_protocol, upstream_protocol),
-        api_key.as_ref(),
-    );
+    let endpoint_always_streams = state
+        .extensions
+        .endpoint_declaration(endpoint.api_type)
+        .is_some_and(|declaration| declaration.always_event_stream);
+    if endpoint.extension_endpoint_type().is_none() {
+        apply_core_upstream_headers(
+            &mut request_headers,
+            endpoint.api_type,
+            (caller_protocol, upstream_protocol),
+            credential.as_ref(),
+        );
+    }
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -600,35 +675,46 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         }
     };
     let mut body = body;
-    if endpoint.api_type == ApiType::OpenaiCodex {
-        let implementation = match state.extensions.provider_endpoint("openai_codex") {
-            Some(implementation) => implementation,
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "OpenAI Subscription Extension is not enabled",
-                );
+    let endpoint_implementation = match endpoint.extension_endpoint_type() {
+        Some(endpoint_type) => match state.extensions.provider_endpoint(endpoint_type) {
+            Some(implementation) => Some(implementation),
+            None => return endpoint_type_unavailable(&endpoint.id),
+        },
+        None => None,
+    };
+    if let Some(implementation) = endpoint_implementation {
+        // Core hands over the stored identity as-is: the declaration names the
+        // kind, and the material keeps the shape Core stored.
+        let request_credential = credential.as_ref().map(|credential| {
+            yabane_extension_api::ProviderEndpointCredential {
+                kind: credential.kind.as_str(),
+                material: match &credential.material {
+                    crate::config::CredentialMaterial::Secret { secret } => {
+                        yabane_extension_api::ProviderEndpointMaterial::Secret { secret }
+                    }
+                    crate::config::CredentialMaterial::Subscription {
+                        access_token,
+                        account_id,
+                        ..
+                    } => yabane_extension_api::ProviderEndpointMaterial::Subscription {
+                        access_token,
+                        account_id,
+                    },
+                },
             }
-        };
-        let subscription = endpoint
-            .openai_subscription
-            .as_ref()
-            .expect("refreshed subscription");
+        });
         if let Err(error) =
             implementation.prepare_request(yabane_extension_api::ProviderEndpointRequest {
                 headers: &mut request_headers,
                 body: &mut body,
                 target_path: &mut target_path,
-                credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                    access_token: &subscription.access_token,
-                    account_id: &subscription.account_id,
-                }),
+                credential: request_credential,
             })
         {
-            error!(provider = %provider.id, endpoint = %endpoint.id, %error, "OpenAI subscription request preparation failed");
+            error!(provider = %provider.id, endpoint = %endpoint.id, %error, "Endpoint implementation request preparation failed");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "OpenAI Subscription Extension failed",
+                format!("Endpoint '{}' could not prepare the request", endpoint.id),
             );
         }
     }
@@ -638,11 +724,6 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let sent_upstream_model = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| value.get("model")?.as_str().map(str::to_owned));
-    let endpoint_implementation = if endpoint.api_type == ApiType::OpenaiCodex {
-        state.extensions.provider_endpoint("openai_codex")
-    } else {
-        None
-    };
     let target = join_upstream_url(
         provider_endpoint_base_url(&endpoint.base_url, endpoint_implementation),
         &target_path,
@@ -714,6 +795,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     upstream_model: sent_upstream_model,
                     provider: provider.id.clone(),
                     endpoint: endpoint.id.clone(),
+                    upstream_credential_id: credential
+                        .as_ref()
+                        .map(|credential| credential.id.clone()),
                     caller_protocol: Some(caller_protocol.name().to_owned()),
                     upstream_protocol: Some(upstream_protocol.name().to_owned()),
                     status: StatusCode::BAD_GATEWAY.as_u16(),
@@ -740,8 +824,20 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
 
     let upstream_response_ms = upstream_started.elapsed().as_millis() as u64;
     let status = upstream_response.status();
-    let api_type = endpoint.api_type;
     let response_headers = upstream_response.headers().clone();
+    // The credential's own answer is the only evidence Yabane accepts that an
+    // identity is exhausted, and only an explicitly configured policy turns it
+    // into a cooldown. The response itself stays untouched.
+    if status == StatusCode::TOO_MANY_REQUESTS
+        && endpoint.rate_limit_cooldown.enabled()
+        && let Some(credential) = &credential
+    {
+        let duration = cooldown_duration(&endpoint.rate_limit_cooldown, &response_headers);
+        state.credential_health.cool_down(
+            health::credential_key(&provider.id, &endpoint.id, &credential.id),
+            duration,
+        );
+    }
     if !exchange_observers.is_empty() {
         let observed_response_headers = observed_headers(&response_headers);
         observe_response_head(&mut exchange_observers, status, &observed_response_headers);
@@ -750,17 +846,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    // The ChatGPT Codex endpoint is always SSE, but currently omits Content-Type
-    // on successful responses. pi-ai parses it as SSE by protocol, not by header.
-    let event_stream = response_is_event_stream(
-        status,
-        api_type,
-        state
-            .extensions
-            .provider_endpoint("openai_codex")
-            .is_some_and(|implementation| implementation.endpoint_type().always_event_stream),
-        content_type,
-    );
+    // Some Endpoint types answer with SSE even when a caller asked for one
+    // response, and may omit Content-Type on success. The declaration decides;
+    // callers parse the stream by protocol, not by header.
+    let event_stream = response_is_event_stream(status, endpoint_always_streams, content_type);
     let activity_pricing = {
         let global_pricing = state.pricing.read().await;
         sent_upstream_model.as_deref().and_then(|model_id| {
@@ -775,6 +864,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         upstream_model: sent_upstream_model,
         provider: provider.id.clone(),
         endpoint: endpoint.id.clone(),
+        credential_id: credential.as_ref().map(|credential| credential.id.clone()),
         pricing: activity_pricing,
         gateway_api_key,
         caller_protocol,
@@ -788,9 +878,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
 
     // Some upstreams, including ChatGPT Codex subscriptions, require SSE even
     // when a native Responses caller requested one non-streaming response.
-    if event_stream && !requested_streaming && (converting || api_type == ApiType::OpenaiCodex) {
+    if event_stream && !requested_streaming && (converting || endpoint_always_streams) {
         let mut upstream = upstream_response.bytes_stream();
-        let mut usage = UsageTracker::new(api_type, true);
+        let mut usage = UsageTracker::new(upstream_protocol, true);
         let mut converter = StreamConverter::new_aggregating(upstream_protocol, caller_protocol);
         let mut failure = None;
         let mut failure_record = None;
@@ -900,7 +990,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             }
         };
         observe_response_chunk(&mut exchange_observers, &bytes);
-        let mut usage = UsageTracker::new(api_type, false);
+        let mut usage = UsageTracker::new(upstream_protocol, false);
         usage.observe(&bytes);
         let converted = protocol::convert_response(&bytes, upstream_protocol, caller_protocol);
         let (usage, protocol_failed) = usage.finish();
@@ -965,7 +1055,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let stream = async_stream::stream! {
         let mut exchange_observers = exchange_observers;
         let mut upstream = upstream_response.bytes_stream();
-        let mut usage = UsageTracker::new(api_type, event_stream);
+        let mut usage = UsageTracker::new(upstream_protocol, event_stream);
         let mut converter = converting.then(|| StreamConverter::new(upstream_protocol, caller_protocol));
         let mut conversion_failed = false;
         let mut first_byte_ms = None;
@@ -1094,7 +1184,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     if status.is_client_error() || status.is_server_error() {
         error::set_error_origin(&mut response, error::ErrorOrigin::Upstream);
     }
-    if api_type == ApiType::OpenaiCodex {
+    if endpoint_always_streams {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
@@ -1242,7 +1332,7 @@ fn apply_core_upstream_headers(
     headers: &mut HeaderMap,
     api_type: ApiType,
     protocol_route: (Protocol, Protocol),
-    api_key: Option<&ApiKey>,
+    credential: Option<&Credential>,
 ) {
     if protocol_route.0 != protocol_route.1 {
         headers.insert(
@@ -1250,26 +1340,83 @@ fn apply_core_upstream_headers(
             HeaderValue::from_static("identity"),
         );
     }
-    if let Some(api_key) = api_key {
+    // Only Core's own secret kind travels as a static header. An Extension-owned
+    // Endpoint receives its identity through its own request preparation, so Core
+    // never guesses a header for it.
+    if let Some(secret) = credential.and_then(Credential::secret) {
         let (name, value) = match api_type {
-            ApiType::OpenaiCompatible
-            | ApiType::OpenaiChatCompletions
-            | ApiType::OpenaiResponses
-            | ApiType::OpenaiCodex => (
-                header::AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", api_key.secret)),
-            ),
             ApiType::Anthropic => (
                 HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(&api_key.secret),
+                HeaderValue::from_str(secret),
+            ),
+            _ => (
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {secret}")),
             ),
         };
-        headers.insert(name, value.expect("validated API key header value"));
+        headers.insert(name, value.expect("validated credential header value"));
     }
     if api_type == ApiType::Anthropic {
         headers
             .entry(HeaderName::from_static("anthropic-version"))
             .or_insert(HeaderValue::from_static("2023-06-01"));
+    }
+}
+
+/// Resolves how long a credential stays out of selection. The configured
+/// duration is authoritative; the Provider's `Retry-After` only replaces it when
+/// the policy explicitly honors it and the header carries an integer number of
+/// seconds.
+fn cooldown_duration(policy: &RateLimitCooldown, headers: &reqwest::header::HeaderMap) -> Duration {
+    if policy.honor_retry_after
+        && let Some(seconds) = headers
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.min(RateLimitCooldown::MAX_SECONDS));
+    }
+    Duration::from_secs(policy.seconds)
+}
+
+/// The refusal used whenever an Endpoint's Extension is not enabled. Core names
+/// the Endpoint type from configuration and never a vendor.
+fn endpoint_type_unavailable(endpoint_id: &str) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Endpoint '{endpoint_id}' uses an Endpoint type that no enabled Extension provides"
+        ),
+    )
+}
+
+fn unavailable_endpoint_type_message(endpoints: &[ApiEndpoint], state: &AppState) -> String {
+    let endpoint_types: Vec<&str> = endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.extension_endpoint_type())
+        .filter(|endpoint_type| state.extensions.provider_endpoint(endpoint_type).is_none())
+        .collect();
+    if let Some(endpoint_type) = endpoint_types.first() {
+        format!(
+            "Endpoint type '{endpoint_type}' is not available because its Extension is not enabled"
+        )
+    } else {
+        "Endpoint type is not available because its Extension is not enabled".to_owned()
+    }
+}
+
+/// How an Endpoint type without a connected account is described to a caller,
+/// in the words of the declaration that owns the identity.
+fn missing_identity_message(
+    endpoint: &ApiEndpoint,
+    declaration: Option<&yabane_extension_api::ProviderEndpointType>,
+) -> String {
+    match declaration {
+        Some(declaration) => format!(
+            "Endpoint '{}' has no connected account for {}",
+            endpoint.id, declaration.display_name
+        ),
+        None => format!("Endpoint '{}' has no connected identity", endpoint.id),
     }
 }
 
@@ -1498,11 +1645,10 @@ fn io_failure_detail(err: &(dyn StdError + 'static)) -> Option<&'static str> {
 
 fn response_is_event_stream(
     status: StatusCode,
-    api_type: ApiType,
     endpoint_always_streams: bool,
     content_type: &str,
 ) -> bool {
-    (status.is_success() && api_type == ApiType::OpenaiCodex && endpoint_always_streams)
+    (status.is_success() && endpoint_always_streams)
         || content_type
             .split(';')
             .next()
@@ -1515,33 +1661,81 @@ fn to_reqwest_method(method: &Method) -> reqwest::Method {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::http::{HeaderMap, HeaderValue};
+    use reqwest::header;
+
+    use crate::config::RateLimitCooldown;
 
     #[cfg(feature = "extension-openai-subscription")]
     use super::provider_endpoint_base_url;
     use super::{
-        ApiSurface, ApiType, Protocol, apply_core_upstream_headers, copy_response_headers,
-        response_is_event_stream, sanitize_request_headers, strip_transformed_response_headers,
-        upstream_transport_failure,
+        ApiSurface, ApiType, Protocol, apply_core_upstream_headers, cooldown_duration,
+        copy_response_headers, response_is_event_stream, sanitize_request_headers,
+        strip_transformed_response_headers, upstream_transport_failure,
     };
 
     #[test]
-    fn codex_http_errors_are_not_misclassified_as_event_streams() {
+    fn cooldown_duration_uses_the_policy_and_only_integer_retry_after() {
+        let policy = |seconds, honor_retry_after| RateLimitCooldown {
+            seconds,
+            honor_retry_after,
+        };
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(
+            cooldown_duration(&policy(300, false), &headers),
+            Duration::from_secs(300)
+        );
+
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
+        assert_eq!(
+            cooldown_duration(&policy(300, false), &headers),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            cooldown_duration(&policy(300, true), &headers),
+            Duration::from_secs(120)
+        );
+
+        // A Retry-After date is not an integer number of seconds.
+        headers.insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(
+            cooldown_duration(&policy(300, true), &headers),
+            Duration::from_secs(300)
+        );
+
+        // A Provider cannot extend a cooldown past the maximum.
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("999999999"));
+        assert_eq!(
+            cooldown_duration(&policy(300, true), &headers),
+            Duration::from_secs(RateLimitCooldown::MAX_SECONDS)
+        );
+
+        // A policy of zero seconds disables the cooldown entirely.
+        assert_eq!(
+            cooldown_duration(&policy(0, true), &header::HeaderMap::new()),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn declared_always_stream_endpoints_are_not_misclassified_on_errors() {
         assert!(!response_is_event_stream(
             axum::http::StatusCode::BAD_REQUEST,
-            ApiType::OpenaiCodex,
             true,
             "application/json",
         ));
         assert!(response_is_event_stream(
             axum::http::StatusCode::OK,
-            ApiType::OpenaiCodex,
             true,
             "",
         ));
         assert!(response_is_event_stream(
             axum::http::StatusCode::BAD_GATEWAY,
-            ApiType::OpenaiCodex,
             true,
             "text/event-stream; charset=utf-8",
         ));
@@ -1617,19 +1811,19 @@ mod tests {
     }
 
     #[test]
-    fn subscription_uses_responses_upstream_for_every_caller_surface() {
-        assert_eq!(
-            ApiSurface::OpenAiResponses.upstream_protocol(ApiType::OpenaiCodex),
-            Protocol::OpenAiResponses
+    fn an_endpoint_type_serves_only_the_caller_surfaces_it_declares() {
+        // The declaration decides which caller APIs an Extension-owned Endpoint
+        // accepts and which protocol Core speaks upstream for it.
+        let registry = crate::extensions::ExtensionRegistry::for_tests();
+        assert!(
+            ApiSurface::OpenAiResponses.supports(ApiType::Extension("openai_codex"), &registry)
         );
-        assert_eq!(
-            ApiSurface::OpenAiChat.upstream_protocol(ApiType::OpenaiCodex),
-            Protocol::OpenAiResponses
-        );
-        assert_eq!(
-            ApiSurface::Anthropic.upstream_protocol(ApiType::OpenaiCodex),
-            Protocol::OpenAiResponses
-        );
+        assert!(!ApiSurface::OpenAiChat.supports(ApiType::Extension("openai_codex"), &registry));
+        assert!(!ApiSurface::Anthropic.supports(ApiType::Extension("openai_codex"), &registry));
+        assert!(!ApiSurface::OpenAiResponses.supports(
+            ApiType::Extension("openai_codex"),
+            &crate::extensions::ExtensionRegistry::without_endpoint_types()
+        ));
     }
 
     #[test]
@@ -1784,7 +1978,7 @@ mod tests {
         );
         apply_core_upstream_headers(
             &mut sanitized,
-            ApiType::OpenaiCodex,
+            ApiType::Extension("openai_codex"),
             (Protocol::OpenAiResponses, Protocol::OpenAiResponses),
             None,
         );
@@ -1797,8 +1991,11 @@ mod tests {
                 body: &mut body,
                 target_path: &mut target_path,
                 credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                    access_token: "access-token",
-                    account_id: "account-123",
+                    kind: "openai_subscription",
+                    material: yabane_extension_api::ProviderEndpointMaterial::Subscription {
+                        access_token: "access-token",
+                        account_id: "account-123",
+                    },
                 }),
             },
         )

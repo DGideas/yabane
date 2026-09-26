@@ -35,6 +35,16 @@ pub struct ExtensionView {
     pub enabled: bool,
     pub runtime_configurable: bool,
     pub hooks: Vec<&'static str>,
+    /// The Endpoint types this Extension owns, so the console can count and
+    /// describe them without knowing any Extension by name.
+    pub endpoint_types: Vec<ExtensionEndpointTypeView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ExtensionEndpointTypeView {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub sign_in: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +95,113 @@ pub struct RequestHooks<'a> {
     pub upstream_exchange: Vec<&'a dyn UpstreamExchangeHook>,
 }
 
+/// A credential kind as the console needs it: the identifier and label belong
+/// to the Endpoint type that declares them.
+#[derive(Serialize)]
+pub struct CredentialKindView {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub flow: &'static str,
+}
+
+impl From<&yabane_extension_api::ProviderCredentialKind> for CredentialKindView {
+    fn from(kind: &yabane_extension_api::ProviderCredentialKind) -> Self {
+        Self {
+            id: kind.id,
+            label: kind.label,
+            flow: credential_flow_name(kind.flow),
+        }
+    }
+}
+
+fn credential_flow_name(flow: yabane_extension_api::CredentialFlow) -> &'static str {
+    match flow {
+        yabane_extension_api::CredentialFlow::Secret => "secret",
+        yabane_extension_api::CredentialFlow::Subscription => "subscription",
+    }
+}
+
+#[derive(Serialize)]
+pub struct SignInView {
+    pub device_code: bool,
+    pub browser: bool,
+}
+
+/// One Endpoint type a Provider may be connected to. Native types are Core's
+/// own; every other entry is described entirely by the Extension that declares
+/// it, so the console never needs a type list of its own.
+#[derive(Serialize)]
+pub struct EndpointTypeView {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub default_endpoint_id: &'static str,
+    pub fixed_base_url: Option<&'static str>,
+    pub credential_kinds: Vec<CredentialKindView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_in: Option<SignInView>,
+    pub native: bool,
+}
+
+impl EndpointTypeView {
+    fn native(
+        api_type: crate::config::ApiType,
+        credential_kinds: Option<&'static [yabane_extension_api::ProviderCredentialKind]>,
+    ) -> Self {
+        let (label, description) = native_endpoint_type_copy(api_type);
+        Self {
+            id: api_type.id(),
+            label,
+            description,
+            default_endpoint_id: api_type.default_endpoint_id(),
+            fixed_base_url: None,
+            credential_kinds: credential_kinds
+                .unwrap_or_default()
+                .iter()
+                .map(CredentialKindView::from)
+                .collect(),
+            sign_in: None,
+            native: true,
+        }
+    }
+}
+
+/// Core's own copy for the Endpoint types Core implements. Extension-owned
+/// types bring their own words instead of being named here.
+fn native_endpoint_type_copy(api_type: crate::config::ApiType) -> (&'static str, &'static str) {
+    match api_type {
+        crate::config::ApiType::OpenaiCompatible => (
+            "OpenAI compatible",
+            "Endpoint supports both Chat Completions and Responses",
+        ),
+        crate::config::ApiType::OpenaiChatCompletions => (
+            "Chat Completions only",
+            "Other caller APIs convert to Chat Completions",
+        ),
+        crate::config::ApiType::OpenaiResponses => {
+            ("Responses only", "Other caller APIs convert to Responses")
+        }
+        crate::config::ApiType::Anthropic => ("Anthropic", "Messages API"),
+        crate::config::ApiType::Extension(_) => ("Extension", "Provided by an Extension"),
+    }
+}
+
+/// The identifier of Core's own identity kind. Every other identifier is
+/// declared by the Endpoint type that accepts it.
+pub const SECRET_CREDENTIAL_KIND: &str = "secret";
+
+/// The identity kind Core itself owns: a secret the caller pasted. Every other
+/// kind is declared by the Endpoint type that accepts it.
+pub fn native_credential_kinds() -> &'static [yabane_extension_api::ProviderCredentialKind] {
+    static KINDS: &[yabane_extension_api::ProviderCredentialKind] =
+        &[yabane_extension_api::ProviderCredentialKind {
+            id: SECRET_CREDENTIAL_KIND,
+            label: "API key",
+            flow: yabane_extension_api::CredentialFlow::Secret,
+        }];
+    KINDS
+}
+
 pub struct ExtensionRegistry {
     extensions: Vec<ExtensionEntry>,
     provider_endpoints: Vec<&'static dyn ProviderEndpoint>,
@@ -117,6 +234,37 @@ impl ExtensionRegistry {
                 .push(&yabane_extension_openai_subscription::ENDPOINT);
         }
         Ok(registry)
+    }
+
+    /// The registry a process would build without touching disk, used by tests
+    /// that need the declarations compiled into this binary.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        let infos: Vec<ExtensionInfo> = vec![
+            #[cfg(feature = "extension-request-defaults")]
+            extension_info(yabane_extension_request_defaults::metadata()).unwrap(),
+            #[cfg(feature = "extension-traffic-capture")]
+            extension_info(yabane_extension_traffic_capture::metadata()).unwrap(),
+            #[cfg(feature = "extension-openai-subscription")]
+            extension_info(yabane_extension_openai_subscription::metadata()).unwrap(),
+        ];
+        let mut registry = Self::new(
+            infos,
+            ExtensionSettings::default(),
+            PathBuf::from("data/extensions.test.json"),
+            false,
+        )
+        .expect("build test registry");
+        #[cfg(feature = "extension-openai-subscription")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_openai_subscription::ENDPOINT);
+            registry
+                .subscription_providers
+                .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        registry
     }
 
     fn new(
@@ -161,6 +309,19 @@ impl ExtensionRegistry {
                 included: true,
                 enabled: !self.disabled_by_cli && extension.enabled.load(Ordering::Acquire),
                 runtime_configurable: !self.disabled_by_cli,
+                endpoint_types: self
+                    .provider_endpoints
+                    .iter()
+                    .filter(|implementation| implementation.extension_id() == extension.info.id)
+                    .map(|implementation| {
+                        let declaration = implementation.endpoint_type();
+                        ExtensionEndpointTypeView {
+                            id: declaration.id,
+                            label: declaration.display_name,
+                            sign_in: declaration.sign_in.is_some(),
+                        }
+                    })
+                    .collect(),
                 hooks: extension.info.hooks.clone(),
             })
             .collect()
@@ -191,6 +352,108 @@ impl ExtensionRegistry {
                 implementation.endpoint_type().id == endpoint_type
                     && self.is_enabled(implementation.extension_id())
             })
+    }
+
+    /// The Endpoint type declaration an Endpoint is governed by, if any.
+    ///
+    /// A native Endpoint type is Core's own and has no declaration; an
+    /// Extension-owned one is described entirely by its Extension.
+    pub fn endpoint_declaration(
+        &self,
+        api_type: crate::config::ApiType,
+    ) -> Option<&'static yabane_extension_api::ProviderEndpointType> {
+        self.endpoint_type_declaration(api_type.extension_endpoint_type()?)
+    }
+
+    /// The declaration of one Endpoint type, by identifier.
+    pub fn endpoint_type_declaration(
+        &self,
+        endpoint_type: &str,
+    ) -> Option<&'static yabane_extension_api::ProviderEndpointType> {
+        self.provider_endpoints
+            .iter()
+            .copied()
+            .find(|implementation| {
+                implementation.endpoint_type().id == endpoint_type
+                    && self.is_enabled(implementation.extension_id())
+            })
+            .map(|implementation| {
+                let declaration: &'static yabane_extension_api::ProviderEndpointType =
+                    Box::leak(Box::new(implementation.endpoint_type()));
+                declaration
+            })
+    }
+
+    /// A registry without any Endpoint type, used to test what an Endpoint whose
+    /// Extension is not enabled can still do.
+    #[cfg(test)]
+    pub fn without_endpoint_types() -> Self {
+        let mut registry = Self::for_tests();
+        registry.provider_endpoints.clear();
+        registry.subscription_providers.clear();
+        registry
+    }
+
+    /// Whether an Extension owns an Endpoint type that connects accounts through
+    /// sign-in. Core uses this to keep a sign-in in flight from racing with the
+    /// Extension being disabled.
+    pub fn owns_sign_in_endpoints(&self, extension_id: &str) -> bool {
+        self.provider_endpoints.iter().any(|implementation| {
+            implementation.extension_id() == extension_id
+                && implementation.endpoint_type().sign_in.is_some()
+        })
+    }
+
+    /// The identity kinds an Endpoint type accepts.
+    ///
+    /// Every declared kind, and every label that describes one, comes from the
+    /// Endpoint type that owns it. Core's native Endpoint types declare only
+    /// Core's own secret kind. `None` means the Endpoint type is unavailable
+    /// because its Extension is not enabled, so nothing can be validated against
+    /// it and routing reports the condition when the Endpoint is used.
+    pub fn credential_kinds(
+        &self,
+        api_type: crate::config::ApiType,
+    ) -> Option<&'static [yabane_extension_api::ProviderCredentialKind]> {
+        match self.endpoint_declaration(api_type) {
+            Some(declaration) => Some(declaration.credential_kinds),
+            None if api_type.extension_endpoint_type().is_none() => Some(native_credential_kinds()),
+            None => None,
+        }
+    }
+
+    /// Every Endpoint type this process can offer, native ones first. The
+    /// console builds its choices from this list instead of a name list of its
+    /// own, so a new Extension appears without a console change.
+    pub fn endpoint_types(&self) -> Vec<EndpointTypeView> {
+        let mut endpoint_types: Vec<EndpointTypeView> = crate::config::ApiType::NATIVE
+            .iter()
+            .map(|api_type| EndpointTypeView::native(*api_type, self.credential_kinds(*api_type)))
+            .collect();
+        for implementation in &self.provider_endpoints {
+            if !self.is_enabled(implementation.extension_id()) {
+                continue;
+            }
+            let declaration = implementation.endpoint_type();
+            endpoint_types.push(EndpointTypeView {
+                id: declaration.id,
+                label: declaration.display_name,
+                description: declaration.description,
+                default_endpoint_id: declaration.default_endpoint_id,
+                fixed_base_url: declaration.fixed_base_url,
+                credential_kinds: declaration
+                    .credential_kinds
+                    .iter()
+                    .map(CredentialKindView::from)
+                    .collect(),
+                sign_in: declaration.sign_in.map(|sign_in| SignInView {
+                    device_code: sign_in.device_code,
+                    browser: sign_in.browser,
+                }),
+                native: false,
+            });
+        }
+        endpoint_types
     }
 
     pub fn subscription_provider(
@@ -516,8 +779,114 @@ mod tests {
     };
 
     use super::{
-        DispatchOutcome, ExtensionRegistry, ExtensionSettings, RequestHooks, extension_info,
+        DispatchOutcome, ExtensionEntry, ExtensionInfo, ExtensionRegistry, ExtensionSettings,
+        RequestHooks, extension_info,
     };
+
+    /// A second, unrelated Endpoint-type Extension. It exists only to prove that
+    /// the surfaces Core publishes are built from declarations: its identifier,
+    /// words, identity kinds, and sign-in flows are its own, and no Core code
+    /// mentions any of them.
+    struct AcmeEndpoint;
+
+    impl yabane_extension_api::ProviderEndpoint for AcmeEndpoint {
+        fn extension_id(&self) -> &'static str {
+            "acme-subscription"
+        }
+
+        fn endpoint_type(&self) -> yabane_extension_api::ProviderEndpointType {
+            yabane_extension_api::ProviderEndpointType {
+                id: "acme_plan",
+                display_name: "Acme plan",
+                description: "Acme plan Endpoints",
+                default_endpoint_id: "acme",
+                fixed_base_url: Some("https://api.acme.test/plan"),
+                upstream_protocol: Protocol::OpenAiResponses,
+                surfaces: &[Protocol::OpenAiResponses],
+                always_event_stream: true,
+                credential_kinds: &[yabane_extension_api::ProviderCredentialKind {
+                    id: "acme_account",
+                    label: "Acme account",
+                    flow: yabane_extension_api::CredentialFlow::Subscription,
+                }],
+                sign_in: Some(yabane_extension_api::ProviderSignIn {
+                    device_code: true,
+                    browser: false,
+                }),
+            }
+        }
+
+        fn models(&self) -> &'static [&'static str] {
+            &["acme-large"]
+        }
+
+        fn prepare_request(
+            &self,
+            _request: yabane_extension_api::ProviderEndpointRequest<'_>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn registry_with_an_acme_endpoint() -> ExtensionRegistry {
+        let mut registry = ExtensionRegistry::for_tests();
+        let implementation: &'static AcmeEndpoint = Box::leak(Box::new(AcmeEndpoint));
+        registry.provider_endpoints.push(implementation);
+        // An Extension the process carries but does not enable publishes nothing,
+        // so the test enables it exactly as an administrator would.
+        registry.extensions.push(ExtensionEntry {
+            info: ExtensionInfo {
+                id: "acme-subscription",
+                name: "Acme Subscription",
+                version: "0.1.0",
+                api_version: EXTENSION_API_VERSION,
+                description: "Acme plan Endpoints",
+                hooks: Vec::new(),
+            },
+            enabled: std::sync::atomic::AtomicBool::new(true),
+        });
+        registry
+    }
+
+    #[test]
+    fn a_new_endpoint_type_publishes_its_own_words_and_kinds() {
+        let registry = registry_with_an_acme_endpoint();
+        let published = registry
+            .endpoint_types()
+            .into_iter()
+            .find(|endpoint_type| endpoint_type.id == "acme_plan")
+            .expect("the declaration is published without a Core change");
+        assert_eq!(published.label, "Acme plan");
+        assert_eq!(published.default_endpoint_id, "acme");
+        assert_eq!(published.fixed_base_url, Some("https://api.acme.test/plan"));
+        assert!(!published.native);
+        assert_eq!(
+            published
+                .credential_kinds
+                .iter()
+                .map(|kind| (kind.id, kind.label, kind.flow))
+                .collect::<Vec<_>>(),
+            vec![("acme_account", "Acme account", "subscription")]
+        );
+        assert_eq!(
+            published
+                .sign_in
+                .map(|sign_in| (sign_in.device_code, sign_in.browser)),
+            Some((true, false))
+        );
+        // The identity kinds and the sign-in endpoints follow the declaration.
+        assert_eq!(
+            registry
+                .credential_kinds(crate::config::ApiType::Extension("acme_plan"))
+                .expect("declared kinds")
+                .iter()
+                .map(|kind| kind.id)
+                .collect::<Vec<_>>(),
+            vec!["acme_account"]
+        );
+        assert!(registry.owns_sign_in_endpoints("acme-subscription"));
+        assert!(!registry.owns_sign_in_endpoints("request-defaults"));
+    }
 
     struct Append {
         id: &'static str,

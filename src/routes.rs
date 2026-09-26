@@ -15,8 +15,10 @@ pub const ROUTES_FILE: &str = "data/routes.json";
 pub struct RouteTarget {
     pub provider_id: String,
     pub endpoint_id: String,
+    /// Empty means the Endpoint chooses the identity from its own credential
+    /// policy; a non-empty value pins one credential to this destination.
     #[serde(default)]
-    pub api_key_id: String,
+    pub credential_id: String,
     pub upstream_model: String,
     pub weight: u32,
     #[serde(default = "enabled_by_default")]
@@ -225,7 +227,7 @@ mod tests {
             targets: vec![RouteTarget {
                 provider_id: "provider".to_owned(),
                 endpoint_id: "endpoint".to_owned(),
-                api_key_id: "key".to_owned(),
+                credential_id: "key".to_owned(),
                 upstream_model: model.to_owned(),
                 weight,
                 enabled: true,
@@ -262,7 +264,7 @@ mod tests {
         RouteTarget {
             provider_id: provider_id.to_owned(),
             endpoint_id: "endpoint".to_owned(),
-            api_key_id: "key".to_owned(),
+            credential_id: "key".to_owned(),
             upstream_model: model.to_owned(),
             weight,
             enabled,
@@ -297,20 +299,32 @@ mod tests {
         assert!(super::validate_route_identities(&[route]).is_ok());
 
         // Rounding down cannot reach 100%, so the largest survivor takes the remainder.
-        let mut route = split(&[("gone", 30, true), ("first", 40, true), ("second", 30, true)]);
+        let mut route = split(&[
+            ("gone", 30, true),
+            ("first", 40, true),
+            ("second", 30, true),
+        ]);
         route.prune_targets(|target| target.provider_id != "gone");
         assert_eq!(shares(&route), [58, 42]);
         assert!(super::validate_route_identities(&[route]).is_ok());
 
         // Surviving destinations that already split evenly keep their shares equal.
-        let mut route = split(&[("gone", 40, true), ("first", 30, true), ("second", 30, true)]);
+        let mut route = split(&[
+            ("gone", 40, true),
+            ("first", 30, true),
+            ("second", 30, true),
+        ]);
         route.prune_targets(|target| target.provider_id != "gone");
         assert_eq!(shares(&route), [50, 50]);
         assert!(super::validate_route_identities(&[route]).is_ok());
 
         // A destination that receives no traffic must not add to the 100% a request
         // distributes, so it stays at zero while the live share is scaled up.
-        let mut route = split(&[("gone", 50, true), ("stays", 25, true), ("paused", 25, false)]);
+        let mut route = split(&[
+            ("gone", 50, true),
+            ("stays", 25, true),
+            ("paused", 25, false),
+        ]);
         route.prune_targets(|target| target.provider_id != "gone");
         assert_eq!(shares(&route), [100, 0]);
         assert!(super::validate_route_identities(&[route]).is_ok());
@@ -383,7 +397,7 @@ mod tests {
                 RouteTarget {
                     provider_id: "provider".to_owned(),
                     endpoint_id: "disabled".to_owned(),
-                    api_key_id: "key".to_owned(),
+                    credential_id: "key".to_owned(),
                     upstream_model: "disabled".to_owned(),
                     weight: 100,
                     enabled: false,
@@ -391,7 +405,7 @@ mod tests {
                 RouteTarget {
                     provider_id: "provider".to_owned(),
                     endpoint_id: "one".to_owned(),
-                    api_key_id: "key".to_owned(),
+                    credential_id: "key".to_owned(),
                     upstream_model: "one".to_owned(),
                     weight: 1,
                     enabled: true,
@@ -399,7 +413,7 @@ mod tests {
                 RouteTarget {
                     provider_id: "provider".to_owned(),
                     endpoint_id: "two".to_owned(),
-                    api_key_id: "key".to_owned(),
+                    credential_id: "key".to_owned(),
                     upstream_model: "two".to_owned(),
                     weight: 2,
                     enabled: true,
@@ -422,7 +436,7 @@ mod tests {
                 RouteTarget {
                     provider_id: "provider".to_owned(),
                     endpoint_id: "zero".to_owned(),
-                    api_key_id: "key".to_owned(),
+                    credential_id: "key".to_owned(),
                     upstream_model: "zero".to_owned(),
                     weight: 0,
                     enabled: true,

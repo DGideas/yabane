@@ -398,7 +398,7 @@ mod tests {
             ..provider()
         };
         let codex_endpoint = ApiEndpoint {
-            api_type: ApiType::OpenaiCodex,
+            api_type: ApiType::Extension("openai_codex"),
             ..ApiEndpoint::default()
         };
         let qwen_endpoint = ApiEndpoint {

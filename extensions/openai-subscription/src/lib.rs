@@ -7,21 +7,32 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use yabane_extension_api::{
     BrowserAuthorization, DeviceAuthorization, EXTENSION_API_VERSION, Extension, HookStage,
-    Protocol, ProviderEndpoint, ProviderEndpointKind, ProviderEndpointRequest,
-    ProviderEndpointType, SubscriptionCredential, SubscriptionProvider,
+    Protocol, ProviderCredentialKind, ProviderEndpoint, ProviderEndpointMaterial,
+    ProviderEndpointRequest, ProviderEndpointType, ProviderSignIn, SubscriptionCredential,
+    SubscriptionProvider,
 };
 
 pub const ID: &str = "openai-subscription";
 pub const ENDPOINT_TYPE: &str = "openai_codex";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL: &str = "https://auth.openai.com";
-const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+/// The fixed base URL this Endpoint type always talks to. Core stores it in
+/// configuration and reads wire behavior from here instead of assuming one.
+pub const BASE_URL: &str = "https://chatgpt.com/backend-api";
 const BROWSER_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const BROWSER_SCOPE: &str = "openid profile email offline_access";
 const BROWSER_TIMEOUT_SECONDS: u64 = 15 * 60;
 const DEVICE_TIMEOUT_SECONDS: u64 = 15 * 60;
 const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
+
+/// The identity this Endpoint type owns: a ChatGPT account connected through
+/// OpenAI sign-in. The identifier and label are declared here, not in Core.
+const CREDENTIAL_KINDS: &[ProviderCredentialKind] = &[ProviderCredentialKind {
+    id: "openai_subscription",
+    label: "OAuth account",
+    flow: yabane_extension_api::CredentialFlow::Subscription,
+}];
 
 // ChatGPT's Codex backend has no supported /models operation, so keep this catalog explicit
 // and update it from pi-ai's OpenAI Codex provider catalog.
@@ -131,11 +142,17 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
         ProviderEndpointType {
             id: ENDPOINT_TYPE,
             display_name: "OpenAI subscription",
+            description: "Responses API with ChatGPT Plus or Pro",
             default_endpoint_id: "chatgpt",
-            fixed_base_url: Some(CHATGPT_BASE_URL),
-            kind: ProviderEndpointKind::Subscription,
+            fixed_base_url: Some(BASE_URL),
             upstream_protocol: Protocol::OpenAiResponses,
             always_event_stream: true,
+            surfaces: &[Protocol::OpenAiResponses],
+            credential_kinds: CREDENTIAL_KINDS,
+            sign_in: Some(ProviderSignIn {
+                device_code: true,
+                browser: true,
+            }),
         }
     }
 
@@ -147,6 +164,13 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
         let credential = request
             .credential
             .ok_or_else(|| "OpenAI subscription is not connected".to_owned())?;
+        let ProviderEndpointMaterial::Subscription {
+            access_token,
+            account_id,
+        } = credential.material
+        else {
+            return Err("OpenAI subscription needs a signed-in account".to_owned());
+        };
         strip_inbound_headers(request.headers);
         request.headers.insert(
             header::ACCEPT_ENCODING,
@@ -154,12 +178,12 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
         );
         request.headers.insert(
             header::AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", credential.access_token))
+            HeaderValue::from_str(&format!("Bearer {access_token}"))
                 .map_err(|_| "OpenAI subscription access token is invalid".to_owned())?,
         );
         request.headers.insert(
             HeaderName::from_static("chatgpt-account-id"),
-            HeaderValue::from_str(credential.account_id)
+            HeaderValue::from_str(account_id)
                 .map_err(|_| "OpenAI subscription account ID is invalid".to_owned())?,
         );
         request.headers.insert(
@@ -597,8 +621,11 @@ mod tests {
                 body: &mut body,
                 target_path: &mut target_path,
                 credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                    access_token: "upstream-token",
-                    account_id: "upstream-account",
+                    kind: "openai_subscription",
+                    material: ProviderEndpointMaterial::Subscription {
+                        access_token: "upstream-token",
+                        account_id: "upstream-account",
+                    },
                 }),
             })
             .unwrap();
@@ -646,8 +673,11 @@ mod tests {
                     body: &mut body,
                     target_path: &mut target_path,
                     credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                        access_token: "invalid\nvalue",
-                        account_id: "account",
+                        kind: "openai_subscription",
+                        material: ProviderEndpointMaterial::Subscription {
+                            access_token: "invalid\nvalue",
+                            account_id: "account",
+                        },
                     }),
                 })
                 .is_err()
@@ -720,8 +750,11 @@ mod tests {
                 body: &mut body,
                 target_path: &mut target_path,
                 credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                    access_token: "upstream-token",
-                    account_id: "upstream-account",
+                    kind: "openai_subscription",
+                    material: ProviderEndpointMaterial::Subscription {
+                        access_token: "upstream-token",
+                        account_id: "upstream-account",
+                    },
                 }),
             })
             .unwrap();
@@ -774,8 +807,11 @@ mod tests {
                 body: &mut body,
                 target_path: &mut target_path,
                 credential: Some(yabane_extension_api::ProviderEndpointCredential {
-                    access_token: "upstream-token",
-                    account_id: "upstream-account",
+                    kind: "openai_subscription",
+                    material: ProviderEndpointMaterial::Subscription {
+                        access_token: "upstream-token",
+                        account_id: "upstream-account",
+                    },
                 }),
             })
             .unwrap();

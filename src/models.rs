@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::{
-    config::{ApiEndpoint, ApiKey, ApiType, AppState, Provider, UpstreamTimeouts},
+    config::{ApiEndpoint, ApiType, AppState, Credential, Provider, UpstreamTimeouts},
     gateway::join_upstream_url,
 };
 
@@ -200,17 +200,16 @@ fn discovery_inputs_match(current: &Provider, snapshot: &Provider) -> bool {
                     && current.api_type == snapshot.api_type
                     && current.base_url == snapshot.base_url
                     && current.socks5_proxy == snapshot.socks5_proxy
-                    && current.requires_api_key == snapshot.requires_api_key
-                    && discovery_keys_match(&current.api_keys, &snapshot.api_keys)
-                    && current.openai_subscription == snapshot.openai_subscription
+                    && current.requires_credential == snapshot.requires_credential
+                    && discovery_credentials_match(&current.credentials, &snapshot.credentials)
             })
 }
 
-fn discovery_keys_match(current: &[ApiKey], snapshot: &[ApiKey]) -> bool {
+fn discovery_credentials_match(current: &[Credential], snapshot: &[Credential]) -> bool {
     current.len() == snapshot.len()
         && current.iter().zip(snapshot).all(|(current, snapshot)| {
             current.id == snapshot.id
-                && current.secret == snapshot.secret
+                && current.material == snapshot.material
                 && current.enabled == snapshot.enabled
         })
 }
@@ -259,51 +258,58 @@ async fn list_endpoint_models(
     provider: &Provider,
     endpoint: &ApiEndpoint,
 ) -> Result<Vec<Model>, String> {
-    if endpoint.api_type == ApiType::OpenaiCodex {
-        if endpoint.openai_subscription.is_none() {
+    if let Some(endpoint_type) = endpoint.extension_endpoint_type() {
+        // An Extension-owned Endpoint type publishes its own catalog instead of
+        // being discovered over the network.
+        if endpoint.requires_credential && endpoint.credentials.iter().all(|c| !c.is_usable()) {
             return Err(format!(
-                "endpoint '{}' has no connected OpenAI subscription",
+                "endpoint '{}' has no connected account yet",
                 endpoint.id
             ));
         }
-        let implementation = state
-            .extensions
-            .provider_endpoint("openai_codex")
-            .ok_or_else(|| "OpenAI Subscription Extension is not enabled".to_owned())?;
+        let implementation = state.extensions.provider_endpoint(endpoint_type).ok_or_else(|| {
+            format!(
+                "Endpoint type '{endpoint_type}' is not available because its Extension is not enabled"
+            )
+        })?;
+        let owned_by = provider.id.clone();
         return Ok(implementation
             .models()
             .iter()
             .map(|id| Model {
                 id: (*id).to_owned(),
                 object: model_object(),
-                owned_by: "openai".to_owned(),
+                owned_by: owned_by.clone(),
                 created: None,
                 context_window: None,
             })
             .collect());
     }
     let client = &state.client;
-    let keys: Vec<Option<ApiKey>> = if endpoint.requires_api_key {
+    let credentials: Vec<Option<Credential>> = if endpoint.requires_credential {
         endpoint
-            .api_keys
+            .credentials
             .iter()
-            .filter(|key| key.enabled)
+            .filter(|credential| credential.enabled && credential.secret().is_some())
             .cloned()
             .map(Some)
             .collect()
     } else {
         vec![None]
     };
-    if keys.is_empty() {
-        return Err(format!("endpoint '{}' has no enabled API key", endpoint.id));
+    if credentials.is_empty() {
+        return Err(format!(
+            "endpoint '{}' has no enabled credential",
+            endpoint.id
+        ));
     }
 
-    let responses = join_all(keys.iter().map(|key| {
+    let responses = join_all(credentials.iter().map(|credential| {
         fetch_models(
             client,
             state.upstream_timeouts,
             endpoint,
-            key.as_ref(),
+            credential.as_ref(),
             provider,
         )
     }))
@@ -328,14 +334,14 @@ async fn fetch_models(
     client: &reqwest::Client,
     timeouts: UpstreamTimeouts,
     endpoint: &ApiEndpoint,
-    key: Option<&ApiKey>,
+    credential: Option<&Credential>,
     provider: &Provider,
 ) -> Result<Vec<Model>, String> {
     fetch_models_with_timeout(
         client,
         timeouts,
         endpoint,
-        key,
+        credential,
         provider,
         MODEL_DISCOVERY_TIMEOUT,
     )
@@ -346,7 +352,7 @@ async fn fetch_models_with_timeout(
     client: &reqwest::Client,
     timeouts: UpstreamTimeouts,
     endpoint: &ApiEndpoint,
-    key: Option<&ApiKey>,
+    credential: Option<&Credential>,
     provider: &Provider,
     timeout: Duration,
 ) -> Result<Vec<Model>, String> {
@@ -354,19 +360,19 @@ async fn fetch_models_with_timeout(
         ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions | ApiType::OpenaiResponses => {
             "/v1/models"
         }
-        ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
+        ApiType::Extension(_) => unreachable!("Extension Endpoints publish their own catalog"),
         ApiType::Anthropic => "/v1/models?limit=1000",
     };
     let client = endpoint.client(client, timeouts)?;
     let mut request = client.get(join_upstream_url(&endpoint.base_url, path));
-    if let Some(key) = key {
+    if let Some(secret) = credential.and_then(Credential::secret) {
         request = match endpoint.api_type {
             ApiType::OpenaiCompatible
             | ApiType::OpenaiChatCompletions
-            | ApiType::OpenaiResponses => request.bearer_auth(&key.secret),
-            ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
+            | ApiType::OpenaiResponses => request.bearer_auth(secret),
+            ApiType::Extension(_) => unreachable!("Extension Endpoints publish their own catalog"),
             ApiType::Anthropic => request
-                .header("x-api-key", &key.secret)
+                .header("x-api-key", secret)
                 .header("anthropic-version", ANTHROPIC_VERSION),
         };
     } else if endpoint.api_type == ApiType::Anthropic {
@@ -396,7 +402,7 @@ async fn fetch_models_with_timeout(
         ApiType::OpenaiCompatible | ApiType::OpenaiChatCompletions | ApiType::OpenaiResponses => {
             parse_openai_models(&body, provider)
         }
-        ApiType::OpenaiCodex => unreachable!("subscription models use the built-in catalog"),
+        ApiType::Extension(_) => unreachable!("Extension Endpoints publish their own catalog"),
         ApiType::Anthropic => parse_anthropic_models(&body, provider),
     }
 }
@@ -480,7 +486,7 @@ mod tests {
         snapshot.endpoints.push(ApiEndpoint {
             id: "primary".to_owned(),
             base_url: "https://old.example/v1".to_owned(),
-            requires_api_key: false,
+            requires_credential: false,
             ..ApiEndpoint::default()
         });
         let mut current = snapshot.clone();
@@ -531,7 +537,7 @@ mod tests {
         let endpoint = ApiEndpoint {
             id: "delayed".to_owned(),
             base_url: format!("http://{address}/v1"),
-            requires_api_key: false,
+            requires_credential: false,
             ..ApiEndpoint::default()
         };
         let error = fetch_models_with_timeout(
