@@ -594,7 +594,7 @@ function renderProviderPage() {
         ? `<button class="button secondary connect-account" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Connect account</button>`
         : `<button class="button secondary add-credential" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add credential</button>`;
     const endpointKind = endpoint.endpoint_type_label || formatType(endpoint.api_type);
-    return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-pricing text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Cost estimation</button><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
+    return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
@@ -611,7 +611,7 @@ function renderProviderPage() {
   const defaultsNotice = requestDefaultsExtension && !requestDefaultsExtension.enabled ? `<div class="defaults-disabled-notice" role="status"><span class="defaults-disabled-mark" aria-hidden="true">!</span><span><strong>Request defaults are off</strong><small>No saved headers or body fields will be added to Provider requests. ${defaultsEnableGuidance}</small></span></div>` : '';
   const defaultsAction = requestDefaultsExtension ? '<button class="button secondary edit-provider-options">Configure</button>' : '<button class="button secondary include-request-defaults-extension" type="button">How to include</button>';
   const coverage = provider.endpoints.map(endpoint => { const count = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length; return `<div><span><strong>${escapeHtml(endpoint.id)}</strong><small>${escapeHtml(formatType(endpoint.api_type))}</small></span><b>${count.toLocaleString()}</b></div>`; }).join('');
-  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} Provider credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section><section class="card provider-pricing-card"><div class="card-head"><div><span class="section-kicker">Provider default</span><h2>Cost estimation</h2><p>Yabane uses these rates when an Endpoint has no override. This setting is separate from Request Defaults.</p></div><button class="button secondary edit-provider-pricing" data-provider="${provider.id}" type="button">Configure pricing</button></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each Endpoint is a connection to the Provider. Credentials and connected accounts belong only to their Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an Endpoint to start routing requests.</p></div>'}</div></section>`;
+  $('#provider-detail').innerHTML = `<nav class="provider-breadcrumb" aria-label="Breadcrumb"><button id="back-to-providers">Providers</button>${icon('chevron-right', 'breadcrumb-icon')}<strong>${escapeHtml(provider.name)}</strong></nav><header class="provider-hero"><div class="provider-hero-mark">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</div><div class="provider-hero-main"><span class="provider-eyebrow">Provider settings</span><h1>${escapeHtml(provider.name)}</h1><p>Requests use <code>${escapeHtml(provider.id)}/model-id</code>. This provider contains ${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} and ${credentialCount(provider)} Provider credential${credentialCount(provider) === 1 ? '' : 's'}.</p></div><div class="provider-hero-actions"><button class="button secondary contextual-help" data-help-context="provider" data-provider="${provider.id}" type="button">${icon('help', 'button-icon')}Provider guide</button><button class="button secondary edit-provider" data-provider="${provider.id}" type="button">Edit provider</button><button class="delete-provider button danger" data-provider="${provider.id}">Delete provider</button></div></header><div class="provider-overview"><section class="card model-summary-card"><div class="card-head"><div><span class="section-kicker">Model catalog</span><h2>Discovered models</h2><p>${discovery}</p></div><div>${sharedVariants.length ? `<button class="button secondary manage-model-endpoints">Manage endpoint defaults</button>` : ''}<button class="text-link browse-provider-models" aria-expanded="false">Browse catalog</button><button class="text-link refresh-models" data-provider="${provider.id}">Refresh</button></div></div><div class="model-insights"><div class="model-insight"><strong>${provider.discovered_models.length.toLocaleString()}</strong><span>Models</span><small>Unique model IDs</small></div><div class="model-insight ${sharedVariants.length ? 'attention' : ''}"><strong>${sharedVariants.length.toLocaleString()}</strong><span>Shared models</span><small>${sharedVariants.length ? `${configuredPreferences} explicit default${configuredPreferences === 1 ? '' : 's'}` : 'No endpoint overlap'}</small></div><div class="endpoint-coverage"><header><span>Endpoint coverage</span><small>Models reported</small></header>${coverage || '<p>No endpoints configured</p>'}</div></div><div class="provider-model-browser" hidden><div class="model-browser-toolbar"><label class="model-filter"><svg class="model-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="5.5"></circle><path d="m15 15 4 4"></path></svg><input type="text" role="searchbox" placeholder="Search model IDs" autocomplete="off" aria-label="Search model IDs"><button type="button" class="model-search-clear" aria-label="Clear search" hidden>${icon('close')}</button></label><span class="model-result-count"></span></div><div class="model-table"><header><span>Model ID</span><span>Available through</span><span>Default routing</span></header><div class="model-table-body"></div></div><footer class="model-pagination"><span class="model-page-status"></span><div><button type="button" class="button secondary model-page-previous">Previous</button><button type="button" class="button secondary model-page-next">Next</button></div></footer></div></section><section class="card defaults-card ${defaultsStateClass}"><div class="card-head"><div><span class="section-kicker">${defaultsAvailability} · ${escapeHtml(defaultsScope)}</span><h2>Request defaults</h2><p>${defaultsDescription}</p></div><div class="defaults-actions">${defaultsAction}</div></div>${defaultsNotice}<div class="request-defaults-summary"><div><span class="defaults-count">${headerCount}</span><span><strong>Headers</strong><small>${headerCount ? 'Configured' : 'Not configured'}</small></span></div><div><span class="defaults-count">${bodyCount}</span><span><strong>Body fields</strong><small>${bodyCount ? 'Configured' : 'Not configured'}</small></span></div></div></section></div><section class="endpoint-group"><div class="endpoint-group-head"><div><span class="section-kicker">Provider children</span><h2>API endpoints</h2><p>Each Endpoint is a connection to the Provider. Credentials and connected accounts belong only to their Endpoint.</p></div><button class="button primary add-endpoint" data-provider="${provider.id}">${icon('plus', 'button-icon')}Add endpoint</button></div><div class="endpoint-stack">${endpointHtml || '<div class="empty endpoint-empty"><h3>No endpoints</h3><p>Add an Endpoint to start routing requests.</p></div>'}</div></section>`;
   const browse = $('#provider-detail .browse-provider-models');
   if (!provider.discovered_models.length) browse.disabled = true;
   const pageSize = 25; let modelPage = 0;
@@ -736,8 +736,6 @@ function bindProviderActions() {
     await Promise.all([loadProviders(), loadRoutes(), loadAuth()]);
   }));
   $$('.endpoint-edit').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider, button.dataset.endpoint)));
-  $$('.endpoint-pricing').forEach(button => button.addEventListener('click', () => openPricingEditor(button.dataset.provider, button.dataset.endpoint)));
-  $$('.edit-provider-pricing').forEach(button => button.addEventListener('click', () => openPricingEditor(button.dataset.provider)));
   $$('.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     const endpoint = provider.endpoints.find(item => item.id === button.dataset.endpoint);
@@ -1063,15 +1061,6 @@ function openCentralPricingEditor(options = {}) {
   $('#pricing-list-page').hidden = true; $('#pricing-editor-page').hidden = false;
   updatePricingScopeFields(); $('#pricing-model').focus();
 }
-function openPricingEditor(providerId, endpointId = null, modelId = null) {
-  const provider = providers.find(item => item.id === providerId);
-  const endpoint = provider?.endpoints.find(item => item.id === endpointId);
-  let scope = 'global';
-  if (modelId && endpoint?.pricing?.models?.[modelId]) scope = 'endpoint';
-  else if (modelId && provider?.pricing?.models?.[modelId]) scope = 'provider';
-  showView('pricing');
-  openCentralPricingEditor({scope, providerId, endpointId, modelId});
-}
 async function savePricingScope(scope, providerId, endpointId, table) {
   const url = scope === 'global' ? '/admin/pricing' : scope === 'provider' ? `/admin/pricing/providers/${encodeURIComponent(providerId)}` : `/admin/pricing/providers/${encodeURIComponent(providerId)}/endpoints/${encodeURIComponent(endpointId)}`;
   return fetch(url, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify(table)});
@@ -1394,16 +1383,322 @@ $('#request-defaults-form').addEventListener('submit', async event => {
 
 const routeDialog = $('#route-dialog');
 let editingRoutePattern = null;
-function routeTargetOptions() { return providers.flatMap(provider => provider.endpoints.flatMap(endpoint => {
-  const options = [];
-  const endpointOption = label => { const option = new Option(`${provider.name} · ${endpoint.id} · ${label}`, `${provider.id}\n${endpoint.id}\n`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; option.dataset.automatic = 'true'; return option; };
-  if (!endpoint.requires_credential) { options.push(endpointOption('No credential')); return options; }
+/// The console draws its own option lists. A native select renders the operating
+/// system's dropdown, which cannot show Provider → Endpoint → identity as three
+/// levels, cannot annotate a row with weight, cooling, or availability, and
+/// cannot use this console's wording.
+function createPicker(host) {
+  if (host.pickerApi) return host.pickerApi;
+  host.classList.add('picker');
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'picker-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.innerHTML = '<span class="picker-value"></span><svg class="ui-icon picker-chevron" aria-hidden="true"><use href="#icon-chevron-right"></use></svg>';
+  const popup = document.createElement('div');
+  popup.className = 'picker-popup';
+  popup.setAttribute('role', 'listbox');
+  popup.hidden = true;
+  // A cloned destination editor carries the previous picker markup, so the host is
+  // reset before this picker builds its own trigger and list.
+  host.replaceChildren(trigger, popup);
+
+  const api = {host, trigger, popup, groups: [], value: '', highlighted: -1, disabled: false, onChange: null, placeholder: ''};
+  host.pickerApi = api;
+  const rows = () => api.groups.flatMap(group => group.options).filter(option => !option.separator);
+  const selected = () => rows().find(option => option.value === api.value) || null;
+  const selectable = () => [...popup.querySelectorAll('.picker-option:not([disabled])')];
+
+  const renderTrigger = () => {
+    const option = selected();
+    trigger.querySelector('.picker-value').textContent = option ? (option.trigger ?? option.title) : (api.placeholder || 'Nothing available');
+    trigger.classList.toggle('is-empty', !option);
+    trigger.classList.toggle('is-warning', Boolean(option?.warning));
+    trigger.classList.toggle('is-disabled', Boolean(option?.disabled));
+    trigger.disabled = api.disabled || !rows().length;
+  };
+  const renderPopup = () => {
+    if (!rows().length) {
+      const empty = document.createElement('p');
+      empty.className = 'picker-empty';
+      empty.textContent = api.placeholder || 'Nothing available yet.';
+      popup.replaceChildren(empty);
+      return;
+    }
+    popup.replaceChildren(...api.groups.map(group => {
+      const section = document.createElement('div');
+      section.className = 'picker-group';
+      if (group.label) {
+        const head = document.createElement('div');
+        head.className = 'picker-group-label';
+        head.textContent = group.label;
+        section.append(head);
+      }
+      group.options.forEach(option => {
+        if (option.separator) {
+          const rule = document.createElement('div');
+          rule.className = 'picker-rule';
+          section.append(rule);
+          return;
+        }
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'picker-option';
+        row.setAttribute('role', 'option');
+        row.dataset.value = option.value;
+        row.disabled = Boolean(option.disabled);
+        row.setAttribute('aria-selected', String(option.value === api.value));
+        if (option.warning) row.classList.add('is-warning');
+        if (option.disabled) row.classList.add('is-disabled');
+        row.innerHTML = `<span class="picker-option-text"><strong>${escapeHtml(option.title)}</strong>${option.meta ? `<small>${escapeHtml(option.meta)}</small>` : ''}</span><svg class="ui-icon picker-check" aria-hidden="true"><use href="#icon-check"></use></svg>`;
+        row.addEventListener('click', () => { if (row.disabled) return; api.pick(option.value); });
+        section.append(row);
+      });
+      return section;
+    }));
+  };
+  const highlight = index => {
+    const options = selectable();
+    if (!options.length) return;
+    api.highlighted = Math.max(0, Math.min(index, options.length - 1));
+    options.forEach((row, position) => row.classList.toggle('is-highlighted', position === api.highlighted));
+    options[api.highlighted].scrollIntoView({block: 'nearest'});
+  };
+  const open = () => {
+    if (api.disabled || !rows().length) return;
+    for (const other of document.querySelectorAll('.picker[data-open]')) if (other !== host) other.pickerApi?.close();
+    host.dataset.open = 'true';
+    popup.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    const position = selectable().findIndex(row => row.dataset.value === api.value);
+    highlight(position === -1 ? 0 : position);
+  };
+  const close = (refocus = false) => {
+    delete host.dataset.open;
+    popup.hidden = true;
+    api.highlighted = -1;
+    trigger.setAttribute('aria-expanded', 'false');
+    if (refocus) trigger.focus();
+  };
+  api.open = open;
+  api.close = close;
+  api.setOptions = (groups, wanted) => {
+    api.groups = groups;
+    const options = groups.flatMap(group => group.options).filter(option => !option.separator);
+    const candidate = wanted ?? api.value;
+    const match = options.find(option => option.value === candidate && !option.disabled);
+    const fallback = options.find(option => !option.disabled);
+    api.value = (match || fallback)?.value ?? '';
+    renderTrigger();
+    renderPopup();
+    if (host.dataset.open) open();
+  };
+  api.setDisabled = disabled => { api.disabled = disabled; if (disabled) close(); renderTrigger(); };
+  api.pick = value => {
+    const changed = value !== api.value;
+    api.value = value;
+    renderTrigger();
+    renderPopup();
+    close(true);
+    if (changed) api.onChange?.(value);
+  };
+  trigger.addEventListener('click', event => { event.stopPropagation(); if (host.dataset.open) close(); else open(); });
+  trigger.addEventListener('keydown', event => {
+    if (['ArrowDown', 'ArrowUp', 'Enter', ' '].includes(event.key)) { event.preventDefault(); open(); }
+    else if (event.key === 'Escape') close();
+  });
+  popup.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); close(true); return; }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      selectable()[api.highlighted]?.click();
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === 'Home') highlight(0);
+    else if (event.key === 'End') highlight(selectable().length - 1);
+    else highlight(api.highlighted + (event.key === 'ArrowDown' ? 1 : -1));
+  });
+  document.addEventListener('click', event => { if (!host.contains(event.target)) close(); });
+  return api;
+}
+function destinationPicker(editor, level) { return createPicker(editor.querySelector(`.route-${level}`)); }
+function destinationValue(editor, level) { return destinationPicker(editor, level).value; }
+function destinationProvider(editor) { return providers.find(item => item.id === destinationValue(editor, 'provider')) || null; }
+function destinationEndpoint(editor) {
+  const provider = destinationProvider(editor);
+  return provider?.endpoints.find(item => item.id === destinationValue(editor, 'endpoint')) || null;
+}
+function destinationTarget(editor) {
+  return {provider_id: destinationValue(editor, 'provider'), endpoint_id: destinationValue(editor, 'endpoint'), credential_id: destinationValue(editor, 'identity')};
+}
+/// An Endpoint type is usable only while the Extension providing it is enabled,
+/// which is exactly what the published Endpoint type catalog says.
+function endpointTypeUsable(apiType) { return endpointTypes.some(type => type.id === apiType); }
+function endpointModels(provider, endpointId) { return provider.discovered_models.filter(model => (provider.model_endpoints[model] || []).includes(endpointId)); }
+function identityShare(endpoint, credential) {
+  const total = enabledCredentials(endpoint).reduce((sum, item) => sum + item.weight, 0) || 1;
+  return `${Math.round(credential.weight / total * 100)}%`;
+}
+function identityState(endpoint, credential) {
+  if (!credential.enabled) return 'disabled';
+  const remaining = credential.cooldown_seconds_remaining;
+  return remaining ? `cooling down ${formatCooldown(remaining)}` : 'healthy';
+}
+function identityNoun(endpoint, count) {
+  const label = endpoint.credentials[0]?.kind_label || 'identity';
+  return count === 1 ? label : `${label}s`;
+}
+/// Identities that can serve right now: enabled, and not cooling down.
+function eligibleIdentities(endpoint) { return enabledCredentials(endpoint).filter(credential => !credential.cooldown_seconds_remaining); }
+function coolingIdentities(endpoint) { return enabledCredentials(endpoint).filter(credential => credential.cooldown_seconds_remaining); }
+function renderDestination(editor, wanted = {}) {
+  const providerPicker = destinationPicker(editor, 'provider');
+  providerPicker.setOptions([{
+    label: 'Provider',
+    options: providers.map(provider => ({
+      value: provider.id,
+      title: provider.name,
+      meta: `${provider.id} · ${provider.endpoints.length} ${provider.endpoints.length === 1 ? 'Endpoint' : 'Endpoints'}`,
+    })),
+  }], wanted.providerId);
+  const provider = destinationProvider(editor);
+  const endpointPicker = destinationPicker(editor, 'endpoint');
+  endpointPicker.setDisabled(!provider);
+  endpointPicker.placeholder = provider ? 'This Provider has no Endpoint' : 'Choose a Provider first';
+  endpointPicker.setOptions([{
+    label: provider ? `${provider.name} · Endpoints` : 'Endpoints',
+    options: (provider?.endpoints || []).map(endpoint => {
+      const usable = endpointTypeUsable(endpoint.api_type);
+      const models = endpointModels(provider, endpoint.id).length;
+      const notes = [endpoint.endpoint_type_label || endpointTypeLabel(endpoint.api_type), `${models} model${models === 1 ? '' : 's'}`];
+      if (!endpoint.requires_credential) notes.push('no identity');
+      if (!usable) notes.push('unavailable: its Extension is not enabled');
+      return {
+        value: endpoint.id,
+        title: endpoint.id,
+        meta: notes.join(' · '),
+        disabled: !usable && endpoint.id !== wanted.endpointId,
+        warning: !usable,
+      };
+    }),
+  }], wanted.endpointId);
+  renderDestinationIdentities(editor, wanted.credentialId);
+  updateDestinationModels(editor);
+  updateDestinationEffect(editor);
+}
+function renderDestinationIdentities(editor, wanted = null) {
+  const picker = destinationPicker(editor, 'identity');
+  const endpoint = destinationEndpoint(editor);
+  if (!endpoint) {
+    picker.setDisabled(true);
+    picker.placeholder = 'Choose an Endpoint first';
+    picker.setOptions([], null);
+    return;
+  }
+  if (!endpointTypeUsable(endpoint.api_type)) {
+    picker.setDisabled(true);
+    picker.placeholder = 'Unavailable until its Extension is enabled';
+    picker.setOptions([], null);
+    return;
+  }
+  picker.setDisabled(false);
+  picker.placeholder = 'No identity';
+  if (!endpoint.requires_credential) {
+    picker.setOptions([{label: 'Identity', options: [{value: '', title: 'No identity needed', meta: 'This Endpoint sends requests without one'}]}], null);
+    return;
+  }
+  const eligible = eligibleIdentities(endpoint);
+  const cooling = coolingIdentities(endpoint);
+  const automatic = {
+    value: '',
+    title: 'Endpoint policy',
+    trigger: eligible.length ? `Endpoint policy · ${eligible.length} rotating` : 'Endpoint policy',
+    meta: eligible.length
+      ? `rotates ${eligible.length} eligible ${identityNoun(endpoint, eligible.length)} by weight${cooling.length ? `, ${cooling.length} cooling down now` : ''}`
+      : enabledCredentials(endpoint).length ? 'every identity is cooling down right now' : 'no enabled identity yet',
+  };
+  picker.setOptions([
+    {label: 'Automatic', options: [automatic]},
+    {
+      label: 'Pin exactly one identity',
+      options: endpoint.credentials.map(credential => ({
+        value: credential.id,
+        title: credential.name,
+        trigger: credential.name,
+        meta: credential.enabled
+          ? `${identityShare(endpoint, credential)} · ${identityState(endpoint, credential)}`
+          : 'disabled · excluded from rotation',
+        disabled: !credential.enabled,
+      })),
+    },
+  ], wanted ?? picker.value);
+}
+function updateDestinationEffect(editor) {
+  const effect = editor.querySelector('.route-destination-effect');
+  const provider = destinationProvider(editor);
+  const endpoint = destinationEndpoint(editor);
+  const {credential_id: pinned} = destinationTarget(editor);
+  if (!provider || !endpoint) { effect.dataset.tone = 'warn'; effect.textContent = 'Choose a Provider and one of its Endpoints for this destination.'; return; }
+  const where = `${provider.id}/${endpoint.id}`;
+  if (!endpointTypeUsable(endpoint.api_type)) {
+    effect.dataset.tone = 'warn';
+    effect.textContent = `Endpoint type “${endpoint.endpoint_type_label || endpointTypeLabel(endpoint.api_type)}” is unavailable because its Extension is not enabled; choose another Endpoint before saving.`;
+    return;
+  }
+  if (!endpoint.requires_credential) {
+    effect.dataset.tone = 'info';
+    effect.textContent = `Sends every matching request to ${where}, which needs no identity.`;
+    return;
+  }
+  if (pinned) {
+    const credential = endpoint.credentials.find(item => item.id === pinned);
+    effect.dataset.tone = 'pin';
+    effect.textContent = `Pins ${credential?.name || pinned} on ${where}: every matching request uses that identity, even while it is cooling down, and the Endpoint's other identities are never used for this route.`;
+    return;
+  }
   const enabled = enabledCredentials(endpoint);
-  options.push(endpointOption(enabled.length ? `Endpoint policy · rotates ${enabled.length} credential${enabled.length === 1 ? '' : 's'}` : 'Endpoint policy · no credential yet'));
-  endpoint.credentials.forEach(credential => { const option = new Option(`${provider.name} · ${endpoint.id} · ${credential.name}${credential.enabled ? '' : ' (disabled)'}`, `${provider.id}\n${endpoint.id}\n${credential.id}`); option.dataset.provider = provider.id; option.dataset.endpoint = endpoint.id; options.push(option); });
-  return options;
-})); }
-function routeTargetValue(target) { return `${target.provider_id}\n${target.endpoint_id}\n${target.credential_id || ''}`; }
+  const cooling = coolingIdentities(endpoint);
+  effect.dataset.tone = enabled.length ? 'info' : 'warn';
+  effect.textContent = enabled.length
+    ? `Sends every matching request to ${where} and rotates between its ${enabled.length} enabled ${identityNoun(endpoint, enabled.length)} by weight; an identity that hits the Provider's rate limit drops out until its cooldown ends.${cooling.length ? ` ${cooling.length} of them ${cooling.length === 1 ? 'is' : 'are'} cooling down right now, so requests go to the others.` : ''}`
+    : `Sends every matching request to ${where}, which has no enabled identity, so requests fail until one is added.`;
+}
+function updateDestinationModels(editor) {
+  const input = editor.querySelector('.upstream-model-input');
+  const provider = destinationProvider(editor);
+  const endpoint = destinationEndpoint(editor);
+  const usable = provider && endpoint && endpointTypeUsable(endpoint.api_type);
+  const models = usable ? endpointModels(provider, endpoint.id) : [];
+  let list = editor.querySelector('datalist');
+  if (!list) { list = document.createElement('datalist'); editor.append(list); }
+  list.id = `upstream-model-suggestions-${crypto.randomUUID()}`;
+  list.replaceChildren(...models.map(model => new Option(model)));
+  input.setAttribute('list', list.id);
+  input.dataset.suggestions = JSON.stringify(models);
+  input.placeholder = models[0] ? `e.g. ${models[0]}` : 'e.g. model-name or org/model-name';
+  const chips = editor.querySelector('.route-model-chips');
+  // The model IDs this Endpoint reports belong to the Endpoint, so they are
+  // offered as one-click choices next to the field that accepts them.
+  chips.replaceChildren(...models.slice(0, 8).map(model => {
+    const chip = document.createElement('button');
+    chip.type = 'button'; chip.className = 'route-model-chip'; chip.textContent = model;
+    chip.addEventListener('click', () => { input.value = model; updateDestinationNotice(editor); });
+    return chip;
+  }));
+  chips.hidden = !models.length;
+  updateDestinationNotice(editor);
+}
+function updateDestinationNotice(editor) {
+  const input = editor.querySelector('.upstream-model-input');
+  const notice = editor.querySelector('.upstream-model-notice');
+  const models = JSON.parse(input.dataset.suggestions || '[]');
+  if (!models.length) notice.textContent = 'No models reported for this Endpoint yet. A custom model ID is still accepted.';
+  else if (input.value.trim() && !models.includes(input.value.trim())) notice.textContent = 'Custom model ID — not reported by this Endpoint. It will still be saved.';
+  else notice.textContent = `${models.length} model${models.length === 1 ? '' : 's'} reported by this Endpoint; a custom ID is also accepted.`;
+}
 function routeTargetEditors() { return $$('#route-targets .route-target-editor'); }
 function distributeRouteShares(weights) {
   const count = weights.length;
@@ -1443,7 +1738,7 @@ function validateRouteSplit() {
   totalLabel.textContent = `${total}%`;
   totalLabel.classList.toggle('invalid', multiple && !validTotal);
   totalLabel.setAttribute('aria-label', multiple && !validTotal ? `Invalid traffic total: ${total}%` : `Traffic total: ${total}%`);
-  const hasDestinations = editors.every(editor => editor.querySelector('.route-target').options.length > 0);
+  const hasDestinations = editors.every(editor => Boolean(destinationValue(editor, 'endpoint')) && Boolean(destinationValue(editor, 'provider')));
   $('#save-route').disabled = !hasDestinations || (multiple && !validTotal);
 }
 function updateRouteTargetMode(rebalance = false) {
@@ -1470,41 +1765,22 @@ function updateRouteTargetMode(rebalance = false) {
   validateRouteSplit();
 }
 function initializeRouteTarget(editor, target = null) {
-  const select = editor.querySelector('.route-target');
-  const existingValue = target ? routeTargetValue(target) : select.value;
-  select.replaceChildren(...routeTargetOptions());
-  if (existingValue && [...select.options].some(option => option.value === existingValue)) select.value = existingValue;
+  renderDestination(editor, target
+    ? {providerId: target.provider_id, endpointId: target.endpoint_id, credentialId: target.credential_id || ''}
+    : {});
   const input = editor.querySelector('.upstream-model-input');
-  const notice = editor.querySelector('.upstream-model-notice');
-  const updateNotice = () => {
-    const models = JSON.parse(input.dataset.suggestions || '[]');
-    if (!models.length) notice.textContent = 'No models have been discovered for this endpoint yet. You can still enter a valid custom model ID.';
-    else if (input.value.trim() && !models.includes(input.value.trim())) notice.textContent = 'Custom model ID — this value was not reported by the selected endpoint. It will still be saved.';
-    else notice.textContent = `${models.length} discovered model${models.length === 1 ? '' : 's'} available as suggestions; custom IDs are also accepted.`;
-  };
-  const updateSuggestions = () => {
-    const option = select.selectedOptions[0];
-    select.title = option?.textContent || '';
-    const provider = providers.find(item => item.id === option?.dataset.provider);
-    const endpointId = option?.dataset.endpoint;
-    const models = provider?.discovered_models.filter(model => (provider.model_endpoints[model] || []).includes(endpointId)) || [];
-    let list = editor.querySelector('datalist');
-    if (!list) { list = document.createElement('datalist'); editor.append(list); }
-    list.id = `upstream-model-suggestions-${crypto.randomUUID()}`;
-    list.replaceChildren(...models.map(model => new Option(model)));
-    input.setAttribute('list', list.id);
-    input.dataset.suggestions = JSON.stringify(models);
-    input.placeholder = models[0] ? `e.g. ${models[0]}` : 'e.g. model-name or org/model-name';
-    updateNotice();
-  };
-  input.value = target?.upstream_model || input.value;
-  if (target) {
-    const enabled = target.enabled !== false && target.weight > 0;
-    const input = editor.querySelector('[name="target_weight"]');
-    input.value = enabled ? target.weight : 0;
-    editor.querySelector('[name="target_enabled"]').checked = enabled;
-  }
-  select.addEventListener('change', updateSuggestions); input.addEventListener('input', updateNotice); updateSuggestions();
+  if (target?.upstream_model) input.value = target.upstream_model;
+  const enabled = target ? target.enabled !== false && target.weight > 0 : true;
+  const weight = editor.querySelector('[name="target_weight"]');
+  weight.value = target ? (enabled ? target.weight : 0) : weight.value;
+  editor.querySelector('[name="target_enabled"]').checked = enabled;
+  // Changing a level re-renders the levels below it, so Provider → Endpoint →
+  // identity can never drift out of sync with what is displayed.
+  destinationPicker(editor, 'provider').onChange = value => renderDestination(editor, {providerId: value});
+  destinationPicker(editor, 'endpoint').onChange = value => renderDestination(editor, {providerId: destinationValue(editor, 'provider'), endpointId: value});
+  destinationPicker(editor, 'identity').onChange = () => updateDestinationEffect(editor);
+  input.addEventListener('input', () => updateDestinationNotice(editor));
+  updateDestinationNotice(editor);
 }
 function addRouteTargetEditor(target = null) {
   const template = $('#route-targets .route-target-editor');
@@ -1528,7 +1804,7 @@ function openRouteDialog(route = null) {
     route.targets.slice(1).forEach(addRouteTargetEditor);
   } else initializeRouteTarget(editors[0]);
   updateRouteTargetMode(false);
-  const hasDestinations = $('#route-targets .route-target').options.length > 0;
+  const hasDestinations = Boolean(destinationValue($('#route-targets .route-target-editor'), 'endpoint'));
   $('#route-error').textContent = hasDestinations ? '' : 'Configure an eligible Endpoint before creating a route.';
   validateRouteSplit();
   routeDialog.showModal();
@@ -1557,7 +1833,7 @@ $('#route-targets').addEventListener('click', event => {
 });
 $$('.close-route').forEach(button => button.addEventListener('click', () => routeDialog.close()));
 $('#route-form').addEventListener('submit', async event => {
-  event.preventDefault(); const data = new FormData(event.target); const targets = [...event.target.querySelectorAll('.route-target-editor')].map(editor => { const [provider_id, endpoint_id, credential_id] = editor.querySelector('.route-target').value.split('\n'); const weight = Number(editor.querySelector('[name="target_weight"]').value); return {provider_id, endpoint_id, credential_id, upstream_model: editor.querySelector('[name="upstream_model"]').value, weight, enabled: weight > 0}; });
+  event.preventDefault(); const data = new FormData(event.target); const targets = [...event.target.querySelectorAll('.route-target-editor')].map(editor => { const {provider_id, endpoint_id, credential_id} = destinationTarget(editor); const weight = Number(editor.querySelector('[name="target_weight"]').value); return {provider_id, endpoint_id, credential_id, upstream_model: editor.querySelector('[name="upstream_model"]').value, weight, enabled: weight > 0}; });
   const response = await fetch(editingRoutePattern ? `/admin/routes/${encodeURIComponent(editingRoutePattern)}` : '/admin/routes', {method: editingRoutePattern ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pattern: data.get('pattern'), targets})});
   if (!response.ok) return showApiError(response, $('#route-error'));
   routeDialog.close(); await loadRoutes();
@@ -1578,23 +1854,32 @@ $('#refresh-all-models').addEventListener('click', async event => {
   if (failures) alert(`${failures} provider${failures === 1 ? '' : 's'} could not refresh models. See the status below.`);
 });
 
+function pinnedCredentialKind(endpoint, credentialId) {
+  const credential = endpoint.credentials.find(item => item.id === credentialId);
+  return credential?.kind_label || 'Identity';
+}
+/// One destination is one line: the Endpoint and the identity that will carry the
+/// traffic are the primary text, the model Yabane sends follows, and the share is a
+/// plain number instead of the largest element on the row.
 function routeTargetSummary(target, activeWeightTotal) {
   const provider = providers.find(item => item.id === target.provider_id);
   const endpoint = provider?.endpoints.find(item => item.id === target.endpoint_id);
-  const identity = !endpoint || !endpoint.requires_credential
-    ? 'No credential'
-    : target.credential_id
-      ? `Credential <strong>${escapeHtml(endpoint.credentials.find(item => item.id === target.credential_id)?.name || target.credential_id)}</strong>`
-      : `Endpoint policy · <strong>${enabledCredentials(endpoint).length} rotating</strong>`;
   const enabled = target.enabled !== false && target.weight > 0;
   const share = enabled && activeWeightTotal > 0 ? Math.round(Number(target.weight) / activeWeightTotal * 100) : 0;
-  return `<article class="route-destination${enabled ? '' : ' is-disabled'}">
-    <div class="route-destination-mark" aria-hidden="true">${icon('arrow-right')}</div>
-    <div class="route-destination-main">
-      <div class="route-upstream"><span>${escapeHtml(target.provider_id)}</span><b>/</b><code>${escapeHtml(target.upstream_model)}</code></div>
-      <div class="route-destination-meta"><span title="Endpoint">Endpoint <code>${escapeHtml(target.endpoint_id)}</code></span><span title="Credential">${identity}</span></div>
-    </div>
-    <div class="route-target-state"><span class="route-status ${enabled ? 'active' : 'disabled'}"><i></i>${enabled ? 'Active' : 'Disabled'}</span><strong>${share}%</strong><small>traffic</small></div>
+  let identity;
+  if (!endpoint || !endpoint.requires_credential) {
+    identity = '<span class="route-identity is-policy" title="This Endpoint sends requests without an identity">No identity</span>';
+  } else if (target.credential_id) {
+    const credential = endpoint.credentials.find(item => item.id === target.credential_id);
+    identity = `<span class="route-identity" title="Pinned identity — used exactly as configured, even while it is cooling down">${escapeHtml(pinnedCredentialKind(endpoint, target.credential_id))} <strong>${escapeHtml(credential?.name || target.credential_id)}</strong><svg class="route-pin-mark" aria-hidden="true"><use href="#icon-lock"></use></svg></span>`;
+  } else {
+    identity = `<span class="route-identity is-policy" title="Endpoint policy — rotates the Endpoint's eligible identities by weight and skips one that is cooling down">Endpoint policy · <strong>${enabledCredentials(endpoint).length} rotating</strong></span>`;
+  }
+  const state = enabled ? 'Receives traffic' : 'Inactive, 0% share';
+  const shareLabel = enabled ? `${share}%` : `${share}% <small>inactive</small>`;
+  return `<article class="route-destination${enabled ? '' : ' is-disabled'}" title="${state}">
+    <div class="route-destination-main"><span class="route-destination-route" title="Provider / Endpoint"><code>${escapeHtml(target.provider_id)}</code><b class="route-path-sep">/</b><code>${escapeHtml(target.endpoint_id)}</code></span><span class="route-sep" aria-hidden="true">·</span>${identity}<span class="route-sep" aria-hidden="true">·</span><span class="route-upstream" title="Provider model ID">→ <code>${escapeHtml(target.upstream_model)}</code></span></div>
+    <span class="route-share" title="Share of this rule's traffic">${shareLabel}</span>
   </article>`;
 }
 

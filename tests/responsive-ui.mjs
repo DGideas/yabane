@@ -758,7 +758,37 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('[data-view="models"]').click());
     const renderedRoute = page.locator('#routes .route-destination').first();
     if (await renderedRoute.count()) {
-      if (!(await renderedRoute.locator('.route-upstream').isVisible()) || !(await renderedRoute.locator('.route-status').isVisible()) || !(await renderedRoute.locator('.route-target-state > strong').isVisible())) throw new Error(`${project.name}: route destination does not visually separate its upstream, status, and traffic share`);
+      if (!(await renderedRoute.locator('.route-upstream').isVisible()) || !(await renderedRoute.locator('.route-share').isVisible())) throw new Error(`${project.name}: route destination does not show its Provider model and traffic share`);
+      // The Endpoint and the identity carrying the traffic lead the row; the model Yabane
+      // sends is secondary and the share stays small.
+      const identityFont = await renderedRoute.locator('.route-destination-route code').first().evaluate(node => parseFloat(getComputedStyle(node).fontSize));
+      const upstreamFont = await renderedRoute.locator('.route-upstream code').evaluate(node => parseFloat(getComputedStyle(node).fontSize));
+      const shareFont = await renderedRoute.locator('.route-share').evaluate(node => parseFloat(getComputedStyle(node).fontSize));
+      if (identityFont < upstreamFont || shareFont > identityFont) throw new Error(`${project.name}: destination hierarchy is inverted (endpoint ${identityFont}px, model ${upstreamFont}px, share ${shareFont}px)`);
+      const destinationHeight = await renderedRoute.evaluate(node => Math.round(node.getBoundingClientRect().height));
+      // With enough width one destination is a single line; narrower viewports wrap the
+      // same content instead of overflowing, so only the cap differs.
+      const heightLimit = project.name === 'desktop-chrome' ? 56 : 110;
+      if (destinationHeight > heightLimit) throw new Error(`${project.name}: one destination takes ${destinationHeight}px instead of a compact row`);
+      // Shares are adjusted often, so a 0% destination stays an ordinary visible row.
+      const destinations = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('#routes .route-destination')];
+        return {
+          rendered: rows.length,
+          hidden: rows.filter(row => row.offsetParent === null).length,
+          expected: modelRoutes.reduce((total, route) => total + route.targets.length, 0),
+          inactive: rows.filter(row => row.classList.contains('is-disabled')).length,
+          zeroShares: [...document.querySelectorAll('#routes .route-share')].filter(node => node.textContent.trim() === '0%').length,
+        };
+      });
+      if (destinations.rendered !== destinations.expected || destinations.hidden !== 0) throw new Error(`${project.name}: the list renders ${destinations.rendered}/${destinations.expected} destinations with ${destinations.hidden} hidden`);
+      if (destinations.inactive !== destinations.zeroShares) throw new Error(`${project.name}: ${destinations.inactive} inactive rows do not match ${destinations.zeroShares} 0% shares`);
+      if (destinations.inactive) {
+        const inactiveText = await page.locator('#routes .route-destination.is-disabled .route-share').first().textContent();
+        if (!inactiveText.includes('0%') || !inactiveText.includes('inactive')) throw new Error(`${project.name}: an inactive destination does not state 0% and that it is inactive (${inactiveText})`);
+        if (await page.locator('#routes .route-status').count()) throw new Error(`${project.name}: an inactive destination is marked with a shape instead of text`);
+      }
+      if (await page.locator('.route-legend').count()) throw new Error(`${project.name}: the routing list still carries a legend above the table`);
       const routeModelCell = page.locator('#routes .route-model-cell').first();
       const [modelCellBox, modelHeadingBox, matchKind] = await Promise.all([
         routeModelCell.boundingBox(),
@@ -770,23 +800,66 @@ for (const project of projects) {
       if (!(await routeModelCell.locator('small').textContent()).includes('destination')) throw new Error(`${project.name}: route destination count is missing from the public model summary`);
       const routeOverflow = await page.locator('#routes-table').evaluate(element => element.scrollWidth > element.clientWidth + 1);
       if (routeOverflow) throw new Error(`${project.name}: structured route summary overflows its table viewport`);
-      const policyRoute = page.locator('#routes .route-destination').filter({has: page.locator('.route-upstream', {hasText: 'ui-subscription/'})}).first();
+      const policyRoute = page.locator('#routes .route-destination').filter({has: page.locator('.route-destination-route code', {hasText: 'ui-subscription'})}).first();
       if (await policyRoute.count()) {
-        const identity = await policyRoute.locator('.route-destination-meta').textContent();
+        const identity = await policyRoute.locator('.route-identity').textContent();
         if (!identity.includes('Endpoint policy')) throw new Error(`${project.name}: a destination that uses the Endpoint credential policy does not say so (${identity})`);
-        if (/Credential (No credential|Endpoint policy)/.test(identity)) throw new Error(`${project.name}: route destination identity repeats the credential label (${identity})`);
+        if (/Credential (No identity|Endpoint policy)/.test(identity)) throw new Error(`${project.name}: route destination identity repeats the identity label (${identity})`);
       }
     }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
     await assertNoUpstreamCopy(page, project.name, 'Model routing');
-    const keylessDestination = page.locator('#route-targets .route-target option', {hasText: 'UI keyless fixture · local · No credential'});
-    if (await keylessDestination.count() !== 1) throw new Error(`${project.name}: route editor omits an Endpoint configured without a credential`);
-    const policyDestination = page.locator('#route-targets .route-target option', {hasText: 'UI subscription fixture · chatgpt · Endpoint policy'});
-    if (await policyDestination.count() !== 1) throw new Error(`${project.name}: route editor does not offer the Endpoint credential policy as a destination`);
+    // Destinations are drawn by the console: Provider → Endpoint → identity are
+    // three separate choices, and each level annotates its own list.
+    const editor = page.locator('#route-targets .route-target-editor').first();
+    const picker = level => editor.locator(`.route-${level}`);
+    const openPicker = async level => {
+      await picker(level).locator('.picker-trigger').click();
+      await picker(level).locator('.picker-popup').waitFor({state: 'visible'});
+    };
+    const triggerText = level => picker(level).locator('.picker-value').textContent();
+    await openPicker('provider');
+    const providerNames = await picker('provider').locator('.picker-option-text strong').allTextContents();
+    if (!providerNames.includes('UI keyless fixture') || !providerNames.includes('UI subscription fixture')) throw new Error(`${project.name}: the Provider list omits a configured Provider (${providerNames.join(', ')})`);
+    await page.locator('#route-dialog .dialog-head h2').click();
+    await picker('provider').locator('.picker-trigger').click();
+    await picker('provider').locator('.picker-option', {hasText: 'UI keyless fixture'}).click();
+    if (!(await triggerText('provider')).includes('UI keyless')) throw new Error(`${project.name}: choosing a Provider does not show it on the trigger (${await triggerText('provider')})`);
+    if (!(await triggerText('endpoint')).includes('local')) throw new Error(`${project.name}: choosing a Provider does not narrow the Endpoint list to it (${await triggerText('endpoint')})`);
+    await openPicker('identity');
+    const keylessIdentity = await picker('identity').locator('.picker-option-text strong').allTextContents();
+    if (keylessIdentity.join('|') !== 'No identity needed') throw new Error(`${project.name}: an Endpoint without a credential requirement does not say so (${keylessIdentity.join(', ')})`);
+    await page.locator('#route-dialog .dialog-head h2').click();
+    await picker('provider').locator('.picker-trigger').click();
+    await picker('provider').locator('.picker-option', {hasText: 'UI subscription fixture'}).click();
+    await openPicker('endpoint');
+    const endpointRows = await picker('endpoint').locator('.picker-option-text').allTextContents();
+    if (!endpointRows.some(row => row.includes('accounts') || row.includes('chatgpt'))) throw new Error(`${project.name}: the Endpoint list omits the Provider's Endpoint (${endpointRows.join(', ')})`);
+    await picker('endpoint').locator('.picker-option').first().click();
+    await openPicker('identity');
+    const policyRow = picker('identity').locator('.picker-option', {hasText: 'Endpoint policy'}).first();
+    if (!(await policyRow.count())) throw new Error(`${project.name}: route editor does not offer the Endpoint credential policy as a destination`);
+    const policyMeta = await policyRow.locator('small').textContent();
+    if (!/rotates|cooling down|no enabled identity/.test(policyMeta)) throw new Error(`${project.name}: the Endpoint policy row does not explain the state of the Endpoint's identities (${policyMeta})`);
+    await policyRow.click();
+    const policyEffect = await editor.locator('.route-destination-effect').textContent();
+    if (!policyEffect.includes('rate limit') || !policyEffect.includes('cooldown')) throw new Error(`${project.name}: choosing the Endpoint policy does not state the cooldown consequence (${policyEffect})`);
+    await openPicker('identity');
+    const pinnedEffect = await picker('identity').locator('.picker-option').nth(1).locator('small').textContent();
+    if (!pinnedEffect.includes('%')) throw new Error(`${project.name}: a pinnable identity does not state its share (${pinnedEffect})`);
+    await picker('identity').locator('.picker-option').nth(1).click();
+    const pinEffect = await editor.locator('.route-destination-effect').textContent();
+    if (!pinEffect.includes('Pins') || !pinEffect.includes('cooling down') || !pinEffect.includes('never used')) throw new Error(`${project.name}: pinning an identity does not state that it ignores cooling and the other identities (${pinEffect})`);
+    await picker('identity').locator('.picker-trigger').click();
+    await picker('identity').locator('.picker-option').first().click();
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
     await page.locator('#add-route-target').click();
     await page.locator('#route-split-head').waitFor({ state: 'visible' });
+    // A cloned destination editor builds one picker per level instead of keeping
+    // the markup it was cloned with.
+    const pickerCounts = await page.locator('#route-targets .route-target-editor').evaluateAll(editors => editors.map(editor => ['provider', 'endpoint', 'identity'].map(level => editor.querySelectorAll(`.route-${level} .picker-trigger`).length)));
+    if (pickerCounts.some(counts => counts.join(',') !== '1,1,1')) throw new Error(`${project.name}: a destination editor renders ${JSON.stringify(pickerCounts)} instead of one picker per level`);
     const shares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => input.value));
     if (shares.join(',') !== '50,50') throw new Error(`${project.name}: initial traffic split is not 50/50 (${shares.join(',')})`);
     await page.locator('#route-targets [name="target_weight"]').first().fill('60');
