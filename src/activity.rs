@@ -64,6 +64,19 @@ pub struct RequestLog {
     /// one. The credential itself is never recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_credential_id: Option<String>,
+    /// Name that identity had when it carried the request, so the record stays
+    /// readable after the credential is deleted or when it is read on an
+    /// instance that does not configure it. Display metadata only: the
+    /// credential and the account behind it are never recorded. Older imported
+    /// or retained records may not contain this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_credential_name: Option<String>,
+    /// True when the identity that carried the request was itself cooling down,
+    /// which happens when the Endpoint had no eligible identity left or when a
+    /// model route pinned an exhausted one, so a `429` here is explainable
+    /// instead of surprising. Older imported or retained records read as false.
+    #[serde(default)]
+    pub credential_cooling: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1213,6 +1226,8 @@ mod tests {
             timestamp,
             request_id: id.to_owned(),
             upstream_credential_id: None,
+            upstream_credential_name: None,
+            credential_cooling: false,
             source_instance_id: None,
             gateway_api_key_id: None,
             gateway_api_key_note: None,

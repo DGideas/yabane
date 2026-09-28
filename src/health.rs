@@ -11,15 +11,46 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
+
 /// Identifies one credential inside its Endpoint. Credential IDs are unique
 /// within an Endpoint only, so the Provider and Endpoint are part of the key.
 pub fn credential_key(provider_id: &str, endpoint_id: &str, credential_id: &str) -> String {
     format!("{provider_id}/{endpoint_id}/{credential_id}")
 }
 
+/// Identifies the Endpoint whose cooldown policy is being observed.
+pub fn endpoint_key(provider_id: &str, endpoint_id: &str) -> String {
+    format!("{provider_id}/{endpoint_id}")
+}
+
+/// What an Endpoint's cooldown policy has done since this instance started.
+///
+/// A policy whose length comes from the Provider can be configured correctly and
+/// still never arm, so the console reports what was observed instead of leaving
+/// an administrator unable to tell a working policy from a dead one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct CooldownActivity {
+    /// Rate-limit answers that took an identity out of selection.
+    pub applied: u64,
+    /// Rate-limit answers the policy deliberately did nothing about, which is
+    /// possible only when the Provider reported no usable delay.
+    pub skipped: u64,
+    /// Length of the most recent cooldown this policy armed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seconds: Option<u64>,
+    /// When that cooldown was armed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_applied_at: Option<u64>,
+    /// When this Endpoint last answered a request with a rate limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<u64>,
+}
+
 #[derive(Clone, Default)]
 pub struct CredentialHealth {
     cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
+    activity: Arc<Mutex<HashMap<String, CooldownActivity>>>,
 }
 
 impl CredentialHealth {
@@ -63,13 +94,54 @@ impl CredentialHealth {
             .expect("credential health lock")
             .remove(key);
     }
+
+    /// What this Endpoint's cooldown policy has done so far. An Endpoint that
+    /// has not seen a rate-limit answer reports nothing but zeroes.
+    pub fn activity(&self, key: &str) -> CooldownActivity {
+        self.activity
+            .lock()
+            .expect("credential health lock")
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn record_cooldown_applied(&self, key: String, seconds: u64, at: u64) {
+        let mut activity = self.activity.lock().expect("credential health lock");
+        let entry = activity.entry(key).or_default();
+        entry.applied += 1;
+        entry.last_seconds = Some(seconds);
+        entry.last_applied_at = Some(at);
+        entry.last_observed_at = Some(at);
+    }
+
+    pub fn record_cooldown_skipped(&self, key: String, at: u64) {
+        let mut activity = self.activity.lock().expect("credential health lock");
+        let entry = activity.entry(key).or_default();
+        entry.skipped += 1;
+        entry.last_observed_at = Some(at);
+    }
+
+    /// Forgets every cooldown and observation recorded for one Endpoint, so a
+    /// renamed or deleted Endpoint cannot inherit another one's history.
+    pub fn forget_endpoint(&self, key: &str) {
+        let prefix = format!("{key}/");
+        self.cooldowns
+            .lock()
+            .expect("credential health lock")
+            .retain(|stored, _| !stored.starts_with(&prefix));
+        self.activity
+            .lock()
+            .expect("credential health lock")
+            .remove(key);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{CredentialHealth, credential_key};
+    use super::{CooldownActivity, CredentialHealth, credential_key, endpoint_key};
 
     #[test]
     fn cooldown_expires_and_can_be_cleared() {
@@ -101,5 +173,50 @@ mod tests {
         let first = credential_key("openai", "zen", "account");
         let second = credential_key("openai", "other", "account");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn activity_counts_what_the_policy_did() {
+        let health = CredentialHealth::default();
+        let key = endpoint_key("openai", "zen");
+
+        assert_eq!(health.activity(&key), CooldownActivity::default());
+        health.record_cooldown_skipped(key.clone(), 1_700_000_000);
+        health.record_cooldown_applied(key.clone(), 120, 1_700_000_060);
+        let activity = health.activity(&key);
+        assert_eq!(activity.applied, 1);
+        assert_eq!(activity.skipped, 1);
+        assert_eq!(activity.last_seconds, Some(120));
+        assert_eq!(activity.last_applied_at, Some(1_700_000_060));
+        assert_eq!(activity.last_observed_at, Some(1_700_000_060));
+        // A skipped answer is observed but arms nothing.
+        let skipped = CredentialHealth::default();
+        skipped.record_cooldown_skipped(endpoint_key("openai", "zen"), 1_700_000_000);
+        assert_eq!(
+            skipped
+                .activity(&endpoint_key("openai", "zen"))
+                .last_applied_at,
+            None
+        );
+    }
+
+    #[test]
+    fn forgetting_an_endpoint_clears_its_credentials_and_history() {
+        let health = CredentialHealth::default();
+        let key = credential_key("openai", "zen", "account");
+        health.cool_down(key.clone(), Duration::from_secs(60));
+        health.record_cooldown_applied(endpoint_key("openai", "zen"), 60, 1);
+
+        health.forget_endpoint(&endpoint_key("openai", "zen"));
+        assert!(!health.is_cooling(&key));
+        assert_eq!(
+            health.activity(&endpoint_key("openai", "zen")),
+            CooldownActivity::default()
+        );
+        // Another Endpoint of the same Provider is untouched.
+        let other = credential_key("openai", "other", "account");
+        health.cool_down(other.clone(), Duration::from_secs(60));
+        health.forget_endpoint(&endpoint_key("openai", "zen"));
+        assert!(health.is_cooling(&other));
     }
 }

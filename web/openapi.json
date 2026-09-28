@@ -244,6 +244,9 @@
           "rate_limit_cooldown": {
             "$ref": "#/components/schemas/RateLimitCooldown"
           },
+          "rate_limit_cooldown_activity": {
+            "$ref": "#/components/schemas/RateLimitCooldownActivity"
+          },
           "credentials": {
             "type": "array",
             "items": {
@@ -621,6 +624,15 @@
             "type": "string",
             "nullable": true,
             "description": "Stable ID of the Endpoint credential that carried the request. Null for Endpoints without credentials and for records created before this metadata was introduced. Provider secrets are never recorded."
+          },
+          "upstream_credential_name": {
+            "type": "string",
+            "nullable": true,
+            "description": "Name the Endpoint credential had when it carried the request, so the record stays readable after the credential is deleted or when it is read on an instance that does not configure it. Null for Endpoints without credentials and for records created before this metadata was introduced. Credential material is never recorded."
+          },
+          "credential_cooling": {
+            "type": "boolean",
+            "description": "Whether the identity that carried the request was itself cooling down at selection time, because the Endpoint had no eligible identity left or a model route pinned an exhausted one. False for Endpoints without credentials and for older records."
           },
           "caller_protocol": {
             "type": "string",
@@ -1285,6 +1297,7 @@
           "id",
           "name",
           "weight",
+          "priority",
           "enabled",
           "kind",
           "kind_label"
@@ -1300,6 +1313,12 @@
           "weight": {
             "type": "integer",
             "minimum": 1
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 1,
+            "description": "Priority group, lowest first. Traffic uses the lowest-numbered group that still has an eligible identity, so a higher-numbered group carries nothing while a preferred identity can serve. Configuration written before priorities existed is one group."
           },
           "enabled": {
             "type": "boolean"
@@ -1326,10 +1345,10 @@
       },
       "RateLimitCooldown": {
         "type": "object",
-        "description": "Explicit policy that turns a 429 from the Provider for one credential into a cooldown during which that credential is not selected.",
+        "description": "Explicit policy that turns a 429 from the Provider for one credential into a cooldown during which that credential is not selected. The configured length is the ceiling in every mode: a cooldown never outlasts it.",
         "required": [
           "seconds",
-          "honor_retry_after"
+          "mode"
         ],
         "properties": {
           "seconds": {
@@ -1337,12 +1356,47 @@
             "minimum": 0,
             "maximum": 2592000,
             "default": 0,
-            "description": "0 disables the policy. Otherwise the credential stays out of selection for this many seconds after the Provider answers 429."
+            "description": "0 disables the policy. Otherwise the longest a credential can stay out of selection after the Provider answers 429, in seconds."
           },
-          "honor_retry_after": {
-            "type": "boolean",
-            "default": false,
-            "description": "Replace the configured duration with the Provider Retry-After header when it carries an integer number of seconds, capped at 30 days."
+          "mode": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "prefer_provider",
+              "provider_only"
+            ],
+            "default": "fixed",
+            "description": "Where the length of the cooldown comes from. fixed uses seconds and ignores anything the Provider reports. prefer_provider uses the Provider's own Retry-After when it carries an integer number of seconds, and seconds when it does not. provider_only uses the Provider's own delay and arms no cooldown when there is none, so a rate limit without a usable delay changes nothing."
+          }
+        }
+      },
+      "RateLimitCooldownActivity": {
+        "type": "object",
+        "description": "What an Endpoint's cooldown policy has done since this process started. Present on an Endpoint only while its policy is enabled, so a policy that can be configured correctly and still never fire is distinguishable from a working one.",
+        "required": [
+          "applied",
+          "skipped"
+        ],
+        "properties": {
+          "applied": {
+            "type": "integer",
+            "description": "How many 429 answers from the Provider armed a cooldown."
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "How many 429 answers from the Provider carried no usable delay under a policy that requires one, and therefore changed nothing."
+          },
+          "last_seconds": {
+            "type": "integer",
+            "description": "How long the most recent applied cooldown lasted, in seconds."
+          },
+          "last_applied_at": {
+            "type": "integer",
+            "description": "Unix timestamp of the most recent applied cooldown. This is runtime state and is not persisted: it resets when the process restarts."
+          },
+          "last_observed_at": {
+            "type": "integer",
+            "description": "Unix timestamp of the most recent 429 answer that changed nothing. Runtime state, reset on restart."
           }
         }
       },
@@ -2857,7 +2911,7 @@
                   "credential_secret": "sk-…",
                   "rate_limit_cooldown": {
                     "seconds": 3600,
-                    "honor_retry_after": true
+                    "mode": "prefer_provider"
                   }
                 }
               }
@@ -3088,7 +3142,7 @@
                 "credential_secret": "sk-…",
                 "rate_limit_cooldown": {
                   "seconds": 3600,
-                  "honor_retry_after": true
+                  "mode": "prefer_provider"
                 }
               }
             }
@@ -3157,7 +3211,20 @@
                   "weight": {
                     "type": "integer",
                     "minimum": 1
+                  },
+                  "priority": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "Priority group, lowest first, default 1. Traffic uses the lowest-numbered group that still has an eligible identity, so a higher-numbered group carries nothing while a preferred identity can serve. Group membership is not part of the traffic percentages; it decides which percentages apply."
                   }
+                },
+                "example": {
+                  "endpoint_id": "openai",
+                  "name": "Account A",
+                  "secret": "sk-…",
+                  "weight": 100,
+                  "priority": 1
                 }
               },
               "example": {
@@ -3884,7 +3951,7 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Update a Provider credential name, weight, or enabled state",
+        "summary": "Update a Provider credential name, weight, priority group, or enabled state",
         "description": "Updates any subset of the credential name, weight, and enabled state without replacing its secret. Renaming keeps the stable credential ID, so model-route destinations and historical records continue to refer to the same identity.",
         "security": [
           {
@@ -3938,6 +4005,11 @@
                   "enabled": {
                     "type": "boolean",
                     "description": "A credential pinned by a retained model-route target cannot be disabled until that target is updated or deleted."
+                  },
+                  "priority": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Move this identity to another priority group. Percentages are read within a group, so the traffic distribution of the groups it leaves and joins has to be updated to total 100 again."
                   }
                 }
               },
@@ -4225,7 +4297,7 @@
         "tags": [
           "Providers"
         ],
-        "summary": "Set traffic distribution across enabled endpoint credentials",
+        "summary": "Set traffic distribution across enabled endpoint credentials within each priority group",
         "description": "Set one positive integer percentage for every enabled credential. Percentages must total 100. Credentials that hit a configured rate-limit cooldown are skipped until their cooldown ends.",
         "security": [
           {
@@ -4282,7 +4354,7 @@
                         }
                       }
                     },
-                    "description": "Every enabled credential exactly once; integer weights must total 100."
+                    "description": "Every enabled credential exactly once; integer weights must be positive and must total 100 within each priority group, because a standby group describes what happens after the preferred group is exhausted."
                   }
                 }
               },

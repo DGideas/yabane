@@ -709,6 +709,7 @@ fn signed_in_endpoint(
             name,
             weight: 100,
             enabled: true,
+            priority: 1,
             kind,
             material,
         }],
@@ -753,6 +754,7 @@ fn attach_subscription_credential(
         name,
         weight: 100,
         enabled: true,
+        priority: 1,
         kind: signed_in_credential_kind(declaration)?.id.to_owned(),
         material,
     });
@@ -920,6 +922,7 @@ mod tests {
             name: id.to_owned(),
             weight: 100,
             enabled: true,
+            priority: 1,
             kind: "account".to_owned(),
             material: crate::config::CredentialMaterial::Subscription {
                 access_token: access_token.to_owned(),

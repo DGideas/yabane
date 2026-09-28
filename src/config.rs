@@ -149,6 +149,12 @@ pub struct Credential {
     pub name: String,
     pub weight: u32,
     pub enabled: bool,
+    /// Which group this identity belongs to, lowest first. A request uses the
+    /// lowest-numbered group that still has an eligible identity, so a standby
+    /// identity carries traffic only while every identity above it is
+    /// exhausted. Configuration written before priorities existed is one group.
+    #[serde(default = "default_credential_priority")]
+    pub priority: u32,
     pub kind: String,
     #[serde(flatten)]
     pub material: CredentialMaterial,
@@ -238,17 +244,30 @@ impl Credential {
     }
 }
 
-/// Explicit, Endpoint-scoped policy for how a Provider's rate-limit answer
-/// affects its credentials. Yabane never derives a cooldown from the status
-/// code alone: `seconds` is the configured duration and zero disables the
-/// whole behavior, while `honor_retry_after` opts into the Provider's own
-/// explicit retry hint when it sends one.
+/// Where the length of a rate-limit cooldown comes from. Yabane never derives a
+/// cooldown from a status code alone, so choosing a source is the whole
+/// configuration; `seconds` is the ceiling in every mode, which is the only
+/// statement that stays true whichever source supplies the number.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitCooldownMode {
+    /// Use the configured length and ignore anything the Provider reports.
+    #[default]
+    Fixed,
+    /// Use the Provider's own delay when it reports one, otherwise the
+    /// configured length.
+    PreferProvider,
+    /// Use the Provider's own delay when it reports one and do nothing when it
+    /// reports none, so no length is ever invented for it.
+    ProviderOnly,
+}
+
+/// Explicit, Endpoint-scoped policy for how a Provider's rate-limit answer
+/// affects its credentials. `seconds` of zero disables the whole behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RateLimitCooldown {
-    #[serde(default)]
     pub seconds: u64,
-    #[serde(default)]
-    pub honor_retry_after: bool,
+    pub mode: RateLimitCooldownMode,
 }
 
 impl RateLimitCooldown {
@@ -256,6 +275,58 @@ impl RateLimitCooldown {
 
     pub fn enabled(&self) -> bool {
         self.seconds > 0
+    }
+}
+
+/// Configuration written before delay sources existed carried a boolean instead
+/// of a mode, so an honored `Retry-After` keeps meaning the Provider-first mode
+/// instead of being silently reinterpreted as a fixed duration.
+impl<'de> Deserialize<'de> for RateLimitCooldown {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RateLimitCooldownInput::deserialize(deserializer)?
+            .policy()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The policy as it arrives from a caller or a configuration file, before the
+/// delay source is checked. Both shapes go through here so there is one place
+/// that decides what an accepted policy means: a stored file fails to load on an
+/// unrecognized source, while the admin API reports it as the rejected field it
+/// is instead of answering with a body the console cannot read.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RateLimitCooldownInput {
+    #[serde(default)]
+    pub seconds: u64,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub honor_retry_after: bool,
+}
+
+impl RateLimitCooldownInput {
+    pub fn policy(&self) -> Result<RateLimitCooldown, String> {
+        let mode = match self.mode.as_deref() {
+            Some("fixed") => RateLimitCooldownMode::Fixed,
+            Some("prefer_provider") => RateLimitCooldownMode::PreferProvider,
+            Some("provider_only") => RateLimitCooldownMode::ProviderOnly,
+            Some(unknown) => {
+                return Err(format!(
+                    "Rate-limit cooldown delay source must be one of fixed, prefer_provider, provider_only, not '{unknown}'"
+                ));
+            }
+            // An honored `Retry-After` predates delay sources and meant exactly
+            // the Provider-first mode.
+            None if self.honor_retry_after => RateLimitCooldownMode::PreferProvider,
+            None => RateLimitCooldownMode::Fixed,
+        };
+        Ok(RateLimitCooldown {
+            seconds: self.seconds,
+            mode,
+        })
     }
 }
 
@@ -339,36 +410,47 @@ impl ApiEndpoint {
 
     /// Chooses the identity a request leaves with.
     ///
-    /// Eligible credentials are enabled, carry a positive weight, and are not
-    /// cooling down. When every credential is cooling down the pool falls back
-    /// to an exhausted credential instead of inventing its own error, so the
+    /// Identities are grouped by priority, and only the lowest-numbered group
+    /// that still has an eligible identity takes part in a choice: within that
+    /// group the traffic is shared by weight, exactly as a single pool always
+    /// was. A higher-numbered group is therefore a standby, not a participant —
+    /// it carries nothing while a preferred identity can serve — and identities
+    /// sharing one group are interchangeable.
+    ///
+    /// When every identity is cooling down the pool falls back to the
+    /// lowest-numbered usable group instead of inventing its own error, so the
     /// Provider's own rate-limit answer still reaches the caller.
     pub fn select_credential(
         &self,
         health: &crate::health::CredentialHealth,
         provider_id: &str,
     ) -> Option<CredentialChoice> {
-        let eligible: Vec<&Credential> = self
+        let usable: Vec<&Credential> = self
             .credentials
             .iter()
+            .filter(|credential| credential.is_usable())
+            .collect();
+        let eligible: Vec<&Credential> = usable
+            .iter()
+            .copied()
             .filter(|credential| {
-                credential.is_usable()
-                    && !health.is_cooling(&crate::health::credential_key(
-                        provider_id,
-                        &self.id,
-                        &credential.id,
-                    ))
+                !health.is_cooling(&crate::health::credential_key(
+                    provider_id,
+                    &self.id,
+                    &credential.id,
+                ))
             })
             .collect();
         let all_exhausted = eligible.is_empty();
-        let pool: Vec<&Credential> = if all_exhausted {
-            self.credentials
-                .iter()
-                .filter(|credential| credential.is_usable())
-                .collect()
-        } else {
-            eligible
-        };
+        let candidates = if all_exhausted { usable } else { eligible };
+        let priority = candidates
+            .iter()
+            .map(|credential| credential.priority)
+            .min()?;
+        let pool: Vec<&Credential> = candidates
+            .into_iter()
+            .filter(|credential| credential.priority == priority)
+            .collect();
         let total_weight: u64 = pool
             .iter()
             .map(|credential| u64::from(credential.weight))
@@ -692,6 +774,12 @@ fn default_cursor() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(0))
 }
 
+/// The only group an installation had before priorities existed, and the group
+/// every new identity joins until an administrator separates them.
+pub(crate) fn default_credential_priority() -> u32 {
+    1
+}
+
 fn default_proxy_client() -> Arc<OnceLock<Result<reqwest::Client, String>>> {
     Arc::new(OnceLock::new())
 }
@@ -712,6 +800,7 @@ mod tests {
             name: id.to_owned(),
             weight,
             enabled,
+            priority: 1,
             kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
             material: CredentialMaterial::Secret {
                 secret: "secret".to_owned(),
@@ -770,6 +859,7 @@ mod tests {
                 name: "Account".to_owned(),
                 weight: 100,
                 enabled: true,
+                priority: 1,
                 kind: kind.to_owned(),
                 material: CredentialMaterial::Subscription {
                     access_token: "access".to_owned(),
@@ -1060,6 +1150,147 @@ mod tests {
                 "primary",
                 "secondary"
             ]
+        );
+    }
+
+    #[test]
+    fn a_standby_group_carries_traffic_only_while_the_preferred_group_is_exhausted() {
+        let endpoint = ApiEndpoint {
+            id: "openai".to_owned(),
+            api_type: ApiType::OpenaiCompatible,
+            base_url: "https://example.com/v1".to_owned(),
+            socks5_proxy: None,
+            extra_headers: HashMap::new(),
+            extra_body: serde_json::Map::new(),
+            pricing: None,
+            requires_credential: true,
+            credentials: vec![
+                Credential {
+                    priority: 1,
+                    ..credential("preferred", 70, true)
+                },
+                Credential {
+                    priority: 2,
+                    ..credential("standby", 30, true)
+                },
+            ],
+            cursor: super::default_cursor(),
+            proxy_client: super::default_proxy_client(),
+            ..ApiEndpoint::default()
+        };
+        let health = crate::health::CredentialHealth::default();
+        let selection = |health: &crate::health::CredentialHealth| {
+            endpoint
+                .select_credential(health, "provider")
+                .map(|choice| (choice.credential.id, choice.all_exhausted))
+        };
+        let cool = |id: &str| {
+            health.cool_down(
+                crate::health::credential_key("provider", "openai", id),
+                std::time::Duration::from_secs(60),
+            );
+        };
+
+        // A standby waits; it does not take a share, however often the cursor moves.
+        for _ in 0..4 {
+            assert_eq!(selection(&health), Some(("preferred".to_owned(), false)));
+        }
+        // Only an exhausted preferred group hands the traffic over.
+        cool("preferred");
+        assert_eq!(selection(&health), Some(("standby".to_owned(), false)));
+        assert_eq!(selection(&health), Some(("standby".to_owned(), false)));
+        // When nothing is left, the request still leaves with the preferred group,
+        // so the Provider's own answer reaches the caller.
+        cool("standby");
+        assert_eq!(selection(&health), Some(("preferred".to_owned(), true)));
+        // An identity that is enabled again is preferred again, without restarting.
+        health.clear(&crate::health::credential_key(
+            "provider",
+            "openai",
+            "preferred",
+        ));
+        assert_eq!(selection(&health), Some(("preferred".to_owned(), false)));
+    }
+
+    #[test]
+    fn configuration_without_priorities_keeps_one_group_and_todays_rotation() {
+        let endpoint: ApiEndpoint = serde_json::from_str(
+            r#"{
+                "id": "openai",
+                "api_type": "openai_compatible",
+                "base_url": "https://example.com/v1",
+                "requires_credential": true,
+                "credentials": [
+                    {"id": "primary", "name": "Primary", "weight": 2, "enabled": true, "kind": "secret", "secret": "a"},
+                    {"id": "secondary", "name": "Secondary", "weight": 1, "enabled": true, "kind": "secret", "secret": "b"}
+                ]
+            }"#,
+        )
+        .expect("parse an Endpoint written before priorities existed");
+        assert!(
+            endpoint
+                .credentials
+                .iter()
+                .all(|credential| credential.priority == 1)
+        );
+        let health = crate::health::CredentialHealth::default();
+        let selected: Vec<_> = (0..6)
+            .map(|_| {
+                endpoint
+                    .select_credential(&health, "provider")
+                    .expect("select credential")
+                    .credential
+                    .id
+            })
+            .collect();
+
+        // The same sequence the weighted pool produced before priorities existed.
+        assert_eq!(
+            selected,
+            [
+                "primary",
+                "primary",
+                "secondary",
+                "primary",
+                "primary",
+                "secondary"
+            ]
+        );
+    }
+
+    #[test]
+    fn delay_sources_read_legacy_and_current_policies_identically() {
+        let legacy = |json: &str| -> super::RateLimitCooldown {
+            serde_json::from_str(json).expect("parse a cooldown policy")
+        };
+
+        // Configuration written before delay sources existed keeps its meaning:
+        // an honored Retry-After was the Provider-first mode, and a fixed length
+        // never consulted the Provider at all.
+        assert_eq!(
+            legacy(r#"{"seconds":3600,"honor_retry_after":true}"#).mode,
+            super::RateLimitCooldownMode::PreferProvider
+        );
+        assert_eq!(
+            legacy(r#"{"seconds":3600,"honor_retry_after":false}"#).mode,
+            super::RateLimitCooldownMode::Fixed
+        );
+        assert_eq!(legacy("{}").mode, super::RateLimitCooldownMode::Fixed);
+
+        // The current shape round-trips, and a mode it does not define is
+        // rejected instead of being read as one of the three.
+        let current = legacy(r#"{"seconds":600,"mode":"provider_only"}"#);
+        assert_eq!(current.seconds, 600);
+        assert_eq!(current.mode, super::RateLimitCooldownMode::ProviderOnly);
+        assert_eq!(
+            serde_json::to_value(current).expect("serialize a cooldown policy"),
+            serde_json::json!({"seconds": 600, "mode": "provider_only"})
+        );
+        assert!(
+            serde_json::from_str::<super::RateLimitCooldown>(
+                r#"{"seconds":600,"mode":"sometimes"}"#
+            )
+            .is_err()
         );
     }
 

@@ -15,11 +15,11 @@ use crate::{
     auth::{self, GatewayApiKey, GatewayApiKeyView, generate_secret, hash_secret, now, save_auth},
     config::{
         ApiEndpoint, ApiType, AppState, Credential, CredentialMaterial, ModelEndpointPreference,
-        Provider, RateLimitCooldown, save_providers,
+        Provider, RateLimitCooldown, RateLimitCooldownInput, save_providers,
     },
     endpoint_signin,
     error::api_error,
-    health::credential_key,
+    health::{credential_key, endpoint_key},
     models, routes,
     storage::{AtomicWrite, CONFIG_TRANSACTION_FILE, write_transaction},
 };
@@ -184,7 +184,7 @@ struct CreateEndpoint {
     #[serde(default)]
     credential_name: Option<String>,
     #[serde(default)]
-    rate_limit_cooldown: RateLimitCooldown,
+    rate_limit_cooldown: RateLimitCooldownInput,
 }
 
 #[derive(Deserialize)]
@@ -196,7 +196,7 @@ struct UpdateEndpoint {
     requires_credential: bool,
     pricing: Option<crate::pricing::PricingTable>,
     #[serde(default)]
-    rate_limit_cooldown: Option<RateLimitCooldown>,
+    rate_limit_cooldown: Option<RateLimitCooldownInput>,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +205,8 @@ struct CreateCredential {
     name: String,
     secret: String,
     weight: u32,
+    #[serde(default = "crate::config::default_credential_priority")]
+    priority: u32,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +214,7 @@ struct UpdateCredential {
     name: Option<String>,
     weight: Option<u32>,
     enabled: Option<bool>,
+    priority: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +311,11 @@ struct EndpointView {
     requires_credential: bool,
     credentials: Vec<CredentialView>,
     rate_limit_cooldown: RateLimitCooldown,
+    /// What this policy has done since the process started. Present while the
+    /// policy is enabled, so a policy that never armed reads as unobserved
+    /// instead of being indistinguishable from a working one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit_cooldown_activity: Option<crate::health::CooldownActivity>,
 }
 
 #[derive(Serialize)]
@@ -315,6 +323,9 @@ struct CredentialView {
     id: String,
     name: String,
     weight: u32,
+    /// The group this identity belongs to; the console states which group
+    /// carries traffic rather than re-deriving it from weights.
+    priority: u32,
     enabled: bool,
     kind: String,
     /// How the Endpoint type that owns this kind describes it.
@@ -1288,6 +1299,10 @@ fn provider_view(
                 extra_body: endpoint.extra_body.clone(),
                 pricing: endpoint.pricing.clone(),
                 requires_credential: endpoint.requires_credential,
+                rate_limit_cooldown_activity: endpoint
+                    .rate_limit_cooldown
+                    .enabled()
+                    .then(|| health.activity(&endpoint_key(&provider.id, &endpoint.id))),
                 rate_limit_cooldown: endpoint.rate_limit_cooldown,
                 credentials: endpoint
                     .credentials
@@ -1296,6 +1311,7 @@ fn provider_view(
                         id: credential.id.clone(),
                         name: credential.name.clone(),
                         weight: credential.weight,
+                        priority: credential.priority,
                         enabled: credential.enabled,
                         kind: credential.kind.clone(),
                         kind_label: extensions
@@ -1613,7 +1629,11 @@ async fn create_provider(
             "A credential secret is required for this endpoint",
         );
     }
-    if let Err(message) = validate_rate_limit_cooldown(&input.endpoint.rate_limit_cooldown) {
+    let rate_limit_cooldown = match input.endpoint.rate_limit_cooldown.policy() {
+        Ok(cooldown) => cooldown,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    if let Err(message) = validate_rate_limit_cooldown(&rate_limit_cooldown) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
 
@@ -1640,6 +1660,7 @@ async fn create_provider(
                     .unwrap_or("Default"),
                 secret,
                 100,
+                1,
             )]
         })
         .unwrap_or_default();
@@ -1665,7 +1686,7 @@ async fn create_provider(
             pricing: input.endpoint.pricing.and_then(normalize_pricing),
             requires_credential: input.endpoint.requires_credential,
             credentials,
-            rate_limit_cooldown: input.endpoint.rate_limit_cooldown,
+            rate_limit_cooldown,
             ..ApiEndpoint::default()
         }],
         discovered_models: Vec::new(),
@@ -1726,12 +1747,7 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
     let removed_cooldowns: Vec<String> = removed
         .endpoints
         .iter()
-        .flat_map(|endpoint| {
-            endpoint
-                .credentials
-                .iter()
-                .map(|credential| credential_key(&removed.id, &endpoint.id, &credential.id))
-        })
+        .map(|endpoint| endpoint_key(&removed.id, &endpoint.id))
         .collect();
 
     let mut routes = state.routes.0.write().await;
@@ -1781,7 +1797,7 @@ async fn delete_provider(State(state): State<AppState>, Path(id): Path<String>) 
         );
     }
     for key in removed_cooldowns {
-        state.credential_health.clear(&key);
+        state.credential_health.forget_endpoint(&key);
     }
     *auth = updated_auth;
     *providers = updated_providers;
@@ -1838,7 +1854,11 @@ async fn create_endpoint(
             "A credential secret is required for this endpoint",
         );
     }
-    if let Err(message) = validate_rate_limit_cooldown(&input.rate_limit_cooldown) {
+    let rate_limit_cooldown = match input.rate_limit_cooldown.policy() {
+        Ok(cooldown) => cooldown,
+        Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
+    };
+    if let Err(message) = validate_rate_limit_cooldown(&rate_limit_cooldown) {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
     let mut providers = state.providers.write().await;
@@ -1867,6 +1887,7 @@ async fn create_endpoint(
                     .unwrap_or("Default"),
                 secret,
                 100,
+                1,
             )]
         })
         .unwrap_or_default();
@@ -1880,7 +1901,7 @@ async fn create_endpoint(
         pricing: input.pricing.and_then(normalize_pricing),
         requires_credential: input.requires_credential,
         credentials,
-        rate_limit_cooldown: input.rate_limit_cooldown,
+        rate_limit_cooldown,
         ..ApiEndpoint::default()
     });
     let response = persist_or_error(&updated).await;
@@ -1921,7 +1942,16 @@ async fn update_endpoint(
     {
         return api_error(StatusCode::BAD_REQUEST, message);
     }
-    if let Some(cooldown) = &input.rate_limit_cooldown
+    let rate_limit_cooldown = match input
+        .rate_limit_cooldown
+        .as_ref()
+        .map(RateLimitCooldownInput::policy)
+    {
+        Some(Ok(cooldown)) => Some(cooldown),
+        Some(Err(message)) => return api_error(StatusCode::BAD_REQUEST, message),
+        None => None,
+    };
+    if let Some(cooldown) = &rate_limit_cooldown
         && let Err(message) = validate_rate_limit_cooldown(cooldown)
     {
         return api_error(StatusCode::BAD_REQUEST, message);
@@ -2029,13 +2059,9 @@ async fn update_endpoint(
             // Runtime health belongs to the Endpoint it was observed on. A discarded
             // identity layer or a rename must not leave its key behind, where a later
             // Endpoint reusing that ID would inherit a stale exhaustion.
-            for credential in &endpoint.credentials {
-                state.credential_health.clear(&credential_key(
-                    &provider_id,
-                    &endpoint_id,
-                    &credential.id,
-                ));
-            }
+            state
+                .credential_health
+                .forget_endpoint(&endpoint_key(&provider_id, &endpoint_id));
             if stopped_requiring_credential {
                 endpoint.credentials.clear();
             }
@@ -2043,7 +2069,7 @@ async fn update_endpoint(
         if let Some(pricing) = input.pricing {
             endpoint.pricing = normalize_pricing(pricing);
         }
-        if let Some(cooldown) = input.rate_limit_cooldown {
+        if let Some(cooldown) = rate_limit_cooldown {
             endpoint.rate_limit_cooldown = cooldown;
         }
         endpoint.proxy_client = Default::default();
@@ -2151,12 +2177,7 @@ async fn delete_endpoint(
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.id == endpoint_id)
-        .flat_map(|endpoint| {
-            endpoint
-                .credentials
-                .iter()
-                .map(|credential| credential_key(&provider_id, &endpoint.id, &credential.id))
-        })
+        .map(|endpoint| endpoint_key(&provider_id, &endpoint.id))
         .collect();
     provider
         .endpoints
@@ -2206,7 +2227,7 @@ async fn delete_endpoint(
         );
     }
     for key in removed_cooldowns {
-        state.credential_health.clear(&key);
+        state.credential_health.forget_endpoint(&key);
     }
     *providers = updated_providers;
     *routes = updated_routes;
@@ -2218,18 +2239,10 @@ async fn update_endpoint_traffic(
     Path((provider_id, endpoint_id)): Path<(String, String)>,
     axum::Json(input): axum::Json<UpdateEndpointTraffic>,
 ) -> Response {
-    if input.weights.is_empty()
-        || input.weights.iter().any(|item| item.weight == 0)
-        || input
-            .weights
-            .iter()
-            .map(|item| u64::from(item.weight))
-            .sum::<u64>()
-            != 100
-    {
+    if input.weights.is_empty() || input.weights.iter().any(|item| item.weight == 0) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Enabled credential traffic percentages must total 100",
+            "Enabled credential traffic percentages must be positive",
         );
     }
     let mut seen = std::collections::HashSet::new();
@@ -2265,6 +2278,17 @@ async fn update_endpoint_traffic(
             "Traffic distribution must include every enabled credential exactly once",
         );
     }
+    // Percentages are read within a priority group, so each group splits its own
+    // 100%: a standby group describes what happens after the preferred group is
+    // exhausted, not a slice of the same pool.
+    if let Some((priority, total)) =
+        unbalanced_priority_group(&endpoint.credentials, &input.weights)
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("Priority {priority} traffic percentages must total 100 (currently {total})"),
+        );
+    }
     for item in &input.weights {
         endpoint
             .credentials
@@ -2289,6 +2313,12 @@ async fn create_credential(
         return api_error(
             StatusCode::BAD_REQUEST,
             "Credential name, secret and positive weight are required",
+        );
+    }
+    if input.priority == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Credential priority must be at least 1",
         );
     }
     let mut providers = state.providers.write().await;
@@ -2329,6 +2359,7 @@ async fn create_credential(
         input.name.trim(),
         input.secret,
         input.weight,
+        input.priority,
     ));
     let response = persist_or_error(&updated).await;
     if response.status().is_success() {
@@ -2346,6 +2377,12 @@ async fn update_credential(
         return api_error(
             StatusCode::BAD_REQUEST,
             "Credential weight must be positive",
+        );
+    }
+    if input.priority == Some(0) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Credential priority must be at least 1",
         );
     }
     // Renaming keeps the stable credential ID and therefore every model-route reference.
@@ -2392,6 +2429,9 @@ async fn update_credential(
     }
     if let Some(weight) = input.weight {
         credential.weight = weight;
+    }
+    if let Some(priority) = input.priority {
+        credential.priority = priority;
     }
     if let Some(enabled) = input.enabled {
         credential.enabled = enabled;
@@ -2653,13 +2693,39 @@ fn slugify(value: &str) -> String {
         .join("-")
 }
 
+/// The first priority group whose submitted percentages do not total 100, named
+/// with what they do total, so the console can say which group to fix instead of
+/// rejecting the whole distribution without a reason.
+fn unbalanced_priority_group(
+    credentials: &[Credential],
+    weights: &[CredentialWeight],
+) -> Option<(u32, u64)> {
+    let mut totals: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    for item in weights {
+        let priority = credentials
+            .iter()
+            .find(|credential| credential.id == item.credential_id)
+            .expect("validated credential")
+            .priority;
+        *totals.entry(priority).or_default() += u64::from(item.weight);
+    }
+    totals.into_iter().find(|(_, total)| *total != 100)
+}
+
 /// Core's own secret kind, used by the Endpoint types Core implements.
-fn new_secret_credential(id: &str, name: &str, secret: String, weight: u32) -> Credential {
+fn new_secret_credential(
+    id: &str,
+    name: &str,
+    secret: String,
+    weight: u32,
+    priority: u32,
+) -> Credential {
     Credential {
         id: id.to_owned(),
         name: name.to_owned(),
         weight,
         enabled: true,
+        priority,
         kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
         material: CredentialMaterial::Secret { secret },
     }
@@ -2751,6 +2817,84 @@ mod tests {
 
     use crate::config::{ApiEndpoint, ApiType, Credential, CredentialMaterial, Provider};
 
+    fn credential(id: &str, priority: u32) -> Credential {
+        Credential {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            weight: 100,
+            enabled: true,
+            priority,
+            kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
+            material: CredentialMaterial::Secret {
+                secret: "secret".to_owned(),
+            },
+        }
+    }
+
+    fn weights(items: &[(&str, u32)]) -> Vec<super::CredentialWeight> {
+        items
+            .iter()
+            .map(|(credential_id, weight)| super::CredentialWeight {
+                credential_id: (*credential_id).to_owned(),
+                weight: *weight,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn traffic_percentages_are_read_within_each_priority_group() {
+        let credentials = [
+            credential("preferred-a", 1),
+            credential("preferred-b", 1),
+            credential("standby", 2),
+        ];
+
+        // A standby group splits its own 100%: it becomes the whole pool once the
+        // preferred group is exhausted, so it is never a slice of one total.
+        assert_eq!(
+            super::unbalanced_priority_group(
+                &credentials,
+                &weights(&[("preferred-a", 50), ("preferred-b", 50), ("standby", 100)])
+            ),
+            None
+        );
+        // Every group is checked, not just the one that carries traffic first.
+        assert_eq!(
+            super::unbalanced_priority_group(
+                &credentials,
+                &weights(&[("preferred-a", 50), ("preferred-b", 50), ("standby", 40)])
+            ),
+            Some((2, 40))
+        );
+        // The group name and the total it currently has are both reported.
+        assert_eq!(
+            super::unbalanced_priority_group(
+                &credentials,
+                &weights(&[("preferred-a", 70), ("preferred-b", 50)])
+            ),
+            Some((1, 120))
+        );
+    }
+
+    #[test]
+    fn a_single_group_still_needs_exactly_one_hundred_percent() {
+        let credentials = [credential("account", 1), credential("second", 1)];
+        assert_eq!(
+            super::unbalanced_priority_group(
+                &credentials,
+                &weights(&[("account", 60), ("second", 60)])
+            ),
+            Some((1, 120))
+        );
+        assert_eq!(
+            super::unbalanced_priority_group(
+                &credentials,
+                &weights(&[("account", 1), ("second", 99)])
+            ),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn activity_import_persistence_error_is_server_side_and_redacted() {
         let response = super::activity_import_error(crate::activity::ActivityImportError::Persist(
@@ -2821,6 +2965,7 @@ mod tests {
                     name: "Account".to_owned(),
                     weight: 100,
                     enabled: true,
+                    priority: 1,
                     kind: "account".to_owned(),
                     material: CredentialMaterial::Subscription {
                         access_token: "private-access".to_owned(),
@@ -2869,6 +3014,7 @@ mod tests {
                     name: "Account".to_owned(),
                     weight: 100,
                     enabled: true,
+                    priority: 1,
                     kind: crate::extensions::SECRET_CREDENTIAL_KIND.to_owned(),
                     material: CredentialMaterial::Secret {
                         secret: "private".to_owned(),

@@ -84,6 +84,9 @@ if [[ $ready != true ]]; then cat server.log >&2; echo "Yabane did not become re
 [[ ! -s data/activity.jsonl ]]
 [[ $(jq -r '.retention_days' data/activity-settings.json) == 30 ]]
 [[ $(jq -r '.[0].id' data/providers.json) == subscription-fixture ]]
+# A policy stored in the earlier shape is read without rewriting the file the
+# administrator has, and reads back as the source it always meant.
+[[ $(jq -r '.[0].endpoints[0].rate_limit_cooldown.honor_retry_after' data/providers.json) == false ]]
 base="http://127.0.0.1:$port"
 cookie="$work/cookie.txt"
 about=$(curl -fsS "$base/about")
@@ -118,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
         endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
         if self.path not in ['/v1/models', '/nested/v1/models']:
             self.send_response(404); self.end_headers(); return
-        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared'], 'nested': ['nested-model']}.get(endpoint, [])
+        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared'], 'nested': ['nested-model'], 'namespaced': ['google/gemma-3-27b-it', 'plain-model']}.get(endpoint, [])
         if self.path == '/nested/v1/models' and endpoint != 'nested':
             models = []
         body = json.dumps({'object': 'list', 'data': [{'id': model} for model in models]}).encode()
@@ -127,9 +130,12 @@ class Handler(BaseHTTPRequestHandler):
         Handler.posts += 1
         length = int(self.headers.get('content-length', 0)); request = json.loads(self.rfile.read(length))
         endpoint = self.headers.get('authorization', '').removeprefix('Bearer ') or self.headers.get('x-api-key', 'unknown')
-        if endpoint == 'throttled':
+        if endpoint in ('throttled', 'throttled-silent'):
             body = json.dumps({'error': {'message': 'quota exhausted', 'type': 'rate_limit_error'}}).encode()
-            self.send_response(429); self.send_header('content-type', 'application/json'); self.send_header('retry-after', '120'); self.end_headers(); self.wfile.write(body); return
+            self.send_response(429); self.send_header('content-type', 'application/json')
+            if endpoint == 'throttled':
+                self.send_header('retry-after', '120')
+            self.end_headers(); self.wfile.write(body); return
         if request.get('model') == 'timeout-before-headers':
             time.sleep(2)
             try:
@@ -230,6 +236,9 @@ extensions=$(admin -f "$base/admin/extensions")
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai_codex") | [.label, .native, (.sign_in.device_code | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'OpenAI subscription|false|true|openai_subscription:subscription' ]]
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "anthropic") | [.label, (.native | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'Anthropic|true|secret:secret' ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].endpoint_type_label, .endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'OpenAI subscription|https://chatgpt.com/backend-api|true|OAuth account' ]]
+# A policy stored in the earlier honored-Retry-After shape reads back as the delay
+# source it always meant, and reads back as the disabled fixed source here.
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 0,fixed ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.endpoint_types[].id] | join(",")') == openai_codex ]]
 # An Endpoint type that owns its own identity refuses pasted secrets, and one
 # that owns its own sign-in cannot be created through the plain Endpoint API.
@@ -399,6 +408,23 @@ unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: applic
 unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
 unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
+
+# A Provider model ID removes only Yabane's first `provider/` segment, so a native
+# namespace that begins with the Provider ID survives route authoring and proxying:
+# `google/google/gemma-3-27b-it` must reach the Provider as Google's own
+# `google/gemma-3-27b-it`, while the accidental repeat of the prefix on a known
+# model is still refused.
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"google\",\"name\":\"Google\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"namespaced\"}}") == 204 ]]
+admin -f -X POST "$base/admin/providers/google/models/refresh" >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "google") | .discovered_models | sort | join(",")') == 'google/gemma-3-27b-it,plain-model' ]]
+namespaced_model=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"google/google/gemma-3-27b-it","messages":[]}')
+[[ $(printf '%s' "$namespaced_model" | jq -r .model) == 'google/gemma-3-27b-it' ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"namespaced-alias","targets":[{"provider_id":"google","endpoint_id":"main","credential_id":"default","upstream_model":"google/gemma-3-27b-it","weight":100}]}') == 204 ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"repeated-prefix-alias","targets":[{"provider_id":"google","endpoint_id":"main","credential_id":"default","upstream_model":"google/plain-model","weight":100}]}') == 400 ]]
+curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"namespaced-alias","messages":[]}' >/dev/null
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "namespaced-alias" and .upstream_model == "google/gemma-3-27b-it" and .provider == "google")] | length') -ge 1 ]]
+admin -f -X DELETE "$base/admin/providers/google" >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq '[.[] | select(.pattern == "namespaced-alias")] | length') == 0 ]]
 # Renaming an upstream API key keeps its ID, secret, weight, enabled state, and
 # the model-route destination that references it, so routing keeps working.
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"renamed-key-route","targets":[{"provider_id":"multi","endpoint_id":"two","credential_id":"default","upstream_model":"model-b","weight":100}]}' >/dev/null
@@ -703,8 +729,19 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/credentials/routed
 # A credential pool survives quota exhaustion without editing routes by hand: the
 # Provider's 429 reaches the caller verbatim, later requests skip that identity, and
 # the identity returns only when its cooldown ends or an administrator clears it.
+# A policy written in the earlier shape keeps its meaning, so an honored
+# Retry-After stays the Provider-first source instead of a fixed duration.
+# What a cooldown policy has done is reported for the policy that is enabled, in
+# both the number of cooldowns it armed and the delay it used.
+cooldown_activity() { admin -f "$base/admin/providers" | jq -r --arg id "$1" '.[] | select(.id == $id) | .endpoints[0].rate_limit_cooldown_activity | [.applied, .skipped, (.last_seconds // -1)] | join(",")'; }
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"pool\",\"name\":\"Credential pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Throttled account\",\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":true}}}" >/dev/null
-[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"bad-cooldown\",\"name\":\"Bad cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false,\"rate_limit_cooldown\":{\"seconds\":2592001,\"honor_retry_after\":false}}}") == 400 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 3600,prefer_provider ]]
+[[ $(cooldown_activity pool) == 0,0,-1 ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"bad-cooldown\",\"name\":\"Bad cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false,\"rate_limit_cooldown\":{\"seconds\":2592001,\"mode\":\"fixed\"}}}") == 400 ]]
+# A delay source Yabane does not define is refused as the rejected field it is
+# instead of being read as one of the sources it does define.
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"odd-cooldown\",\"name\":\"Odd cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":false,\"rate_limit_cooldown\":{\"seconds\":60,\"mode\":\"sometimes\"}}}") == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Rate-limit cooldown delay source must be one of fixed, prefer_provider, provider_only, not 'sometimes'" ]]
 admin -f -X POST "$base/admin/providers/pool/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Healthy account","secret":"healthy","weight":100}' >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | [.endpoints[0].credentials[] | .id] | join(",")') == default,healthy-account ]]
 pool_route='{"pattern":"pool-model","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"","upstream_model":"pool-model","weight":100}]}'
@@ -721,6 +758,9 @@ pool_throttled_status=$(curl -sS -D pool-throttled.headers -o pool-throttled.bod
 pool_cooling=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].credentials[] | select(.id == "default") | .cooldown_seconds_remaining')
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].credentials[] | select(.id == "healthy-account") | has("cooldown_seconds_remaining")') == false ]]
 [[ $pool_cooling =~ ^[0-9]+$ && $pool_cooling -gt 0 && $pool_cooling -le 120 ]]
+# The Provider's own delay is preferred over the configured length, and Activity
+# reports which of the two armed the cooldown.
+[[ $(cooldown_activity pool) == 1,0,120 ]]
 # The credential that exhausted its quota stays out of selection for as many requests
 # as the pool receives, so no manual route or credential edit is needed.
 for _ in $(seq 1 3); do
@@ -731,10 +771,19 @@ done
 pool_activity=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "default" and .status == 429)] | length') -ge 1 ]]
 [[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "healthy-account" and .status == 200)] | length') -ge 1 ]]
+# The record names the identity the way the administrator does, so a rename or a
+# deletion cannot turn Activity into a list of internal credential IDs.
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "default" and .upstream_credential_name == "Throttled account" and .status == 429)] | length') -ge 1 ]]
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "healthy-account" and .upstream_credential_name == "Healthy account" and .status == 200)] | length') -ge 1 ]]
+# Activity states whether the identity that carried the request was itself out of
+# the pool, so a rate-limit answer stays attributable after the cooldown expires.
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "default" and .credential_cooling == false)] | length') -ge 1 ]]
+[[ $(printf '%s' "$pool_activity" | jq '[.[] | select(.model == "pool-model" and .upstream_credential_id == "healthy-account") | .credential_cooling] | all(.) == false') == true ]]
 # A pinned destination keeps using the identity it names, cooldown or not.
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-pinned","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"default","upstream_model":"pool-model","weight":100}]}' >/dev/null
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"pool-pinned","messages":[]}') == 429 ]]
 [[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "pool-pinned" and .upstream_credential_id == "default" and .status == 429 and .credential_cooling == true)] | length') -ge 1 ]]
 # A destination is validated against the identities of the Endpoint it names.
 [[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"pool-missing-pin","targets":[{"provider_id":"pool","endpoint_id":"main","credential_id":"missing-account","upstream_model":"pool-model","weight":100}]}') == 400 ]]
 [[ $(jq -r '.error.message' response.json) == "Route target credential was not found" ]]
@@ -749,32 +798,114 @@ admin -f -X PATCH "$base/admin/providers/pool/endpoints/main/credentials/healthy
 [[ $(admin_status -X DELETE "$base/admin/providers/pool/endpoints/main/credentials/default/cooldown") == 204 ]]
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "pool") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
 [[ $(admin_status -X DELETE "$base/admin/providers/pool/endpoints/main/credentials/missing/cooldown") == 404 ]]
+# Two accounts can be ordered instead of shared: the preferred group carries every
+# request while it can serve, and a standby group only takes over once the Provider
+# has rate-limited every identity above it.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"tiered\",\"name\":\"Tiered pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Preferred account\",\"credential_secret\":\"healthy\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
+admin -f -X POST "$base/admin/providers/tiered/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Standby account","secret":"throttled","weight":100,"priority":2}' >/dev/null
+# A credential that names no group joins the group that carries traffic first, and
+# a group number that does not name a group at all is refused as the invalid field
+# it is.
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "tiered") | [.endpoints[0].credentials[] | "\(.id):\(.priority)"] | join(",")') == default:1,standby-account:2 ]]
+[[ $(admin_status -X POST "$base/admin/providers/tiered/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Zero group","secret":"healthy","weight":100,"priority":0}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Credential priority must be at least 1" ]]
+[[ $(admin_status -X PATCH "$base/admin/providers/tiered/endpoints/main/credentials/default" -H 'content-type: application/json' -d '{"priority":0}') == 400 ]]
+# Percentages are read inside one group, so a standby group splits its own 100% and
+# the rejection names the group that still has to be adjusted.
+[[ $(admin_status -X PATCH "$base/admin/providers/tiered/endpoints/main/traffic" -H 'content-type: application/json' -d '{"weights":[{"credential_id":"default","weight":50},{"credential_id":"standby-account","weight":50}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Priority 1 traffic percentages must total 100 (currently 50)" ]]
+admin -f -X PATCH "$base/admin/providers/tiered/endpoints/main/traffic" -H 'content-type: application/json' -d '{"weights":[{"credential_id":"default","weight":100},{"credential_id":"standby-account","weight":100}]}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"tiered-model","targets":[{"provider_id":"tiered","endpoint_id":"main","credential_id":"","upstream_model":"tiered-model","weight":100}]}' >/dev/null
+# A standby is not a participant: it carries nothing while the preferred group can
+# serve, however many requests arrive and however far the rotation cursor moves.
+for _ in $(seq 1 4); do
+  tiered_body=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}')
+  [[ $(printf '%s' "$tiered_body" | jq -r .endpoint) == healthy ]]
+done
+# Swapping the groups makes the rate-limited account the preferred one, and the
+# same percentages stay valid because each group still totals 100 on its own.
+admin -f -X PATCH "$base/admin/providers/tiered/endpoints/main/credentials/default" -H 'content-type: application/json' -d '{"priority":2}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/tiered/endpoints/main/credentials/standby-account" -H 'content-type: application/json' -d '{"priority":1}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+# The request that hit the limit was not rescued: it received the Provider's own
+# answer, and only the requests after it use the standby group.
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "tiered-model" and .upstream_credential_id == "standby-account" and .status == 429 and .credential_cooling == false)] | length') -ge 1 ]]
+[[ $(cooldown_activity tiered) == 1,0,600 ]]
+for _ in $(seq 1 3); do
+  tiered_body=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}')
+  [[ $(printf '%s' "$tiered_body" | jq -r .endpoint) == healthy ]]
+done
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "tiered-model" and .upstream_credential_id == "default" and .status == 200 and .credential_cooling == false)] | length') -ge 3 ]]
+# The traffic returns to the preferred group as soon as its cooldown is over,
+# which is the difference between a standby and a hand-off.
+[[ $(admin_status -X DELETE "$base/admin/providers/tiered/endpoints/main/credentials/standby-account/cooldown") == 204 ]]
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+
 # When every pool member is cooling down Yabane still sends the request, so the
 # Provider's own answer reaches the caller instead of an invented gateway failure.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"solo-pool\",\"name\":\"Solo pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"honor_retry_after\":false}}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"solo-pool\",\"name\":\"Solo pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"solo-model","targets":[{"provider_id":"solo-pool","endpoint_id":"main","credential_id":"","upstream_model":"solo-model","weight":100}]}' >/dev/null
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"solo-model","messages":[]}') == 429 ]]
+# A fixed policy uses its own length and ignores the delay the Provider reports.
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "solo-pool") | .endpoints[0].credentials[0].cooldown_seconds_remaining') == 600 ]]
+[[ $(cooldown_activity solo-pool) == 1,0,600 ]]
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"solo-model","messages":[]}') == 429 ]]
 [[ $(jq -r '.error.type' response.json) == rate_limit_error ]]
 grep -q 'every credential is cooling down' server.log
+# An exhausted pool serves the Provider's answer from a cooling identity, and
+# Activity records that this is what happened instead of presenting it as healthy.
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "solo-model" and .status == 429 and .credential_cooling == true)] | length') -ge 1 ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "solo-model" and .status == 429 and .credential_cooling == false)] | length') -ge 1 ]]
+# A policy that takes its length from the Provider alone arms nothing when the
+# Provider reports no usable delay, and the Endpoint reports that nothing was
+# armed instead of leaving a policy that can look configured but be dead.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"header-only\",\"name\":\"Header only\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled-silent\",\"rate_limit_cooldown\":{\"seconds\":3600,\"mode\":\"provider_only\"}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"header-only-model","targets":[{"provider_id":"header-only","endpoint_id":"main","credential_id":"","upstream_model":"header-only-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"header-only-model","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+[[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "header-only") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
+[[ $(cooldown_activity header-only) == 0,1,-1 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-only") | .endpoints[0].rate_limit_cooldown_activity | [has("last_applied_at"), (.last_observed_at > 0)] | join(",")') == false,true ]]
+# The same source does follow a delay the Provider reports, capped by the
+# configured length the administrator accepted.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"header-delay\",\"name\":\"Header delay\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":60,\"mode\":\"provider_only\"}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"header-delay-model","targets":[{"provider_id":"header-delay","endpoint_id":"main","credential_id":"","upstream_model":"header-delay-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"header-delay-model","messages":[]}') == 429 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-delay") | .endpoints[0].credentials[0].cooldown_seconds_remaining') == 60 ]]
+[[ $(cooldown_activity header-delay) == 1,0,60 ]]
+# The ceiling holds when the preferred source reports a longer delay than the
+# configured length, so a cooldown never outlasts what was accepted.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"prefer-cap\",\"name\":\"Prefer cap\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":60,\"mode\":\"prefer_provider\"}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"prefer-cap-model","targets":[{"provider_id":"prefer-cap","endpoint_id":"main","credential_id":"","upstream_model":"prefer-cap-model","weight":100}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"prefer-cap-model","messages":[]}') == 429 ]]
+[[ $(cooldown_activity prefer-cap) == 1,0,60 ]]
 # Without an explicit policy a 429 only reaches the caller: Yabane never infers exhaustion.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"no-cooldown\",\"name\":\"No cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\"}}" >/dev/null
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "no-cooldown") | .endpoints[0].rate_limit_cooldown | [.seconds, .honor_retry_after] | join(",")') == 0,false ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "no-cooldown") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 0,fixed ]]
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"no-cooldown-model","targets":[{"provider_id":"no-cooldown","endpoint_id":"main","credential_id":"","upstream_model":"no-cooldown-model","weight":100}]}' >/dev/null
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"no-cooldown-model","messages":[]}') == 429 ]]
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "no-cooldown") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
+# A policy that is not enabled observes nothing, so the console does not present
+# counters for behavior the Endpoint never applies.
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "no-cooldown") | .endpoints[0] | has("rate_limit_cooldown_activity")') == false ]]
 # Runtime health follows the Endpoint it was observed on: renaming an Endpoint
 # clears its cooldown instead of leaving a key that another Endpoint could inherit.
-admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"restart-pool\",\"name\":\"Restart pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":false}}}" >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"restart-pool\",\"name\":\"Restart pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"mode\":\"fixed\"}}}" >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"restart-model","targets":[{"provider_id":"restart-pool","endpoint_id":"main","credential_id":"","upstream_model":"restart-model","weight":100}]}' >/dev/null
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"restart-model","messages":[]}') == 429 ]]
 restart_cooling() { admin -f "$base/admin/providers" | jq --arg id restart-pool '[.[] | select(.id == $id) | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any'; }
 [[ $(restart_cooling) == true ]]
-admin -f -X PATCH "$base/admin/providers/restart-pool/endpoints/main" -H 'content-type: application/json' -d "{\"id\":\"rotating\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":false}}" >/dev/null
+admin -f -X PATCH "$base/admin/providers/restart-pool/endpoints/main" -H 'content-type: application/json' -d "{\"id\":\"rotating\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"rate_limit_cooldown\":{\"seconds\":3600,\"mode\":\"fixed\"}}" >/dev/null
 [[ $(restart_cooling) == false ]]
+# Renaming the Endpoint also forgets what its policy had observed, because that
+# history belongs to the Endpoint it was observed on.
+[[ $(cooldown_activity restart-pool) == 0,0,-1 ]]
 [[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "restart-model") | .targets[0].endpoint_id') == rotating ]]
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"restart-model","messages":[]}') == 429 ]]
 [[ $(restart_cooling) == true ]]
+[[ $(cooldown_activity restart-pool) == 1,0,3600 ]]
 # Converting an Endpoint into a subscription Endpoint is rejected instead of guessing.
 [[ $(admin_status -X POST "$base/admin/providers/multi/endpoints" -H 'content-type: application/json' -d "{\"id\":\"codex\",\"api_type\":\"openai_codex\",\"base_url\":\"https://chatgpt.com/backend-api\",\"requires_credential\":true,\"credential_secret\":\"secret\"}") == 400 ]]
 
@@ -872,6 +1003,8 @@ stats=$(admin -f "$base/admin/activity/stats?since=0&buckets=24")
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.required | index("filter_options") != null') == true ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.Stats.required | index("reported_requests") != null and index("estimated_requests") != null') == true ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.RequestLog.properties.cost_source.enum | join(",")') == reported,estimated ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.RateLimitCooldown.properties.mode.enum | join(",")') == fixed,prefer_provider,provider_only ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.EndpointView.properties | [has("rate_limit_cooldown"), has("rate_limit_cooldown_activity")] | join(",")') == true,true ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.ProviderView.properties.pricing.allOf[0]."$ref"') == '#/components/schemas/PricingTable' ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/pricing"].get.responses["200"].content["application/json"].schema."$ref"') == '#/components/schemas/PricingTable' ]]
 [[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/activity/recalculate-costs"].post.requestBody.content["application/json"].schema.properties | has("source_instance_id")') == true ]]

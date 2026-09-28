@@ -524,13 +524,65 @@ function accountCredentialDetail(endpoint) {
     ? `The current access token is valid until ${new Date(soonest).toLocaleString()} and will be renewed automatically when needed.`
     : 'The current access token will be renewed when the next request uses this Endpoint.';
 }
+/// One Endpoint's identities grouped by priority, lowest group first. A group is
+/// a standby when a lower-numbered group exists: it carries traffic only while
+/// every identity in those groups is out, so its percentages describe that
+/// moment rather than a slice of one shared pool.
+function identityGroups(endpoint) {
+  const byPriority = new Map();
+  enabledCredentials(endpoint).forEach(credential => {
+    const priority = credential.priority || 1;
+    if (!byPriority.has(priority)) byPriority.set(priority, []);
+    byPriority.get(priority).push(credential);
+  });
+  return [...byPriority.entries()].sort((a, b) => a[0] - b[0]).map(([priority, members], index) => {
+    const eligible = members.filter(credential => !credential.cooldown_seconds_remaining);
+    return {priority, members, eligible, standby: index > 0, configured: trafficShares(members), effective: trafficShares(eligible)};
+  });
+}
+/// The group the next request uses: the lowest-numbered group that still has an
+/// identity which is not out, or the lowest-numbered group at all when every
+/// identity in the Endpoint is exhausted.
+function carryingGroup(groups) {
+  return groups.find(group => group.eligible.length) || groups[0] || null;
+}
+/// Even percentages inside one group, so moving an identity in or out leaves a
+/// total of exactly 100 without the administrator doing arithmetic.
+function evenShares(count) {
+  if (!count) return [];
+  const base = Math.floor(100 / count);
+  const remainder = 100 - base * count;
+  return Array.from({length: count}, (_, index) => base + (index < remainder ? 1 : 0));
+}
 function credentialRows(provider, endpoint) {
-  const shares = trafficShares(enabledCredentials(endpoint));
+  const pool = identityPool(endpoint);
+  const groups = identityGroups(endpoint);
+  const carrier = carryingGroup(groups);
   return endpoint.credentials.map(credential => {
+    const group = groups.find(item => item.members.some(member => member.id === credential.id));
     const cooldown = credential.cooldown_seconds_remaining
       ? `<span class="credential-cooldown">Cooling down · resumes in ${formatCooldown(credential.cooldown_seconds_remaining)} <button class="text-link clear-cooldown" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}">Resume now</button></span>`
       : '';
-    return `<div class="key-row"><span class="status ${credential.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(credential.name)}</strong><small>${escapeHtml(credentialDetail(credential))}</small>${cooldown}</span><span class="traffic-share"><strong>${credential.enabled ? `${shares.get(credential.id)}%` : '—'}</strong><small>${credential.enabled ? 'of default traffic' : 'no traffic'}</small></span><button class="credential-rename text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" aria-label="Rename credential ${escapeHtml(credential.name)}">Rename</button><button class="credential-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-enabled="${credential.enabled}">${credential.enabled ? 'Disable' : 'Enable'}</button><button class="credential-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-name="${escapeHtml(credential.name)}" aria-label="Delete credential ${escapeHtml(credential.name)}">Delete</button></div>`;
+    // The share column states what this identity carries now, and names the
+    // configured value next to it whenever those two differ. Only the group that
+    // currently carries traffic hands anything out, so an identity in a standby
+    // group reads 0% while the groups above it can still serve.
+    const carries = group && carrier && group.priority === carrier.priority;
+    const configured = group?.configured.get(credential.id) ?? 0;
+    const scope = groups.length > 1 ? `of Priority ${group?.priority} traffic` : 'of default traffic';
+    const share = !credential.enabled
+      ? {value: '—', note: 'no traffic'}
+      : credential.cooldown_seconds_remaining
+        ? {value: '0%', note: 'while cooling down'}
+        : !carries
+          ? {value: '0%', note: `only while Priority ${carrier?.priority} is out`}
+          : carrier.eligible.length < carrier.members.length
+            ? {value: `${carrier.effective.get(credential.id) ?? 0}%`, note: `right now · normally ${configured}%`}
+            : {value: `${configured}%`, note: scope};
+    const tier = groups.length > 1
+      ? `<span class="credential-tier" data-tone="${group?.standby ? 'standby' : 'first'}">${group?.standby ? `Priority ${group.priority} · standby` : 'Priority 1 · first'}</span>`
+      : '';
+    return `<div class="key-row"><span class="status ${credential.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(credential.name)}</strong>${tier}<small>${escapeHtml(credentialDetail(credential))}</small>${cooldown}</span><span class="traffic-share"><strong>${share.value}</strong><small>${share.note}</small></span><button class="credential-rename text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" aria-label="Rename credential ${escapeHtml(credential.name)}">Rename</button><button class="credential-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-enabled="${credential.enabled}">${credential.enabled ? 'Disable' : 'Enable'}</button><button class="credential-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-name="${escapeHtml(credential.name)}" aria-label="Delete credential ${escapeHtml(credential.name)}">Delete</button></div>`;
   }).join('');
 }
 
@@ -569,12 +621,14 @@ function renderProviderPage() {
       ? `<span><strong>${enabled.length}</strong> of ${endpoint.credentials.length} ${credentialLabel}s enabled</span>`
       : '<span>No credential</span>';
     const cooldownSeconds = endpoint.rate_limit_cooldown?.seconds || 0;
+    const cooldownSource = cooldownPolicyLabel(endpoint.rate_limit_cooldown);
     const cooldownPolicy = cooldownSeconds > 0
-      ? `<span>Rate-limit cooldown <strong>${formatCooldown(cooldownSeconds)}</strong>${endpoint.rate_limit_cooldown.honor_retry_after ? ' · honors Retry-After' : ''}</span>`
+      ? `<span>Rate-limit cooldown <strong>${formatCooldown(cooldownSeconds)}</strong>${cooldownSource ? ` · ${cooldownSource}` : ''}</span>`
       : '';
     const rows = credentialRows(provider, endpoint);
+    const poolSummary = endpointPoolSummary(endpoint);
     const headCopy = !subscription
-      ? `<h4>Credentials</h4><p>${endpoint.requires_credential ? `Credentials belong only to <code>${escapeHtml(endpoint.id)}</code>. Traffic is distributed between enabled credentials.` : 'This Endpoint sends requests without an identity.'}</p>`
+      ? `<h4>Credentials</h4><p>${endpoint.requires_credential ? `Credentials belong only to <code>${escapeHtml(endpoint.id)}</code>. ${identityGroups(endpoint).length > 1 ? 'Each priority group splits its own traffic between the credentials in it.' : 'Traffic is distributed between enabled credentials.'}` : 'This Endpoint sends requests without an identity.'}</p>`
       : enabled.length
         ? `<h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or the Provider revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(accountCredentialDetail(endpoint))} Access and refresh tokens are never shown in the console or API.</p></details>`
         : '<h4>Reconnect required</h4><p>No account is connected. Use Connect account to sign in and resume requests through this Endpoint.</p>';
@@ -594,7 +648,7 @@ function renderProviderPage() {
         ? `<button class="button secondary connect-account" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Connect account</button>`
         : `<button class="button secondary add-credential" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add credential</button>`;
     const endpointKind = endpoint.endpoint_type_label || formatType(endpoint.api_type);
-    return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header><section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
+    return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header>${poolSummary}<section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
   }).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
@@ -709,6 +763,150 @@ function trafficShares(keys) {
   calculated.sort((a, b) => b.remainder - a.remainder).slice(0, remaining).forEach(item => item.share++);
   calculated.forEach(item => shares.set(item.key.id, item.share));
   return shares;
+}
+
+/// One Endpoint's identities and what each of them can serve right now. An
+/// identity the Provider rate-limited leaves the pool for the length of its
+/// cooldown, so the configured shares describe the healthy case while the
+/// effective shares describe this moment.
+function identityPool(endpoint) {
+  const enabled = enabledCredentials(endpoint);
+  const usable = enabled.filter(credential => credential.weight > 0);
+  const eligible = usable.filter(credential => !credential.cooldown_seconds_remaining);
+  const cooling = usable.filter(credential => credential.cooldown_seconds_remaining);
+  return {enabled, eligible, cooling, configured: trafficShares(enabled), effective: trafficShares(eligible), seconds: endpoint.rate_limit_cooldown?.seconds || 0};
+}
+/// The wall-clock moment a live cooldown ends, so the pool can be reasoned about
+/// without watching the page.
+function cooldownEndsAt(seconds) {
+  return new Date(Date.now() + seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+}
+function identityList(credentials) {
+  const names = credentials.map(credential => escapeHtml(credential.name));
+  const last = names.at(-1);
+  return names.length < 3 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${last}`;
+}
+/// How long an identity stays out under a cooldown policy, in the words the
+/// Endpoint card, the traffic dialog, and the edit form all use, so one policy is
+/// never described three different ways. The configured length is the ceiling in
+/// every mode, and only the Provider-only mode can pass without effect.
+function cooldownDelayClause(policy) {
+  const duration = formatCooldown(policy?.seconds || 0);
+  if (policy?.mode === 'provider_only') return `for the delay the Provider reports, never longer than ${duration}`;
+  if (policy?.mode === 'prefer_provider') return `for the delay the Provider reports, or ${duration} when it reports none, never longer than ${duration}`;
+  return `for ${duration}`;
+}
+function cooldownNoDelayClause(policy) {
+  return policy?.mode === 'provider_only'
+    ? ' When the Provider reports no usable delay, nothing changes and requests keep reaching that identity.'
+    : '';
+}
+function cooldownPolicyLabel(policy) {
+  if (policy?.mode === 'provider_only') return 'Provider delay only';
+  if (policy?.mode === 'prefer_provider') return 'Provider delay first';
+  return '';
+}
+function formatClock(seconds) {
+  return new Date(seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+}
+/// What this instance has observed of the Endpoint's cooldown policy. A policy
+/// whose length comes from the Provider can be configured correctly and still
+/// never arm, so the console reports what happened instead of leaving the
+/// administrator unable to tell a working policy from a dead one.
+function endpointPolicyActivity(endpoint) {
+  const activity = endpoint.rate_limit_cooldown_activity;
+  if (!activity || !endpoint.rate_limit_cooldown?.seconds) return '';
+  const applied = activity.applied || 0;
+  const skipped = activity.skipped || 0;
+  const plural = (count, noun) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+  if (!applied && !skipped) return 'No rate-limit answer has reached this Endpoint since Yabane started.';
+  if (!applied) return `${plural(skipped, 'rate-limit answer')} reported no usable delay, so no identity has been taken out yet.`;
+  const last = activity.last_applied_at
+    ? ` Most recently it took an identity out for ${formatCooldown(activity.last_seconds)} at ${formatClock(activity.last_applied_at)}.`
+    : '';
+  const skippedNote = skipped ? ` ${plural(skipped, 'rate-limit answer')} reported no usable delay.` : '';
+  return `This policy has taken an identity out ${plural(applied, 'time')} since Yabane started.${last}${skippedNote}`;
+}
+/// How a group splits its own traffic, named the way the pool states it: a single
+/// identity is just itself, because 100% of one group states nothing.
+function groupShareText(group) {
+  const names = group.members.map(member => `<strong>${escapeHtml(member.name)}</strong>`);
+  if (names.length === 1) return names[0];
+  return `${identityList(group.members)} — ${group.members.map(member => `${group.configured.get(member.id) ?? 0}%`).join(' / ')}`;
+}
+/// States the identity pool as the mechanism it is, instead of leaving the
+/// administrator to assemble it from a policy field and a percentage: how
+/// traffic is split while every identity is healthy, what a Provider rate limit
+/// does to that split, and what is true right now.
+function endpointPoolSummary(endpoint) {
+  if (!endpoint.requires_credential || !endpoint.credentials.length) return '';
+  const pool = identityPool(endpoint);
+  const groups = identityGroups(endpoint);
+  const carrier = carryingGroup(groups);
+  const standbyGroups = groups.filter(group => group.standby);
+  // The pool explains something only while a policy can take an identity out,
+  // while one is out, while there is another identity to carry the traffic, or
+  // while a group waits behind another one. Restating an Endpoint that only ever
+  // sends as its single identity would be noise, and the edit dialog is where a
+  // policy is chosen.
+  if (pool.seconds === 0 && !pool.cooling.length && pool.enabled.length < 2 && !standbyGroups.length) return '';
+  const noun = identityNoun(endpoint, 2);
+  const singular = identityNoun(endpoint, 1);
+  const retryHint = 'The request that hit the limit still receives the Provider’s own answer.';
+  if (!pool.enabled.length) {
+    return `<div class="endpoint-pool" data-tone="idle"><p><strong>No ${escapeHtml(noun)} are enabled.</strong> Requests to this Endpoint fail until one is enabled.</p></div>`;
+  }
+  // A standby group is a second claim about the same traffic, so the pool states
+  // where one group ends and the next begins instead of calling every identity
+  // part of one rotation.
+  const steady = standbyGroups.length
+    ? `Traffic always uses <strong>Priority ${groups[0].priority}</strong> first (${groupShareText(groups[0])}).${standbyGroups.map(group => ` <strong>Priority ${group.priority}</strong> (${groupShareText(group)}) only carries it while every identity in the ${standbyGroups.length > 1 ? 'groups' : 'group'} above it is cooling down.`).join('')}`
+    : pool.enabled.length === 1
+      ? `Every request leaves as <strong>${escapeHtml(pool.enabled[0].name)}</strong>.`
+      : `Traffic rotates between ${pool.enabled.length} ${escapeHtml(noun)} by weight — ${pool.enabled.map(key => `${pool.configured.get(key.id) ?? 0}%`).join(' / ')}.`;
+  const policy = {seconds: pool.seconds, mode: endpoint.rate_limit_cooldown?.mode || 'fixed'};
+  let failure;
+  if (pool.seconds > 0) {
+    const delay = cooldownDelayClause(policy);
+    const noDelay = cooldownNoDelayClause(policy);
+    failure = standbyGroups.length
+      ? `If the Provider rate-limits one, it leaves the pool ${delay}, and its own group carries every request until the whole group is out; the next priority group takes over from there and hands the traffic back when the cooldown ends.${noDelay} ${retryHint}`
+      : pool.enabled.length === 1
+        ? `If the Provider rate-limits this ${escapeHtml(singular)}, it leaves the pool ${delay}. Nothing else can carry the traffic, so requests still go out.${noDelay} ${retryHint}`
+        : `If the Provider rate-limits one, it leaves the pool ${delay}, and the others carry every request until it returns automatically.${noDelay}`;
+  } else {
+    failure = standbyGroups.length
+      ? 'Rate limits are not tracked here, so an identity the Provider rate-limits keeps its configured share and a lower priority group never takes over. Only disabling every identity above it hands that traffic a lower group.'
+      : pool.enabled.length === 1
+        ? 'Rate limits are not tracked here, so a request that hits one receives the Provider’s own answer.'
+        : 'Rate limits are not tracked here, so an identity the Provider rate-limits keeps its configured share. Edit settings to let the others take over while it is limited.';
+  }
+  let now = '';
+  let tone = 'steady';
+  if (pool.cooling.length) {
+    tone = 'cooling';
+    // Under priority groups only the group that carries traffic hands it out, so
+    // this sentence names that group's identities rather than every healthy
+    // identity, which would include the ones waiting in a standby group.
+    const carrying = standbyGroups.length ? carrier.members.filter(key => !key.cooldown_seconds_remaining) : pool.eligible;
+    now = pool.cooling.length === pool.enabled.length
+      ? `Every ${escapeHtml(noun)} is cooling down right now, so requests still go out and the Provider’s own 429 reaches the caller.`
+      : `Right now ${identityList(pool.cooling)} ${pool.cooling.length === 1 ? 'is' : 'are'} out until ${pool.cooling.map(key => cooldownEndsAt(key.cooldown_seconds_remaining)).join(' / ')}, so ${identityList(carrying)} carr${carrying.length === 1 ? 'ies' : 'y'} every request.`;
+    if (standbyGroups.length) {
+      now += carrier.standby
+        ? ` Priority ${carrier.priority} is carrying the traffic while the groups above it are out, and hands it back as they return.`
+        : ` Priority ${carrier.priority} still carries the traffic, so the groups below it wait.`;
+    }
+  }
+  const observed = endpointPolicyActivity(endpoint);
+  // A standby group that can never be reached is a configuration the
+  // administrator has to see: nothing leaves the rotation while no cooldown
+  // policy is configured, so the lower group would only take over by disabling
+  // every identity above it.
+  const unreachable = standbyGroups.length && pool.seconds === 0
+    ? `<p class="pool-standby">Priority ${standbyGroups[0].priority} never takes over: this Endpoint does not track rate limits, so no identity above it ever leaves the rotation. Set a rate-limit cooldown, or move those identities into Priority ${groups[0].priority}.</p>`
+    : '';
+  return `<div class="endpoint-pool" data-tone="${tone}">${now ? `<p class="pool-now">${now}</p>` : ''}<p class="pool-steady">${steady}</p><p class="pool-failure">${failure}</p>${unreachable}${observed ? `<p class="pool-observed">${observed}</p>` : ''}</div>`;
 }
 
 function bindProviderActions() {
@@ -837,7 +1035,7 @@ function pricingNameLabel(name) { return name === 'incoming' ? 'Incoming' : 'Out
 function pricingScopeText(entry) {
   if (entry.scope === 'global') return {label: 'Global', detail: 'All Providers'};
   if (entry.scope === 'provider') return {label: 'Provider', detail: entry.providerId};
-  return {label: 'Endpoint', detail: `${entry.providerId} / ${entry.endpointId}`};
+  return {label: 'Endpoint', detail: `${entry.providerId} → ${entry.endpointId}`};
 }
 function formatPricingRate(value) { return value == null ? 'Inherit' : `$${new Intl.NumberFormat('en', {maximumFractionDigits: 12}).format(value)}`; }
 function showPricingList() { $('#pricing-list-page').hidden = false; $('#pricing-editor-page').hidden = true; pricingEditTarget = null; }
@@ -1120,6 +1318,23 @@ $('#delete-pricing-rule').addEventListener('click', async () => {
   await refreshPricingConfiguration(); showPricingList();
 });
 
+/// Connection settings and the rate-limit policy are read and changed at different
+/// times, so the Endpoint dialog keeps them on separate tabs instead of one column
+/// that has to be scrolled to reach either half.
+function selectEndpointTab(tab) {
+  $$('#endpoint-form [data-endpoint-tab]').forEach(item => {
+    const active = item.dataset.endpointTab === tab;
+    item.classList.toggle('active', active);
+    item.setAttribute('aria-selected', String(active));
+  });
+  $$('#endpoint-form [data-endpoint-panel]').forEach(panel => { panel.hidden = panel.dataset.endpointPanel !== tab; });
+}
+/// Brings the tab that owns a control forward, so a required field or a rejected
+/// value is never reported while its field is on the other tab.
+function revealEndpointField(control) {
+  const panel = control?.closest?.('[data-endpoint-panel]');
+  if (panel) selectEndpointTab(panel.dataset.endpointPanel);
+}
 function openEndpointDialog(providerId, endpointId = null) {
   const form = $('#endpoint-form'); form.reset(); form.elements.provider_id.value = providerId; form.dataset.endpointId = endpointId || ''; form.elements.id.dataset.edited = ''; delete form.elements.base_url.dataset.previousValue; $('#endpoint-error').textContent = ''; form.querySelector('.base-url-notice').textContent = '';
   const provider = providers.find(item => item.id === providerId);
@@ -1149,16 +1364,66 @@ function openEndpointDialog(providerId, endpointId = null) {
   if (endpoint) {
     form.elements.id.value = endpoint.id; form.elements.base_url.value = endpoint.base_url; form.elements.api_type.value = endpoint.api_type;
     form.elements.socks5_proxy.value = endpoint.socks5_proxy || ''; form.elements.requires_credential.checked = endpoint.requires_credential;
-    selectCooldownSeconds(form.elements.cooldown_seconds, endpoint.rate_limit_cooldown?.seconds || 0);
-    form.elements.honor_retry_after.checked = Boolean(endpoint.rate_limit_cooldown?.honor_retry_after);
     operationPathNotice(form.elements.base_url);
   }
-  toggleEndpointMode(); bindSecretToggles(endpointDialog); endpointDialog.showModal();
+  const policy = endpoint?.rate_limit_cooldown;
+  form.elements.cooldown_enabled.checked = (policy?.seconds || 0) > 0;
+  selectCooldownSeconds(form.elements.cooldown_duration, policy?.seconds || 60);
+  form.elements.cooldown_source.value = !policy?.mode || policy.mode === 'fixed' ? 'fixed' : 'provider';
+  form.elements.cooldown_missing.value = policy?.mode === 'provider_only' ? 'skip' : 'fallback';
+  // What the chosen policy does depends on how many identities could take over,
+  // so the dialog states the scenario for this Endpoint instead of a definition.
+  form.dataset.identityCount = String(endpoint ? enabledCredentials(endpoint).filter(key => key.weight > 0).length : 1);
+  toggleEndpointMode(); updateCooldownPreview(); bindSecretToggles(endpointDialog); selectEndpointTab('connection'); endpointDialog.showModal();
+}
+// The figure is a configuration illustration, not live health or a rescued
+// request. Its bypass only exists when another positive-weight identity exists.
+function updateCooldownPreview() {
+  const form = $('#endpoint-form');
+  const disabled = !form.elements.cooldown_enabled.checked;
+  const fromProvider = form.elements.cooldown_source.value === 'provider';
+  const duration = Number(form.elements.cooldown_duration.value);
+  // The form asks independent questions; the wire policy stays compatible with
+  // existing configurations. Turning it off never destroys the in-dialog choices.
+  form.elements.cooldown_seconds.value = disabled ? '0' : String(duration);
+  form.elements.cooldown_mode.value = !fromProvider ? 'fixed' : form.elements.cooldown_missing.value === 'skip' ? 'provider_only' : 'prefer_provider';
+  const count = Number(form.dataset.identityCount || 0);
+  const keyless = !form.elements.requires_credential.checked;
+  $('#cooldown-enable-status').textContent = disabled ? 'Off' : 'On';
+  $('#cooldown-enable-help').textContent = disabled
+    ? 'Cooldown is off. Settings below apply only when enabled.'
+    : keyless ? 'This Endpoint sends requests without credentials, so no identity can be paused.' : 'Applies to the identity that receives a rate-limit response.';
+  $('#cooldown-duration-label').textContent = fromProvider ? 'Maximum cooldown' : 'Fixed cooldown';
+  $('#cooldown-duration-help').textContent = fromProvider
+    ? 'Uses Retry-After in whole seconds, capped at this maximum.'
+    : 'Uses this duration for every 429, ignoring the Provider’s wait time.';
+  $('#cooldown-missing-field').hidden = !fromProvider;
+  form.elements.cooldown_missing.options[0].textContent = `Use the maximum · ${formatCooldown(duration)}`;
+  const flow = $('#cooldown-flow');
+  flow.dataset.state = keyless ? 'direct' : !count ? 'empty' : count === 1 ? 'solo' : disabled ? 'shared' : 'bypass';
+  flow.dataset.enabled = String(!disabled && !keyless && count > 0);
+  $('#cooldown-flow-identity').textContent = count > 1 ? 'Identity A' : 'Identity';
+  $('#cooldown-flow-others').textContent = count === 2 ? 'Identity B' : 'Others';
+  $('#cooldown-flow-status').textContent = disabled ? 'In rotation' : count === 1 ? 'Still used' : 'Cooling down';
+  $('#cooldown-flow-others-status').textContent = disabled ? 'In rotation' : 'Taking traffic';
+  $('#cooldown-flow-heading').textContent = keyless ? 'No identity to pause' : !count ? 'No eligible identity' : disabled ? 'Rotation stays unchanged' : count === 1 ? 'No alternative identity' : 'Let another identity take over';
+  $('#cooldown-flow-caption').textContent = keyless
+    ? 'This Endpoint sends requests without credentials; cooldown has no identity to affect.'
+    : !count ? 'Requests fail until an identity is enabled with a positive traffic share.'
+    : disabled ? 'A rate-limited identity keeps its share. Nothing is taken out of rotation.'
+    : count === 1 ? 'There is nobody else to take over. Requests still go out with the same identity.'
+    : 'When a cooldown starts, later requests use the others. The paused identity rejoins automatically.';
+  $('#cooldown-preview').textContent = 'The original 429 is returned unchanged. No request is retried; pinned identities are not bypassed.';
 }
 function selectCooldownSeconds(select, seconds) {
   const value = String(seconds);
+  // A duration the console does not offer is appended for this dialog only, so
+  // reopening with another Endpoint must not accumulate stale custom options.
+  Array.from(select.options).filter(option => option.dataset.custom === 'true' && option.value !== value).forEach(option => option.remove());
   if (!Array.from(select.options).some(option => option.value === value)) {
-    select.add(new Option(`${formatCooldown(seconds)} · custom`, value));
+    const option = new Option(`${formatCooldown(seconds)} · custom`, value);
+    option.dataset.custom = 'true';
+    select.add(option);
   }
   select.value = value;
 }
@@ -1185,7 +1450,8 @@ function toggleEndpointMode() {
   $('.endpoint-key-section').classList.toggle('collapsed', !required || editing); form.elements.credential_secret.required = required && !editing;
   $('#endpoint-dialog button[type="submit"]').textContent = editing ? 'Save changes' : declaration?.sign_in ? 'Connect account' : 'Add endpoint';
 }
-$('#endpoint-form [name="requires_credential"]').addEventListener('change', toggleEndpointMode);
+$('#endpoint-form [name="requires_credential"]').addEventListener('change', () => { toggleEndpointMode(); updateCooldownPreview(); });
+$$('#endpoint-form [name="cooldown_enabled"], #endpoint-form [name="cooldown_duration"], #endpoint-form [name="cooldown_source"], #endpoint-form [name="cooldown_missing"]').forEach(input => input.addEventListener('change', updateCooldownPreview));
 $('#endpoint-form [name="id"]').addEventListener('input', event => { event.target.value = slugify(event.target.value); event.target.dataset.edited = 'true'; });
 $('#endpoint-form [name="api_type"]').addEventListener('change', event => {
   const form = $('#endpoint-form');
@@ -1196,16 +1462,27 @@ $('#endpoint-form [name="api_type"]').addEventListener('change', event => {
   toggleEndpointMode();
 });
 $$('.close-endpoint').forEach(button => button.addEventListener('click', () => endpointDialog.close()));
+$$('#endpoint-form [data-endpoint-tab]').forEach(button => button.addEventListener('click', () => selectEndpointTab(button.dataset.endpointTab)));
+// Native validation has to report a field the administrator can see, which means
+// the tab holding it has to be the one on screen first.
+$('#endpoint-form').addEventListener('invalid', event => revealEndpointField(event.target), true);
 $('#endpoint-form').addEventListener('submit', async event => {
   event.preventDefault(); const form = event.target; const data = new FormData(form); const providerId = data.get('provider_id'); const endpointId = form.dataset.endpointId;
   const requiresCredential = data.get('requires_credential') === 'on';
-  const rateLimitCooldown = {seconds: Number(data.get('cooldown_seconds') || 0), honor_retry_after: data.get('honor_retry_after') === 'on'};
+  const rateLimitCooldown = {seconds: Number(data.get('cooldown_seconds') || 0), mode: data.get('cooldown_mode') || 'fixed'};
   const payload = endpointId
     ? {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, requires_credential: requiresCredential, rate_limit_cooldown: rateLimitCooldown}
     : {id: data.get('id'), api_type: data.get('api_type'), base_url: data.get('base_url'), socks5_proxy: data.get('socks5_proxy') || null, extra_headers: {}, extra_body: {}, requires_credential: requiresCredential, credential_secret: requiresCredential ? data.get('credential_secret') : null, rate_limit_cooldown: rateLimitCooldown};
   if (!endpointId && endpointSignInRequired(payload.api_type)) return beginEndpointSignIn({endpoint_type: payload.api_type, provider_id: providerId, endpoint_id: payload.id, socks5_proxy: payload.socks5_proxy}, $('#endpoint-error'), endpointDialog);
   const response = await fetch(endpointId ? `/admin/providers/${providerId}/endpoints/${endpointId}` : `/admin/providers/${providerId}/endpoints`, {method: endpointId ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
-  if (!response.ok) return showApiError(response, $('#endpoint-error'));
+  if (!response.ok) {
+    const message = await apiErrorMessage(response);
+    // A rejected policy is reported where the policy is set; every other rejection
+    // belongs to the connection the dialog explains on its first tab.
+    selectEndpointTab(/rate-limit|cooldown/i.test(message) ? 'ratelimits' : 'connection');
+    $('#endpoint-error').textContent = message;
+    return;
+  }
   const renamed = Boolean(endpointId && endpointId !== payload.id);
   endpointDialog.close();
   await (renamed ? Promise.all([loadProviders(), loadRoutes()]) : loadProviders());
@@ -1264,37 +1541,159 @@ $('#credential-name-form').addEventListener('submit', async event => {
 
 const trafficDialog = $('#traffic-dialog');
 let trafficEndpoint = null;
+/// The distribution as the dialog is editing it: one row per enabled identity
+/// carrying the group it belongs to and the percentage it takes inside that
+/// group. Rows live in a draft so what is saved describes exactly what was on
+/// screen, including a move that only takes effect when the dialog is saved.
+let trafficRows = [];
+function trafficRowGroups() {
+  const priorities = [...new Set(trafficRows.map(row => row.priority))].sort((a, b) => a - b);
+  return priorities.map(priority => ({priority, standby: priority !== priorities[0], rows: trafficRows.filter(row => row.priority === priority)}));
+}
+/// Even percentages again in one group, so a move never leaves a group that no
+/// longer adds up to 100.
+function rebalanceTrafficGroup(priority) {
+  const rows = trafficRows.filter(row => row.priority === priority);
+  evenShares(rows.length).forEach((share, index) => { rows[index].weight = share; });
+}
+function trafficRowElement(row, groups, endpoint) {
+  const element = document.createElement('label');
+  element.className = 'traffic-row';
+  const first = groups[0].priority;
+  const highest = groups.at(-1).priority;
+  const choices = [...groups.map(group => group.priority), highest + 1]
+    .filter((priority, index, list) => list.indexOf(priority) === index)
+    .map(priority => {
+      const label = priority === first ? `Priority ${priority} · first` : priority > highest ? `Priority ${priority} · new standby` : `Priority ${priority} · standby`;
+      return `<option value="${priority}"${priority === row.priority ? ' selected' : ''}>${label}</option>`;
+    })
+    .join('');
+  element.innerHTML = `<span><span class="status ${row.enabled ? 'enabled' : ''}"></span><strong>${escapeHtml(row.name)}</strong><small class="identity-state" data-tone="${row.state.tone}">${escapeHtml(row.kind)} · ${escapeHtml(row.state.text)}</small></span><span class="percentage-input"><input type="number" min="1" max="100" required value="${row.weight}" data-credential="${row.id}" aria-label="Traffic percentage for ${escapeHtml(row.name)}"><b>%</b></span><select class="traffic-tier" data-credential="${row.id}" aria-label="Priority group for ${escapeHtml(row.name)}">${choices}</select>`;
+  element.querySelector('input').addEventListener('input', input => {
+    row.weight = Number(input.target.value) || 0;
+    validateTrafficDistribution();
+  });
+  element.querySelector('select').addEventListener('change', select => {
+    const target = Number(select.target.value);
+    const previous = row.priority;
+    if (target === previous) return;
+    row.priority = target;
+    // Both the group that loses an identity and the group that gains one are
+    // shared out again, because each group has to total 100 on its own.
+    rebalanceTrafficGroup(previous);
+    rebalanceTrafficGroup(target);
+    renderTrafficGroups(endpoint);
+  });
+  return element;
+}
+function renderTrafficGroups(endpoint) {
+  const groups = trafficRowGroups();
+  const cooldownOff = !(endpoint?.rate_limit_cooldown?.seconds > 0);
+  $('#traffic-rows').replaceChildren(...groups.map(group => {
+    const section = document.createElement('section');
+    section.className = 'traffic-group';
+    section.dataset.priority = String(group.priority);
+    section.dataset.tone = group.standby ? 'standby' : 'first';
+    const heading = group.priority === groups[0].priority ? `Priority ${group.priority} · carries traffic first` : `Priority ${group.priority} · standby`;
+    // A standby group says when it is used and when it is not, so a group that a
+    // disabled cooldown makes unreachable reads as a warning instead of a plan.
+    const explanation = groups.length === 1
+      ? 'Every request is shared between these identities.'
+      : group.priority === groups[0].priority
+        ? 'Requests use these identities while any of them can serve.'
+        : cooldownOff
+          ? 'Never used while rate limits are untracked: no cooldown ever takes an identity above this group out of the rotation.'
+          : `Only used while every identity in ${groups.filter(item => item.priority < group.priority).map(item => `Priority ${item.priority}`).join(' and ')} is cooling down.`;
+    const head = document.createElement('div');
+    head.className = 'traffic-group-head';
+    head.innerHTML = `<span><strong>${heading}</strong><small>${explanation}</small></span><span class="traffic-group-total" data-priority="${group.priority}">100%</span>`;
+    const rows = document.createElement('div');
+    rows.className = 'traffic-rows';
+    rows.append(...group.rows.map(row => trafficRowElement(row, groups, endpoint)));
+    section.append(head, rows);
+    return section;
+  }));
+  validateTrafficDistribution();
+}
 function openTrafficDialog(providerId, endpointId) {
   const provider = providers.find(item => item.id === providerId);
   const endpoint = provider.endpoints.find(item => item.id === endpointId);
-  const enabledKeys = enabledCredentials(endpoint);
-  const shares = trafficShares(enabledKeys);
+  const groups = identityGroups(endpoint);
+  const configured = new Map();
+  groups.forEach(group => group.configured.forEach((share, id) => configured.set(id, share)));
   trafficEndpoint = {providerId, endpointId};
-  $('#traffic-description').innerHTML = `Set the percentage of <code>${escapeHtml(endpointId)}</code> traffic sent with each enabled credential.`;
-  $('#traffic-error').textContent = '';
-  $('#traffic-rows').replaceChildren(...enabledKeys.map(key => {
-    const row = document.createElement('label'); row.className = 'traffic-row';
-    row.innerHTML = `<span><span class="status enabled"></span><strong>${escapeHtml(key.name)}</strong><small>${escapeHtml(credentialKindLabel(key))}</small></span><span class="percentage-input"><input type="number" min="1" max="99" required value="${shares.get(key.id)}" data-credential="${key.id}" aria-label="Traffic percentage for ${escapeHtml(key.name)}"><b>%</b></span>`;
-    row.querySelector('input').addEventListener('input', validateTrafficDistribution);
-    return row;
+  trafficRows = enabledCredentials(endpoint).map(credential => ({
+    id: credential.id,
+    name: credential.name,
+    kind: credentialKindLabel(credential),
+    enabled: credential.enabled,
+    state: credential.cooldown_seconds_remaining
+      ? {text: `cooling down, resumes in ${formatCooldown(credential.cooldown_seconds_remaining)}`, tone: 'cooling'}
+      : {text: 'healthy', tone: 'healthy'},
+    priority: credential.priority || 1,
+    savedPriority: credential.priority || 1,
+    weight: configured.get(credential.id) ?? 100,
   }));
-  validateTrafficDistribution(); trafficDialog.showModal();
+  const standbyRows = new Set(trafficRows.map(row => row.priority)).size > 1;
+  // A tiered Endpoint has one total per group, so the line above the rows says
+  // which traffic the numbers describe instead of implying a single split.
+  $('#traffic-description').innerHTML = standbyRows
+    ? `Set the percentage each credential takes while its own priority group carries <code>${escapeHtml(endpointId)}</code> traffic.`
+    : `Set the percentage of <code>${escapeHtml(endpointId)}</code> traffic sent with each enabled credential.`;
+  // The percentages describe the healthy case, so the dialog names each
+  // identity's state and states what a Provider rate limit does to the split.
+  const cooldown = endpoint.rate_limit_cooldown || {seconds: 0, mode: 'fixed'};
+  const standbyClause = !standbyRows
+    ? ''
+    : cooldown.seconds > 0
+      ? ' A group above a standby group hands the traffic back as soon as its cooldown ends, so percentages in each group describe only the time that group carries the traffic.'
+      : ' A lower priority group never takes over here, because nothing leaves the rotation while rate limits are untracked.';
+  $('#traffic-consequence').innerHTML = (cooldown.seconds > 0
+    ? `Percentages apply whenever a request reaches this Endpoint without a pinned identity, including model routes that keep the Endpoint policy. While every identity is healthy, traffic is split exactly as configured; if the Provider rate-limits an identity, it leaves the pool ${cooldownDelayClause(cooldown)}, so the remaining ones carry every request until it returns automatically.${cooldownNoDelayClause(cooldown)}`
+    : 'Percentages apply whenever a request reaches this Endpoint without a pinned identity, including model routes that keep the Endpoint policy. This Endpoint does not track rate limits, so an identity the Provider rate-limits keeps receiving its share.') + standbyClause;
+  $('#traffic-set-cooldown').hidden = cooldown.seconds > 0;
+  $('#traffic-error').textContent = '';
+  renderTrafficGroups(endpoint);
+  trafficDialog.showModal();
 }
 function validateTrafficDistribution() {
-  const inputs = $$('#traffic-rows input');
-  const total = inputs.reduce((sum, input) => sum + (Number(input.value) || 0), 0);
-  const valid = inputs.length > 1 && inputs.every(input => input.checkValidity()) && total === 100;
-  $('#traffic-total').textContent = `${total}%`;
-  $('#traffic-total').classList.toggle('invalid', !valid);
-  $('#traffic-error').textContent = total === 100 ? '' : `Traffic shares must add up to 100% (currently ${total}%).`;
+  const groups = trafficRowGroups();
+  const totals = groups.map(group => ({priority: group.priority, total: group.rows.reduce((sum, row) => sum + (Number(row.weight) || 0), 0)}));
+  // Percentages are read inside one group, so each group is checked on its own
+  // and the message names the group that still has to be adjusted.
+  totals.forEach(item => {
+    const total = $(`.traffic-group-total[data-priority="${item.priority}"]`);
+    if (total) { total.textContent = `${item.total}%`; total.classList.toggle('invalid', item.total !== 100); }
+  });
+  const weightsValid = groups.every(group => group.rows.every(row => Number.isInteger(row.weight) && row.weight >= 1 && row.weight <= 100));
+  const unbalanced = totals.find(item => item.total !== 100);
+  const valid = weightsValid && !unbalanced && trafficRows.length > 1;
+  $('#traffic-error').textContent = unbalanced
+    ? `${groups.length > 1 ? `Priority ${unbalanced.priority}` : 'Traffic shares'} must add up to 100% (currently ${unbalanced.total}%).`
+    : '';
   $('#save-traffic').disabled = !valid;
   return valid;
 }
 $$('.close-traffic').forEach(button => button.addEventListener('click', () => trafficDialog.close()));
+// The pool is one mechanism on both screens, so the dialog that sets the split
+// hands the administrator to the policy that changes what the split means
+// instead of describing that policy only in passing.
+$('#traffic-set-cooldown').addEventListener('click', () => {
+  const target = trafficEndpoint;
+  trafficDialog.close();
+  if (target) openEndpointDialog(target.providerId, target.endpointId);
+});
 $('#traffic-form').addEventListener('submit', async event => {
   event.preventDefault(); if (!validateTrafficDistribution()) return;
-  const weights = $$('#traffic-rows input').map(input => ({credential_id: input.dataset.credential, weight: Number(input.value)}));
-  const response = await fetch(`/admin/providers/${trafficEndpoint.providerId}/endpoints/${trafficEndpoint.endpointId}/traffic`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({weights})});
+  const base = `/admin/providers/${trafficEndpoint.providerId}/endpoints/${trafficEndpoint.endpointId}`;
+  // Group membership is a property of the identity, so it is saved before the
+  // percentages that are read within those groups.
+  for (const row of trafficRows.filter(row => row.priority !== row.savedPriority)) {
+    const response = await fetch(`${base}/credentials/${row.id}`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({priority: row.priority})});
+    if (!response.ok) return showApiError(response, $('#traffic-error'));
+  }
+  const weights = trafficRows.map(row => ({credential_id: row.id, weight: Number(row.weight)}));
+  const response = await fetch(`${base}/traffic`, {method: 'PATCH', headers: {'content-type': 'application/json'}, body: JSON.stringify({weights})});
   if (!response.ok) return showApiError(response, $('#traffic-error'));
   trafficDialog.close(); await loadProviders();
 });
@@ -1457,6 +1856,11 @@ function createPicker(host) {
       });
       return section;
     }));
+    // Pointer feedback follows the same current-row idea as the keyboard, so a row
+    // is never hovered and highlighted at the same time with two different states.
+    popup.querySelectorAll('.picker-option').forEach(row => row.addEventListener('mouseenter', () => {
+      if (!row.disabled) highlight(selectable().indexOf(row));
+    }));
   };
   const highlight = index => {
     const options = selectable();
@@ -1532,15 +1936,42 @@ function destinationEndpoint(editor) {
   return provider?.endpoints.find(item => item.id === destinationValue(editor, 'endpoint')) || null;
 }
 function destinationTarget(editor) {
-  return {provider_id: destinationValue(editor, 'provider'), endpoint_id: destinationValue(editor, 'endpoint'), credential_id: destinationValue(editor, 'identity')};
+  // A pinned identity is a claim about which identity must send the request; an
+  // Endpoint that chooses for itself never carries one here.
+  const pinned = identityMode(editor) === 'pin' ? destinationValue(editor, 'identity') : '';
+  return {provider_id: destinationValue(editor, 'provider'), endpoint_id: destinationValue(editor, 'endpoint'), credential_id: pinned};
+}
+let routeIdentityModeSequence = 0;
+/// Each destination owns its identity decision, so a cloned destination gets a
+/// radio group of its own instead of sharing one group with every other editor.
+function ensureIdentityModeGroup(editor) {
+  const name = `route_identity_mode_${++routeIdentityModeSequence}`;
+  editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.name = name; });
+}
+function identityMode(editor) { return editor.querySelector('.route-identity-policy input:checked')?.value === 'pin' ? 'pin' : 'endpoint'; }
+function setIdentityMode(editor, mode) {
+  editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.checked = input.value === mode; });
+  renderDestinationIdentityState(editor);
 }
 /// An Endpoint type is usable only while the Extension providing it is enabled,
 /// which is exactly what the published Endpoint type catalog says.
 function endpointTypeUsable(apiType) { return endpointTypes.some(type => type.id === apiType); }
 function endpointModels(provider, endpointId) { return provider.discovered_models.filter(model => (provider.model_endpoints[model] || []).includes(endpointId)); }
+/// The share an identity takes inside its own priority group, because a group is a
+/// separate pool: a standby identity's percentage is not a slice of the group that
+/// carries traffic first.
 function identityShare(endpoint, credential) {
-  const total = enabledCredentials(endpoint).reduce((sum, item) => sum + item.weight, 0) || 1;
+  const priority = credential.priority || 1;
+  const total = enabledCredentials(endpoint).filter(item => (item.priority || 1) === priority).reduce((sum, item) => sum + item.weight, 0) || 1;
   return `${Math.round(credential.weight / total * 100)}%`;
+}
+/// Which group an identity belongs to, named only when the Endpoint separates its
+/// identities into more than one group; a single group is the whole Endpoint.
+function identityTier(endpoint, credential) {
+  const groups = identityGroups(endpoint);
+  if (groups.length < 2) return '';
+  const priority = credential.priority || 1;
+  return `Priority ${priority}${priority === groups[0].priority ? '' : ' standby'} · `;
 }
 function identityState(endpoint, credential) {
   if (!credential.enabled) return 'disabled';
@@ -1548,11 +1979,11 @@ function identityState(endpoint, credential) {
   return remaining ? `cooling down ${formatCooldown(remaining)}` : 'healthy';
 }
 function identityNoun(endpoint, count) {
-  const label = endpoint.credentials[0]?.kind_label || 'identity';
+  const label = endpoint.credentials[0]?.kind_label;
+  if (!label) return count === 1 ? 'identity' : 'identities';
   return count === 1 ? label : `${label}s`;
 }
 /// Identities that can serve right now: enabled, and not cooling down.
-function eligibleIdentities(endpoint) { return enabledCredentials(endpoint).filter(credential => !credential.cooldown_seconds_remaining); }
 function coolingIdentities(endpoint) { return enabledCredentials(endpoint).filter(credential => credential.cooldown_seconds_remaining); }
 function renderDestination(editor, wanted = {}) {
   const providerPicker = destinationPicker(editor, 'provider');
@@ -1589,52 +2020,45 @@ function renderDestination(editor, wanted = {}) {
   updateDestinationModels(editor);
   updateDestinationEffect(editor);
 }
+/// Which identity sends the request is a choice between two different guarantees,
+/// so the editor asks for that decision directly instead of presenting every value
+/// — including "the Endpoint decides" — as one list of identities.
 function renderDestinationIdentities(editor, wanted = null) {
   const picker = destinationPicker(editor, 'identity');
   const endpoint = destinationEndpoint(editor);
-  if (!endpoint) {
+  if (!endpoint || !endpointTypeUsable(endpoint.api_type)) {
     picker.setDisabled(true);
-    picker.placeholder = 'Choose an Endpoint first';
+    picker.placeholder = endpoint ? 'Unavailable until its Extension is enabled' : 'Choose an Endpoint first';
     picker.setOptions([], null);
+    renderDestinationIdentityState(editor);
     return;
   }
-  if (!endpointTypeUsable(endpoint.api_type)) {
-    picker.setDisabled(true);
-    picker.placeholder = 'Unavailable until its Extension is enabled';
-    picker.setOptions([], null);
-    return;
-  }
-  picker.setDisabled(false);
-  picker.placeholder = 'No identity';
-  if (!endpoint.requires_credential) {
-    picker.setOptions([{label: 'Identity', options: [{value: '', title: 'No identity needed', meta: 'This Endpoint sends requests without one'}]}], null);
-    return;
-  }
-  const eligible = eligibleIdentities(endpoint);
-  const cooling = coolingIdentities(endpoint);
-  const automatic = {
-    value: '',
-    title: 'Endpoint policy',
-    trigger: eligible.length ? `Endpoint policy · ${eligible.length} rotating` : 'Endpoint policy',
-    meta: eligible.length
-      ? `rotates ${eligible.length} eligible ${identityNoun(endpoint, eligible.length)} by weight${cooling.length ? `, ${cooling.length} cooling down now` : ''}`
-      : enabledCredentials(endpoint).length ? 'every identity is cooling down right now' : 'no enabled identity yet',
-  };
-  picker.setOptions([
-    {label: 'Automatic', options: [automatic]},
-    {
-      label: 'Pin exactly one identity',
-      options: endpoint.credentials.map(credential => ({
-        value: credential.id,
-        title: credential.name,
-        trigger: credential.name,
-        meta: credential.enabled
-          ? `${identityShare(endpoint, credential)} · ${identityState(endpoint, credential)}`
-          : 'disabled · excluded from rotation',
-        disabled: !credential.enabled,
-      })),
-    },
-  ], wanted ?? picker.value);
+  picker.placeholder = 'No identity to pin';
+  picker.setDisabled(!endpoint.credentials.length);
+  picker.setOptions(endpoint.credentials.length ? [{
+    label: 'Identities',
+    options: endpoint.credentials.map(credential => ({
+      value: credential.id,
+      title: credential.name,
+      trigger: credential.name,
+      meta: credential.enabled
+        ? `${identityTier(endpoint, credential)}${identityShare(endpoint, credential)} · ${identityState(endpoint, credential)}`
+        : 'disabled · excluded from rotation',
+      disabled: !credential.enabled && credential.id !== wanted,
+    })),
+  }] : [], wanted ?? null);
+  renderDestinationIdentityState(editor);
+}
+/// The identity fields only exist while the Endpoint needs an identity, and the
+/// pinned list only while the administrator actually pins one.
+function renderDestinationIdentityState(editor) {
+  const endpoint = destinationEndpoint(editor);
+  const needingIdentity = Boolean(endpoint?.requires_credential) && endpointTypeUsable(endpoint?.api_type);
+  const pinning = needingIdentity && identityMode(editor) === 'pin';
+  editor.querySelector('.route-identity-policy').hidden = !needingIdentity;
+  editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.checked = input.value === (pinning ? 'pin' : 'endpoint'); });
+  editor.querySelector('.route-identity-step').hidden = !pinning;
+  updateDestinationEffect(editor);
 }
 function updateDestinationEffect(editor) {
   const effect = editor.querySelector('.route-destination-effect');
@@ -1642,29 +2066,58 @@ function updateDestinationEffect(editor) {
   const endpoint = destinationEndpoint(editor);
   const {credential_id: pinned} = destinationTarget(editor);
   if (!provider || !endpoint) { effect.dataset.tone = 'warn'; effect.textContent = 'Choose a Provider and one of its Endpoints for this destination.'; return; }
-  const where = `${provider.id}/${endpoint.id}`;
   if (!endpointTypeUsable(endpoint.api_type)) {
     effect.dataset.tone = 'warn';
     effect.textContent = `Endpoint type “${endpoint.endpoint_type_label || endpointTypeLabel(endpoint.api_type)}” is unavailable because its Extension is not enabled; choose another Endpoint before saving.`;
     return;
   }
+  // The pickers above already name the destination, so this line states only what
+  // the choice means for traffic instead of repeating Provider and Endpoint.
   if (!endpoint.requires_credential) {
     effect.dataset.tone = 'info';
-    effect.textContent = `Sends every matching request to ${where}, which needs no identity.`;
+    effect.textContent = 'Needs no identity; every matching request goes to this Endpoint as configured.';
     return;
   }
-  if (pinned) {
+  if (identityMode(editor) === 'pin') {
     const credential = endpoint.credentials.find(item => item.id === pinned);
+    if (!credential) { effect.dataset.tone = 'warn'; effect.textContent = 'Choose the identity this route must use, or let the Endpoint choose.'; return; }
+    // A stored pin stays the choice even after its identity is disabled, so the line
+    // says why the route cannot be served instead of showing another identity.
+    if (!credential.enabled) {
+      effect.dataset.tone = 'warn';
+      effect.textContent = `Pins ${credential.name}, which is disabled: this route cannot be served until that identity is enabled again.`;
+      return;
+    }
     effect.dataset.tone = 'pin';
-    effect.textContent = `Pins ${credential?.name || pinned} on ${where}: every matching request uses that identity, even while it is cooling down, and the Endpoint's other identities are never used for this route.`;
+    effect.textContent = `Pins ${credential.name}: used exactly as configured, even while it is cooling down; this Endpoint's other identities are never used for this route.`;
     return;
   }
   const enabled = enabledCredentials(endpoint);
+  const groups = identityGroups(endpoint);
   const cooling = coolingIdentities(endpoint);
-  effect.dataset.tone = enabled.length ? 'info' : 'warn';
-  effect.textContent = enabled.length
-    ? `Sends every matching request to ${where} and rotates between its ${enabled.length} enabled ${identityNoun(endpoint, enabled.length)} by weight; an identity that hits the Provider's rate limit drops out until its cooldown ends.${cooling.length ? ` ${cooling.length} of them ${cooling.length === 1 ? 'is' : 'are'} cooling down right now, so requests go to the others.` : ''}`
-    : `Sends every matching request to ${where}, which has no enabled identity, so requests fail until one is added.`;
+  const eligible = enabled.length - cooling.length;
+  effect.dataset.tone = eligible ? 'info' : 'warn';
+  // A destination that cannot carry traffic at all is a warning, and the sentence
+  // is only written when the claim it makes is true.
+  if (!enabled.length) effect.textContent = 'This Endpoint has no enabled identity, so requests fail until one is added.';
+  else {
+    // A rate limit only removes an identity from the rotation while the Endpoint
+    // configures a cooldown; without that policy it keeps receiving its share.
+    const rateLimit = (endpoint.rate_limit_cooldown?.seconds || 0) > 0
+      ? 'an identity that hits the Provider rate limit drops out of the rotation until its cooldown ends'
+      : 'this Endpoint does not track rate limits, so an identity that hits the Provider rate limit keeps receiving its share';
+    const rotation = groups.length > 1
+      ? `Uses Priority ${groups[0].priority} first and only falls back to Priority ${groups[1].priority} while every identity above it is cooling down`
+      : enabled.length === 1
+        ? `Uses its only enabled ${identityNoun(endpoint, 1)} for every matching request`
+        : `Rotates between its ${enabled.length} enabled ${identityNoun(endpoint, enabled.length)} by weight`;
+    // Every identity cooling down still sends the request, so this cannot claim
+    // that requests fail while one remains configured.
+    const state = !cooling.length ? ''
+      : eligible ? ` ${cooling.length} ${cooling.length === 1 ? 'is' : 'are'} cooling down right now, so requests go to the others.`
+      : ' Every enabled identity is cooling down right now; requests still go out with one of them and return the Provider’s own answer until a cooldown ends.';
+    effect.textContent = `${rotation}; ${rateLimit}.${state}`;
+  }
 }
 function updateDestinationModels(editor) {
   const input = editor.querySelector('.upstream-model-input');
@@ -1679,25 +2132,16 @@ function updateDestinationModels(editor) {
   input.setAttribute('list', list.id);
   input.dataset.suggestions = JSON.stringify(models);
   input.placeholder = models[0] ? `e.g. ${models[0]}` : 'e.g. model-name or org/model-name';
-  const chips = editor.querySelector('.route-model-chips');
-  // The model IDs this Endpoint reports belong to the Endpoint, so they are
-  // offered as one-click choices next to the field that accepts them.
-  chips.replaceChildren(...models.slice(0, 8).map(model => {
-    const chip = document.createElement('button');
-    chip.type = 'button'; chip.className = 'route-model-chip'; chip.textContent = model;
-    chip.addEventListener('click', () => { input.value = model; updateDestinationNotice(editor); });
-    return chip;
-  }));
-  chips.hidden = !models.length;
   updateDestinationNotice(editor);
 }
 function updateDestinationNotice(editor) {
   const input = editor.querySelector('.upstream-model-input');
   const notice = editor.querySelector('.upstream-model-notice');
   const models = JSON.parse(input.dataset.suggestions || '[]');
-  if (!models.length) notice.textContent = 'No models reported for this Endpoint yet. A custom model ID is still accepted.';
-  else if (input.value.trim() && !models.includes(input.value.trim())) notice.textContent = 'Custom model ID — not reported by this Endpoint. It will still be saved.';
-  else notice.textContent = `${models.length} model${models.length === 1 ? '' : 's'} reported by this Endpoint; a custom ID is also accepted.`;
+  const typed = input.value.trim();
+  if (!models.length) notice.textContent = 'No models reported for this Endpoint yet; a custom ID is still accepted.';
+  else if (typed && !models.includes(typed)) notice.textContent = 'Custom model ID — not reported by this Endpoint. It will still be saved.';
+  else notice.textContent = '';
 }
 function routeTargetEditors() { return $$('#route-targets .route-target-editor'); }
 function distributeRouteShares(weights) {
@@ -1738,7 +2182,13 @@ function validateRouteSplit() {
   totalLabel.textContent = `${total}%`;
   totalLabel.classList.toggle('invalid', multiple && !validTotal);
   totalLabel.setAttribute('aria-label', multiple && !validTotal ? `Invalid traffic total: ${total}%` : `Traffic total: ${total}%`);
-  const hasDestinations = editors.every(editor => Boolean(destinationValue(editor, 'endpoint')) && Boolean(destinationValue(editor, 'provider')));
+  // A pinned destination is incomplete until it names the identity it must use;
+  // without one, saving would silently fall back to the Endpoint's own choice.
+  const hasDestinations = editors.every(editor => {
+    if (!destinationValue(editor, 'provider') || !destinationValue(editor, 'endpoint')) return false;
+    const endpoint = destinationEndpoint(editor);
+    return identityMode(editor) !== 'pin' || !endpoint?.requires_credential || Boolean(destinationValue(editor, 'identity'));
+  });
   $('#save-route').disabled = !hasDestinations || (multiple && !validTotal);
 }
 function updateRouteTargetMode(rebalance = false) {
@@ -1765,9 +2215,17 @@ function updateRouteTargetMode(rebalance = false) {
   validateRouteSplit();
 }
 function initializeRouteTarget(editor, target = null) {
+  // Each editor owns its identity decision, so the radios never share a group with
+  // another destination in the same route.
+  ensureIdentityModeGroup(editor);
   renderDestination(editor, target
     ? {providerId: target.provider_id, endpointId: target.endpoint_id, credentialId: target.credential_id || ''}
     : {});
+  // The identity decision is applied after the destination exists, because it is
+  // read against the chosen Endpoint: deciding first would let the empty
+  // destination reset a stored pin to the Endpoint's own choice, and the route
+  // would silently lose the identity it was configured with.
+  setIdentityMode(editor, target?.credential_id ? 'pin' : 'endpoint');
   const input = editor.querySelector('.upstream-model-input');
   if (target?.upstream_model) input.value = target.upstream_model;
   const enabled = target ? target.enabled !== false && target.weight > 0 : true;
@@ -1779,12 +2237,22 @@ function initializeRouteTarget(editor, target = null) {
   destinationPicker(editor, 'provider').onChange = value => renderDestination(editor, {providerId: value});
   destinationPicker(editor, 'endpoint').onChange = value => renderDestination(editor, {providerId: destinationValue(editor, 'provider'), endpointId: value});
   destinationPicker(editor, 'identity').onChange = () => updateDestinationEffect(editor);
+  // Switching the identity decision reveals or hides the pinned list and rewrites
+  // the line that states what this destination promises.
+  editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.onchange = () => renderDestinationIdentityState(editor); });
   input.addEventListener('input', () => updateDestinationNotice(editor));
   updateDestinationNotice(editor);
 }
 function addRouteTargetEditor(target = null) {
   const template = $('#route-targets .route-target-editor');
   const editor = template.cloneNode(true);
+  // A clone arrives carrying the identity radios of the destination it was copied
+  // from, group name and checked state included. Once it joins the same form, the
+  // browser keeps only the newest selection in that shared radio group and clears
+  // the selection of the destination it was copied from, which then shows no chosen
+  // identity decision at all. The copy starts with nothing selected and takes its
+  // own group when it is initialized.
+  editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.checked = false; });
   editor.querySelector('[name="upstream_model"]').value = '';
   editor.querySelector('[name="target_weight"]').value = 100;
   editor.querySelector('[name="target_enabled"]').checked = true;
@@ -1812,6 +2280,7 @@ function openRouteDialog(route = null) {
 $('#models-view').addEventListener('click', event => {
   if (event.target.closest('#open-route, #empty-add-route')) openRouteDialog();
 });
+$('#route-search').addEventListener('input', renderRoutes);
 $('#add-route-target').addEventListener('click', () => { addRouteTargetEditor(); updateRouteTargetMode(true); });
 $('#route-targets').addEventListener('input', event => {
   if (event.target.matches('[name="target_weight"]')) {
@@ -1858,43 +2327,99 @@ function pinnedCredentialKind(endpoint, credentialId) {
   const credential = endpoint.credentials.find(item => item.id === credentialId);
   return credential?.kind_label || 'Identity';
 }
-/// One destination is one line: the Endpoint and the identity that will carry the
-/// traffic are the primary text, the model Yabane sends follows, and the share is a
-/// plain number instead of the largest element on the row.
+/// One destination is two lines: where the traffic goes (the Endpoint and the
+/// identity) and which model Yabane asks for there. Provider and Endpoint are
+/// resources and follow the console's resource path — sans-serif with the same `→`
+/// Activity uses — so the one shape reserved for model IDs, a monospace
+/// `provider/model`, can never be read as the destination.
 function routeTargetSummary(target, activeWeightTotal) {
   const provider = providers.find(item => item.id === target.provider_id);
   const endpoint = provider?.endpoints.find(item => item.id === target.endpoint_id);
   const enabled = target.enabled !== false && target.weight > 0;
   const share = enabled && activeWeightTotal > 0 ? Math.round(Number(target.weight) / activeWeightTotal * 100) : 0;
-  let identity;
-  if (!endpoint || !endpoint.requires_credential) {
+  const endpointRequiresIdentity = Boolean(endpoint && endpoint.requires_credential);
+  let identity, mark;
+  if (!endpoint) {
+    // A route can name a Provider and Endpoint that are no longer configured while it is
+    // being edited, so the row says which resource it points at instead of guessing.
+    identity = '<span class="route-identity is-policy" title="This destination names an Endpoint that is not configured">Unknown Endpoint</span>';
+  } else if (!endpointRequiresIdentity) {
     identity = '<span class="route-identity is-policy" title="This Endpoint sends requests without an identity">No identity</span>';
+    mark = 'exact';
   } else if (target.credential_id) {
     const credential = endpoint.credentials.find(item => item.id === target.credential_id);
-    identity = `<span class="route-identity" title="Pinned identity — used exactly as configured, even while it is cooling down">${escapeHtml(pinnedCredentialKind(endpoint, target.credential_id))} <strong>${escapeHtml(credential?.name || target.credential_id)}</strong><svg class="route-pin-mark" aria-hidden="true"><use href="#icon-lock"></use></svg></span>`;
+    identity = `<span class="route-identity" title="Pinned identity — used exactly as configured, even while it is cooling down">${escapeHtml(pinnedCredentialKind(endpoint, target.credential_id))} <strong>${escapeHtml(credential?.name || target.credential_id)}</strong></span>`;
+    mark = 'pinned';
   } else {
-    identity = `<span class="route-identity is-policy" title="Endpoint policy — rotates the Endpoint's eligible identities by weight and skips one that is cooling down">Endpoint policy · <strong>${enabledCredentials(endpoint).length} rotating</strong></span>`;
+    const groups = identityGroups(endpoint);
+    const rotating = groups[0].members.length;
+    const standby = groups.length - 1;
+    // A destination that keeps the Endpoint policy states the group that carries
+    // the traffic and, when the Endpoint separates them, that another group waits
+    // instead of presenting every identity as part of one rotation.
+    const policyTitle = standby
+      ? 'Endpoint policy — uses Priority 1 first, shares it by weight, and hands over to a standby group only while every identity above it is cooling down'
+      : 'Endpoint policy — rotates the Endpoint\'s eligible identities by weight and skips one that is cooling down';
+    identity = `<span class="route-identity is-policy" title="${policyTitle}">Endpoint policy${rotating > 1 ? ` · <strong>${rotating} rotating</strong>` : ''}${standby ? ` · <strong>${standby} standby ${standby === 1 ? 'group' : 'groups'}</strong>` : ''}</span>`;
   }
   const state = enabled ? 'Receives traffic' : 'Inactive, 0% share';
   const shareLabel = enabled ? `${share}%` : `${share}% <small>inactive</small>`;
+  // Pinning one identity and reaching an Endpoint that selects no identity are different
+  // guarantees and must not look alike: only a named identity is marked as pinned to
+  // exactly one, and an Endpoint that sends no identity is marked as used exactly as
+  // configured. The mark carries the claim, so its tooltip states the same consequence.
+  const note = mark === 'pinned'
+    ? 'pinned identity — used exactly as configured, even while it is cooling down'
+    : 'Endpoint used exactly as configured — no identity is selected on the caller\u2019s behalf';
+  const identityLine = mark
+    ? identity.replace('</span>', `<svg class="route-identity-mark is-${mark}" role="img" aria-label="${note}"><use href="#icon-lock"></use></svg></span>`)
+    : identity;
   return `<article class="route-destination${enabled ? '' : ' is-disabled'}" title="${state}">
-    <div class="route-destination-main"><span class="route-destination-route" title="Provider / Endpoint"><code>${escapeHtml(target.provider_id)}</code><b class="route-path-sep">/</b><code>${escapeHtml(target.endpoint_id)}</code></span><span class="route-sep" aria-hidden="true">·</span>${identity}<span class="route-sep" aria-hidden="true">·</span><span class="route-upstream" title="Provider model ID">→ <code>${escapeHtml(target.upstream_model)}</code></span></div>
+    <div class="route-destination-main"><div class="route-destination-where"><span class="route-destination-route" title="Provider and Endpoint that receive this traffic"><span class="route-provider-name">${escapeHtml(target.provider_id)}</span><b class="route-path-arrow">→</b><span class="route-endpoint-name">${escapeHtml(target.endpoint_id)}</span></span>${identityLine}</div><div class="route-destination-sends" title="Provider model ID — the model Yabane sends to this Endpoint"><span class="route-sends-label">Sends</span><code class="route-upstream-model">${escapeHtml(target.upstream_model)}</code></div></div>
     <span class="route-share" title="Share of this rule's traffic">${shareLabel}</span>
   </article>`;
 }
 
+/// An operator looks for a rule by the names they think in: the public pattern,
+/// the Provider and Endpoint it points at, the identity, and the model sent on.
+function routeSearchTokens() {
+  return ($('#route-search').value || '').toLowerCase().split(/\s+/).filter(Boolean);
+}
+function routeMatchesSearch(route, tokens) {
+  if (!tokens.length) return true;
+  const parts = [route.pattern, route.pattern.endsWith('*') ? 'prefix' : 'exact'];
+  route.targets.forEach(target => {
+    const provider = providers.find(item => item.id === target.provider_id);
+    const endpoint = provider?.endpoints.find(item => item.id === target.endpoint_id);
+    const credential = endpoint?.credentials.find(item => item.id === target.credential_id);
+    parts.push(target.provider_id, provider?.name || '', target.endpoint_id, target.upstream_model, target.credential_id || '', credential?.name || '');
+  });
+  const haystack = parts.join(' ').toLowerCase();
+  return tokens.every(token => haystack.includes(token));
+}
 function renderRoutes() {
-  $('#routes-empty').hidden = modelRoutes.length > 0; $('#routes-table').hidden = modelRoutes.length === 0;
-  $('#routes').replaceChildren(...modelRoutes.map((route, index) => {
+  const tokens = routeSearchTokens();
+  const visible = modelRoutes.map((route, index) => ({route, index})).filter(entry => routeMatchesSearch(entry.route, tokens));
+  $('#routes-empty').hidden = modelRoutes.length > 0;
+  $('#routes-table').hidden = modelRoutes.length === 0 || visible.length === 0;
+  $('#route-search-tools').hidden = modelRoutes.length === 0;
+  // The three-step guide teaches the task once; from the first rule on, the list
+  // itself is the page and permanent teaching copy is noise.
+  $('.routing-explainer').hidden = modelRoutes.length > 0;
+  const noMatch = $('#routes-no-match');
+  noMatch.hidden = tokens.length === 0 || visible.length > 0 || modelRoutes.length === 0;
+  if (!noMatch.hidden) noMatch.textContent = `No rules match “${$('#route-search').value.trim()}”.`;
+  $('#routes').replaceChildren(...visible.map(({route, index}) => {
     const row = document.createElement('tr');
     const activeWeightTotal = route.targets.filter(target => target.enabled !== false && target.weight > 0).reduce((total, target) => total + Number(target.weight || 0), 0);
     const destinations = route.targets.map(target => routeTargetSummary(target, activeWeightTotal)).join('');
     const activeDestinationCount = route.targets.filter(target => target.enabled !== false && target.weight > 0).length;
     const matchKind = route.pattern.endsWith('*') ? 'Prefix' : 'Exact';
-    const destinationSummary = route.targets.length === activeDestinationCount
-      ? `${route.targets.length} destination${route.targets.length === 1 ? '' : 's'}`
-      : `${route.targets.length} destinations · ${activeDestinationCount} active`;
-    row.innerHTML = `<td class="route-model-cell"><div class="route-model-heading"><code>${escapeHtml(route.pattern)}</code><span class="route-match-kind">${matchKind}</span></div><small>${destinationSummary}</small></td><td><div class="route-destinations">${destinations}</div></td><td><div class="route-row-actions"><button class="edit-route text-link" data-index="${index}">Edit</button><button class="delete-route text-link danger-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></div></td>`;
+    // One destination is the normal case, so only a split states its count.
+    const destinationSummary = route.targets.length > 1
+      ? (route.targets.length === activeDestinationCount ? `${route.targets.length} destinations` : `${route.targets.length} destinations · ${activeDestinationCount} active`)
+      : '';
+    row.innerHTML = `<td class="route-model-cell"><div class="route-model-heading"><code>${escapeHtml(route.pattern)}</code><span class="route-match-kind">${matchKind}</span></div>${destinationSummary ? `<small>${destinationSummary}</small>` : ''}</td><td><div class="route-destinations">${destinations}</div></td><td><div class="route-row-actions"><button class="edit-route text-link" data-index="${index}">Edit</button><button class="delete-route text-link danger-link" data-pattern="${encodeURIComponent(route.pattern)}">Delete</button></div></td>`;
     return row;
   }));
   $$('.edit-route').forEach(button => button.addEventListener('click', () => openRouteDialog(modelRoutes[Number(button.dataset.index)])));
@@ -2167,7 +2692,8 @@ document.addEventListener('click', event => { if (!event.target.closest('.search
 
 function copyIcon() { return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="10" height="10" rx="2"></rect><path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"></path></svg>'; }
 
-async function showApiError(response, target) { const body = await response.json(); const message = body.error?.message || `Request failed (${response.status})`; if (target) target.textContent = message; else alert(message); }
+async function apiErrorMessage(response) { const body = await response.json().catch(() => null); return body?.error?.message || `Request failed (${response.status})`; }
+async function showApiError(response, target) { const message = await apiErrorMessage(response); if (target) target.textContent = message; else alert(message); }
 function compactNumber(value) { return Intl.NumberFormat('en', {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); }
 function formatCost(value) {
   if (value == null) return '—';
@@ -2516,6 +3042,23 @@ function protocolLabel(protocol) {
     anthropic_messages: 'Anthropic Messages',
   }[protocol] || 'Unknown';
 }
+/// The credential that carried a request is recorded as a stable ID plus the
+/// name it had at the time. The console names it the way the instance that
+/// carried the request did: this instance resolves its own records against the
+/// Endpoint that holds the ID now, so a rename reads here exactly as it does in
+/// the Providers page, while an imported record keeps the name recorded with it
+/// so an identity that only exists on the source instance cannot borrow a local
+/// name. Only an identity with neither name is shown as its bare stable ID, with
+/// the reason stated next to it.
+function activityCarryingCredential(log) {
+  const configured = !log.source_instance_id
+    && providers.find(provider => provider.id === log.provider)?.endpoints
+      .find(endpoint => endpoint.id === log.endpoint)?.credentials
+      .find(credential => credential.id === log.upstream_credential_id);
+  if (configured) return {name: configured.name, note: ''};
+  if (log.upstream_credential_name) return {name: log.upstream_credential_name, note: log.source_instance_id ? '' : 'no longer configured'};
+  return {name: log.upstream_credential_id, note: log.source_instance_id ? 'recorded by another instance without a name' : 'no matching credential is configured now'};
+}
 function openActivityDetail(log) {
   const dialog = $('#activity-detail-dialog'); const firstByte = log.first_byte_ms; const total = log.latency_ms; const gateway = log.gateway_ms; const upstreamHeaders = log.upstream_response_ms; const headersAt = gateway == null || upstreamHeaders == null ? null : gateway + upstreamHeaders; const generation = log.generation_ms ?? (firstByte == null ? null : Math.max(total - firstByte, 0));
   $('#activity-detail-model').textContent = log.model; $('#activity-detail-time').textContent = new Date(log.timestamp * 1000).toLocaleString(); $('#activity-detail-status').innerHTML = statusBadge(log.status);
@@ -2527,7 +3070,9 @@ function openActivityDetail(log) {
   modelOutcome.className = `activity-model-outcome ${!log.upstream_model ? 'unavailable' : modelUnchanged ? 'unchanged' : 'changed'}`;
   const clientProtocol = protocolLabel(log.caller_protocol); const providerProtocol = protocolLabel(log.upstream_protocol); const protocolUnchanged = log.caller_protocol && log.caller_protocol === log.upstream_protocol;
   $('#activity-detail-api-route').innerHTML = `<div><span>Client API</span><strong>${escapeHtml(clientProtocol)}</strong><small>Format received by Yabane</small></div><div><span>Provider API</span><strong>${escapeHtml(providerProtocol)}</strong><small class="activity-routing-result ${protocolUnchanged ? 'unchanged' : ''}">${protocolUnchanged ? 'No API conversion' : log.upstream_protocol ? 'Converted by Yabane' : 'Not recorded'}</small></div>`;
-  $('#activity-detail-destination').innerHTML = `<div><span>Provider</span><code>${escapeHtml(log.provider)}</code><small>Configured Provider</small></div><div><span>Endpoint</span><code>${escapeHtml(log.endpoint)}</code><small>Selected connection</small></div>${log.upstream_credential_id ? `<div><span>Credential</span><code>${escapeHtml(log.upstream_credential_id)}</code><small>Identity that carried the request</small></div>` : ''}`;
+  const credential = log.upstream_credential_id ? activityCarryingCredential(log) : null;
+  const credentialOutcome = log.credential_cooling ? 'Carried the request while cooling down · no eligible identity was left' : 'Identity that carried the request';
+  $('#activity-detail-destination').innerHTML = `<div><span>Provider</span><code>${escapeHtml(log.provider)}</code><small>Configured Provider</small></div><div><span>Endpoint</span><code>${escapeHtml(log.endpoint)}</code><small>Selected connection</small></div>${credential ? `<div><span>Credential</span><code>${escapeHtml(credential.name)}</code><small>${escapeHtml(credential.note ? `${credentialOutcome} · ${credential.note}` : credentialOutcome)}</small></div>` : ''}`;
   const failure = $('#activity-detail-failure'); const failureMessage = log.failure?.message; const failureCategory = log.failure?.category; failure.hidden = !failureMessage; failure.querySelector('p').textContent = failureMessage || ''; failure.querySelector('small').textContent = failureCategory === 'proxy_connect_failed' ? 'Check that the proxy is reachable. If HTTPS works with socks5h but not socks5, let the proxy resolve target hostnames.' : 'Use the request ID below to match this failure with server logs if more detail is needed.';
   const stages = [];
   if (gateway != null) stages.push({label: 'Gateway processing', detail: 'Route and prepare request', start: 0, duration: gateway, color: '#0b57d0', icon: 'route'});
@@ -2881,8 +3426,11 @@ $$('.copy-extension-command').forEach(button => button.addEventListener('click',
   setTimeout(() => { button.textContent = original; }, 1200);
 }));
 
-const extensionHookNames = {upstream_request: 'Provider request', upstream_headers: 'Provider headers', upstream_exchange: 'Provider exchange'};
-function extensionHookLabel(hook) { return extensionHookNames[hook] || hook.replaceAll('_', ' '); }
+// Every Hook stage a card can print is named the way the Provider side names it. The
+// stable Hook IDs stay in the Extension API, so an unknown stage keeps the Provider
+// framing and is spelled out in words instead of leaking its underscored ID.
+const extensionHookNames = {upstream_request: 'Provider request', upstream_headers: 'Provider headers', upstream_exchange: 'Provider exchange', provider_endpoint: 'Provider Endpoint'};
+function extensionHookLabel(hook) { return extensionHookNames[hook] || `Provider ${hook.replaceAll('_', ' ').toLowerCase()}`; }
 
 function renderExtensions() {
   const list = $('#extensions-list');
@@ -2958,7 +3506,7 @@ function renderTrafficCapture() {
   if (!trafficCaptureStatus) return;
   renderCaptureSelectors(); const config = trafficCaptureStatus.config; hydrateCaptureForm(config); const active = config.active && config.remaining > 0; const form = $('#capture-form');
   $('#capture-state').textContent = active ? 'Capture active' : 'Capture stopped'; $('#capture-active-summary').hidden = !active;
-  if (active) { $('#capture-active-title').textContent = `Capturing next ${config.remaining} matching request${config.remaining === 1 ? '' : 's'}`; $('#capture-active-detail').textContent = `${config.provider_id} / ${config.endpoint_id} · ${config.model || 'all models'} · stops ${new Date(config.expires_at * 1000).toLocaleString()}`; }
+  if (active) { $('#capture-active-title').textContent = `Capturing next ${config.remaining} matching request${config.remaining === 1 ? '' : 's'}`; $('#capture-active-detail').textContent = `${config.provider_id} → ${config.endpoint_id} · ${config.model || 'all models'} · stops ${new Date(config.expires_at * 1000).toLocaleString()}`; }
   [...form.elements].forEach(element => { element.disabled = active; }); form.querySelector('[type="submit"]').hidden = active; form.classList.toggle('capture-form-locked', active); renderCaptureScopeSummary();
   $('#stop-capture').hidden = !active; $('#capture-count').textContent = trafficCaptureStatus.retained; $('#capture-dropped').textContent = trafficCaptureStatus.dropped;
   $('#captures-empty').hidden = trafficCaptures.length > 0; $('#capture-list-head').hidden = trafficCaptures.length === 0; $('#delete-all-captures').disabled = !trafficCaptures.length;
@@ -3099,7 +3647,7 @@ async function copyCaptureText(button, text) {
 }
 async function openCaptureDetail(requestId) {
   const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(requestId)}`); if (!response.ok) return;
-  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} / ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} at the Provider`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
+  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} → ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} at the Provider`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
 }
 $('#captures-list').addEventListener('click', event => { const row = event.target.closest('[data-capture-id]'); if (row) openCaptureDetail(row.dataset.captureId); });
 $$('.capture-direction-tabs button').forEach(button => button.addEventListener('click', () => renderCaptureDetail(button.dataset.captureDirection)));

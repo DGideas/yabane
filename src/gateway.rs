@@ -16,7 +16,10 @@ use tracing::{error, warn};
 use crate::{
     activity::{ActivityStore, CostSource, RequestFailure, RequestLog},
     auth,
-    config::{ApiEndpoint, ApiType, AppState, Credential, Provider, RateLimitCooldown},
+    config::{
+        ApiEndpoint, ApiType, AppState, Credential, CredentialChoice, Provider, RateLimitCooldown,
+        RateLimitCooldownMode,
+    },
     endpoint_signin,
     error::{self, api_error},
     health, pricing,
@@ -134,11 +137,18 @@ async fn route_proxied(
         .ok()
         .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
         .unwrap_or(false);
-    let (provider, endpoint, credential, model, upstream_model, body) =
-        match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
-            Ok(resolved) => resolved,
-            Err(err) => return api_error(err.status, err.message),
-        };
+    let ResolvedRoute {
+        provider,
+        endpoint,
+        credential,
+        credential_cooling,
+        model,
+        upstream_model,
+        body,
+    } = match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
+        Ok(resolved) => resolved,
+        Err(err) => return api_error(err.status, err.message),
+    };
 
     let upstream_protocol = match state.extensions.endpoint_declaration(endpoint.api_type) {
         Some(declaration) => protocol_from_extension(declaration.upstream_protocol),
@@ -193,6 +203,7 @@ async fn route_proxied(
             provider,
             endpoint,
             credential,
+            credential_cooling,
             gateway_api_key,
             model,
             upstream_model,
@@ -212,17 +223,7 @@ async fn resolve_provider(
     body: &[u8],
     surface: ApiSurface,
     allowed_providers: Option<&[String]>,
-) -> Result<
-    (
-        Provider,
-        ApiEndpoint,
-        Option<Credential>,
-        String,
-        String,
-        Vec<u8>,
-    ),
-    RoutingError,
-> {
+) -> Result<ResolvedRoute, RoutingError> {
     let mut payload: serde_json::Value =
         serde_json::from_slice(body).map_err(|_| RoutingError {
             status: StatusCode::BAD_REQUEST,
@@ -325,12 +326,13 @@ async fn resolve_provider(
         status: StatusCode::BAD_REQUEST,
         message: format!("Provider '{provider_id}' has no endpoint for model '{upstream_model}'"),
     })?;
-    let credential = if !endpoint.requires_credential {
-        None
+    let (credential, credential_cooling) = if !endpoint.requires_credential {
+        (None, false)
     } else if let Some(target) = &route_target {
         if target.credential_id.is_empty() {
             // An omitted identity means the Endpoint owns credential selection.
-            select_endpoint_credential(state, endpoint, provider_id)?
+            let choice = select_endpoint_credential(state, endpoint, provider_id)?;
+            (Some(choice.credential), choice.all_exhausted)
         } else {
             let credential = endpoint
                 .credentials
@@ -347,18 +349,45 @@ async fn resolve_provider(
                 });
             }
             // A pinned identity is used as configured: it does not take part in
-            // cooldown avoidance, so an exhausted pin fails visibly.
-            Some(credential.clone())
+            // cooldown avoidance, so an exhausted pin fails visibly. Activity
+            // still records that the pin was exhausted when it served.
+            let cooling = state.credential_health.is_cooling(&health::credential_key(
+                provider_id,
+                &endpoint.id,
+                &credential.id,
+            ));
+            (Some(credential.clone()), cooling)
         }
     } else {
-        select_endpoint_credential(state, endpoint, provider_id)?
+        let choice = select_endpoint_credential(state, endpoint, provider_id)?;
+        (Some(choice.credential), choice.all_exhausted)
     };
 
     let endpoint = endpoint.clone();
     let upstream_model = upstream_model.to_owned();
     payload["model"] = serde_json::Value::String(upstream_model.clone());
     let body = serde_json::to_vec(&payload).expect("serialize validated request body");
-    Ok((provider, endpoint, credential, model, upstream_model, body))
+    Ok(ResolvedRoute {
+        provider,
+        endpoint,
+        credential,
+        credential_cooling,
+        model,
+        upstream_model,
+        body,
+    })
+}
+
+/// One request's route decision. `credential_cooling` is the exhaustion fact
+/// Activity records so a `429` stays explainable after the cooldown expires.
+struct ResolvedRoute {
+    provider: Provider,
+    endpoint: ApiEndpoint,
+    credential: Option<Credential>,
+    credential_cooling: bool,
+    model: String,
+    upstream_model: String,
+    body: Vec<u8>,
 }
 
 /// Applies the Endpoint's credential policy. Every usable credential that is not
@@ -368,7 +397,7 @@ fn select_endpoint_credential(
     state: &AppState,
     endpoint: &ApiEndpoint,
     provider_id: &str,
-) -> Result<Option<Credential>, RoutingError> {
+) -> Result<CredentialChoice, RoutingError> {
     match endpoint.select_credential(&state.credential_health, provider_id) {
         Some(choice) => {
             if choice.all_exhausted {
@@ -378,7 +407,7 @@ fn select_endpoint_credential(
                     "every credential is cooling down; serving the request from an exhausted identity"
                 );
             }
-            Ok(Some(choice.credential))
+            Ok(choice)
         }
         None => Err(RoutingError {
             status: StatusCode::CONFLICT,
@@ -409,6 +438,12 @@ struct ProxyActivity {
     endpoint: String,
     /// The identity the request actually left with, when the Endpoint uses one.
     credential_id: Option<String>,
+    /// That identity's name at the time, so Activity stays readable after the
+    /// credential is renamed or deleted. Display metadata only, never the
+    /// credential or the account behind it.
+    credential_name: Option<String>,
+    /// Whether that identity was exhausted when it carried the request.
+    credential_cooling: bool,
     pricing: Option<pricing::ResolvedPricing>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
@@ -490,6 +525,8 @@ impl ProxyActivity {
                 provider: self.provider.clone(),
                 endpoint: self.endpoint.clone(),
                 upstream_credential_id: self.credential_id.clone(),
+                upstream_credential_name: self.credential_name.clone(),
+                credential_cooling: self.credential_cooling,
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
                 upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
                 status: status.as_u16(),
@@ -536,6 +573,7 @@ struct ForwardRequest {
     provider: Provider,
     endpoint: ApiEndpoint,
     credential: Option<Credential>,
+    credential_cooling: bool,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     model: String,
     upstream_model: String,
@@ -553,6 +591,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         provider,
         endpoint,
         credential,
+        credential_cooling,
         gateway_api_key,
         model,
         upstream_model: resolved_upstream_model,
@@ -798,6 +837,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     upstream_credential_id: credential
                         .as_ref()
                         .map(|credential| credential.id.clone()),
+                    upstream_credential_name: credential
+                        .as_ref()
+                        .map(|credential| credential.name.clone()),
+                    credential_cooling,
                     caller_protocol: Some(caller_protocol.name().to_owned()),
                     upstream_protocol: Some(upstream_protocol.name().to_owned()),
                     status: StatusCode::BAD_GATEWAY.as_u16(),
@@ -827,16 +870,30 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     let response_headers = upstream_response.headers().clone();
     // The credential's own answer is the only evidence Yabane accepts that an
     // identity is exhausted, and only an explicitly configured policy turns it
-    // into a cooldown. The response itself stays untouched.
+    // into a cooldown. The response itself stays untouched, and a policy that
+    // relies on the Provider's own delay arms nothing when there is none.
     if status == StatusCode::TOO_MANY_REQUESTS
         && endpoint.rate_limit_cooldown.enabled()
         && let Some(credential) = &credential
     {
-        let duration = cooldown_duration(&endpoint.rate_limit_cooldown, &response_headers);
-        state.credential_health.cool_down(
-            health::credential_key(&provider.id, &endpoint.id, &credential.id),
-            duration,
-        );
+        let observed_at = crate::auth::now();
+        let endpoint_key = health::endpoint_key(&provider.id, &endpoint.id);
+        match cooldown_duration(&endpoint.rate_limit_cooldown, &response_headers) {
+            Some(duration) => {
+                state.credential_health.cool_down(
+                    health::credential_key(&provider.id, &endpoint.id, &credential.id),
+                    duration,
+                );
+                state.credential_health.record_cooldown_applied(
+                    endpoint_key,
+                    duration.as_secs(),
+                    observed_at,
+                );
+            }
+            None => state
+                .credential_health
+                .record_cooldown_skipped(endpoint_key, observed_at),
+        }
     }
     if !exchange_observers.is_empty() {
         let observed_response_headers = observed_headers(&response_headers);
@@ -865,6 +922,10 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         provider: provider.id.clone(),
         endpoint: endpoint.id.clone(),
         credential_id: credential.as_ref().map(|credential| credential.id.clone()),
+        credential_name: credential
+            .as_ref()
+            .map(|credential| credential.name.clone()),
+        credential_cooling,
         pricing: activity_pricing,
         gateway_api_key,
         caller_protocol,
@@ -1363,20 +1424,35 @@ fn apply_core_upstream_headers(
     }
 }
 
-/// Resolves how long a credential stays out of selection. The configured
-/// duration is authoritative; the Provider's `Retry-After` only replaces it when
-/// the policy explicitly honors it and the header carries an integer number of
-/// seconds.
-fn cooldown_duration(policy: &RateLimitCooldown, headers: &reqwest::header::HeaderMap) -> Duration {
-    if policy.honor_retry_after
-        && let Some(seconds) = headers
+/// Resolves how long a credential stays out of selection, or `None` when the
+/// policy arms nothing for this answer. The configured length is the ceiling in
+/// every mode, and the Provider's `Retry-After` only supplies a number when the
+/// policy chose a source that reads it and the header carries an integer number
+/// of seconds.
+fn cooldown_duration(
+    policy: &RateLimitCooldown,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    if !policy.enabled() {
+        return None;
+    }
+    let reported = || {
+        headers
             .get(header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
-    {
-        return Duration::from_secs(seconds.min(RateLimitCooldown::MAX_SECONDS));
+    };
+    // The configured length is the ceiling in every mode, so an identity can
+    // never stay out longer than the administrator accepted.
+    match policy.mode {
+        RateLimitCooldownMode::Fixed => Some(Duration::from_secs(policy.seconds)),
+        RateLimitCooldownMode::PreferProvider => Some(Duration::from_secs(
+            reported().unwrap_or(policy.seconds).min(policy.seconds),
+        )),
+        RateLimitCooldownMode::ProviderOnly => {
+            reported().map(|seconds| Duration::from_secs(seconds.min(policy.seconds)))
+        }
     }
-    Duration::from_secs(policy.seconds)
 }
 
 /// The refusal used whenever an Endpoint's Extension is not enabled. Core names
@@ -1666,7 +1742,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue};
     use reqwest::header;
 
-    use crate::config::RateLimitCooldown;
+    use crate::config::{RateLimitCooldown, RateLimitCooldownMode};
 
     #[cfg(feature = "extension-openai-subscription")]
     use super::provider_endpoint_base_url;
@@ -1677,25 +1753,51 @@ mod tests {
     };
 
     #[test]
-    fn cooldown_duration_uses_the_policy_and_only_integer_retry_after() {
-        let policy = |seconds, honor_retry_after| RateLimitCooldown {
-            seconds,
-            honor_retry_after,
-        };
+    fn cooldown_duration_reads_the_delay_source_and_only_integer_retry_after() {
+        let policy = |seconds, mode| RateLimitCooldown { seconds, mode };
         let mut headers = header::HeaderMap::new();
-        assert_eq!(
-            cooldown_duration(&policy(300, false), &headers),
-            Duration::from_secs(300)
-        );
+        let reported = Duration::from_secs(120);
+        let configured = Duration::from_secs(300);
 
+        // A fixed policy ignores anything the Provider reports.
+        assert_eq!(
+            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), &headers),
+            Some(configured)
+        );
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
         assert_eq!(
-            cooldown_duration(&policy(300, false), &headers),
-            Duration::from_secs(300)
+            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), &headers),
+            Some(configured)
+        );
+
+        // The Provider-first policy prefers the reported delay and falls back to
+        // the configured length, which is also the ceiling in both directions.
+        assert_eq!(
+            cooldown_duration(
+                &policy(300, RateLimitCooldownMode::PreferProvider),
+                &headers
+            ),
+            Some(reported)
         );
         assert_eq!(
-            cooldown_duration(&policy(300, true), &headers),
-            Duration::from_secs(120)
+            cooldown_duration(&policy(60, RateLimitCooldownMode::PreferProvider), &headers),
+            Some(Duration::from_secs(60))
+        );
+
+        // The Provider-only policy never invents a length for the Provider, so
+        // an unusable or absent delay arms nothing at all.
+        assert_eq!(
+            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &headers),
+            Some(reported)
+        );
+        assert_eq!(
+            cooldown_duration(&policy(60, RateLimitCooldownMode::ProviderOnly), &headers),
+            Some(Duration::from_secs(60))
+        );
+        let absent = header::HeaderMap::new();
+        assert_eq!(
+            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &absent),
+            None
         );
 
         // A Retry-After date is not an integer number of seconds.
@@ -1704,21 +1806,43 @@ mod tests {
             HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
         );
         assert_eq!(
-            cooldown_duration(&policy(300, true), &headers),
-            Duration::from_secs(300)
+            cooldown_duration(
+                &policy(300, RateLimitCooldownMode::PreferProvider),
+                &headers
+            ),
+            Some(configured)
+        );
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("not a delay"));
+        assert_eq!(
+            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &headers),
+            None
         );
 
-        // A Provider cannot extend a cooldown past the maximum.
+        // The configured length is the ceiling even when the Provider asks for
+        // longer, so a cooldown can never outlast what the administrator accepted.
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("999999999"));
         assert_eq!(
-            cooldown_duration(&policy(300, true), &headers),
-            Duration::from_secs(RateLimitCooldown::MAX_SECONDS)
+            cooldown_duration(
+                &policy(300, RateLimitCooldownMode::PreferProvider),
+                &headers
+            ),
+            Some(configured)
+        );
+        assert_eq!(
+            cooldown_duration(
+                &policy(
+                    RateLimitCooldown::MAX_SECONDS,
+                    RateLimitCooldownMode::ProviderOnly
+                ),
+                &headers
+            ),
+            Some(Duration::from_secs(RateLimitCooldown::MAX_SECONDS))
         );
 
         // A policy of zero seconds disables the cooldown entirely.
         assert_eq!(
-            cooldown_duration(&policy(0, true), &header::HeaderMap::new()),
-            Duration::ZERO
+            cooldown_duration(&policy(0, RateLimitCooldownMode::PreferProvider), &absent),
+            None
         );
     }
 

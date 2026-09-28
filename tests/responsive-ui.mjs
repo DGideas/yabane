@@ -96,8 +96,9 @@ for (const project of projects) {
         endpoints: [{
           id: 'chatgpt', api_type: 'openai_codex', endpoint_type_label: 'OpenAI subscription', fixed_base_url: 'https://chatgpt.com/backend-api',
           sign_in: {device_code: true, browser: true}, base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
-          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, honor_retry_after: true},
-          credentials: [{id: 'account', name: 'OpenAI account', weight: 100, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, cooldown_seconds_remaining: 90}],
+          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, mode: 'prefer_provider'},
+          rate_limit_cooldown_activity: {applied: 3, skipped: 1, last_seconds: 120, last_applied_at: 1700000000, last_observed_at: 1700000600},
+          credentials: [{id: 'account', name: 'OpenAI account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, cooldown_seconds_remaining: 90}, {id: 'account-2', name: 'Second account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1}],
         }],
         discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
@@ -105,9 +106,38 @@ for (const project of projects) {
         id: 'ui-keyless', name: 'UI keyless fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
         endpoints: [{
           id: 'local', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
-          extra_headers: {}, extra_body: {}, requires_credential: false, credentials: [], rate_limit_cooldown: {seconds: 120, honor_retry_after: false},
+          extra_headers: {}, extra_body: {}, requires_credential: false, credentials: [], rate_limit_cooldown: {seconds: 120, mode: 'fixed'},
         }],
         discovered_models: ['local-model'], model_endpoints: {'local-model': ['local']}, model_endpoint_preferences: [],
+        models_discovered_at: 1, model_discovery_error: null,
+      }, {
+        id: 'ui-plain', name: 'UI plain fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+        endpoints: [{
+          id: 'main', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 0, mode: 'fixed'},
+          credentials: [{id: 'default', name: 'Default', weight: 100, enabled: true, kind: 'secret'}],
+        }],
+        discovered_models: ['plain-model'], model_endpoints: {'plain-model': ['main']}, model_endpoint_preferences: [],
+        models_discovered_at: 1, model_discovery_error: null,
+      }, {
+        id: 'ui-tiered', name: 'UI tiered fixture', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+        endpoints: [{
+          id: 'pool', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, mode: 'prefer_provider'},
+          rate_limit_cooldown_activity: {applied: 1, skipped: 0, last_seconds: 3600, last_applied_at: 1700000000, last_observed_at: 1700000600},
+          credentials: [
+            {id: 'primary', name: 'Primary account', weight: 100, priority: 1, enabled: true, kind: 'secret'},
+            {id: 'standby', name: 'Standby account', weight: 100, priority: 2, enabled: true, kind: 'secret'},
+          ],
+        }, {
+          id: 'open', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
+          extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 0, mode: 'fixed'},
+          credentials: [
+            {id: 'primary', name: 'Primary account', weight: 100, priority: 1, enabled: true, kind: 'secret'},
+            {id: 'standby', name: 'Standby account', weight: 100, priority: 2, enabled: true, kind: 'secret'},
+          ],
+        }],
+        discovered_models: ['tiered-model'], model_endpoints: {'tiered-model': ['pool', 'open']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
       });
       await route.fulfill({response, json: body});
@@ -121,7 +151,8 @@ for (const project of projects) {
       body.unshift({
         timestamp: Math.floor(Date.now() / 1000), request_id: `ui-unchanged-model-${project.name}`, source_instance_id: 'responsive-remote-instance',
         path: '/v1/responses', model: 'activity-only-model', upstream_model: 'activity-only-model',
-        provider: 'ui-subscription', endpoint: 'chatgpt', caller_protocol: 'openai_responses', upstream_protocol: 'openai_responses',
+        provider: 'ui-subscription', endpoint: 'chatgpt', upstream_credential_id: 'account', upstream_credential_name: 'OpenAI account', credential_cooling: true,
+        caller_protocol: 'openai_responses', upstream_protocol: 'openai_responses',
         status: 200, latency_ms: 110, gateway_ms: 4, upstream_response_ms: 18, first_byte_ms: 28, generation_ms: 82,
         input_tokens: 100, output_tokens: 30, cached_tokens: 10, cost: null, finish_reason: 'completed', streaming: false,
       }, {
@@ -137,6 +168,27 @@ for (const project of projects) {
         status: 200, latency_ms: 90, gateway_ms: 3, upstream_response_ms: 15, first_byte_ms: 20, generation_ms: 70,
         input_tokens: 1000, output_tokens: 100, cached_tokens: 0, cost: 0.0033, cost_source: 'estimated', finish_reason: 'end_turn', streaming: false,
         pricing_sources: {input: {scope: 'global', pattern: 'priced-alias', name: 'incoming'}, output: {scope: 'provider', pattern: 'alias-sent-two', name: 'outgoing'}},
+      }, {
+        timestamp: Math.floor(Date.now() / 1000) - 3, request_id: `ui-credential-name-${project.name}`,
+        path: '/v1/chat/completions', model: 'credential-name-fixture', upstream_model: 'credential-name-sent',
+        provider: 'ui-subscription', endpoint: 'chatgpt', upstream_credential_id: 'account-2',
+        caller_protocol: 'openai_chat_completions', upstream_protocol: 'openai_chat_completions',
+        status: 200, latency_ms: 70, gateway_ms: 3, upstream_response_ms: 12, first_byte_ms: 16, generation_ms: 54,
+        input_tokens: 10, output_tokens: 5, cached_tokens: 0, cost: null, finish_reason: 'stop', streaming: false,
+      }, {
+        timestamp: Math.floor(Date.now() / 1000) - 4, request_id: `ui-credential-remote-${project.name}`, source_instance_id: 'responsive-remote-instance',
+        path: '/v1/chat/completions', model: 'credential-remote-fixture', upstream_model: 'credential-remote-sent',
+        provider: 'ui-subscription', endpoint: 'chatgpt', upstream_credential_id: 'account', upstream_credential_name: 'Remote ChatGPT account',
+        caller_protocol: 'openai_chat_completions', upstream_protocol: 'openai_chat_completions',
+        status: 200, latency_ms: 70, gateway_ms: 3, upstream_response_ms: 12, first_byte_ms: 16, generation_ms: 54,
+        input_tokens: 10, output_tokens: 5, cached_tokens: 0, cost: null, finish_reason: 'stop', streaming: false,
+      }, {
+        timestamp: Math.floor(Date.now() / 1000) - 5, request_id: `ui-credential-unknown-${project.name}`,
+        path: '/v1/chat/completions', model: 'credential-unknown-fixture', upstream_model: 'credential-unknown-sent',
+        provider: 'ui-subscription', endpoint: 'chatgpt', upstream_credential_id: 'account-9',
+        caller_protocol: 'openai_chat_completions', upstream_protocol: 'openai_chat_completions',
+        status: 200, latency_ms: 70, gateway_ms: 3, upstream_response_ms: 12, first_byte_ms: 16, generation_ms: 54,
+        input_tokens: 10, output_tokens: 5, cached_tokens: 0, cost: null, finish_reason: 'stop', streaming: false,
       });
       await route.fulfill({response, json: body});
     });
@@ -297,7 +349,13 @@ for (const project of projects) {
     if (!(await requestDefaultsExtension.isVisible())) throw new Error(`${project.name}: Request Defaults is missing from Extensions`);
     const openAiSubscriptionExtension = page.locator('.extension-card').filter({hasText: 'openai-subscription'});
     if (!(await openAiSubscriptionExtension.isVisible()) || !(await openAiSubscriptionExtension.getByText('1 Endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension is missing or not linked to its Endpoint resources`);
-    if (!(await openAiSubscriptionExtension.getByText('provider endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension does not declare its Endpoint stage`);
+    if (!(await openAiSubscriptionExtension.getByText('Provider Endpoint', {exact: true}).isVisible())) throw new Error(`${project.name}: OpenAI Subscription Extension does not declare its Endpoint stage`);
+    // The Extension API keeps the stable Hook IDs; the console prints Provider-side
+    // words, so a card may never show an underscored or lower-cased stage ID.
+    const hookLabels = await page.locator('.extension-card .extension-facts span').evaluateAll(spans => spans.filter(span => span.querySelector('small')?.textContent.trim() === 'Hooks').map(span => span.querySelector('strong').textContent.trim()));
+    if (!hookLabels.length) throw new Error(`${project.name}: no Extension card declares its Hook stages`);
+    const strayLabel = hookLabels.find(label => !/^Provider( [A-Za-z][a-z]*)+( · Provider( [A-Za-z][a-z]*)+)*$/.test(label));
+    if (strayLabel) throw new Error(`${project.name}: an Extension card prints a Hook stage as ${JSON.stringify(strayLabel)} instead of Provider-side words`);
     if (project.name === 'desktop-chrome') {
       let disableWarning = '';
       page.once('dialog', async dialog => { disableWarning = dialog.message(); await dialog.dismiss(); });
@@ -615,9 +673,170 @@ for (const project of projects) {
     if (await cooldown.count() !== 1 || !(await cooldown.textContent()).includes('Cooling down')) throw new Error(`${project.name}: a cooling credential does not state that it is out of selection`);
     if (await cooldown.locator('.clear-cooldown').count() !== 1) throw new Error(`${project.name}: a cooling credential offers no explicit action that returns it to selection`);
     const endpointFacts = await page.locator('.endpoint-facts').first().textContent();
-    if (!endpointFacts.includes('Rate-limit cooldown') || !endpointFacts.includes('honors Retry-After')) throw new Error(`${project.name}: Endpoint facts do not state the configured rate-limit cooldown policy in readable units (${endpointFacts})`);
+    if (!endpointFacts.includes('Rate-limit cooldown') || !endpointFacts.includes('Provider delay first')) throw new Error(`${project.name}: Endpoint facts do not state the configured rate-limit cooldown policy and its delay source (${endpointFacts})`);
+    // The pool is stated as a mechanism rather than a policy field standing next
+    // to a percentage: how traffic rotates, what a Provider rate limit does to
+    // that rotation, and what is true right now.
+    if (await page.locator('.endpoint-pool').count() !== 1) throw new Error(`${project.name}: the Endpoint does not state its identity pool exactly once`);
+    const poolText = await page.locator('.endpoint-pool').textContent();
+    if (!poolText.includes('leaves the pool for the delay the Provider reports') || !poolText.includes('never longer than 1 hour')) throw new Error(`${project.name}: the identity pool does not state what a Provider rate limit does to the rotation (${poolText})`);
+    if (!poolText.includes('is out until') || !poolText.includes('carries every request')) throw new Error(`${project.name}: the identity pool does not state which identity is out now and who carries the traffic instead (${poolText})`);
+    // A policy whose length can come from the Provider may never fire, so the
+    // Endpoint states what it has actually done instead of only what it allows.
+    if (!poolText.includes('taken an identity out 3 times') || !poolText.includes('2 minutes') || !poolText.includes('reported no usable delay')) throw new Error(`${project.name}: the identity pool does not report what the cooldown policy has observed (${poolText})`);
+    const identityShares = await credential.locator('.traffic-share').allTextContents();
+    if (!identityShares.some(text => text.includes('0%') && text.includes('while cooling down'))) throw new Error(`${project.name}: a cooling identity keeps presenting its configured share as what it carries (${identityShares.join(' | ')})`);
+    if (!identityShares.some(text => text.includes('100%') && text.includes('normally 50%'))) throw new Error(`${project.name}: an identity carrying the whole pool does not state both the effective and the configured share (${identityShares.join(' | ')})`);
+    // Setting the split and setting the policy that changes what the split means
+    // are one mechanism, so each screen states the other half of it.
+    await credential.getByRole('button', {name: 'Distribute traffic'}).click();
+    await assertDialog(page, '#traffic-dialog', project.name);
+    const identityStates = await page.locator('#traffic-rows .identity-state').allTextContents();
+    if (!identityStates.some(text => text.includes('cooling down, resumes in')) || !identityStates.some(text => text.includes('healthy'))) throw new Error(`${project.name}: the traffic distribution dialog does not mark each identity's current state (${identityStates.join(' | ')})`);
+    const consequence = await page.locator('#traffic-consequence').textContent();
+    if (!consequence.includes('split exactly as configured') || !consequence.includes('never longer than 1 hour')) throw new Error(`${project.name}: the traffic distribution dialog does not state what a rate limit does to the configured percentages (${consequence})`);
+    if (!(await page.locator('#traffic-set-cooldown').isHidden())) throw new Error(`${project.name}: the traffic distribution dialog offers a cooldown shortcut while a cooldown policy is already configured`);
+    await page.locator('#traffic-dialog .close-traffic').first().click();
+    await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
+    // The policy states its consequence before saving, including the parts its two
+    // controls cannot: that the request which hit the limit still receives the
+    // Provider's own answer, and that Disabled changes nothing at all.
+    await page.locator('.endpoint-edit').first().click();
+    await assertDialog(page, '#endpoint-dialog', project.name);
+    // Connection settings and the rate-limit policy are separate tabs, so neither
+    // half of the dialog has to be scrolled past to reach the other.
+    const connectionTab = page.locator('#endpoint-form [data-endpoint-tab="connection"]');
+    const rateLimitsTab = page.locator('#endpoint-form [data-endpoint-tab="ratelimits"]');
+    if (await page.locator('#endpoint-form [data-endpoint-tab]').count() !== 2) throw new Error(`${project.name}: the Endpoint dialog does not present connection settings and rate limits as two tabs`);
+    if (await connectionTab.getAttribute('aria-selected') !== 'true' || !(await page.locator('#endpoint-panel-connection').isVisible())) throw new Error(`${project.name}: the Endpoint dialog does not open on the connection settings`);
+    if (await rateLimitsTab.getAttribute('aria-selected') !== 'false' || await page.locator('#endpoint-panel-ratelimits').isVisible()) throw new Error(`${project.name}: the Endpoint dialog opens with the rate-limit policy already shown`);
+    if (!await page.locator('#endpoint-panel-connection [name="id"]').isVisible()) throw new Error(`${project.name}: the connection tab does not hold the connection settings`);
+    if (project.width >= 1024 && await page.locator('#endpoint-dialog').evaluate(element => element.scrollHeight - element.clientHeight > 1)) throw new Error(`${project.name}: the connection settings alone do not fit the Endpoint dialog without scrolling`);
+    await rateLimitsTab.click();
+    if (await rateLimitsTab.getAttribute('aria-selected') !== 'true' || !(await page.locator('#endpoint-panel-ratelimits').isVisible()) || await page.locator('#endpoint-panel-connection').isVisible()) throw new Error(`${project.name}: choosing the rate-limit tab does not bring that policy forward`);
+    if (!await page.locator('#endpoint-panel-ratelimits [name="cooldown_duration"]').isVisible()) throw new Error(`${project.name}: the rate-limit tab does not hold the cooldown policy`);
+    if (project.width >= 1024 && await page.locator('#endpoint-dialog').evaluate(element => element.scrollHeight - element.clientHeight > 1)) throw new Error(`${project.name}: the rate-limit policy alone does not fit the Endpoint dialog without scrolling`);
+    const cooldownPreview = await page.locator('#cooldown-preview').textContent();
+    if (!cooldownPreview.includes('429 is returned unchanged') || !cooldownPreview.includes('No request is retried') || !cooldownPreview.includes('pinned identities')) throw new Error(`${project.name}: the illustration implies retry or bypass of a pinned identity (${cooldownPreview})`);
+    const enableCooldown = page.locator('.cooldown-enable .switch-label');
+    const enabledInput = page.getByRole('switch', {name: 'Cooldown after a 429'});
+    const fixedSource = page.getByLabel('Set a fixed duration', {exact: true});
+    const providerSource = page.getByLabel('Use the Provider’s wait time', {exact: true});
+    const durationSelect = page.locator('#endpoint-form [name="cooldown_duration"]');
+    const missingSelect = page.getByLabel('If no usable wait time is provided', {exact: true});
+    if (!await enabledInput.isChecked() || !await providerSource.isChecked() || await missingSelect.inputValue() !== 'fallback') throw new Error(`${project.name}: the preferred-Provider policy did not load into independent timing choices`);
+    if (await page.locator('.cooldown-policy input').count() !== 2 || await page.locator('#cooldown-flow svg').count() !== 1 || await durationSelect.locator('option[value="0"]').count()) throw new Error(`${project.name}: the editor mixes cooldown enablement with its timing policy`);
+    const selectedMode = () => page.locator('#endpoint-form [name="cooldown_mode"]').inputValue();
+    if (await selectedMode() !== 'prefer_provider') throw new Error(`${project.name}: stored cooldown mode was lost`);
+    const flowState = () => page.locator('#cooldown-flow').getAttribute('data-state');
+    if (await flowState() !== 'bypass' || !(await page.locator('#cooldown-flow-caption').textContent()).includes('rejoins automatically')) throw new Error(`${project.name}: the illustration does not explain later requests and automatic return`);
+    if (!(await page.locator('.flow-return').isVisible()) || !(await page.locator('.flow-others').isVisible())) throw new Error(`${project.name}: the illustrated alternate path or return is missing`);
+    if (!(await page.locator('#cooldown-flow header').textContent()).includes('Illustration · later requests')) throw new Error(`${project.name}: the cooldown illustration could be mistaken for live health`);
+    const durationHelp = await page.locator('#cooldown-duration-help').textContent();
+    if (!durationHelp.includes('Retry-After in whole seconds') || !durationHelp.includes('capped') || !(await missingSelect.locator('option:checked').textContent()).includes('1 hour')) throw new Error(`${project.name}: the Provider wait does not explain its cap and missing-wait duration`);
+    await missingSelect.selectOption('skip');
+    if (await selectedMode() !== 'provider_only' || await page.locator('#cooldown-duration-label').textContent() !== 'Maximum cooldown') throw new Error(`${project.name}: Provider-only policy does not separate its ceiling from skipping a missing delay`);
+    await fixedSource.check();
+    if (await selectedMode() !== 'fixed' || await missingSelect.isVisible() || !(await page.locator('#cooldown-duration-help').textContent()).includes('ignoring the Provider') || await page.locator('#cooldown-duration-label').textContent() !== 'Fixed cooldown') throw new Error(`${project.name}: fixed timing retains an irrelevant fallback choice or labels a maximum`);
+    await providerSource.check();
+    if (await missingSelect.inputValue() !== 'skip') throw new Error(`${project.name}: changing the timing source destroys the missing-wait choice`);
+    await durationSelect.selectOption('300');
+    if (!(await missingSelect.locator('option[value="fallback"]').textContent()).includes('5 minutes')) throw new Error(`${project.name}: fallback duration does not follow the chosen maximum`);
+    await enableCooldown.click();
+    if (await flowState() !== 'shared' || await page.locator('.flow-clock').isVisible() || await page.locator('.flow-return').isVisible()) throw new Error(`${project.name}: disabled cooldown still draws a paused identity`);
+    if (!(await page.locator('#cooldown-flow-caption').textContent()).includes('keeps its share') || !(await page.locator('#cooldown-enable-help').textContent()).includes('Cooldown is off')) throw new Error(`${project.name}: disabled cooldown does not explain unchanged selection`);
+    if (await durationSelect.isDisabled() || await providerSource.isDisabled() || await missingSelect.isDisabled()) throw new Error(`${project.name}: cooldown settings cannot be prepared while off`);
+    await enableCooldown.click();
+    if (await durationSelect.inputValue() !== '300' || await selectedMode() !== 'provider_only' || await missingSelect.inputValue() !== 'skip') throw new Error(`${project.name}: toggling cooldown loses unsaved choices`);
+    // Exercise real submit payloads as well as the form. A rejected fixture save
+    // also verifies that the policy tab is revealed when an API error belongs to it.
+    const policyUrl = `${base}/admin/providers/ui-subscription/endpoints/chatgpt`;
+    await page.route(policyUrl, route => route.fulfill({status: 400, contentType: 'application/json', body: JSON.stringify({error: {message: 'Rate-limit cooldown fixture rejection'}})}));
+    const assertPolicySave = async (seconds, mode) => {
+      await connectionTab.click();
+      const requestPromise = page.waitForRequest(request => request.url() === policyUrl && request.method() === 'PATCH');
+      await page.locator('#endpoint-form button[type="submit"]').click();
+      const payload = (await requestPromise).postDataJSON().rate_limit_cooldown;
+      await page.locator('#endpoint-panel-ratelimits').waitFor({state: 'visible'});
+      await page.locator('#endpoint-error').getByText('Rate-limit cooldown fixture rejection', {exact: true}).waitFor();
+      if (payload.seconds !== seconds || payload.mode !== mode || await rateLimitsTab.getAttribute('aria-selected') !== 'true') throw new Error(`${project.name}: cooldown save or error tab mismatch (${JSON.stringify(payload)})`);
+    };
+    await assertPolicySave(300, 'provider_only');
+    await missingSelect.selectOption('fallback');
+    await assertPolicySave(300, 'prefer_provider');
+    await fixedSource.check();
+    await assertPolicySave(300, 'fixed');
+    await enableCooldown.click();
+    await providerSource.check();
+    await missingSelect.selectOption('skip');
+    await assertPolicySave(0, 'provider_only');
+    // Every stored mode, including a disabled policy and non-shortcut duration,
+    // must survive opening and saving without reinterpretation.
+    for (const mode of ['fixed', 'prefer_provider', 'provider_only']) {
+      for (const seconds of [137, 0]) {
+        await page.locator('#endpoint-dialog .close-endpoint').first().click();
+        await page.evaluate(policy => { providers.find(provider => provider.id === 'ui-subscription').endpoints[0].rate_limit_cooldown = policy; }, {seconds, mode});
+        await page.locator('.endpoint-edit').first().click();
+        await rateLimitsTab.click();
+        if (await enabledInput.isChecked() !== (seconds > 0) || await selectedMode() !== mode || await fixedSource.isChecked() !== (mode === 'fixed')) throw new Error(`${project.name}: stored policy changed on open (${seconds}, ${mode})`);
+        if (mode !== 'fixed' && await missingSelect.inputValue() !== (mode === 'provider_only' ? 'skip' : 'fallback')) throw new Error(`${project.name}: stored missing-delay behavior was lost`);
+        if (seconds && await durationSelect.inputValue() !== String(seconds)) throw new Error(`${project.name}: custom duration was normalized on open`);
+        await assertPolicySave(seconds, mode);
+      }
+    }
+    await page.unroute(policyUrl);
+    await connectionTab.click();
+    const storedForm = await page.locator('#endpoint-form').evaluate(form => { const data = new FormData(form); return [data.get('cooldown_seconds'), data.get('cooldown_mode')]; });
+    if (storedForm.join(',') !== '0,provider_only') throw new Error(`${project.name}: hidden cooldown tab loses the disabled policy's chosen mode`);
+    if (await connectionTab.getAttribute('aria-selected') !== 'true' || !(await page.locator('#endpoint-panel-connection').isVisible())) throw new Error(`${project.name}: the connection tab cannot be returned to`);
+    if (await page.locator('.cooldown-policy').isVisible()) throw new Error(`${project.name}: the connection tab still shows the rate-limit policy`);
+    await page.locator('#endpoint-dialog .close-endpoint').first().click();
+    await page.locator('#endpoint-dialog').waitFor({state: 'hidden'});
     await page.locator('#back-to-providers').click();
     await page.locator('#provider-list-page').waitFor({state: 'visible'});
+    // An Endpoint that only ever sends as its single identity is not described as
+    // a pool, because there is no split to explain and no second identity to
+    // carry the traffic while the first is out.
+    const plainProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-plain/model-id'})});
+    if (await plainProvider.count()) {
+      await plainProvider.click();
+      const plainFacts = await page.locator('.endpoint-facts').first().textContent();
+      if (plainFacts.includes('Rate-limit cooldown')) throw new Error(`${project.name}: Endpoint facts state a rate-limit policy that is not configured (${plainFacts})`);
+      if (await page.locator('.endpoint-pool').count()) throw new Error(`${project.name}: an Endpoint with one identity and no cooldown policy is presented as an identity pool`);
+      await page.locator('.endpoint-edit').first().click();
+      await assertDialog(page, '#endpoint-dialog', project.name);
+      if (await page.locator('#endpoint-form [data-endpoint-tab="connection"]').getAttribute('aria-selected') !== 'true') throw new Error(`${project.name}: reopening the Endpoint dialog does not return to the connection settings`);
+      await assertEndpointFieldSpacing(page, project);
+      await page.locator('#endpoint-form [data-endpoint-tab="ratelimits"]').click();
+      if (await enabledInput.isChecked() || await page.locator('#endpoint-form [name="cooldown_seconds"]').inputValue() !== '0') throw new Error(`${project.name}: an Endpoint without a cooldown policy does not open switched off`);
+      if (!(await page.locator('#cooldown-enable-help').textContent()).includes('only when enabled')) throw new Error(`${project.name}: a disabled cooldown does not explain inactive settings`);
+      await enableCooldown.click();
+      if (await page.locator('#cooldown-flow').getAttribute('data-state') !== 'solo' || await page.locator('.flow-others').isVisible() || await page.locator('.flow-return').isVisible()) throw new Error(`${project.name}: the sole identity is incorrectly drawn as bypassable`);
+      if (!(await page.locator('#cooldown-flow-caption').textContent()).includes('Requests still go out')) throw new Error(`${project.name}: the sole identity fallback is unexplained`);
+      // A zero-share identity must not be counted as an alternate destination.
+      await page.evaluate(() => { const endpoint = providers.find(provider => provider.id === 'ui-plain').endpoints[0]; endpoint.credentials.push({...endpoint.credentials[0], id: 'zero-share', weight: 0}); });
+      await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      await page.locator('.endpoint-edit').first().click();
+      await page.locator('#endpoint-tab-ratelimits').click();
+      await enableCooldown.click();
+      if (await page.locator('#cooldown-flow').getAttribute('data-state') !== 'solo') throw new Error(`${project.name}: a zero-share identity is drawn as taking over traffic`);
+      await page.locator('#endpoint-tab-connection').click();
+      const plainEndpointId = await page.locator('#endpoint-form [name="id"]').inputValue();
+      await page.locator('#endpoint-form [name="id"]').fill('');
+      await page.locator('#endpoint-tab-ratelimits').click();
+      await page.locator('#endpoint-form button[type="submit"]').click();
+      if (await page.locator('#endpoint-tab-connection').getAttribute('aria-selected') !== 'true' || !(await page.locator('#endpoint-form [name="id"]').evaluate(input => input === document.activeElement))) throw new Error(`${project.name}: validation leaves a required field hidden on the other tab`);
+      await page.locator('#endpoint-form [name="id"]').fill(plainEndpointId);
+      await page.evaluate(() => { providers.find(provider => provider.id === 'ui-plain').endpoints[0].credentials.forEach(key => { key.weight = 0; }); });
+      await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      await page.locator('.endpoint-edit').first().click();
+      await page.locator('#endpoint-tab-ratelimits').click();
+      if (await page.locator('#cooldown-flow').getAttribute('data-state') !== 'empty' || !(await page.locator('#cooldown-flow-caption').textContent()).includes('Requests fail until')) throw new Error(`${project.name}: an Endpoint with no eligible identity is drawn as usable`);
+      await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      await page.locator('#endpoint-dialog').waitFor({state: 'hidden'});
+      await page.locator('#back-to-providers').click();
+      await page.locator('#provider-list-page').waitFor({state: 'visible'});
+    }
     // A cooldown duration that the console does not offer as a shortcut keeps its
     // exact configured value instead of being rewritten to a nearby option.
     const keylessProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-keyless/model-id'})});
@@ -625,11 +844,90 @@ for (const project of projects) {
       await keylessProvider.click();
       await page.locator('.endpoint-edit').first().click();
       await assertDialog(page, '#endpoint-dialog', project.name);
-      const cooldownSelect = page.locator('#endpoint-form [name="cooldown_seconds"]');
+      const cooldownSelect = page.locator('#endpoint-form [name="cooldown_duration"]');
       if (await cooldownSelect.inputValue() !== '120') throw new Error(`${project.name}: editing an Endpoint silently replaces a cooldown duration the console does not offer (${await cooldownSelect.inputValue()})`);
       if (!(await cooldownSelect.locator('option:checked').textContent()).includes('2 minutes')) throw new Error(`${project.name}: a custom cooldown duration is not labeled in readable units`);
       if (await page.locator('#endpoint-form [name="requires_credential"]').isChecked()) throw new Error(`${project.name}: keyless Endpoint does not keep its credential requirement unchecked`);
+      await page.locator('#endpoint-tab-ratelimits').click();
+      if (await page.locator('#cooldown-flow').getAttribute('data-state') !== 'direct' || await page.locator('.flow-primary').isVisible() || !(await page.locator('#cooldown-flow-caption').textContent()).includes('without credentials')) throw new Error(`${project.name}: keyless Endpoint invents an identity to pause`);
       await page.locator('#endpoint-dialog .close-endpoint').first().click();
+      await page.locator('#back-to-providers').click();
+      await page.locator('#provider-list-page').waitFor({state: 'visible'});
+    }
+    // Two accounts can be ordered instead of shared: the pool names the group that
+    // carries traffic, and each identity row says which group it belongs to.
+    const tieredProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-tiered/model-id'})});
+    if (await tieredProvider.count()) {
+      await tieredProvider.click();
+      const tieredCard = page.locator('.endpoint-card').first();
+      await tieredCard.locator('.endpoint-pool').waitFor({state: 'visible'});
+      const tieredPool = await tieredCard.locator('.endpoint-pool').textContent();
+      if (!tieredPool.includes('Traffic always uses Priority 1 first (Primary account)')) throw new Error(`${project.name}: a tiered pool does not state which group carries traffic (${tieredPool})`);
+      if (!tieredPool.includes('Priority 2 (Standby account) only carries it while every identity in the group above it is cooling down')) throw new Error(`${project.name}: a standby group is not stated as a standby (${tieredPool})`);
+      // The list itself says the numbers are read per group, so a standby row's
+      // 0% is not mistaken for a sharing mistake.
+      const tierCopy = await tieredCard.locator('.endpoint-keys-head p').first().textContent();
+      if (!tierCopy.includes('Each priority group splits its own traffic between the credentials in it')) throw new Error(`${project.name}: the credential list describes one split for a tiered Endpoint (${tierCopy})`);
+      const tiers = await tieredCard.locator('.credential-tier').allTextContents();
+      if (tiers.join('|') !== 'Priority 1 · first|Priority 2 · standby') throw new Error(`${project.name}: identity rows do not name their priority group (${tiers.join(' | ')})`);
+      const tierShares = await tieredCard.locator('.traffic-share').allTextContents();
+      if (!tierShares[0].includes('100%') || !tierShares[0].includes('of Priority 1 traffic')) throw new Error(`${project.name}: the group that carries traffic does not state its share (${tierShares.join(' | ')})`);
+      if (!tierShares[1].includes('0%') || !tierShares[1].includes('only while Priority 1 is out')) throw new Error(`${project.name}: a standby identity presents its configured share as traffic it carries (${tierShares.join(' | ')})`);
+      // The dialog that sets the split is also where a group is chosen, and every
+      // group totals 100 on its own because each one describes what happens while
+      // it is the group carrying the traffic.
+      await tieredCard.getByRole('button', {name: 'Distribute traffic'}).click();
+      await assertDialog(page, '#traffic-dialog', project.name);
+      await page.locator('#traffic-rows').waitFor({state: 'visible'});
+      const tierDescription = await page.locator('#traffic-description').textContent();
+      if (!tierDescription.includes('while its own priority group carries')) throw new Error(`${project.name}: the traffic dialog describes one split for a tiered Endpoint (${tierDescription})`);
+      const groupHeadings = await page.locator('.traffic-group-head strong').allTextContents();
+      if (groupHeadings.join('|') !== 'Priority 1 · carries traffic first|Priority 2 · standby') throw new Error(`${project.name}: the traffic dialog does not group identities by priority (${groupHeadings.join(' | ')})`);
+      const groupNotes = await page.locator('.traffic-group-head small').allTextContents();
+      if (!groupNotes[1].includes('Only used while every identity in Priority 1 is cooling down')) throw new Error(`${project.name}: a standby group does not say when it takes over (${groupNotes.join(' | ')})`);
+      if ((await page.locator('.traffic-group-total').allTextContents()).join('|') !== '100%|100%') throw new Error(`${project.name}: a group is not totalled on its own`);
+      const tierOptions = await page.locator('.traffic-tier').first().locator('option').allTextContents();
+      if (tierOptions.join('|') !== 'Priority 1 · first|Priority 2 · standby|Priority 3 · new standby') throw new Error(`${project.name}: the priority choices do not offer the existing groups and one more (${tierOptions.join(' | ')})`);
+      // Moving an identity between groups shares both groups out again, so a group
+      // never has to be repaired by hand after a move.
+      await page.locator('.traffic-tier').nth(1).selectOption('1');
+      if (await page.locator('.traffic-group').count() !== 1 || (await page.locator('#traffic-rows input[type="number"]').evaluateAll(inputs => inputs.map(input => input.value))).join(',') !== '50,50') throw new Error(`${project.name}: moving an identity into a group does not share that group out again`);
+      // A group that does not exist yet can be created from the same choice.
+      await page.locator('.traffic-tier').first().selectOption('2');
+      const splitNotes = await page.locator('.traffic-group-head small').allTextContents();
+      if (await page.locator('.traffic-group').count() !== 2 || (await page.locator('#traffic-rows input[type="number"]').evaluateAll(inputs => inputs.map(input => input.value))).join(',') !== '100,100') throw new Error(`${project.name}: creating a second group does not total each group at 100 (${splitNotes.join(' | ')})`);
+      // A group change is saved as the identity property it is, before the
+      // percentages that are read inside those groups, and a rejected distribution
+      // names the group that still has to be adjusted.
+      const savedPriorities = [];
+      let rejectTraffic = true;
+      await page.route(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`, async route => {
+        savedPriorities.push(route.request().postDataJSON());
+        await route.fulfill({status: 204, body: ''});
+      });
+      await page.route(`${base}/admin/providers/ui-tiered/endpoints/pool/traffic`, async route => {
+        if (!rejectTraffic) return route.fulfill({status: 204, body: ''});
+        await route.fulfill({status: 400, contentType: 'application/json', body: JSON.stringify({error: {message: 'Priority 1 traffic percentages must total 100 (currently 60)'}})});
+      });
+      await page.locator('#save-traffic').click();
+      await page.locator('#traffic-error').getByText('Priority 1 traffic percentages must total 100 (currently 60)').waitFor();
+      if (savedPriorities.length !== 2 || savedPriorities[0].priority !== 2 || savedPriorities[1].priority !== 1) throw new Error(`${project.name}: a group change is not saved as the identity's own priority (${JSON.stringify(savedPriorities)})`);
+      rejectTraffic = false;
+      await page.locator('#save-traffic').click();
+      await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
+      await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`);
+      await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/traffic`);
+      // A standby group that nothing can ever hand traffic to is a configuration to
+      // see, not a plan: without a cooldown policy no identity leaves its group.
+      const openCard = page.locator('.endpoint-card').nth(1);
+      const openPool = await openCard.locator('.endpoint-pool').textContent();
+      if (!openPool.includes('Priority 2 never takes over') || !openPool.includes('Set a rate-limit cooldown')) throw new Error(`${project.name}: a standby group behind a disabled cooldown is not stated as unreachable (${openPool})`);
+      await openCard.getByRole('button', {name: 'Distribute traffic'}).click();
+      const offNotes = await page.locator('.traffic-group-head small').allTextContents();
+      if (!offNotes[1].includes('Never used while rate limits are untracked')) throw new Error(`${project.name}: the traffic dialog presents an unreachable standby group as a plan (${offNotes.join(' | ')})`);
+      if (!(await page.locator('#traffic-consequence').textContent()).includes('nothing leaves the rotation while rate limits are untracked')) throw new Error(`${project.name}: the traffic dialog does not state that a standby group cannot take over without a cooldown policy`);
+      await page.locator('#traffic-dialog .close-traffic').first().click();
+      await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
       await page.locator('#back-to-providers').click();
       await page.locator('#provider-list-page').waitFor({state: 'visible'});
     }
@@ -688,11 +986,22 @@ for (const project of projects) {
       }
       await page.locator('.add-endpoint').click();
       await assertDialog(page, '#endpoint-dialog', project.name);
+      await assertEndpointFieldSpacing(page, project);
+      const credentialToggle = page.locator('#endpoint-panel-connection .checkbox-row');
+      if (!(await page.locator('#endpoint-form [name="requires_credential"]').isChecked())) await credentialToggle.click();
+      await credentialToggle.click();
+      await assertEndpointFieldSpacing(page, project);
+      if (await page.locator('#endpoint-form [name="credential_secret"]').isVisible()) throw new Error(`${project.name}: keyless setup leaves an empty credential field in the form`);
+      await credentialToggle.click();
+      await page.locator('#endpoint-form [name="credential_secret"]').waitFor({state: 'visible'});
+      // The generic reveal animation may still be changing this field's height.
+      await page.locator('#endpoint-form [name="credential_secret"]').click();
+      if (await page.locator('#endpoint-form [name="cooldown_enabled"]').isChecked() || await page.locator('#endpoint-form [name="cooldown_seconds"]').inputValue() !== '0') throw new Error(`${project.name}: a new Endpoint inherits the previous editor's enabled cooldown`);
       if (!(await page.locator('#endpoint-form [name="id"]').inputValue())) throw new Error(`${project.name}: additional endpoint ID is not suggested`);
       if (await page.locator('#endpoint-form .endpoint-id-permanent').isVisible()) throw new Error(`${project.name}: new Endpoint ID is incorrectly marked permanent before creation`);
       if (!(await page.locator('#endpoint-form .endpoint-id-required').isVisible())) throw new Error(`${project.name}: new Endpoint ID does not remain visibly required`);
       if (!(await page.locator('#endpoint-id-help').textContent()).includes('can be changed later')) throw new Error(`${project.name}: new Endpoint ID does not explain that it remains editable`);
-      const endpointFieldOrder = await page.locator('#endpoint-form .form-body > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('.field-label')?.childNodes[0]?.textContent.trim()));
+      const endpointFieldOrder = await page.locator('#endpoint-panel-connection > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('.field-label')?.childNodes[0]?.textContent.trim()));
       if (endpointFieldOrder.join('|') !== 'Endpoint ID|API type|Base URL') throw new Error(`${project.name}: additional Endpoint setup does not ask for API type before Base URL`);
       if (!(await page.locator('#endpoint-form [name="api_type"] option[value="acme_plan"]').count())) throw new Error(`${project.name}: the Endpoint dialog omits an Extension-declared Endpoint type`);
       await page.locator('#endpoint-form [name="api_type"]').selectOption('openai_codex');
@@ -722,7 +1031,7 @@ for (const project of projects) {
       const providerFixture = {
         id: 'ui-delete-provider', name: 'UI delete provider', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
         pricing: {updated_at: 1, models: {'ui-provider-price*': {input_per_million: 1, output_per_million: 2}}},
-        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, pricing: {updated_at: 1, models: {'ui-endpoint-price*': {output_per_million: 3}}}, requires_credential: true, credentials: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true, kind: 'secret'}], rate_limit_cooldown: {seconds: 0, honor_retry_after: false}}],
+        endpoints: [{id: 'deletable', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, pricing: {updated_at: 1, models: {'ui-endpoint-price*': {output_per_million: 3}}}, requires_credential: true, credentials: [{id: 'delete-key', name: 'Delete key', weight: 100, enabled: true, kind: 'secret'}], rate_limit_cooldown: {seconds: 0, mode: 'fixed'}}],
         discovered_models: [], model_endpoints: {}, model_endpoint_preferences: [], models_discovered_at: null, model_discovery_error: null,
       };
       const routeFixture = {pattern: 'ui-delete-route', targets: [{provider_id: providerFixture.id, endpoint_id: 'deletable', credential_id: 'delete-key', upstream_model: 'upstream-delete-model', weight: 100, enabled: true}]};
@@ -758,17 +1067,19 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('[data-view="models"]').click());
     const renderedRoute = page.locator('#routes .route-destination').first();
     if (await renderedRoute.count()) {
-      if (!(await renderedRoute.locator('.route-upstream').isVisible()) || !(await renderedRoute.locator('.route-share').isVisible())) throw new Error(`${project.name}: route destination does not show its Provider model and traffic share`);
+      if (!(await renderedRoute.locator('.route-destination-sends').isVisible()) || !(await renderedRoute.locator('.route-share').isVisible())) throw new Error(`${project.name}: route destination does not show its Provider model and traffic share`);
+      // Provider and Endpoint are resources: only model IDs may look like `provider/model`.
+      if (await renderedRoute.locator('.route-destination-route code').count()) throw new Error(`${project.name}: a route destination still writes Provider and Endpoint as a model-ID-shaped code path`);
       // The Endpoint and the identity carrying the traffic lead the row; the model Yabane
       // sends is secondary and the share stays small.
-      const identityFont = await renderedRoute.locator('.route-destination-route code').first().evaluate(node => parseFloat(getComputedStyle(node).fontSize));
-      const upstreamFont = await renderedRoute.locator('.route-upstream code').evaluate(node => parseFloat(getComputedStyle(node).fontSize));
+      const identityFont = await renderedRoute.locator('.route-endpoint-name').first().evaluate(node => parseFloat(getComputedStyle(node).fontSize));
+      const upstreamFont = await renderedRoute.locator('.route-upstream-model').evaluate(node => parseFloat(getComputedStyle(node).fontSize));
       const shareFont = await renderedRoute.locator('.route-share').evaluate(node => parseFloat(getComputedStyle(node).fontSize));
-      if (identityFont < upstreamFont || shareFont > identityFont) throw new Error(`${project.name}: destination hierarchy is inverted (endpoint ${identityFont}px, model ${upstreamFont}px, share ${shareFont}px)`);
+      if (identityFont <= upstreamFont || shareFont > identityFont) throw new Error(`${project.name}: destination hierarchy is inverted (endpoint ${identityFont}px, model ${upstreamFont}px, share ${shareFont}px)`);
       const destinationHeight = await renderedRoute.evaluate(node => Math.round(node.getBoundingClientRect().height));
-      // With enough width one destination is a single line; narrower viewports wrap the
-      // same content instead of overflowing, so only the cap differs.
-      const heightLimit = project.name === 'desktop-chrome' ? 56 : 110;
+      // Where the traffic goes and which model it asks for are two lines; narrower
+      // viewports wrap the same content instead of overflowing, so only the cap differs.
+      const heightLimit = project.name === 'desktop-chrome' ? 84 : 140;
       if (destinationHeight > heightLimit) throw new Error(`${project.name}: one destination takes ${destinationHeight}px instead of a compact row`);
       // Shares are adjusted often, so a 0% destination stays an ordinary visible row.
       const destinations = await page.evaluate(() => {
@@ -789,6 +1100,45 @@ for (const project of projects) {
         if (await page.locator('#routes .route-status').count()) throw new Error(`${project.name}: an inactive destination is marked with a shape instead of text`);
       }
       if (await page.locator('.route-legend').count()) throw new Error(`${project.name}: the routing list still carries a legend above the table`);
+      // Pinning one identity and pinning the Endpoint as a whole are different
+      // guarantees, so their marks must not be the same mark: a caller that reads a
+      // mark as "my traffic is pinned to this identity" must never be reading a
+      // destination that selects no identity at all. A destination that hands traffic to
+      // the Endpoint's own rotation or policy is neither, and stays unmarked.
+      const identityMarks = await page.evaluate(() => [...document.querySelectorAll('#routes .route-destination')].map(row => {
+        const identity = row.querySelector('.route-identity');
+        const text = (identity?.textContent || '').trim();
+        const policyLine = !!identity?.classList.contains('is-policy');
+        return {
+          text,
+          kind: policyLine ? (/^No identity/.test(text) ? 'no-identity' : 'policy') : 'named',
+          exact: !!row.querySelector('.route-identity-mark.is-exact'),
+          pinned: !!row.querySelector('.route-identity-mark.is-pinned'),
+        };
+      }));
+      const wrongMark = identityMarks.find(mark => mark.exact && mark.pinned)
+        || identityMarks.find(mark => mark.kind === 'no-identity' && !mark.exact)
+        || identityMarks.find(mark => mark.kind === 'named' && !mark.pinned)
+        || identityMarks.find(mark => mark.kind === 'policy' && (mark.exact || mark.pinned));
+      if (wrongMark) throw new Error(`${project.name}: a destination is marked for the wrong identity guarantee (${JSON.stringify(wrongMark)})`);
+      if (await page.locator('.routing-explainer').isVisible()) throw new Error(`${project.name}: the three-step routing guide stays above a populated rules list`);
+      // One destination is the normal case, so only a rule that splits traffic states its count.
+      const routeCounts = await page.locator('#routes tr').evaluateAll(rows => rows.map(row => ({destinations: row.querySelectorAll('.route-destination').length, summary: (row.querySelector('.route-model-cell small')?.textContent || '').trim()})));
+      if (routeCounts.some(row => row.destinations === 1 && row.summary)) throw new Error(`${project.name}: a single-destination rule states a destination count (${JSON.stringify(routeCounts)})`);
+      if (routeCounts.filter(row => row.destinations > 1).some(row => !row.summary.includes(`${row.destinations} destinations`))) throw new Error(`${project.name}: a rule that splits traffic does not state how many destinations it has (${JSON.stringify(routeCounts)})`);
+      // Rules are found by the names an operator thinks in, and a filter that
+      // hides everything has to say so instead of looking like an empty page.
+      const rulePatterns = () => page.locator('#routes .route-model-cell code').allTextContents();
+      const ruleCount = routeCounts.length;
+      const firstPattern = (await rulePatterns())[0]?.trim() || '';
+      await page.locator('#route-search').fill(firstPattern);
+      const matchedPatterns = await rulePatterns();
+      if (!matchedPatterns.length || matchedPatterns.some(pattern => !pattern.toLowerCase().includes(firstPattern.toLowerCase()))) throw new Error(`${project.name}: routing search does not narrow the list to matching rules (${JSON.stringify(matchedPatterns)})`);
+      await page.locator('#route-search').fill('zzz-no-such-route');
+      if (!(await page.locator('#routes-no-match').isVisible())) throw new Error(`${project.name}: routing search does not state when no rule matches`);
+      if (await page.locator('#routes tr').count()) throw new Error(`${project.name}: routing search leaves non-matching rules rendered`);
+      await page.locator('#route-search').fill('');
+      if (await page.locator('#routes tr').count() !== ruleCount) throw new Error(`${project.name}: clearing routing search does not restore every rule`);
       const routeModelCell = page.locator('#routes .route-model-cell').first();
       const [modelCellBox, modelHeadingBox, matchKind] = await Promise.all([
         routeModelCell.boundingBox(),
@@ -797,10 +1147,9 @@ for (const project of projects) {
       ]);
       if (!modelCellBox || !modelHeadingBox || modelHeadingBox.height > 42) throw new Error(`${project.name}: route match identity becomes tall when a rule has multiple destinations`);
       if (!['Exact', 'Prefix'].includes(matchKind?.trim())) throw new Error(`${project.name}: route match type is not rendered as a compact label`);
-      if (!(await routeModelCell.locator('small').textContent()).includes('destination')) throw new Error(`${project.name}: route destination count is missing from the public model summary`);
       const routeOverflow = await page.locator('#routes-table').evaluate(element => element.scrollWidth > element.clientWidth + 1);
       if (routeOverflow) throw new Error(`${project.name}: structured route summary overflows its table viewport`);
-      const policyRoute = page.locator('#routes .route-destination').filter({has: page.locator('.route-destination-route code', {hasText: 'ui-subscription'})}).first();
+      const policyRoute = page.locator('#routes .route-destination').filter({has: page.locator('.route-destination-route', {hasText: 'ui-subscription'})}).first();
       if (await policyRoute.count()) {
         const identity = await policyRoute.locator('.route-identity').textContent();
         if (!identity.includes('Endpoint policy')) throw new Error(`${project.name}: a destination that uses the Endpoint credential policy does not say so (${identity})`);
@@ -810,8 +1159,8 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
     await assertNoUpstreamCopy(page, project.name, 'Model routing');
-    // Destinations are drawn by the console: Provider → Endpoint → identity are
-    // three separate choices, and each level annotates its own list.
+    // Destinations are drawn by the console: Provider and Endpoint are resource
+    // choices, while whether an identity is pinned at all is its own decision.
     const editor = page.locator('#route-targets .route-target-editor').first();
     const picker = level => editor.locator(`.route-${level}`);
     const openPicker = async level => {
@@ -819,6 +1168,9 @@ for (const project of projects) {
       await picker(level).locator('.picker-popup').waitFor({state: 'visible'});
     };
     const triggerText = level => picker(level).locator('.picker-value').textContent();
+    const identityPolicy = editor.locator('.route-identity-policy');
+    const identityStep = editor.locator('.route-identity-step');
+    const destinationEffect = () => editor.locator('.route-destination-effect').textContent();
     await openPicker('provider');
     const providerNames = await picker('provider').locator('.picker-option-text strong').allTextContents();
     if (!providerNames.includes('UI keyless fixture') || !providerNames.includes('UI subscription fixture')) throw new Error(`${project.name}: the Provider list omits a configured Provider (${providerNames.join(', ')})`);
@@ -827,35 +1179,85 @@ for (const project of projects) {
     await picker('provider').locator('.picker-option', {hasText: 'UI keyless fixture'}).click();
     if (!(await triggerText('provider')).includes('UI keyless')) throw new Error(`${project.name}: choosing a Provider does not show it on the trigger (${await triggerText('provider')})`);
     if (!(await triggerText('endpoint')).includes('local')) throw new Error(`${project.name}: choosing a Provider does not narrow the Endpoint list to it (${await triggerText('endpoint')})`);
-    await openPicker('identity');
-    const keylessIdentity = await picker('identity').locator('.picker-option-text strong').allTextContents();
-    if (keylessIdentity.join('|') !== 'No identity needed') throw new Error(`${project.name}: an Endpoint without a credential requirement does not say so (${keylessIdentity.join(', ')})`);
+    // An Endpoint that sends no identity has nothing to decide, and the line says so.
+    if (await identityPolicy.isVisible() || await identityStep.isVisible()) throw new Error(`${project.name}: an Endpoint without a credential requirement still asks for an identity`);
+    if (!(await destinationEffect()).includes('Needs no identity')) throw new Error(`${project.name}: an Endpoint without a credential requirement does not say so (${await destinationEffect()})`);
     await page.locator('#route-dialog .dialog-head h2').click();
+    // The consequence line answers the Endpoint's own cooldown policy, so this block
+    // states that policy instead of inheriting whatever the previous block left behind.
+    await page.evaluate(() => { providers.find(provider => provider.id === 'ui-subscription').endpoints[0].rate_limit_cooldown = {seconds: 3600, mode: 'prefer_provider'}; });
     await picker('provider').locator('.picker-trigger').click();
     await picker('provider').locator('.picker-option', {hasText: 'UI subscription fixture'}).click();
     await openPicker('endpoint');
     const endpointRows = await picker('endpoint').locator('.picker-option-text').allTextContents();
     if (!endpointRows.some(row => row.includes('accounts') || row.includes('chatgpt'))) throw new Error(`${project.name}: the Endpoint list omits the Provider's Endpoint (${endpointRows.join(', ')})`);
     await picker('endpoint').locator('.picker-option').first().click();
+    // The models this Endpoint reports are the field's own suggestions, so one can be
+    // chosen instead of retyped exactly.
+    const suggestionList = await editor.locator('.upstream-model-input').getAttribute('list');
+    const endpointSuggestions = await page.locator(`#${suggestionList} option`).evaluateAll(options => options.map(option => option.value));
+    if (!endpointSuggestions.includes('gpt-fixture')) throw new Error(`${project.name}: the Provider model field does not suggest the models this Endpoint reports (${endpointSuggestions.join(', ')})`);
+    // Choosing an Endpoint finishes the resource decision; delegating the identity
+    // to the Endpoint is the default and shows no identity list at all.
+    await identityPolicy.waitFor({state: 'visible'});
+    const identityChoices = await identityPolicy.locator('label').allTextContents();
+    if (identityChoices.join('|') !== 'Let the Endpoint choose|Pin one identity') throw new Error(`${project.name}: the identity decision is not named by its guarantees (${identityChoices.join(', ')})`);
+    if (!(await identityPolicy.getByLabel('Let the Endpoint choose').isChecked()) || await identityStep.isVisible()) throw new Error(`${project.name}: the route editor does not delegate the identity to the Endpoint by default`);
+    const delegatedEffect = await destinationEffect();
+    if (!delegatedEffect.includes('by weight') || !delegatedEffect.includes('rate limit') || !delegatedEffect.includes('cooldown')) throw new Error(`${project.name}: letting the Endpoint choose does not state rotation and the configured cooldown consequence (${delegatedEffect})`);
+    await identityPolicy.getByLabel('Pin one identity').check();
+    if (!(await identityStep.isVisible())) throw new Error(`${project.name}: pinning one identity does not reveal the identity list`);
+    // An option row answers the pointer the same way it answers the keyboard: the row
+    // under the cursor becomes the current row instead of leaving no feedback at all.
+    // A touch screen has no pointer, so this is the one interaction the mobile
+    // viewports do not exercise.
     await openPicker('identity');
-    const policyRow = picker('identity').locator('.picker-option', {hasText: 'Endpoint policy'}).first();
-    if (!(await policyRow.count())) throw new Error(`${project.name}: route editor does not offer the Endpoint credential policy as a destination`);
-    const policyMeta = await policyRow.locator('small').textContent();
-    if (!/rotates|cooling down|no enabled identity/.test(policyMeta)) throw new Error(`${project.name}: the Endpoint policy row does not explain the state of the Endpoint's identities (${policyMeta})`);
-    await policyRow.click();
-    const policyEffect = await editor.locator('.route-destination-effect').textContent();
-    if (!policyEffect.includes('rate limit') || !policyEffect.includes('cooldown')) throw new Error(`${project.name}: choosing the Endpoint policy does not state the cooldown consequence (${policyEffect})`);
-    await openPicker('identity');
-    const pinnedEffect = await picker('identity').locator('.picker-option').nth(1).locator('small').textContent();
-    if (!pinnedEffect.includes('%')) throw new Error(`${project.name}: a pinnable identity does not state its share (${pinnedEffect})`);
-    await picker('identity').locator('.picker-option').nth(1).click();
-    const pinEffect = await editor.locator('.route-destination-effect').textContent();
+    const identityRows = picker('identity').locator('.picker-option');
+    if (await identityRows.count() < 2) throw new Error(`${project.name}: pinning one identity does not offer the Endpoint's identities`);
+    if (!project.mobile) {
+      const hoveredRow = identityRows.nth(1);
+      await hoveredRow.hover();
+      if (!(await hoveredRow.getAttribute('class')).includes('is-highlighted')) throw new Error(`${project.name}: hovering an option row gives no feedback`);
+      if ((await identityRows.first().getAttribute('class')).includes('is-highlighted')) throw new Error(`${project.name}: hovering an option row leaves the previously highlighted row marked`);
+    }
+    const identityMeta = await identityRows.first().locator('small').textContent();
+    if (!identityMeta.includes('%')) throw new Error(`${project.name}: a pinnable identity does not state its share (${identityMeta})`);
+    await identityRows.first().click();
+    const pinEffect = await destinationEffect();
     if (!pinEffect.includes('Pins') || !pinEffect.includes('cooling down') || !pinEffect.includes('never used')) throw new Error(`${project.name}: pinning an identity does not state that it ignores cooling and the other identities (${pinEffect})`);
-    await picker('identity').locator('.picker-trigger').click();
-    await picker('identity').locator('.picker-option').first().click();
+    // A stored pin is never replaced by another identity, even after that identity has
+    // been disabled: the route states why it cannot be served instead of saving a
+    // different identity under the same destination.
+    await page.evaluate(() => { providers.find(provider => provider.id === 'ui-subscription').endpoints[0].credentials[0].enabled = false; });
+    await page.evaluate(() => {
+      const editor = document.querySelector('#route-targets .route-target-editor');
+      setIdentityMode(editor, 'pin');
+      renderDestination(editor, {providerId: 'ui-subscription', endpointId: 'chatgpt', credentialId: 'account'});
+    });
+    if (!(await triggerText('identity')).includes('OpenAI account')) throw new Error(`${project.name}: opening a stored pin replaces it with another identity (${await triggerText('identity')})`);
+    const disabledPinEffect = await destinationEffect();
+    if (!disabledPinEffect.includes('which is disabled')) throw new Error(`${project.name}: a pinned identity that has been disabled is not stated (${disabledPinEffect})`);
+    await page.evaluate(() => { providers.find(provider => provider.id === 'ui-subscription').endpoints[0].credentials[0].enabled = true; });
+    await identityPolicy.getByLabel('Let the Endpoint choose').check();
+    if (await identityStep.isVisible()) throw new Error(`${project.name}: letting the Endpoint choose keeps the pinned identity list on screen`);
+    // A rate limit only skips an identity while the Endpoint configures a cooldown,
+    // and an Endpoint whose every identity is cooling down still sends the request.
+    await page.evaluate(() => providers.find(provider => provider.id === 'ui-plain').endpoints[0].credentials.forEach(key => { key.cooldown_seconds_remaining = 60; }));
+    await picker('provider').locator('.picker-trigger').click();
+    await picker('provider').locator('.picker-option', {hasText: 'UI plain fixture'}).click();
+    const coolingEffect = await destinationEffect();
+    if (!coolingEffect.includes('does not track rate limits') || !coolingEffect.includes('still go out')) throw new Error(`${project.name}: a destination without a cooldown policy or with every identity cooling down states the wrong outcome (${coolingEffect})`);
+    await page.evaluate(() => providers.find(provider => provider.id === 'ui-plain').endpoints[0].credentials.forEach(key => { delete key.cooldown_seconds_remaining; }));
+    await picker('provider').locator('.picker-trigger').click();
+    await picker('provider').locator('.picker-option', {hasText: 'UI subscription fixture'}).click();
     if (await page.locator('#route-targets .route-weight-field').first().isVisible()) throw new Error(`${project.name}: traffic share is visible for a simple alias`);
     await page.locator('#add-route-target').click();
     await page.locator('#route-split-head').waitFor({ state: 'visible' });
+    // Adding a destination must not clear the identity decision above it: the copy
+    // arrives carrying the same radio group name and checked state, and a browser
+    // keeps only the newest selection inside one group.
+    const destinationChoices = await page.locator('#route-targets .route-target-editor').evaluateAll(editors => editors.map(editor => [...editor.querySelectorAll('.route-identity-policy input')].filter(input => input.checked).map(input => input.value).join(',') || 'none'));
+    if (destinationChoices.join('|') !== 'endpoint|endpoint') throw new Error(`${project.name}: adding a destination leaves ${JSON.stringify(destinationChoices)} selected instead of one identity decision per destination`);
     // A cloned destination editor builds one picker per level instead of keeping
     // the markup it was cloned with.
     const pickerCounts = await page.locator('#route-targets .route-target-editor').evaluateAll(editors => editors.map(editor => ['provider', 'endpoint', 'identity'].map(level => editor.querySelectorAll(`.route-${level} .picker-trigger`).length)));
@@ -875,9 +1277,71 @@ for (const project of projects) {
     await page.locator('#route-targets [name="target_weight"]').first().fill('0');
     switchedShares = await page.locator('#route-targets [name="target_weight"]').evaluateAll(inputs => inputs.map(input => input.value));
     if (switchedShares.join(',') !== '0,100' || await page.locator('#route-targets [name="target_enabled"]').first().isChecked()) throw new Error(`${project.name}: a 0% share does not turn off and redistribute the destination`);
+    // A turned-off destination dims its own labels and triggers, and that dimming must
+    // not trap the menu it opens: the row whose share and toggle follow the picker, and
+    // the next destination card, would otherwise paint over the open list.
+    await openPicker('endpoint');
+    const offDestinationPopup = await picker('endpoint').locator('.picker-popup').evaluate(popup => {
+      const box = popup.getBoundingClientRect();
+      // A scroll container clips what it scrolls, so only the part of the list its
+      // ancestors leave unclipped can tell whether something paints over it.
+      const clip = {left: box.left, right: box.right, top: box.top, bottom: box.bottom};
+      for (let node = popup.parentElement; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (!/auto|scroll|hidden/.test(style.overflowX + style.overflowY)) continue;
+        const parentBox = node.getBoundingClientRect();
+        clip.left = Math.max(clip.left, parentBox.left + parseFloat(style.borderLeftWidth));
+        clip.right = Math.min(clip.right, parentBox.right - parseFloat(style.borderRightWidth));
+        clip.top = Math.max(clip.top, parentBox.top + parseFloat(style.borderTopWidth));
+        clip.bottom = Math.min(clip.bottom, parentBox.bottom - parseFloat(style.borderBottomWidth));
+      }
+      let covered = 0, samples = 0;
+      const covering = [];
+      for (let x = 0.06; x < 1; x += 0.09) for (let y = 0.06; y < 1; y += 0.06) {
+        const pointX = box.left + box.width * x, pointY = box.top + box.height * y;
+        if (pointX < clip.left || pointX > clip.right || pointY < clip.top || pointY > clip.bottom) continue;
+        samples++;
+        const node = document.elementFromPoint(pointX, pointY);
+        if (!node || popup.contains(node)) continue;
+        covered++;
+        // Naming what covers the list turns a bare count into something diagnosable.
+        if (covering.length < 3) covering.push(`${node.tagName.toLowerCase()}.${node.className}`);
+      }
+      let dimming = 1;
+      for (let node = popup; node && node.nodeType === 1; node = node.parentElement) dimming *= parseFloat(getComputedStyle(node).opacity);
+      return {covered, samples, dimming, covering};
+    });
+    if (offDestinationPopup.covered) throw new Error(`${project.name}: the open Endpoint list of a turned-off destination is painted under the fields that follow it (${offDestinationPopup.covered} of ${offDestinationPopup.samples} points, covered by ${offDestinationPopup.covering.join(', ') || 'nothing named'})`);
+    if (offDestinationPopup.dimming < 1) throw new Error(`${project.name}: turning a destination off leaves its open Endpoint list see-through (effective opacity ${offDestinationPopup.dimming})`);
+    await page.locator('#route-dialog .dialog-head h2').click();
     await page.locator('#route-targets [name="target_enabled"]').nth(1).uncheck();
     if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be turned off`);
     await page.locator('#route-dialog .close-route').first().click();
+    // A destination that pins an identity keeps it when the route is reopened: the
+    // decision is read against the chosen Endpoint, so it can never be reset by the
+    // empty destination that exists before the pickers are rendered.
+    await page.evaluate(() => {
+      modelRoutes.push({pattern: 'ui-pinned-route', targets: [
+        {provider_id: 'ui-subscription', endpoint_id: 'chatgpt', credential_id: 'account', upstream_model: 'gpt-fixture', weight: 0, enabled: false},
+        {provider_id: 'ui-plain', endpoint_id: 'main', credential_id: '', upstream_model: 'plain-model', weight: 100, enabled: true},
+      ]});
+      document.querySelector('[data-view="models"]').click();
+      renderRoutes();
+    });
+    await page.locator('#routes').getByText('ui-pinned-route', {exact: true}).waitFor({state: 'visible'});
+    await page.evaluate(() => document.querySelector(`.edit-route[data-index="${modelRoutes.length - 1}"]`).click());
+    await page.locator('#route-dialog').waitFor({state: 'visible'});
+    const pinnedTarget = page.locator('#route-targets .route-target-editor').first();
+    if (!(await pinnedTarget.locator('.route-identity-policy input[value="pin"]').isChecked())) throw new Error(`${project.name}: a reopened route shows a pinned destination as if the Endpoint chose the identity`);
+    if (await pinnedTarget.locator('.route-identity-step').isHidden()) throw new Error(`${project.name}: a pinned destination does not reveal the identity it pins`);
+    const pinnedTrigger = await pinnedTarget.locator('.route-identity .picker-trigger').textContent();
+    if (!pinnedTrigger.includes('OpenAI account')) throw new Error(`${project.name}: a pinned destination does not show the identity it pins (${pinnedTrigger})`);
+    const pinnedEffect = await pinnedTarget.locator('.route-destination-effect').textContent();
+    if (!pinnedEffect.includes('Pins OpenAI account')) throw new Error(`${project.name}: a pinned destination does not state that one identity is pinned (${pinnedEffect})`);
+    const clonedTarget = page.locator('#route-targets .route-target-editor').nth(1);
+    if (!(await clonedTarget.locator('.route-identity-policy input[value="endpoint"]').isChecked())) throw new Error(`${project.name}: a destination added after a pinned one does not keep the Endpoint's own choice`);
+    await page.locator('#route-dialog .close-route').first().click();
+    await page.evaluate(() => modelRoutes.pop());
     await page.evaluate(() => document.querySelector('[data-view="pricing"]').click());
     await page.locator('#pricing-view').waitFor({state: 'visible'});
     if (!(await page.locator('#pricing-list-page').isVisible()) || !(await page.locator('#open-pricing-editor').isVisible())) throw new Error(`${project.name}: Model pricing lacks a dedicated top-level management entry`);
@@ -1253,6 +1717,7 @@ for (const project of projects) {
       if (!(await page.locator('#activity-detail-model-outcome').getByText('Model ID unchanged', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain identical client and Provider model IDs`);
       if (!(await page.locator('#activity-detail-api-route').getByText('Client API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('Provider API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('No API conversion', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain the client and Provider API formats`);
       if (!(await page.locator('#activity-detail-destination').getByText('Provider', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-destination').getByText('Endpoint', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not group Provider and Endpoint under the routing destination`);
+      if (!(await page.locator('#activity-detail-destination').getByText('Carried the request while cooling down · no eligible identity was left', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail presents an identity that was out of the pool as a healthy carrier`);
       if (await page.locator('#activity-detail-request').getByText('Caller protocol', { exact: true }).count() || await page.locator('#activity-detail-request').getByText('Upstream protocol', { exact: true }).count()) throw new Error(`${project.name}: request metadata still uses unexplained protocol terminology`);
       if (!(await page.locator('#activity-detail-request').getByText('Provider finish reason', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the Provider finish reason`);
       const detailTypography = await page.locator('#activity-detail-dialog').evaluate(dialog => {
@@ -1313,6 +1778,27 @@ for (const project of projects) {
         if (!rateSource.includes('Global incoming rule') || !rateSource.includes('priced-alias') || !rateSource.includes('Provider outgoing rule') || !rateSource.includes('alias-sent-two')) throw new Error(`${project.name}: an estimated cost does not explain which pricing rules supplied each rate (${rateSource})`);
         await page.locator('#activity-detail-dialog').evaluate(dialog => dialog.close());
       }
+      // The routing destination names the credential that carried the request
+      // instead of showing the internal ID: a record from this instance follows
+      // the credential's current name, an imported record keeps the name recorded
+      // with it, and an identity with neither is shown as its stable ID with the
+      // reason stated next to it.
+      const credentialDestinations = new Map();
+      for (const [model, name, note] of [
+        ['credential-name-fixture', 'Second account', 'Identity that carried the request'],
+        ['credential-remote-fixture', 'Remote ChatGPT account', 'Identity that carried the request'],
+        ['credential-unknown-fixture', 'account-9', 'Identity that carried the request · no matching credential is configured now'],
+      ]) {
+        const row = recentActivityRows.filter({hasText: model}).first();
+        if (!(await row.count())) throw new Error(`${project.name}: Activity credential fixture ${model} is missing from recent requests`);
+        await row.click();
+        await assertDialog(page, '#activity-detail-dialog', project.name);
+        const destination = await page.locator('#activity-detail-destination').textContent();
+        credentialDestinations.set(model, destination);
+        if (!destination.includes(name) || !destination.includes(note)) throw new Error(`${project.name}: Activity destination does not identify the carrying credential as ${name} (${destination})`);
+        await page.locator('#activity-detail-dialog').evaluate(dialog => dialog.close());
+      }
+      if (credentialDestinations.get('credential-remote-fixture').includes('OpenAI account')) throw new Error(`${project.name}: an imported Activity record borrowed this instance's name for the same credential ID`);
     }
     await page.locator('#manage-activity-data').click();
     await assertDialog(page, '#activity-data-dialog', project.name);
@@ -1343,6 +1829,28 @@ for (const project of projects) {
   } finally {
     await browser.close();
   }
+}
+
+async function assertEndpointFieldSpacing(page, project) {
+  const dialog = page.locator('#endpoint-dialog');
+  // At the end of a small screen's scroll range the sticky actions must leave
+  // room for the last field, not cover it or be pulled up by a hidden section.
+  await dialog.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  const layout = await dialog.evaluate(element => {
+    const fields = [...element.querySelector('#endpoint-panel-connection').children]
+      .map(field => field.getBoundingClientRect()).filter(box => box.height > 0);
+    const button = element.querySelector('button[type="submit"]').getBoundingClientRect();
+    return {
+      gaps: fields.slice(1).map((field, index) => field.top - fields[index].bottom),
+      actionGap: button.top - fields.at(-1).bottom,
+      width: element.clientWidth,
+      overflow: element.scrollHeight - element.clientHeight,
+      editing: Boolean(element.querySelector('form').dataset.endpointId),
+    };
+  });
+  if (layout.gaps.some(gap => gap < 20) || layout.actionGap < 20) throw new Error(`${project.name}: Endpoint fields or actions are crowded (${JSON.stringify(layout)})`);
+  if (project.width >= 1024 && (layout.width < 620 || (layout.editing && layout.overflow > 1))) throw new Error(`${project.name}: desktop Endpoint settings do not use available width to fit (${JSON.stringify(layout)})`);
+  await dialog.evaluate(element => { element.scrollTop = 0; });
 }
 
 async function assertNoPageOverflow(page, name, surface) {
