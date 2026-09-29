@@ -524,10 +524,15 @@ function accountCredentialDetail(endpoint) {
     ? `The current access token is valid until ${new Date(soonest).toLocaleString()} and will be renewed automatically when needed.`
     : 'The current access token will be renewed when the next request uses this Endpoint.';
 }
-/// One Endpoint's identities grouped by priority, lowest group first. A group is
-/// a standby when a lower-numbered group exists: it carries traffic only while
-/// every identity in those groups is out, so its percentages describe that
-/// moment rather than a slice of one shared pool.
+/// One Endpoint's identities grouped the way the console shows them, lowest group
+/// first. A group is a standby when a lower-numbered group exists: it carries
+/// traffic only while every identity in those groups is out, so its percentages
+/// describe that moment rather than a slice of one shared pool. The number a group
+/// carries is its position here, not the value the configuration stores: the group
+/// that carries traffic first is Priority 1 to whoever reads the console whether the
+/// file calls it 1 or 4, and the distribution dialog writes these positions back.
+/// Without that, a group whose number disappeared could not be chosen again and the
+/// numbers would only ever climb.
 function identityGroups(endpoint) {
   const byPriority = new Map();
   enabledCredentials(endpoint).forEach(credential => {
@@ -535,9 +540,9 @@ function identityGroups(endpoint) {
     if (!byPriority.has(priority)) byPriority.set(priority, []);
     byPriority.get(priority).push(credential);
   });
-  return [...byPriority.entries()].sort((a, b) => a[0] - b[0]).map(([priority, members], index) => {
+  return [...byPriority.entries()].sort((a, b) => a[0] - b[0]).map(([, members], index) => {
     const eligible = members.filter(credential => !credential.cooldown_seconds_remaining);
-    return {priority, members, eligible, standby: index > 0, configured: trafficShares(members), effective: trafficShares(eligible)};
+    return {priority: index + 1, members, eligible, standby: index > 0, configured: trafficShares(members), effective: trafficShares(eligible)};
   });
 }
 /// The group the next request uses: the lowest-numbered group that still has an
@@ -1620,6 +1625,8 @@ function openTrafficDialog(providerId, endpointId) {
   const endpoint = provider.endpoints.find(item => item.id === endpointId);
   const groups = identityGroups(endpoint);
   const configured = new Map();
+  const position = new Map();
+  groups.forEach(group => group.members.forEach(member => position.set(member.id, group.priority)));
   groups.forEach(group => group.configured.forEach((share, id) => configured.set(id, share)));
   trafficEndpoint = {providerId, endpointId};
   trafficRows = enabledCredentials(endpoint).map(credential => ({
@@ -1630,7 +1637,11 @@ function openTrafficDialog(providerId, endpointId) {
     state: credential.cooldown_seconds_remaining
       ? {text: `cooling down, resumes in ${formatCooldown(credential.cooldown_seconds_remaining)}`, tone: 'cooling'}
       : {text: 'healthy', tone: 'healthy'},
-    priority: credential.priority || 1,
+    // The draft works in group positions while the file stores a number of its
+    // own, so what was stored is remembered next to the position: saving then
+    // writes the position back exactly where the two differ, and a moved identity
+    // is never a no-op because its number happened to read the same.
+    priority: position.get(credential.id) ?? 1,
     savedPriority: credential.priority || 1,
     weight: configured.get(credential.id) ?? 100,
   }));
@@ -1961,17 +1972,16 @@ function endpointModels(provider, endpointId) { return provider.discovered_model
 /// separate pool: a standby identity's percentage is not a slice of the group that
 /// carries traffic first.
 function identityShare(endpoint, credential) {
-  const priority = credential.priority || 1;
-  const total = enabledCredentials(endpoint).filter(item => (item.priority || 1) === priority).reduce((sum, item) => sum + item.weight, 0) || 1;
-  return `${Math.round(credential.weight / total * 100)}%`;
+  const group = identityGroups(endpoint).find(item => item.members.some(member => member.id === credential.id));
+  return `${group?.configured.get(credential.id) ?? 0}%`;
 }
 /// Which group an identity belongs to, named only when the Endpoint separates its
 /// identities into more than one group; a single group is the whole Endpoint.
 function identityTier(endpoint, credential) {
   const groups = identityGroups(endpoint);
   if (groups.length < 2) return '';
-  const priority = credential.priority || 1;
-  return `Priority ${priority}${priority === groups[0].priority ? '' : ' standby'} · `;
+  const group = groups.find(item => item.members.some(member => member.id === credential.id));
+  return group ? `Priority ${group.priority}${group.standby ? ' standby' : ''} · ` : '';
 }
 function identityState(endpoint, credential) {
   if (!credential.enabled) return 'disabled';

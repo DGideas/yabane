@@ -917,6 +917,35 @@ for (const project of projects) {
       await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
       await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`);
       await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/traffic`);
+      // A group number is a position in the console, not a fact about the file: a
+      // distribution whose stored numbers drifted apart (or lost their lowest one)
+      // must still show Priority 1 first, must still be able to create a group below
+      // it, and must write those positions back when it is saved.
+      await page.evaluate(() => {
+        const endpoint = providers.find(provider => provider.id === 'ui-tiered').endpoints[0];
+        endpoint.credentials[0].priority = 4;
+        endpoint.credentials[1].priority = 9;
+        renderProviderPage();
+      });
+      const driftedPool = await page.locator('.endpoint-card').first().locator('.endpoint-pool').textContent();
+      if (!driftedPool.includes('Traffic always uses Priority 1 first (Primary account)')) throw new Error(`${project.name}: a stored group number changes which group the pool calls first (${driftedPool})`);
+      await page.locator('.endpoint-card').first().getByRole('button', {name: 'Distribute traffic'}).click();
+      await page.locator('#traffic-dialog').waitFor({state: 'visible'});
+      const driftedHeadings = await page.locator('.traffic-group-head strong').allTextContents();
+      if (driftedHeadings.join('|') !== 'Priority 1 · carries traffic first|Priority 2 · standby') throw new Error(`${project.name}: stored group numbers are presented as group names (${driftedHeadings.join(' | ')})`);
+      const driftedOptions = await page.locator('.traffic-tier').first().locator('option').allTextContents();
+      if (driftedOptions.join('|') !== 'Priority 1 · first|Priority 2 · standby|Priority 3 · new standby') throw new Error(`${project.name}: a drifted numbering removes a group that can still be chosen (${driftedOptions.join(' | ')})`);
+      const normalised = [];
+      await page.route(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`, async route => {
+        normalised.push(route.request().postDataJSON());
+        await route.fulfill({status: 204, body: ''});
+      });
+      await page.route(`${base}/admin/providers/ui-tiered/endpoints/pool/traffic`, async route => route.fulfill({status: 204, body: ''}));
+      await page.locator('#save-traffic').click();
+      await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
+      if (JSON.stringify(normalised) !== '[{"priority":1},{"priority":2}]') throw new Error(`${project.name}: saving a distribution does not write the group positions back (${JSON.stringify(normalised)})`);
+      await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`);
+      await page.unroute(`${base}/admin/providers/ui-tiered/endpoints/pool/traffic`);
       // A standby group that nothing can ever hand traffic to is a configuration to
       // see, not a plan: without a cooldown policy no identity leaves its group.
       const openCard = page.locator('.endpoint-card').nth(1);
