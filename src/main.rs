@@ -140,10 +140,10 @@ async fn main() {
     .expect("recover interrupted configuration transaction");
     storage::recover_transaction(
         activity::ACTIVITY_TRANSACTION_FILE,
-        &[activity::ACTIVITY_FILE, activity::ACTIVITY_SETTINGS_FILE],
+        &[activity::ACTIVITY_DIRECTORY],
     )
     .await
-    .expect("recover interrupted Activity retention transaction");
+    .expect("recover interrupted Activity transaction");
 
     let upstream_timeouts = UpstreamTimeouts {
         connect: timeout_from_env(

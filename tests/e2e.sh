@@ -20,6 +20,9 @@ upstream_pid=
 cleanup() { [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; [[ -n "$upstream_pid" ]] && kill "$upstream_pid" 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT
 cd "$work"
+# Activity is stored as one JSON Lines file per UTC day, so every count spans the
+# files that are still retained instead of one flat history file.
+activity_lines() { cat data/activity/*.jsonl 2>/dev/null | wc -l | tr -d ' '; }
 version_output=$("$binary" --version)
 [[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
 [[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
@@ -41,6 +44,7 @@ JSON
 # journals were removed. Startup must restore each complete old file set before
 # parsing either configuration or Activity.
 python3 - <<'PY'
+import datetime
 import json
 from pathlib import Path
 
@@ -51,20 +55,18 @@ Path('data/config-transaction.json').write_text(json.dumps({
     'version': 1,
     'entries': [{'path': str(path), 'previous': list(previous)}],
 }))
-activity_path = Path('data/activity.jsonl')
 settings_path = Path('data/activity-settings.json')
-activity_path.write_bytes(b'')
 settings_path.write_text(json.dumps({'retention_days': 30}))
-activity_previous = activity_path.read_bytes()
-settings_previous = settings_path.read_bytes()
-activity_path.write_bytes(b'{interrupted')
-settings_path.write_text(json.dumps({'retention_days': 1}))
+activity_directory = Path('data/activity')
+activity_directory.mkdir(parents=True, exist_ok=True)
+day = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+day_path = activity_directory / f'{day}.jsonl'
+day_path.write_bytes(b'')
+day_previous = day_path.read_bytes()
+day_path.write_bytes(b'{interrupted')
 Path('data/activity-transaction.json').write_text(json.dumps({
     'version': 1,
-    'entries': [
-        {'path': str(activity_path), 'previous': list(activity_previous)},
-        {'path': str(settings_path), 'previous': list(settings_previous)},
-    ],
+    'entries': [{'path': str(day_path), 'previous': list(day_previous)}],
 }))
 PY
 TURNSTILE_SECRET="${TURNSTILE_TEST_SECRET:-1x0000000000000000000000000000000AA}" \
@@ -81,7 +83,7 @@ done
 if [[ $ready != true ]]; then cat server.log >&2; echo "Yabane did not become ready" >&2; exit 1; fi
 [[ ! -e data/config-transaction.json ]]
 [[ ! -e data/activity-transaction.json ]]
-[[ ! -s data/activity.jsonl ]]
+[[ ! -s data/activity/"$(date -u +%F)".jsonl ]]
 [[ $(jq -r '.retention_days' data/activity-settings.json) == 30 ]]
 [[ $(jq -r '.[0].id' data/providers.json) == subscription-fixture ]]
 # A policy stored in the earlier shape is read without rewriting the file the
@@ -989,11 +991,11 @@ admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 # Recreate the Provider needed by the remaining Activity checks.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"multi\",\"name\":\"Multi endpoint\",\"endpoint\":{\"id\":\"one\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"credential_secret\":\"one\"}}" >/dev/null
 # A completed batch is appended in groups of ten without depending on earlier Activity totals.
-before_batch_count=$(wc -l < data/activity.jsonl | tr -d ' ')
+before_batch_count=$(activity_lines)
 after_batch_count=$before_batch_count
 for _ in $(seq 1 10); do
   curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}' >/dev/null
-  after_batch_count=$(wc -l < data/activity.jsonl | tr -d ' ')
+  after_batch_count=$(activity_lines)
   [[ $after_batch_count -gt $before_batch_count ]] && break
 done
 [[ $((after_batch_count - before_batch_count)) -eq 10 ]]
@@ -1072,12 +1074,17 @@ summary=$(admin -f "$base/admin/activity/export/preview?since=0")
 [[ $(admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":45}' | jq -r .retention_days) == 45 ]]
 [[ $(jq -r .retention_days "$work/data/activity-settings.json") == 45 ]]
 old_retained_at=$(( $(date +%s) - 2 * 86400 ))
+old_retained_day=$(python3 -c "import datetime; print(datetime.datetime.fromtimestamp($old_retained_at, datetime.timezone.utc).strftime('%Y-%m-%d'))")
 # Legacy records without upstream_model remain importable for backward compatibility.
 old_retained_payload="{\"format\":\"yabane-activity\",\"version\":1,\"instance_id\":\"retention-test\",\"records\":[{\"timestamp\":$old_retained_at,\"request_id\":\"req-retention-old\",\"path\":\"/v1/responses\",\"model\":\"old/model\",\"provider\":\"old\",\"endpoint\":\"old\",\"status\":200,\"latency_ms\":1,\"input_tokens\":0,\"output_tokens\":0,\"cached_tokens\":0,\"cost\":null,\"streaming\":false}]}"
 [[ $(admin -f -X POST "$base/admin/activity/import" -H 'content-type: application/json' -d "$old_retained_payload" | jq -r .imported) == 1 ]]
+# Imported records join the day file they belong to.
+[[ -s "data/activity/$old_retained_day.jsonl" ]]
 admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":1}' >/dev/null
 [[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.request_id == "req-retention-old")] | length') == 0 ]]
-! grep -q 'req-retention-old' "$work/data/activity.jsonl"
+# A day that left the window is removed as a whole file instead of being rewritten.
+[[ ! -e "data/activity/$old_retained_day.jsonl" ]]
+! grep -rq 'req-retention-old' data/activity/
 admin -f -X PATCH "$base/admin/activity/settings" -H 'content-type: application/json' -d '{"retention_days":45}' >/dev/null
 # Activity exports are portable metadata snapshots. Imports preview and deduplicate by source instance and request ID.
 admin -f -D activity-export.headers "$base/admin/activity/export?since=0" > activity-export.json
@@ -1147,12 +1154,12 @@ session=$(admin -f "$base/admin/session")
 [[ $(printf '%s' "$session" | jq -r .email) == owner@example.com ]]
 [[ $(admin_status -X PATCH "$base/admin/profile" -H 'content-type: application/json' -d '{"username":"owner","email":"owner@example.com","current_password":"wrong","new_password":"newpassword123"}') == 403 ]]
 # Graceful shutdown flushes a final batch smaller than ten records.
-before_shutdown_count=$(wc -l < data/activity.jsonl | tr -d ' ')
+before_shutdown_count=$(activity_lines)
 curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"multi/model-a","messages":[]}' >/dev/null
 kill -TERM "$pid"
 wait "$pid"
 pid=
-[[ $(wc -l < data/activity.jsonl | tr -d ' ') -eq $((before_shutdown_count + 1)) ]]
+[[ $(activity_lines) -eq $((before_shutdown_count + 1)) ]]
 # The process-wide CLI override leaves compiled Extensions visible but prevents every Hook and runtime enablement.
 "$binary" --no-extensions --addr "127.0.0.1:$port" >no-extensions.log 2>&1 & pid=$!
 for _ in $(seq 1 50); do curl -sf "$base/healthz" >/dev/null && break; sleep .1; done

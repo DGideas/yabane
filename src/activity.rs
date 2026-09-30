@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::ErrorKind,
     sync::{
         Arc,
@@ -9,11 +10,29 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
-use tracing::error;
+use tracing::{error, warn};
 
-pub(crate) const ACTIVITY_FILE: &str = "data/activity.jsonl";
+/// Activity lives in one JSON Lines file per UTC day. A normal flush only appends
+/// to the day it belongs to, and a day that leaves the retention window is removed
+/// as a whole file, so retaining history never rewrites the records that stay.
+pub(crate) const ACTIVITY_DIRECTORY: &str = "data/activity/";
 pub(crate) const ACTIVITY_SETTINGS_FILE: &str = "data/activity-settings.json";
 pub(crate) const ACTIVITY_TRANSACTION_FILE: &str = "data/activity-transaction.json";
+
+/// Files an Activity transaction may replace. Tests point the same logic at a
+/// temporary directory instead of the process working directory.
+#[derive(Clone, Copy)]
+pub(crate) struct ActivityPaths<'a> {
+    pub directory: &'a str,
+    pub settings: &'a str,
+    pub transaction: &'a str,
+}
+
+const ACTIVITY_PATHS: ActivityPaths<'static> = ActivityPaths {
+    directory: ACTIVITY_DIRECTORY,
+    settings: ACTIVITY_SETTINGS_FILE,
+    transaction: ACTIVITY_TRANSACTION_FILE,
+};
 const FLUSH_SIZE: usize = 10;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -222,6 +241,9 @@ pub struct ActivityStore {
 struct ActivityData {
     persisted: Vec<RequestLog>,
     pending: Vec<RequestLog>,
+    /// UTC days present in `persisted`, so a periodic flush decides which day
+    /// files expired without scanning the retained history.
+    days: BTreeSet<i64>,
 }
 
 #[derive(Serialize)]
@@ -266,6 +288,7 @@ pub struct ImportResult {
     pub newest_at: Option<u64>,
 }
 
+#[derive(Debug)]
 pub enum ActivityImportError {
     Invalid(String),
     Persist(std::io::Error),
@@ -399,26 +422,12 @@ pub struct ActivityBucket {
 
 impl ActivityStore {
     pub async fn load() -> Result<Self, String> {
-        let contents = match tokio::fs::read_to_string(ACTIVITY_FILE).await {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
-            Err(err) => return Err(format!("read {ACTIVITY_FILE}: {err}")),
-        };
         let retention_days = load_retention_days().await?;
         let cutoff = retention_cutoff(retention_days);
-        let persisted = contents
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                serde_json::from_str::<RequestLog>(line)
-                    .map_err(|err| format!("parse {ACTIVITY_FILE}: {err}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|log| log.timestamp >= cutoff)
-            .collect();
+        let persisted = load_day_files(ACTIVITY_DIRECTORY, cutoff).await?;
         Ok(Self {
             inner: Arc::new(Mutex::new(ActivityData {
+                days: persisted.iter().map(|log| day_of(log.timestamp)).collect(),
                 persisted,
                 pending: Vec::new(),
             })),
@@ -550,51 +559,45 @@ impl ActivityStore {
     }
 
     pub async fn set_retention_days(&self, days: u64) -> Result<(), String> {
-        self.set_retention_days_at(
-            days,
-            ACTIVITY_SETTINGS_FILE,
-            ACTIVITY_FILE,
-            ACTIVITY_TRANSACTION_FILE,
-        )
-        .await
+        self.set_retention_days_at(days, ACTIVITY_PATHS).await
     }
 
     async fn set_retention_days_at(
         &self,
         days: u64,
-        settings_path: &str,
-        activity_path: &str,
-        transaction_path: &str,
+        paths: ActivityPaths<'_>,
     ) -> Result<(), String> {
         if !(1..=3650).contains(&days) {
             return Err("Activity retention must be between 1 and 3650 days".to_owned());
         }
         let _flush_guard = self.flush_lock.lock().await;
-        let mut data = self.inner.lock().await;
         let cutoff = retention_cutoff(days);
-        let records: Vec<_> = data
-            .persisted
-            .iter()
-            .chain(&data.pending)
-            .filter(|log| log.timestamp >= cutoff)
-            .cloned()
-            .collect();
-        let writes = [
-            crate::storage::AtomicWrite::bytes(activity_path, serialize_logs(&records))
-                .map_err(|err| format!("prepare compacted activity: {err}"))?,
-            crate::storage::AtomicWrite::json(
-                settings_path,
-                &ActivitySettings {
-                    retention_days: days,
-                },
-            )
-            .map_err(|err| format!("prepare activity settings: {err}"))?,
-        ];
-        crate::storage::write_transaction(transaction_path, &writes)
-            .await
-            .map_err(|err| format!("save activity retention: {err}"))?;
-        data.persisted = records;
-        data.pending.clear();
+        // The persisted setting is the policy. Removing the day files it excludes is
+        // cleanup that the next flush can retry, so neither step can leave a
+        // half-published retention window behind.
+        crate::storage::write_json_atomic(
+            paths.settings,
+            &ActivitySettings {
+                retention_days: days,
+            },
+        )
+        .await
+        .map_err(|err| format!("save activity retention: {err}"))?;
+        let cutoff_day = day_of(cutoff);
+        let remaining = match prune_day_files(paths.directory, cutoff_day).await {
+            Ok(remaining) => remaining,
+            Err(err) => {
+                warn!(%err, "failed to prune expired activity");
+                self.retention_days.store(days, Ordering::Relaxed);
+                return Ok(());
+            }
+        };
+        let mut data = self.inner.lock().await;
+        data.days.retain(|day| remaining.contains(day));
+        data.persisted
+            .retain(|log| remaining.contains(&day_of(log.timestamp)));
+        data.pending
+            .retain(|log| day_of(log.timestamp) >= cutoff_day);
         self.retention_days.store(days, Ordering::Relaxed);
         Ok(())
     }
@@ -607,13 +610,13 @@ impl ActivityStore {
     where
         F: Fn(&RequestLog) -> CostRecalculationResolution,
     {
-        self.recalculate_non_reported_costs_at(ACTIVITY_FILE, record, pricing_for)
+        self.recalculate_non_reported_costs_at(ACTIVITY_PATHS, record, pricing_for)
             .await
     }
 
     async fn recalculate_non_reported_costs_at<F>(
         &self,
-        activity_path: &str,
+        paths: ActivityPaths<'_>,
         record: Option<(&str, Option<&str>)>,
         pricing_for: F,
     ) -> Result<CostRecalculationResult, std::io::Error>
@@ -629,6 +632,7 @@ impl ActivityStore {
             .cloned()
             .collect();
         let mut result = CostRecalculationResult::default();
+        let mut updated_days = BTreeSet::new();
         for log in &mut records {
             if record.is_some_and(|(request_id, source_instance_id)| {
                 request_id != log.request_id
@@ -672,6 +676,7 @@ impl ActivityStore {
             log.cost = Some(cost);
             log.cost_source = Some(CostSource::Estimated);
             log.pricing_sources = Some(resolved.sources);
+            updated_days.insert(day_of(log.timestamp));
             result.updated += 1;
             if recalculated {
                 result.recalculated += 1;
@@ -682,7 +687,12 @@ impl ActivityStore {
         if result.updated == 0 {
             return Ok(result);
         }
-        write_logs_at(activity_path, &records).await?;
+        // Only the days whose records changed are rewritten, and pending records
+        // share that write so clearing them cannot drop anything from disk.
+        updated_days.extend(data.pending.iter().map(|log| day_of(log.timestamp)));
+        let writes = day_writes(paths.directory, &records, &updated_days)?;
+        crate::storage::write_transaction(paths.transaction, &writes).await?;
+        data.days = records.iter().map(|log| day_of(log.timestamp)).collect();
         data.persisted = records;
         data.pending.clear();
         Ok(result)
@@ -698,29 +708,44 @@ impl ActivityStore {
         &self,
         import: ActivityImport,
     ) -> Result<ImportResult, ActivityImportError> {
+        self.import_at(ACTIVITY_PATHS, import).await
+    }
+
+    async fn import_at(
+        &self,
+        paths: ActivityPaths<'_>,
+        import: ActivityImport,
+    ) -> Result<ImportResult, ActivityImportError> {
         self.validate_import(&import)
             .map_err(ActivityImportError::Invalid)?;
         let _flush_guard = self.flush_lock.lock().await;
         let mut data = self.inner.lock().await;
         let (result, imported) = self.classify_import(&import, &data);
         if !imported.is_empty() {
-            let cutoff = retention_cutoff(self.retention_days());
+            // Memory already mirrors the day files exactly, so an import only has to
+            // merge the accepted records into the days it touches.
             let mut records: Vec<_> = data
                 .persisted
                 .iter()
                 .chain(&data.pending)
-                .filter(|log| log.timestamp >= cutoff)
                 .cloned()
                 .collect();
+            // Imported records join the day files they belong to, and every pending
+            // record shares that write so clearing it cannot lose anything.
+            let mut days: BTreeSet<_> = imported.iter().map(|log| day_of(log.timestamp)).collect();
+            days.extend(data.pending.iter().map(|log| day_of(log.timestamp)));
             records.extend(imported);
             records.sort_by(|a, b| {
                 a.timestamp
                     .cmp(&b.timestamp)
                     .then_with(|| a.request_id.cmp(&b.request_id))
             });
-            write_logs(&records)
+            let writes = day_writes(paths.directory, &records, &days)
+                .map_err(ActivityImportError::Persist)?;
+            crate::storage::write_transaction(paths.transaction, &writes)
                 .await
                 .map_err(ActivityImportError::Persist)?;
+            data.days = records.iter().map(|log| day_of(log.timestamp)).collect();
             data.persisted = records;
             data.pending.clear();
         }
@@ -1071,50 +1096,68 @@ impl ActivityStore {
     }
 
     pub async fn flush(&self) {
+        self.flush_at(ACTIVITY_PATHS).await;
+    }
+
+    async fn flush_at(&self, paths: ActivityPaths<'_>) {
         let _flush_guard = self.flush_lock.lock().await;
-        let (pending, retained, needs_compaction) = {
+        // An idle periodic flush only reads memory: nothing is written unless records
+        // are pending or a whole day has left the retention window.
+        let (pending, expired_days) = {
             let mut data = self.inner.lock().await;
-            let cutoff = retention_cutoff(self.retention_days());
-            let retained: Vec<_> = data
-                .persisted
-                .iter()
-                .filter(|log| log.timestamp >= cutoff)
-                .cloned()
-                .collect();
-            let needs_compaction = retained.len() != data.persisted.len();
-            if data.pending.is_empty() && !needs_compaction {
+            let cutoff_day = day_of(retention_cutoff(self.retention_days()));
+            data.pending
+                .retain(|log| day_of(log.timestamp) >= cutoff_day);
+            let expired_days: BTreeSet<_> = data.days.range(..cutoff_day).copied().collect();
+            if data.pending.is_empty() && expired_days.is_empty() {
                 return;
             }
-            (
-                std::mem::take(&mut data.pending),
-                retained,
-                needs_compaction,
-            )
+            (std::mem::take(&mut data.pending), expired_days)
         };
 
-        let result = if needs_compaction {
-            let mut logs = retained.clone();
-            logs.extend(pending.iter().cloned());
-            write_logs(&logs).await
-        } else {
-            append_logs(&pending).await
-        };
-
-        let mut data = self.inner.lock().await;
-        match result {
-            Ok(()) => {
-                if needs_compaction {
-                    data.persisted = retained;
+        // A day outside the window leaves as a whole file, and its records leave
+        // memory with it. This is what keeps retention from rewriting what stays.
+        let mut removed_days = BTreeSet::new();
+        for day in &expired_days {
+            let path = day_path(paths.directory, *day);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    removed_days.insert(*day);
                 }
-                data.persisted.extend(pending);
-            }
-            Err(err) => {
-                error!(%err, "failed to flush request activity");
-                let newer = std::mem::take(&mut data.pending);
-                data.pending = pending;
-                data.pending.extend(newer);
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    removed_days.insert(*day);
+                }
+                Err(err) => error!(%err, %path, "failed to remove expired activity"),
             }
         }
+
+        // Pending records are appended to their own day file. A batch that spans a
+        // day boundary is still a pair of appends instead of a rewrite.
+        let mut appended = Vec::new();
+        let mut appended_days = Vec::new();
+        let mut failed = Vec::new();
+        for (day, records) in group_by_day(pending) {
+            match append_day_records(paths.directory, day, &records).await {
+                Ok(()) => {
+                    appended_days.push(day);
+                    appended.extend(records);
+                }
+                Err(err) => {
+                    error!(%err, day = %day_file_name(day), "failed to flush request activity");
+                    failed.extend(records);
+                }
+            }
+        }
+
+        let mut data = self.inner.lock().await;
+        data.days.retain(|day| !removed_days.contains(day));
+        data.days.extend(appended_days);
+        data.persisted
+            .retain(|log| !removed_days.contains(&day_of(log.timestamp)));
+        data.persisted.extend(appended);
+        let newer = std::mem::take(&mut data.pending);
+        data.pending = failed;
+        data.pending.extend(newer);
     }
 
     pub fn start_flusher(&self) {
@@ -1132,24 +1175,204 @@ impl ActivityStore {
     }
 }
 
-async fn append_logs(logs: &[RequestLog]) -> Result<(), std::io::Error> {
-    tokio::fs::create_dir_all("data").await?;
-    let contents = serialize_logs(logs);
+async fn append_day_records(
+    directory: &str,
+    day: i64,
+    records: &[RequestLog],
+) -> Result<(), std::io::Error> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(directory).await?;
+    let contents = serialize_logs(records);
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(ACTIVITY_FILE)
+        .open(day_path(directory, day))
         .await?
         .write_all(&contents)
         .await
 }
 
-async fn write_logs(logs: &[RequestLog]) -> Result<(), std::io::Error> {
-    write_logs_at(ACTIVITY_FILE, logs).await
+fn group_by_day(records: Vec<RequestLog>) -> Vec<(i64, Vec<RequestLog>)> {
+    let mut days = BTreeMap::<i64, Vec<RequestLog>>::new();
+    for record in records {
+        days.entry(day_of(record.timestamp))
+            .or_default()
+            .push(record);
+    }
+    days.into_iter().collect()
 }
 
-async fn write_logs_at(path: &str, logs: &[RequestLog]) -> Result<(), std::io::Error> {
-    crate::storage::write_atomic(path, &serialize_logs(logs)).await
+fn day_writes(
+    directory: &str,
+    records: &[RequestLog],
+    days: &BTreeSet<i64>,
+) -> std::io::Result<Vec<crate::storage::AtomicWrite>> {
+    days.iter()
+        .map(|day| {
+            let selected: Vec<_> = records
+                .iter()
+                .filter(|log| day_of(log.timestamp) == *day)
+                .cloned()
+                .collect();
+            crate::storage::AtomicWrite::bytes(day_path(directory, *day), serialize_logs(&selected))
+        })
+        .collect()
+}
+
+async fn load_day_files(directory: &str, cutoff: u64) -> Result<Vec<RequestLog>, String> {
+    let cutoff_day = day_of(cutoff);
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("read {directory}: {err}")),
+    };
+    let mut retained = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| format!("read {directory}: {err}"))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(day) = parse_day_file_name(&name) else {
+            continue;
+        };
+        let path = day_path(directory, day);
+        if day < cutoff_day {
+            if let Err(err) = tokio::fs::remove_file(&path).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                warn!(%err, %path, "failed to remove expired activity");
+            }
+            continue;
+        }
+        retained.push((day, path));
+    }
+    retained.sort_by_key(|(day, _)| *day);
+    let mut persisted = Vec::new();
+    for (_, path) in retained {
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|err| format!("read {path}: {err}"))?;
+        let records = contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_str::<RequestLog>(line)
+                    .map_err(|err| format!("parse {path}: {err}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        persisted.extend(records);
+    }
+    Ok(persisted)
+}
+
+/// Removes the day files outside the window and reports which days remain, so
+/// memory can keep exactly what is still on disk.
+async fn prune_day_files(directory: &str, cutoff_day: i64) -> Result<BTreeSet<i64>, String> {
+    let mut remaining = BTreeSet::new();
+    let mut entries = match tokio::fs::read_dir(directory).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(remaining),
+        Err(err) => return Err(format!("read {directory}: {err}")),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| format!("read {directory}: {err}"))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(day) = parse_day_file_name(&name) else {
+            continue;
+        };
+        if day >= cutoff_day {
+            remaining.insert(day);
+            continue;
+        }
+        let path = day_path(directory, day);
+        if let Err(err) = tokio::fs::remove_file(&path).await
+            && err.kind() != ErrorKind::NotFound
+        {
+            warn!(%err, %path, "failed to remove expired activity");
+            remaining.insert(day);
+        }
+    }
+    Ok(remaining)
+}
+
+/// Activity day files are named by UTC calendar day, which keeps the retention
+/// window a whole-file decision and keeps file names sorted chronologically.
+fn day_of(timestamp: u64) -> i64 {
+    (timestamp / 86_400) as i64
+}
+
+fn day_file_name(day: i64) -> String {
+    let (year, month, day_of_month) = civil_from_days(day);
+    format!("{year:04}-{month:02}-{day_of_month:02}.jsonl")
+}
+
+fn day_path(directory: &str, day: i64) -> String {
+    format!("{directory}{}", day_file_name(day))
+}
+
+fn parse_day_file_name(name: &str) -> Option<i64> {
+    let date = name.strip_suffix(".jsonl")?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day_of_month: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day_of_month) {
+        return None;
+    }
+    let day = days_from_civil(year, month, day_of_month);
+    (civil_from_days(day) == (year, month, day_of_month)).then_some(day)
+}
+
+/// Howard Hinnant's civil calendar algorithms keep whole UTC days free of a date
+/// dependency: Activity only ever needs to know which day a second belongs to.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_position + 2) / 5 + 1;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    };
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_position = if month > 2 {
+        (month - 3) as i64
+    } else {
+        (month + 9) as i64
+    };
+    let day_of_year = (153 * month_position + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn serialize_logs(logs: &[RequestLog]) -> Vec<u8> {
@@ -1285,6 +1508,7 @@ mod tests {
     fn store(logs: Vec<RequestLog>) -> ActivityStore {
         ActivityStore {
             inner: Arc::new(Mutex::new(ActivityData {
+                days: logs.iter().map(|log| day_of(log.timestamp)).collect(),
                 persisted: logs,
                 pending: Vec::new(),
             })),
@@ -1300,6 +1524,234 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
+    }
+
+    /// Points the storage logic at a temporary directory instead of `data/`.
+    struct TestPaths {
+        directory: String,
+        settings: String,
+        transaction: String,
+    }
+
+    impl TestPaths {
+        fn new(directory: &std::path::Path) -> Self {
+            let directory = format!("{}/", directory.display());
+            Self {
+                settings: format!("{directory}activity-settings.json"),
+                transaction: format!("{directory}activity-transaction.json"),
+                directory,
+            }
+        }
+
+        fn as_paths(&self) -> ActivityPaths<'_> {
+            ActivityPaths {
+                directory: &self.directory,
+                settings: &self.settings,
+                transaction: &self.transaction,
+            }
+        }
+
+        fn day_file(&self, timestamp: u64) -> String {
+            day_path(&self.directory, day_of(timestamp))
+        }
+    }
+
+    #[test]
+    fn day_file_names_follow_utc_calendar_days() {
+        assert_eq!(day_file_name(day_of(0)), "1970-01-01.jsonl");
+        assert_eq!(days_from_civil(2000, 1, 1), 10_957);
+        for day in [-1, 0, 1, 19_782, 20_000, 30_000] {
+            let (year, month, day_of_month) = civil_from_days(day);
+            assert_eq!(days_from_civil(year, month, day_of_month), day);
+            assert_eq!(
+                parse_day_file_name(&day_file_name(day)),
+                Some(day),
+                "{year:04}-{month:02}-{day_of_month:02} must round-trip"
+            );
+        }
+        for invalid in [
+            "activity.jsonl",
+            "2024-02-30.jsonl",
+            "2026-13-01.jsonl",
+            "2024-02.jsonl",
+            "2024-02-29.txt",
+            "notes",
+        ] {
+            assert_eq!(parse_day_file_name(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_appends_without_rewriting_a_retained_day_file() {
+        let now = crate::auth::now();
+        let directory = test_directory("flush-append");
+        let paths = TestPaths::new(&directory);
+        let store = store(Vec::new());
+
+        store.record(request(now, "first", "alpha", 200)).await;
+        store.flush_at(paths.as_paths()).await;
+        let today = paths.day_file(now);
+        let first = tokio::fs::read_to_string(&today).await.unwrap();
+        assert!(first.contains("\"first\""));
+
+        store.record(request(now + 1, "second", "alpha", 200)).await;
+        store.flush_at(paths.as_paths()).await;
+        let second = tokio::fs::read_to_string(&today).await.unwrap();
+        assert!(
+            second.starts_with(&first),
+            "the retained prefix must stay byte for byte"
+        );
+        assert!(second.contains("\"second\""));
+        assert_eq!(second.lines().count(), 2);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_removes_a_day_file_once_it_leaves_the_retention_window() {
+        let now = crate::auth::now();
+        let directory = test_directory("flush-expired");
+        let paths = TestPaths::new(&directory);
+        let expired_at = now - 31 * 86_400;
+        let retained_at = now - 10 * 86_400;
+        let store = store(vec![
+            request(expired_at, "expired", "alpha", 200),
+            request(retained_at, "retained", "alpha", 200),
+        ]);
+        tokio::fs::create_dir_all(&paths.directory).await.unwrap();
+        let expired = paths.day_file(expired_at);
+        let retained = paths.day_file(retained_at);
+        tokio::fs::write(
+            &expired,
+            serialize_logs(&[request(expired_at, "expired", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &retained,
+            serialize_logs(&[request(retained_at, "retained", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        let retained_before = tokio::fs::read(&retained).await.unwrap();
+
+        store.record(request(now, "current", "alpha", 200)).await;
+        store.flush_at(paths.as_paths()).await;
+
+        assert!(!std::path::Path::new(&expired).exists());
+        assert!(std::path::Path::new(&paths.day_file(now)).exists());
+        // Removing an expired day rewrites nothing: the retained history is the
+        // same bytes it was, which is the whole point of day files.
+        assert_eq!(tokio::fs::read(&retained).await.unwrap(), retained_before);
+        let records = store.export_records(0).await;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.request_id == "retained"));
+        assert!(records.iter().any(|record| record.request_id == "current"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_keeps_a_day_file_that_is_only_partially_expired() {
+        let now = crate::auth::now();
+        let directory = test_directory("flush-partial");
+        let paths = TestPaths::new(&directory);
+        let cutoff = now - 30 * 86_400;
+        // The retention boundary falls inside a UTC day, so that day file still
+        // carries a retained record and must stay whole instead of being trimmed.
+        let day_start = day_of(cutoff) as u64 * 86_400;
+        let expired_at = day_start;
+        let retained_at = day_start + 86_400 - 1;
+        let store = store(vec![
+            request(expired_at, "expired", "alpha", 200),
+            request(retained_at, "kept", "alpha", 200),
+        ]);
+        tokio::fs::create_dir_all(&paths.directory).await.unwrap();
+        let file = paths.day_file(retained_at);
+        tokio::fs::write(
+            &file,
+            serialize_logs(&[
+                request(expired_at, "expired", "alpha", 200),
+                request(retained_at, "kept", "alpha", 200),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        store.flush_at(paths.as_paths()).await;
+
+        assert!(std::path::Path::new(&file).exists());
+        let records = store.export_records(0).await;
+        assert!(records.iter().all(|record| record.timestamp >= cutoff));
+        assert!(records.iter().any(|record| record.request_id == "kept"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_day_files_reads_retained_days_and_removes_expired_ones() {
+        let now = crate::auth::now();
+        let directory = test_directory("load-days");
+        let directory_path = format!("{}/", directory.display());
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let expired_at = now - 40 * 86_400;
+        tokio::fs::write(
+            day_path(&directory_path, day_of(now)),
+            serialize_logs(&[request(now, "kept", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            day_path(&directory_path, day_of(expired_at)),
+            serialize_logs(&[request(expired_at, "expired", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        let unrelated = format!("{directory_path}notes.txt");
+        tokio::fs::write(&unrelated, "not activity").await.unwrap();
+
+        let persisted = load_day_files(&directory_path, now - 30 * 86_400)
+            .await
+            .unwrap();
+
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].request_id, "kept");
+        assert!(!std::path::Path::new(&day_path(&directory_path, day_of(expired_at))).exists());
+        assert!(std::path::Path::new(&unrelated).exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_writes_only_the_day_files_it_touches() {
+        let now = crate::auth::now();
+        let directory = test_directory("import-days");
+        let paths = TestPaths::new(&directory);
+        let store = store(vec![request(now, "existing", "alpha", 200)]);
+        tokio::fs::create_dir_all(&paths.directory).await.unwrap();
+        let today = paths.day_file(now);
+        tokio::fs::write(
+            &today,
+            serialize_logs(&[request(now, "existing", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        let imported_at = now - 2 * 86_400;
+        let import = ActivityImport {
+            format: "yabane-activity".to_owned(),
+            version: 1,
+            instance_id: Some("remote".to_owned()),
+            records: vec![request(imported_at, "imported", "alpha", 200)],
+        };
+
+        let result = store.import_at(paths.as_paths(), import).await.unwrap();
+
+        assert_eq!(result.imported, 1);
+        let today_contents = tokio::fs::read_to_string(&today).await.unwrap();
+        assert_eq!(today_contents.lines().count(), 1);
+        assert!(!today_contents.contains("imported"));
+        let imported_contents = tokio::fs::read_to_string(paths.day_file(imported_at))
+            .await
+            .unwrap();
+        assert_eq!(imported_contents.lines().count(), 1);
+        assert!(imported_contents.contains("imported"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     fn complete_pricing() -> Box<crate::pricing::ResolvedPricing> {
@@ -1334,10 +1786,10 @@ mod tests {
         let store = store(vec![missing, estimated, reported, legacy]);
         let directory = test_directory("recalculate-success");
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let activity_path = directory.join("activity.jsonl");
+        let paths = TestPaths::new(&directory);
 
         let result = store
-            .recalculate_non_reported_costs_at(activity_path.to_str().unwrap(), None, |_| {
+            .recalculate_non_reported_costs_at(paths.as_paths(), None, |_| {
                 CostRecalculationResolution::Available(complete_pricing())
             })
             .await
@@ -1363,7 +1815,7 @@ mod tests {
         assert_eq!(record("legacy-cost").cost, Some(8.0));
         assert_eq!(record("legacy-cost").cost_source, None);
         assert_eq!(
-            tokio::fs::read_to_string(&activity_path)
+            tokio::fs::read_to_string(paths.day_file(now))
                 .await
                 .unwrap()
                 .lines()
@@ -1386,10 +1838,10 @@ mod tests {
         store.inner.lock().await.pending.push(pending);
         let directory = test_directory("recalculate-pending");
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let activity_path = directory.join("activity.jsonl");
+        let paths = TestPaths::new(&directory);
 
         let result = store
-            .recalculate_non_reported_costs_at(activity_path.to_str().unwrap(), None, |_| {
+            .recalculate_non_reported_costs_at(paths.as_paths(), None, |_| {
                 CostRecalculationResolution::Available(complete_pricing())
             })
             .await
@@ -1402,6 +1854,14 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(records.iter().all(|record| record.cost == Some(0.001)));
         assert!(store.inner.lock().await.pending.is_empty());
+        assert_eq!(
+            tokio::fs::read_to_string(paths.day_file(now))
+                .await
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -1415,10 +1875,10 @@ mod tests {
         let store = store(vec![estimated]);
         let directory = test_directory("recalculate-unavailable");
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let activity_path = directory.join("activity.jsonl");
+        let paths = TestPaths::new(&directory);
 
         let result = store
-            .recalculate_non_reported_costs_at(activity_path.to_str().unwrap(), None, |_| {
+            .recalculate_non_reported_costs_at(paths.as_paths(), None, |_| {
                 CostRecalculationResolution::MissingPricing
             })
             .await
@@ -1440,10 +1900,10 @@ mod tests {
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let blocked_parent = directory.join("blocked");
         tokio::fs::write(&blocked_parent, b"blocked").await.unwrap();
-        let activity_path = blocked_parent.join("activity.jsonl");
+        let paths = TestPaths::new(&blocked_parent.join("activity"));
 
         let result = store
-            .recalculate_non_reported_costs_at(activity_path.to_str().unwrap(), None, |_| {
+            .recalculate_non_reported_costs_at(paths.as_paths(), None, |_| {
                 CostRecalculationResolution::Available(complete_pricing())
             })
             .await;
@@ -1464,11 +1924,11 @@ mod tests {
         let store = store(vec![local, imported]);
         let directory = test_directory("recalculate-identity");
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let activity_path = directory.join("activity.jsonl");
+        let paths = TestPaths::new(&directory);
 
         let result = store
             .recalculate_non_reported_costs_at(
-                activity_path.to_str().unwrap(),
+                paths.as_paths(),
                 Some(("shared-id", Some("remote-instance"))),
                 |_| CostRecalculationResolution::Available(complete_pricing()),
             )
@@ -1492,74 +1952,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retention_update_compacts_activity_and_settings_together() {
+    async fn retention_update_removes_expired_day_files_and_persists_settings() {
         let now = crate::auth::now();
         let directory = test_directory("retention-success");
-        let activity_path = directory.join("activity.jsonl");
-        let settings_path = directory.join("activity-settings.json");
-        let transaction_path = directory.join("activity-transaction.json");
+        let paths = TestPaths::new(&directory);
+        let expired_at = now - 2 * 86_400;
         let store = store(vec![
-            request(now - 2 * 86_400, "expired", "alpha", 200),
+            request(expired_at, "expired", "alpha", 200),
             request(now, "retained", "alpha", 200),
         ]);
+        tokio::fs::create_dir_all(&paths.directory).await.unwrap();
+        let expired = paths.day_file(expired_at);
+        let retained = paths.day_file(now);
+        tokio::fs::write(
+            &expired,
+            serialize_logs(&[request(expired_at, "expired", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &retained,
+            serialize_logs(&[request(now, "retained", "alpha", 200)]),
+        )
+        .await
+        .unwrap();
 
         store
-            .set_retention_days_at(
-                1,
-                settings_path.to_str().unwrap(),
-                activity_path.to_str().unwrap(),
-                transaction_path.to_str().unwrap(),
-            )
+            .set_retention_days_at(1, paths.as_paths())
             .await
             .unwrap();
 
         assert_eq!(store.retention_days(), 1);
         assert_eq!(store.export_records(0).await.len(), 1);
-        let activity = tokio::fs::read_to_string(&activity_path).await.unwrap();
-        assert!(activity.contains("retained"));
-        assert!(!activity.contains("expired"));
+        assert!(!std::path::Path::new(&expired).exists());
+        assert!(std::path::Path::new(&retained).exists());
         let settings: ActivitySettings =
-            serde_json::from_slice(&tokio::fs::read(&settings_path).await.unwrap()).unwrap();
+            serde_json::from_slice(&tokio::fs::read(&paths.settings).await.unwrap()).unwrap();
         assert_eq!(settings.retention_days, 1);
-        assert!(!transaction_path.exists());
+        assert!(!std::path::Path::new(&paths.transaction).exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[tokio::test]
-    async fn failed_retention_transaction_does_not_publish_or_delete_records() {
+    async fn failed_retention_update_does_not_publish_or_delete_records() {
         let now = crate::auth::now();
         let directory = test_directory("retention-failure");
         tokio::fs::create_dir_all(&directory).await.unwrap();
-        let activity_path = directory.join("activity.jsonl");
         let blocked_parent = directory.join("not-a-directory");
-        let settings_path = blocked_parent.join("activity-settings.json");
-        let transaction_path = directory.join("activity-transaction.json");
-        tokio::fs::write(&activity_path, b"existing activity\n")
-            .await
-            .unwrap();
         tokio::fs::write(&blocked_parent, b"blocked").await.unwrap();
+        let paths = TestPaths::new(&blocked_parent.join("activity"));
         let store = store(vec![
             request(now - 2 * 86_400, "would-expire", "alpha", 200),
             request(now, "would-remain", "alpha", 200),
         ]);
 
-        let result = store
-            .set_retention_days_at(
-                1,
-                settings_path.to_str().unwrap(),
-                activity_path.to_str().unwrap(),
-                transaction_path.to_str().unwrap(),
-            )
-            .await;
+        let result = store.set_retention_days_at(1, paths.as_paths()).await;
 
         assert!(result.is_err());
         assert_eq!(store.retention_days(), DEFAULT_RETENTION_DAYS);
         assert_eq!(store.export_records(0).await.len(), 2);
-        assert_eq!(
-            tokio::fs::read(&activity_path).await.unwrap(),
-            b"existing activity\n"
-        );
-        assert!(!transaction_path.exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

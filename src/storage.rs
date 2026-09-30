@@ -119,7 +119,7 @@ pub async fn write_transaction(
 
 pub async fn recover_transaction(
     journal_path: impl AsRef<Path>,
-    allowed_paths: &[&str],
+    allowed_targets: &[&str],
 ) -> Result<(), String> {
     let _persistence = PERSISTENCE_LOCK.lock().await;
     let journal_path = journal_path.as_ref();
@@ -137,11 +137,10 @@ pub async fn recover_transaction(
             journal.version
         ));
     }
-    let allowed: HashSet<_> = allowed_paths.iter().copied().collect();
     let mut seen = HashSet::new();
     if journal.entries.is_empty()
         || journal.entries.iter().any(|entry| {
-            !allowed.contains(entry.path.as_str()) || !seen.insert(entry.path.as_str())
+            !is_allowed_target(&entry.path, allowed_targets) || !seen.insert(entry.path.as_str())
         })
     {
         return Err(format!(
@@ -178,6 +177,20 @@ async fn rollback_after_error(
         ));
     }
     Err(original)
+}
+
+/// An allowed target is either one exact path or one file directly inside an
+/// allowed directory, written with a trailing `/`. A directory never authorizes
+/// a nested or escaping path, so a journal cannot be pointed at a file the
+/// transaction did not create.
+fn is_allowed_target(path: &str, allowed: &[&str]) -> bool {
+    allowed.iter().any(|entry| match entry.strip_suffix('/') {
+        Some(directory) => path
+            .strip_prefix(directory)
+            .and_then(|name| name.strip_prefix('/'))
+            .is_some_and(|name| !name.is_empty() && !name.contains('/')),
+        None => path == *entry,
+    })
 }
 
 async fn rollback_unlocked(journal: &RollbackJournal) -> io::Result<()> {
@@ -432,6 +445,63 @@ mod tests {
         assert_eq!(tokio::fs::read(&second).await.unwrap(), b"old-second");
         assert!(!created.exists());
         assert!(!journal.exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_scopes_directory_targets_to_direct_children() {
+        let directory = directory("directory-recovery");
+        let activity = directory.join("activity");
+        tokio::fs::create_dir_all(&activity).await.unwrap();
+        let allowed_directory = format!("{}/", activity.display());
+        let allowed = [allowed_directory.as_str()];
+        let day = activity.join("2026-01-01.jsonl");
+        let journal = directory.join("transaction.json");
+
+        tokio::fs::write(&day, b"new").await.unwrap();
+        write_json_atomic(
+            &journal,
+            &RollbackJournal {
+                version: TRANSACTION_VERSION,
+                entries: vec![RollbackEntry {
+                    path: day.to_str().unwrap().to_owned(),
+                    previous: Some(b"old".to_vec()),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        recover_transaction(&journal, &allowed).await.unwrap();
+        assert_eq!(tokio::fs::read(&day).await.unwrap(), b"old");
+        assert!(!journal.exists());
+
+        // A nested or escaping path is not a direct child of the allowed directory.
+        let nested = activity.join("nested");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        for outside in [
+            nested.join("2026-01-01.jsonl"),
+            directory.join("outside.jsonl"),
+        ] {
+            tokio::fs::write(&outside, b"untouched").await.unwrap();
+            write_json_atomic(
+                &journal,
+                &RollbackJournal {
+                    version: TRANSACTION_VERSION,
+                    entries: vec![RollbackEntry {
+                        path: outside.to_str().unwrap().to_owned(),
+                        previous: Some(b"restored anyway".to_vec()),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+
+            let error = recover_transaction(&journal, &allowed).await.unwrap_err();
+
+            assert!(error.contains("invalid transaction target"));
+            assert_eq!(tokio::fs::read(&outside).await.unwrap(), b"untouched");
+            tokio::fs::remove_file(&journal).await.unwrap();
+        }
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
