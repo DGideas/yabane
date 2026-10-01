@@ -1547,13 +1547,41 @@ $('#credential-name-form').addEventListener('submit', async event => {
 const trafficDialog = $('#traffic-dialog');
 let trafficEndpoint = null;
 /// The distribution as the dialog is editing it: one row per enabled identity
-/// carrying the group it belongs to and the percentage it takes inside that
-/// group. Rows live in a draft so what is saved describes exactly what was on
-/// screen, including a move that only takes effect when the dialog is saved.
+/// carrying the group position it belongs to and the percentage it takes inside
+/// that group, plus how many groups the draft holds, so a group can exist before
+/// an identity is moved into it. Rows live in a draft so what is saved describes
+/// exactly what was on screen, including a move that only takes effect when the
+/// dialog is saved.
 let trafficRows = [];
+let trafficGroupCount = 1;
+/// True while the last group is one the administrator just added and has not
+/// filled yet. A group exists while it holds an identity, and the only exception
+/// is the position someone created to move an identity into.
+let trafficPendingGroup = false;
+/// A group is named by the order it carries traffic in — the preferred group
+/// first, then its standby groups — while the priority number stays next to that
+/// name, because the pool summary and the API both name groups by the number.
+function trafficGroupName(priority) {
+  if (priority === 1) return 'Preferred group';
+  return trafficGroupCount > 2 ? `Standby group ${priority - 1}` : 'Standby group';
+}
+/// The draft's groups in the order they carry traffic, including one that holds
+/// no identity yet: an empty group is a position the administrator is about to
+/// move an identity into.
 function trafficRowGroups() {
-  const priorities = [...new Set(trafficRows.map(row => row.priority))].sort((a, b) => a - b);
-  return priorities.map(priority => ({priority, standby: priority !== priorities[0], rows: trafficRows.filter(row => row.priority === priority)}));
+  return Array.from({length: trafficGroupCount}, (_, index) => ({priority: index + 1, standby: index > 0, rows: trafficRows.filter(row => row.priority === index + 1)}));
+}
+/// A group that only lost its last identity is not left behind as an empty
+/// position to clean up, so moving every identity out of a group is how that
+/// group is closed. The position added for an identity to be moved into survives
+/// until it holds one or is removed.
+function collapseTrafficGroups() {
+  for (let priority = trafficGroupCount; priority >= 1; priority -= 1) {
+    if (trafficRows.some(row => row.priority === priority)) continue;
+    if (trafficPendingGroup && priority === trafficGroupCount) continue;
+    trafficRows.forEach(row => { if (row.priority > priority) row.priority -= 1; });
+    trafficGroupCount -= 1;
+  }
 }
 /// Even percentages again in one group, so a move never leaves a group that no
 /// longer adds up to 100.
@@ -1561,45 +1589,44 @@ function rebalanceTrafficGroup(priority) {
   const rows = trafficRows.filter(row => row.priority === priority);
   evenShares(rows.length).forEach((share, index) => { rows[index].weight = share; });
 }
-function trafficRowElement(row, groups, endpoint) {
-  const element = document.createElement('label');
+function trafficRowElement(row, group, groups) {
+  const element = document.createElement('div');
   element.className = 'traffic-row';
-  const first = groups[0].priority;
-  const highest = groups.at(-1).priority;
-  const choices = [...groups.map(group => group.priority), highest + 1]
-    .filter((priority, index, list) => list.indexOf(priority) === index)
-    .map(priority => {
-      const label = priority === first ? `Priority ${priority} · first` : priority > highest ? `Priority ${priority} · new standby` : `Priority ${priority} · standby`;
-      return `<option value="${priority}"${priority === row.priority ? ' selected' : ''}>${label}</option>`;
-    })
-    .join('');
-  element.innerHTML = `<span><span class="status ${row.enabled ? 'enabled' : ''}"></span><strong>${escapeHtml(row.name)}</strong><small class="identity-state" data-tone="${row.state.tone}">${escapeHtml(row.kind)} · ${escapeHtml(row.state.text)}</small></span><span class="percentage-input"><input type="number" min="1" max="100" required value="${row.weight}" data-credential="${row.id}" aria-label="Traffic percentage for ${escapeHtml(row.name)}"><b>%</b></span><select class="traffic-tier" data-credential="${row.id}" aria-label="Priority group for ${escapeHtml(row.name)}">${choices}</select>`;
-  element.querySelector('input').addEventListener('input', input => {
+  // A group that holds one identity carries that group's whole traffic, so it
+  // asks for no percentage: the number would be 100 by definition.
+  const shared = group.rows.length > 1;
+  // Moving an identity is its own control, so creating a group stays a separate
+  // action instead of hiding inside the list of groups that already exist.
+  const destinations = groups.filter(item => item.priority !== row.priority);
+  const choices = destinations.map(item => `<option value="${item.priority}">${trafficGroupName(item.priority)} · Priority ${item.priority}</option>`).join('');
+  element.innerHTML = `<span class="traffic-identity"><span class="status ${row.enabled ? 'enabled' : ''}"></span><strong>${escapeHtml(row.name)}</strong><small class="identity-state" data-tone="${row.state.tone}">${escapeHtml(row.kind)} · ${escapeHtml(row.state.text)}</small></span>${shared ? `<span class="percentage-input"><input type="number" min="1" max="100" required value="${row.weight}" data-credential="${row.id}" aria-label="Share of ${trafficGroupName(group.priority)} taken by ${escapeHtml(row.name)}"><b>%</b></span>` : ''}${destinations.length ? `<select class="traffic-move" data-credential="${row.id}" aria-label="Move ${escapeHtml(row.name)} to another group"><option value="" selected>Move to group…</option>${choices}</select>` : ''}`;
+  element.querySelector('input')?.addEventListener('input', input => {
     row.weight = Number(input.target.value) || 0;
     validateTrafficDistribution();
   });
-  element.querySelector('select').addEventListener('change', select => {
+  element.querySelector('select')?.addEventListener('change', select => {
     const target = Number(select.target.value);
     const previous = row.priority;
-    if (target === previous) return;
+    if (!target || target === previous) return;
     row.priority = target;
     // Both the group that loses an identity and the group that gains one are
     // shared out again, because each group has to total 100 on its own.
     rebalanceTrafficGroup(previous);
     rebalanceTrafficGroup(target);
-    renderTrafficGroups(endpoint);
+    renderTrafficGroups(trafficEndpoint.endpoint);
   });
   return element;
 }
 function renderTrafficGroups(endpoint) {
+  collapseTrafficGroups();
   const groups = trafficRowGroups();
   const cooldownOff = !(endpoint?.rate_limit_cooldown?.seconds > 0);
+  const noun = identityNoun(endpoint, 1);
   $('#traffic-rows').replaceChildren(...groups.map(group => {
     const section = document.createElement('section');
     section.className = 'traffic-group';
     section.dataset.priority = String(group.priority);
     section.dataset.tone = group.standby ? 'standby' : 'first';
-    const heading = group.priority === groups[0].priority ? `Priority ${group.priority} · carries traffic first` : `Priority ${group.priority} · standby`;
     // A standby group says when it is used and when it is not, so a group that a
     // disabled cooldown makes unreachable reads as a warning instead of a plan.
     const explanation = groups.length === 1
@@ -1611,11 +1638,29 @@ function renderTrafficGroups(endpoint) {
           : `Only used while every identity in ${groups.filter(item => item.priority < group.priority).map(item => `Priority ${item.priority}`).join(' and ')} is cooling down.`;
     const head = document.createElement('div');
     head.className = 'traffic-group-head';
-    head.innerHTML = `<span><strong>${heading}</strong><small>${explanation}</small></span><span class="traffic-group-total" data-priority="${group.priority}">100%</span>`;
+    // The order of the groups is the dialog's subject, so the buttons that change
+    // it sit on the group itself and the total belongs only to a group whose
+    // identities actually share it. An empty position can only be filled or
+    // removed, so it has no order to change.
+    const stepButtons = group.rows.length ? `<button type="button" class="icon-button traffic-group-step" data-action="up" data-priority="${group.priority}" aria-label="Move ${trafficGroupName(group.priority)} above the group before it"${group.priority === 1 ? ' disabled' : ''}>${icon('chevron-up')}</button><button type="button" class="icon-button traffic-group-step" data-action="down" data-priority="${group.priority}" aria-label="Move ${trafficGroupName(group.priority)} below the group after it"${group.priority === trafficGroupCount ? ' disabled' : ''}>${icon('chevron-down')}</button>` : `<button type="button" class="icon-button traffic-group-remove" data-action="remove" data-priority="${group.priority}" aria-label="Remove ${trafficGroupName(group.priority)}">${icon('close')}</button>`;
+    head.innerHTML = `<div class="traffic-group-title"><span class="traffic-group-name"><strong>${trafficGroupName(group.priority)}</strong><span class="traffic-group-priority">Priority ${group.priority}</span></span><small>${explanation}</small></div><div class="traffic-group-tools">${group.rows.length > 1 ? `<span class="traffic-group-total" data-priority="${group.priority}">100%</span>` : ''}${stepButtons}</div>`;
     const rows = document.createElement('div');
     rows.className = 'traffic-rows';
-    rows.append(...group.rows.map(row => trafficRowElement(row, groups, endpoint)));
+    rows.append(...group.rows.map(row => trafficRowElement(row, group, groups)));
     section.append(head, rows);
+    // A percentage that only ever reads 100 is stated as what it means instead of
+    // being offered as a field, and a group waiting for its first identity says so
+    // rather than looking like a group that carries nothing.
+    const note = document.createElement('p');
+    if (group.rows.length === 1) {
+      note.className = 'traffic-group-note';
+      note.textContent = `This is the only ${noun} in this group, so it takes all of this group’s traffic.`;
+      section.append(note);
+    } else if (!group.rows.length) {
+      note.className = 'traffic-group-empty';
+      note.textContent = 'No identities in this group yet. Move one here with Move to group, or remove this group.';
+      section.append(note);
+    }
     return section;
   }));
   validateTrafficDistribution();
@@ -1628,7 +1673,9 @@ function openTrafficDialog(providerId, endpointId) {
   const position = new Map();
   groups.forEach(group => group.members.forEach(member => position.set(member.id, group.priority)));
   groups.forEach(group => group.configured.forEach((share, id) => configured.set(id, share)));
-  trafficEndpoint = {providerId, endpointId};
+  trafficEndpoint = {providerId, endpointId, endpoint};
+  trafficGroupCount = groups.length;
+  trafficPendingGroup = false;
   trafficRows = enabledCredentials(endpoint).map(credential => ({
     id: credential.id,
     name: credential.name,
@@ -1645,15 +1692,29 @@ function openTrafficDialog(providerId, endpointId) {
     savedPriority: credential.priority || 1,
     weight: configured.get(credential.id) ?? 100,
   }));
-  const standbyRows = new Set(trafficRows.map(row => row.priority)).size > 1;
-  // A tiered Endpoint has one total per group, so the line above the rows says
+  // A group holding one identity always carries that group's whole traffic, so the
+  // draft holds the 100% the dialog states instead of a stored number the shares
+  // no longer describe.
+  trafficRowGroups().forEach(group => { if (group.rows.length === 1) group.rows[0].weight = 100; });
+  const standbyRows = trafficGroupCount > 1;
+  const noun = identityNoun(endpoint, 2);
+  const singular = identityNoun(endpoint, 1);
+  // A tiered Endpoint has one total per group, so the line above the groups says
   // which traffic the numbers describe instead of implying a single split.
   $('#traffic-description').innerHTML = standbyRows
-    ? `Set the percentage each credential takes while its own priority group carries <code>${escapeHtml(endpointId)}</code> traffic.`
-    : `Set the percentage of <code>${escapeHtml(endpointId)}</code> traffic sent with each enabled credential.`;
+    ? `Set the order these groups carry <code>${escapeHtml(endpointId)}</code> traffic in, and the share each of its enabled ${escapeHtml(noun)} takes inside its own group.`
+    : `Set the percentage of <code>${escapeHtml(endpointId)}</code> traffic sent with each enabled ${escapeHtml(noun)}.`;
   // The percentages describe the healthy case, so the dialog names each
   // identity's state and states what a Provider rate limit does to the split.
   const cooldown = endpoint.rate_limit_cooldown || {seconds: 0, mode: 'fixed'};
+  // Which group is used first is the dialog's subject, so the order is stated once
+  // above the groups instead of being reassembled from each group heading.
+  const order = !standbyRows
+    ? `Every enabled ${escapeHtml(singular)} is in one group, so requests are shared between them by the percentages below. Add a standby group to keep one back instead of giving it a share.`
+    : cooldown.seconds > 0
+      ? `<b>Yabane uses the preferred group first.</b> A standby group carries traffic only while every ${escapeHtml(singular)} above it is cooling down, and the preferred group takes the traffic back when those identities return.`
+      : `<b>Yabane uses the preferred group first.</b> This Endpoint does not track rate limits, so a standby group never takes over while the preferred group still has an ${escapeHtml(singular)} that can serve.`;
+  $('#traffic-order').innerHTML = `${icon('chevron-down', 'traffic-order-mark')}<span>${order}</span>`;
   const standbyClause = !standbyRows
     ? ''
     : cooldown.seconds > 0
@@ -1677,14 +1738,48 @@ function validateTrafficDistribution() {
     if (total) { total.textContent = `${item.total}%`; total.classList.toggle('invalid', item.total !== 100); }
   });
   const weightsValid = groups.every(group => group.rows.every(row => Number.isInteger(row.weight) && row.weight >= 1 && row.weight <= 100));
+  // A group the administrator has to fill is stated as that rather than as a total
+  // that reads zero, because an empty position is not a distribution at all.
+  const empty = groups.find(group => !group.rows.length);
   const unbalanced = totals.find(item => item.total !== 100);
-  const valid = weightsValid && !unbalanced && trafficRows.length > 1;
-  $('#traffic-error').textContent = unbalanced
-    ? `${groups.length > 1 ? `Priority ${unbalanced.priority}` : 'Traffic shares'} must add up to 100% (currently ${unbalanced.total}%).`
-    : '';
+  const valid = weightsValid && !empty && !unbalanced && trafficRows.length > 1;
+  $('#traffic-error').textContent = empty
+    ? `${trafficGroupName(empty.priority)} has no identities. Move an identity into it, or remove the group.`
+    : unbalanced
+      ? `${groups.length > 1 ? `Priority ${unbalanced.priority}` : 'Traffic shares'} must add up to 100% (currently ${unbalanced.total}%).`
+      : '';
   $('#save-traffic').disabled = !valid;
   return valid;
 }
+/// A group is a position, so changing its order swaps every identity in the two
+/// groups, and removing one closes the gap it leaves so the positions that follow
+/// stay contiguous.
+function moveTrafficGroup(priority, action) {
+  if (action === 'remove') {
+    trafficRows.forEach(row => { if (row.priority > priority) row.priority -= 1; });
+    trafficGroupCount -= 1;
+    trafficPendingGroup = false;
+  } else {
+    const target = priority + (action === 'up' ? -1 : 1);
+    trafficRows.forEach(row => {
+      if (row.priority === priority) row.priority = target;
+      else if (row.priority === target) row.priority = priority;
+    });
+  }
+  renderTrafficGroups(trafficEndpoint.endpoint);
+}
+$('#traffic-rows').addEventListener('click', event => {
+  const button = event.target.closest('[data-action]');
+  if (button) moveTrafficGroup(Number(button.dataset.priority), button.dataset.action);
+});
+// Creating a group is its own action, so an identity is moved into a group that
+// already exists and the list of groups stays a list of groups.
+$('#traffic-add-group').addEventListener('click', () => {
+  trafficGroupCount += 1;
+  trafficPendingGroup = true;
+  renderTrafficGroups(trafficEndpoint.endpoint);
+  $('#traffic-rows').lastElementChild?.scrollIntoView({block: 'nearest'});
+});
 $$('.close-traffic').forEach(button => button.addEventListener('click', () => trafficDialog.close()));
 // The pool is one mechanism on both screens, so the dialog that sets the split
 // hands the administrator to the policy that changes what the split means

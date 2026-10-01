@@ -693,6 +693,15 @@ for (const project of projects) {
     await assertDialog(page, '#traffic-dialog', project.name);
     const identityStates = await page.locator('#traffic-rows .identity-state').allTextContents();
     if (!identityStates.some(text => text.includes('cooling down, resumes in')) || !identityStates.some(text => text.includes('healthy'))) throw new Error(`${project.name}: the traffic distribution dialog does not mark each identity's current state (${identityStates.join(' | ')})`);
+    // Both identities are in one group, so the dialog states that single order and
+    // names the way out of it instead of presenting a group that can be chosen.
+    const singleGroupHeadings = await page.locator('.traffic-group-head strong').allTextContents();
+    if (singleGroupHeadings.join('|') !== 'Preferred group' || await page.locator('.traffic-move').count()) throw new Error(`${project.name}: a one-group distribution presents groups to choose (${singleGroupHeadings.join(' | ')})`);
+    if ((await page.locator('#traffic-rows input[type="number"]').evaluateAll(inputs => inputs.map(input => input.value))).join(',') !== '50,50') throw new Error(`${project.name}: the identities sharing one group do not state their shares`);
+    if (!(await page.locator('#traffic-order').textContent()).includes('Add a standby group to keep one back')) throw new Error(`${project.name}: the traffic dialog does not say how a standby group is created`);
+    // What the percentages mean is one step away, so the order the dialog is about
+    // is readable without leaving it.
+    await page.locator('#traffic-dialog .traffic-details summary').click();
     const consequence = await page.locator('#traffic-consequence').textContent();
     if (!consequence.includes('split exactly as configured') || !consequence.includes('never longer than 1 hour')) throw new Error(`${project.name}: the traffic distribution dialog does not state what a rate limit does to the configured percentages (${consequence})`);
     if (!(await page.locator('#traffic-set-cooldown').isHidden())) throw new Error(`${project.name}: the traffic distribution dialog offers a cooldown shortcut while a cooldown policy is already configured`);
@@ -880,22 +889,49 @@ for (const project of projects) {
       await assertDialog(page, '#traffic-dialog', project.name);
       await page.locator('#traffic-rows').waitFor({state: 'visible'});
       const tierDescription = await page.locator('#traffic-description').textContent();
-      if (!tierDescription.includes('while its own priority group carries')) throw new Error(`${project.name}: the traffic dialog describes one split for a tiered Endpoint (${tierDescription})`);
+      if (!tierDescription.includes('takes inside its own group')) throw new Error(`${project.name}: the traffic dialog describes one split for a tiered Endpoint (${tierDescription})`);
+      if (!(await page.locator('#traffic-order').textContent()).includes('Yabane uses the preferred group first')) throw new Error(`${project.name}: the traffic dialog does not state which group carries traffic first`);
+      // A group is named by the order it carries traffic in while it keeps the
+      // number the pool summary and the API call it by.
       const groupHeadings = await page.locator('.traffic-group-head strong').allTextContents();
-      if (groupHeadings.join('|') !== 'Priority 1 · carries traffic first|Priority 2 · standby') throw new Error(`${project.name}: the traffic dialog does not group identities by priority (${groupHeadings.join(' | ')})`);
+      if (groupHeadings.join('|') !== 'Preferred group|Standby group') throw new Error(`${project.name}: the traffic dialog does not name its groups by the order they carry traffic in (${groupHeadings.join(' | ')})`);
+      const groupPriorities = await page.locator('.traffic-group-priority').allTextContents();
+      if (groupPriorities.join('|') !== 'Priority 1|Priority 2') throw new Error(`${project.name}: a group does not keep its priority number next to its name (${groupPriorities.join(' | ')})`);
       const groupNotes = await page.locator('.traffic-group-head small').allTextContents();
       if (!groupNotes[1].includes('Only used while every identity in Priority 1 is cooling down')) throw new Error(`${project.name}: a standby group does not say when it takes over (${groupNotes.join(' | ')})`);
-      if ((await page.locator('.traffic-group-total').allTextContents()).join('|') !== '100%|100%') throw new Error(`${project.name}: a group is not totalled on its own`);
-      const tierOptions = await page.locator('.traffic-tier').first().locator('option').allTextContents();
-      if (tierOptions.join('|') !== 'Priority 1 · first|Priority 2 · standby|Priority 3 · new standby') throw new Error(`${project.name}: the priority choices do not offer the existing groups and one more (${tierOptions.join(' | ')})`);
+      // A group holding one identity carries that group's whole traffic, so it is
+      // stated as what it means instead of being offered as a percentage field.
+      const noteTexts = await page.locator('.traffic-group-note').allTextContents();
+      if (await page.locator('#traffic-rows input[type="number"]').count() || noteTexts.length !== 2 || !noteTexts[0].includes('only identity in this group')) throw new Error(`${project.name}: a single-identity group asks for a percentage that only ever reads 100 (${noteTexts.join(' | ')})`);
+      // Which identity sits in which group is visible, and a move names the group it
+      // would move to instead of hiding that choice behind a number.
+      const groupMembers = () => page.locator('.traffic-group').evaluateAll(groups => groups.map(group => [...group.querySelectorAll('.traffic-identity strong')].map(name => name.textContent)));
+      if (JSON.stringify(await groupMembers()) !== '[["Primary account"],["Standby account"]]') throw new Error(`${project.name}: the traffic dialog does not show which identity is in which group (${JSON.stringify(await groupMembers())})`);
+      const moveOptions = await page.locator('.traffic-move').first().locator('option').allTextContents();
+      if (moveOptions.join('|') !== 'Move to group…|Standby group · Priority 2') throw new Error(`${project.name}: moving an identity does not name the group it would move to (${moveOptions.join(' | ')})`);
+      const standbyMoveOptions = await page.locator('.traffic-move').nth(1).locator('option').allTextContents();
+      if (standbyMoveOptions.join('|') !== 'Move to group…|Preferred group · Priority 1') throw new Error(`${project.name}: a standby identity cannot be moved back into the preferred group (${standbyMoveOptions.join(' | ')})`);
+      // The order of the groups is what the dialog decides, so the group itself
+      // moves: swapping two groups takes every identity in them with it, and the
+      // positions stay numbered from the top.
+      await page.locator('.traffic-group').first().locator('[data-action="down"]').click();
+      if (JSON.stringify(await groupMembers()) !== '[["Standby account"],["Primary account"]]') throw new Error(`${project.name}: the group controls do not change which group carries traffic first (${JSON.stringify(await groupMembers())})`);
+      if ((await page.locator('.traffic-group-priority').allTextContents()).join('|') !== 'Priority 1|Priority 2') throw new Error(`${project.name}: moving a group renames the position of another group`);
+      await page.locator('.traffic-group').nth(1).locator('[data-action="up"]').click();
       // Moving an identity between groups shares both groups out again, so a group
       // never has to be repaired by hand after a move.
-      await page.locator('.traffic-tier').nth(1).selectOption('1');
+      await page.locator('.traffic-move').nth(1).selectOption('1');
       if (await page.locator('.traffic-group').count() !== 1 || (await page.locator('#traffic-rows input[type="number"]').evaluateAll(inputs => inputs.map(input => input.value))).join(',') !== '50,50') throw new Error(`${project.name}: moving an identity into a group does not share that group out again`);
-      // A group that does not exist yet can be created from the same choice.
-      await page.locator('.traffic-tier').first().selectOption('2');
+      if ((await page.locator('.traffic-group-total').allTextContents()).join('|') !== '100%') throw new Error(`${project.name}: a group is not totalled on its own`);
+      // Creating a group is its own action, so the list of groups stays a list of
+      // groups, and a position holding no identity yet says so instead of saving as
+      // a group that carries nothing.
+      await page.locator('#traffic-add-group').click();
+      if (await page.locator('.traffic-group').count() !== 2 || !(await page.locator('.traffic-group-empty').textContent()).includes('No identities in this group yet')) throw new Error(`${project.name}: adding a standby group does not create a position to move an identity into`);
+      if (!await page.locator('#save-traffic').isDisabled() || !(await page.locator('#traffic-error').textContent()).includes('Standby group has no identities')) throw new Error(`${project.name}: a group holding no identity can be saved as a distribution`);
+      await page.locator('.traffic-move').first().selectOption('2');
       const splitNotes = await page.locator('.traffic-group-head small').allTextContents();
-      if (await page.locator('.traffic-group').count() !== 2 || (await page.locator('#traffic-rows input[type="number"]').evaluateAll(inputs => inputs.map(input => input.value))).join(',') !== '100,100') throw new Error(`${project.name}: creating a second group does not total each group at 100 (${splitNotes.join(' | ')})`);
+      if (JSON.stringify(await groupMembers()) !== '[["Standby account"],["Primary account"]]' || await page.locator('#traffic-rows input[type="number"]').count() !== 0) throw new Error(`${project.name}: moving an identity into a new group does not total each group at 100 (${splitNotes.join(' | ')})`);
       // A group change is saved as the identity property it is, before the
       // percentages that are read inside those groups, and a rejected distribution
       // names the group that still has to be adjusted.
@@ -932,9 +968,14 @@ for (const project of projects) {
       await page.locator('.endpoint-card').first().getByRole('button', {name: 'Distribute traffic'}).click();
       await page.locator('#traffic-dialog').waitFor({state: 'visible'});
       const driftedHeadings = await page.locator('.traffic-group-head strong').allTextContents();
-      if (driftedHeadings.join('|') !== 'Priority 1 · carries traffic first|Priority 2 · standby') throw new Error(`${project.name}: stored group numbers are presented as group names (${driftedHeadings.join(' | ')})`);
-      const driftedOptions = await page.locator('.traffic-tier').first().locator('option').allTextContents();
-      if (driftedOptions.join('|') !== 'Priority 1 · first|Priority 2 · standby|Priority 3 · new standby') throw new Error(`${project.name}: a drifted numbering removes a group that can still be chosen (${driftedOptions.join(' | ')})`);
+      if (driftedHeadings.join('|') !== 'Preferred group|Standby group') throw new Error(`${project.name}: stored group numbers are presented as group names (${driftedHeadings.join(' | ')})`);
+      if ((await page.locator('.traffic-group-priority').allTextContents()).join('|') !== 'Priority 1|Priority 2') throw new Error(`${project.name}: stored group numbers are presented as positions (${(await page.locator('.traffic-group-priority').allTextContents()).join(' | ')})`);
+      const driftedOptions = await page.locator('.traffic-move').first().locator('option').allTextContents();
+      if (driftedOptions.join('|') !== 'Move to group…|Standby group · Priority 2') throw new Error(`${project.name}: a drifted numbering removes a group that can still be chosen (${driftedOptions.join(' | ')})`);
+      await page.locator('#traffic-add-group').click();
+      if ((await page.locator('.traffic-group-priority').allTextContents()).join('|') !== 'Priority 1|Priority 2|Priority 3') throw new Error(`${project.name}: a drifted numbering leaves no group to add below the ones shown`);
+      await page.locator('.traffic-group').nth(2).locator('.traffic-group-remove').click();
+      if (await page.locator('.traffic-group').count() !== 2 || await page.locator('#save-traffic').isDisabled()) throw new Error(`${project.name}: removing the group an administrator just added leaves the distribution unsaveable`);
       const normalised = [];
       await page.route(`${base}/admin/providers/ui-tiered/endpoints/pool/credentials/*`, async route => {
         normalised.push(route.request().postDataJSON());
@@ -954,6 +995,7 @@ for (const project of projects) {
       await openCard.getByRole('button', {name: 'Distribute traffic'}).click();
       const offNotes = await page.locator('.traffic-group-head small').allTextContents();
       if (!offNotes[1].includes('Never used while rate limits are untracked')) throw new Error(`${project.name}: the traffic dialog presents an unreachable standby group as a plan (${offNotes.join(' | ')})`);
+      if (!(await page.locator('#traffic-order').textContent()).includes('standby group never takes over while the preferred group still has an identity that can serve')) throw new Error(`${project.name}: the traffic dialog does not state that a standby group cannot take over without a cooldown policy`);
       if (!(await page.locator('#traffic-consequence').textContent()).includes('nothing leaves the rotation while rate limits are untracked')) throw new Error(`${project.name}: the traffic dialog does not state that a standby group cannot take over without a cooldown policy`);
       await page.locator('#traffic-dialog .close-traffic').first().click();
       await page.locator('#traffic-dialog').waitFor({state: 'hidden'});
