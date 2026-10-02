@@ -634,6 +634,24 @@
             "type": "boolean",
             "description": "Whether the identity that carried the request was itself cooling down at selection time, because the Endpoint had no eligible identity left or a model route pinned an exhausted one. False for Endpoints without credentials and for older records."
           },
+          "route_mode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "weighted",
+              "failover"
+            ],
+            "description": "Selection mode of the model route that chose the destination. Null when no model route matched and the caller's Provider/model ID was used directly."
+          },
+          "route_priority": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Priority group of the destination that carried the request. Null unless a failover route chose it."
+          },
+          "route_failover": {
+            "type": "boolean",
+            "description": "Whether the destination was taken while a lower-numbered group could not serve because every destination in it was cooling down."
+          },
           "caller_protocol": {
             "type": "string",
             "nullable": true
@@ -3302,7 +3320,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Routes"
+            "description": "Routes, every destination with its configured fields and the state the route would apply to it right now (serving, standby, cooling, unusable, or inactive). Runtime state is recomputed on every read and stored nowhere."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
@@ -3314,7 +3332,7 @@
           "Model routes"
         ],
         "summary": "Create or replace a public model route",
-        "description": "Every target must currently be usable. Validation and persistence are serialized with Provider and Endpoint mutations so a concurrent deletion cannot leave a dangling target. An OpenAI subscription target requires the OpenAI Subscription Extension to be enabled; disabling it later retains the route but makes that target fail visibly until re-enabled.",
+        "description": "Every target must currently be usable. Validation and persistence are serialized with Provider and Endpoint mutations so a concurrent deletion cannot leave a dangling target. An OpenAI subscription target requires the OpenAI Subscription Extension to be enabled; disabling it later retains the route but makes that target fail visibly until re-enabled. A failover route is validated and described in its own mode's terms: priority groups of at least 1, one 100% split per group, and a destination that cannot serve being reported rather than skipped.",
         "security": [
           {
             "managementKey": []
@@ -3337,6 +3355,15 @@
                   "pattern": {
                     "type": "string",
                     "description": "Exact model ID or one trailing * wildcard."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "weighted",
+                      "failover"
+                    ],
+                    "default": "weighted",
+                    "description": "weighted gives every enabled destination its configured share whether or not its identities are cooling down. failover groups destinations by priority: the lowest-numbered group with a destination that still has an identity to use carries the traffic, and a group is left only while every destination in it is cooling down. A destination whose configuration cannot serve is never skipped, so a standby group cannot hide it."
                   },
                   "targets": {
                     "type": "array",
@@ -3362,7 +3389,7 @@
                           "type": "integer",
                           "minimum": 0,
                           "maximum": 100,
-                          "description": "Exact traffic percentage. A 0% share disables the target; all shares must total 100."
+                          "description": "Traffic percentage. A 0% share disables the destination. A weighted route's shares must total 100; a failover route's must total 100 inside each priority group."
                         },
                         "enabled": {
                           "type": "boolean",
@@ -3372,6 +3399,12 @@
                         "credential_id": {
                           "type": "string",
                           "description": "Optional credential ID to pin. Omit or use an empty string to keep the Endpoint credential policy, which selects among enabled credentials and skips ones that are cooling down. A pinned credential is always used exactly as configured."
+                        },
+                        "priority": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "default": 1,
+                          "description": "Priority group for a failover route, lowest first. A weighted route stores but never reads it."
                         }
                       }
                     }
@@ -3451,6 +3484,15 @@
                     "type": "string",
                     "description": "Exact model ID or one trailing * wildcard."
                   },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "weighted",
+                      "failover"
+                    ],
+                    "default": "weighted",
+                    "description": "weighted gives every enabled destination its configured share whether or not its identities are cooling down. failover groups destinations by priority: the lowest-numbered group with a destination that still has an identity to use carries the traffic, and a group is left only while every destination in it is cooling down. A destination whose configuration cannot serve is never skipped, so a standby group cannot hide it."
+                  },
                   "targets": {
                     "type": "array",
                     "items": {
@@ -3475,7 +3517,7 @@
                           "type": "integer",
                           "minimum": 0,
                           "maximum": 100,
-                          "description": "Exact traffic percentage. A 0% share disables the target; all shares must total 100."
+                          "description": "Traffic percentage. A 0% share disables the destination. A weighted route's shares must total 100; a failover route's must total 100 inside each priority group."
                         },
                         "enabled": {
                           "type": "boolean",
@@ -3485,6 +3527,12 @@
                         "credential_id": {
                           "type": "string",
                           "description": "Optional credential ID to pin. Omit or use an empty string to keep the Endpoint credential policy, which selects among enabled credentials and skips ones that are cooling down. A pinned credential is always used exactly as configured."
+                        },
+                        "priority": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "default": 1,
+                          "description": "Priority group for a failover route, lowest first. A weighted route stores but never reads it."
                         }
                       }
                     }

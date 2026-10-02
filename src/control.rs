@@ -15,7 +15,8 @@ use crate::{
     auth::{self, GatewayApiKey, GatewayApiKeyView, generate_secret, hash_secret, now, save_auth},
     config::{
         ApiEndpoint, ApiType, AppState, Credential, CredentialMaterial, ModelEndpointPreference,
-        Provider, RateLimitCooldown, RateLimitCooldownInput, save_providers,
+        Provider, RateLimitCooldown, RateLimitCooldownInput, destination_availability,
+        save_providers,
     },
     endpoint_signin,
     error::api_error,
@@ -231,6 +232,8 @@ struct CredentialWeight {
 #[derive(Deserialize)]
 struct CreateGlobalRoute {
     pattern: String,
+    #[serde(default)]
+    mode: routes::RouteMode,
     targets: Vec<routes::RouteTarget>,
 }
 
@@ -498,7 +501,62 @@ async fn persist_auth_or_error(auth: &auth::AuthConfig) -> Response {
 }
 
 async fn list_global_routes(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(state.routes.0.read().await.clone())
+    // The Provider snapshot is taken before the route lock, which is the order
+    // Provider and Endpoint mutations use.
+    let providers = state.providers.read().await;
+    let routes = state.routes.0.read().await;
+    let views: Vec<RouteView> = routes
+        .iter()
+        .map(|route| RouteView {
+            pattern: route.pattern.clone(),
+            mode: route.mode,
+            targets: route
+                .destination_states(|target| {
+                    destination_availability(
+                        &providers,
+                        &state.extensions,
+                        &state.credential_health,
+                        target,
+                    )
+                })
+                .into_iter()
+                .zip(route.targets.iter())
+                .map(|(state, target)| RouteTargetView {
+                    provider_id: target.provider_id.clone(),
+                    endpoint_id: target.endpoint_id.clone(),
+                    credential_id: target.credential_id.clone(),
+                    upstream_model: target.upstream_model.clone(),
+                    weight: target.weight,
+                    priority: target.priority,
+                    enabled: target.enabled,
+                    state,
+                })
+                .collect(),
+        })
+        .collect();
+    axum::Json(views)
+}
+
+/// One model route as the console reads it: what is configured, plus what the
+/// route would do with every destination right now. The runtime state is
+/// recomputed on every read and stored nowhere.
+#[derive(Serialize)]
+struct RouteView {
+    pattern: String,
+    mode: routes::RouteMode,
+    targets: Vec<RouteTargetView>,
+}
+
+#[derive(Serialize)]
+struct RouteTargetView {
+    provider_id: String,
+    endpoint_id: String,
+    credential_id: String,
+    upstream_model: String,
+    weight: u32,
+    priority: u32,
+    enabled: bool,
+    state: routes::DestinationState,
 }
 
 async fn create_global_route(
@@ -527,11 +585,12 @@ async fn save_global_route(
             target.weight = 0;
         }
     }
-    let traffic_total: u64 = input
-        .targets
-        .iter()
-        .map(|target| u64::from(target.weight))
-        .sum();
+    if input.targets.iter().any(|target| target.priority == 0) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "Route destination priority must be at least 1",
+        );
+    }
     if !routes::valid_model_pattern(input.pattern.trim())
         || input.targets.is_empty()
         || input
@@ -541,13 +600,27 @@ async fn save_global_route(
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "A valid pattern and traffic shares from 0 to 100 are required; 0 disables a target",
+            match input.mode {
+                routes::RouteMode::Weighted => {
+                    "A valid pattern and traffic shares from 0 to 100 are required; 0 disables a target"
+                }
+                routes::RouteMode::Failover => {
+                    "A valid pattern and traffic shares from 0 to 100 are required; 0 disables a destination"
+                }
+            },
         );
     }
-    if traffic_total != 100 {
+    if !routes::targets_total_as_required(input.mode, &input.targets) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "Enabled route target traffic percentages must total 100",
+            match input.mode {
+                routes::RouteMode::Weighted => {
+                    "Enabled route target traffic percentages must total 100"
+                }
+                routes::RouteMode::Failover => {
+                    "Every priority group's enabled destinations must total 100%, and at least one destination must be enabled"
+                }
+            },
         );
     }
     let providers = state.providers.read().await;
@@ -645,14 +718,17 @@ async fn save_global_route(
         }
         updated[index] = routes::ModelRoute {
             pattern,
+            mode: input.mode,
             targets: input.targets,
             cursor: Default::default(),
         };
     } else if let Some(route) = updated.iter_mut().find(|route| route.pattern == pattern) {
+        route.mode = input.mode;
         route.targets = input.targets;
     } else {
         updated.push(routes::ModelRoute {
             pattern,
+            mode: input.mode,
             targets: input.targets,
             cursor: Default::default(),
         });

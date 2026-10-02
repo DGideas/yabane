@@ -293,6 +293,10 @@ admin -f "$base/admin/auth" | grep -Fq "$secret"
 grep -Fq "$secret" data/auth.json
 [[ $(status "$base/v1/models" -H 'Authorization: Basic nope') == 401 ]]
 [[ $(status "$base/v1/models" -H 'Authorization: Bearer sk-invalid') == 401 ]]
+# A Gateway key is read from `Authorization: Bearer` only. An Anthropic-style
+# `x-api-key` header carries a Provider credential upstream and never
+# authenticates a caller, which the Claude Code entry of the console guide says.
+[[ $(status -X POST "$base/v1/messages" -H "x-api-key: $secret" -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{"model":"x","max_tokens":1,"messages":[]}') == 401 ]]
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 200 ]]
 future_expiry=$(($(date +%s) + 3600))
 admin -f -X PATCH "$base/admin/auth/keys/$id" -H 'content-type: application/json' -d "{\"note\":\"Edited note\",\"expires_at\":$future_expiry,\"provider_ids\":[]}" >/dev/null
@@ -845,6 +849,110 @@ done
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}') == 429 ]]
 [[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
 
+# A failover route holds its preferred Provider until every identity behind it is
+# rate-limited, then hands the traffic to the next priority group. The request that
+# hit the limit still receives the Provider's own answer: nothing in the proxy path
+# retries it, and only the requests after it are routed elsewhere.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"failover-a\",\"name\":\"Failover A\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Primary account\",\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
+admin -f -X POST "$base/admin/providers/failover-a/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Second account","secret":"throttled","weight":100}' >/dev/null
+admin -f -X POST "$base/admin/providers/failover-a/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Third account","secret":"throttled","weight":100}' >/dev/null
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"failover-b\",\"name\":\"Failover B\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Standby account\",\"credential_secret\":\"two\"}}" >/dev/null
+failover_route='{"pattern":"failover-model","mode":"failover","targets":[{"provider_id":"failover-a","endpoint_id":"main","credential_id":"","upstream_model":"failover-model","weight":100,"priority":1},{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-model","weight":100,"priority":2}]}'
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$failover_route") == 204 ]]
+# Every group carries its own 100%, so a standby destination adds a plan instead of
+# taking a share away from the group above it.
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-model") | [.mode, .targets[0].priority, .targets[0].state, .targets[1].priority, .targets[1].state] | join(",")') == failover,1,serving,2,standby ]]
+failover_posts_before=$(curl -sS "http://127.0.0.1:$upstream_port/count")
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-model","messages":[]}') == 429 ]]
+[[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
+# One caller request is one Provider request even when the destination answers with
+# a rate limit, so a failover route never pays for a request it did not send.
+[[ $(( $(curl -sS "http://127.0.0.1:$upstream_port/count") - failover_posts_before )) -eq 1 ]]
+# Every identity has to be rate-limited on its own before a group counts as
+# exhausted, so an account that has not answered yet keeps the group preferred.
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-model","messages":[]}') == 429 ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-model") | [.targets[0].state, .targets[1].state] | join(",")') == serving,standby ]]
+# The request that meets the last usable account is not rescued either: it receives
+# the Provider's own rate-limit answer, and only the requests after it are routed
+# elsewhere.
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-model","messages":[]}') == 429 ]]
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-model") | [.targets[0].state, .targets[1].state] | join(",")') == cooling,serving ]]
+failover_switched=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-model","messages":[]}')
+[[ $(printf '%s' "$failover_switched" | jq -r .endpoint) == two ]]
+# Activity names the group that carried each request and whether a group was left
+# behind, so a rate limit stays explainable after the cooldowns expire.
+failover_activity=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$failover_activity" | jq '[.[] | select(.model == "failover-model" and .provider == "failover-a" and .status == 429 and .route_mode == "failover" and .route_priority == 1 and .route_failover == false)] | length') -ge 3 ]]
+[[ $(printf '%s' "$failover_activity" | jq '[.[] | select(.model == "failover-model" and .provider == "failover-b" and .status == 200 and .route_mode == "failover" and .route_priority == 2 and .route_failover == true)] | length') -ge 1 ]]
+# A cooldown delays the next attempt instead of retiring the account, so once it is
+# over the route prefers its first group again.
+for credential in default second-account third-account; do
+  [[ $(admin_status -X DELETE "$base/admin/providers/failover-a/endpoints/main/credentials/$credential/cooldown") == 204 ]]
+done
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-model","messages":[]}') == 429 ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "failover-model" and .provider == "failover-a" and .route_priority == 1 and .route_failover == false)] | length') -ge 4 ]]
+# A destination is left for a rate limit only, never for an identity that is cooling
+# down while another identity of the same destination can take the request.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"failover-mixed\",\"name\":\"Failover mixed\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Small account\",\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
+admin -f -X POST "$base/admin/providers/failover-mixed/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"main","name":"Main account","secret":"one","weight":99}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/failover-mixed/endpoints/main/credentials/default" -H 'content-type: application/json' -d '{"weight":1}' >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-mixed","mode":"failover","targets":[{"provider_id":"failover-mixed","endpoint_id":"main","credential_id":"","upstream_model":"failover-mixed","weight":100,"priority":1},{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-mixed","weight":100,"priority":2}]}' >/dev/null
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-mixed","messages":[]}') == 429 ]]
+for _ in 1 2; do
+  failover_mixed_body=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-mixed","messages":[]}')
+  [[ $(printf '%s' "$failover_mixed_body" | jq -r .endpoint) == one ]]
+done
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-mixed") | [.targets[0].state, .targets[1].state] | join(",")') == serving,standby ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "failover-mixed" and .provider == "failover-mixed" and .status == 200 and .route_priority == 1 and .route_failover == false)] | length') -ge 2 ]]
+# A destination that pins an identity is judged by that identity alone: while the
+# pinned account is cooling down the route uses the next group instead of quietly
+# answering with another account of the same Endpoint.
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-pinned","mode":"failover","targets":[{"provider_id":"failover-a","endpoint_id":"main","credential_id":"default","upstream_model":"failover-pinned","weight":100,"priority":1},{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-pinned","weight":100,"priority":2}]}' >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-pinned") | [.targets[0].state, .targets[1].state] | join(",")') == cooling,serving ]]
+failover_pinned=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-pinned","messages":[]}')
+[[ $(printf '%s' "$failover_pinned" | jq -r .endpoint) == two ]]
+[[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "failover-pinned" and .provider == "failover-b" and .route_priority == 2 and .route_failover == true)] | length') -ge 1 ]]
+# A weighted route keeps the meaning it always had: a share is a share, so a
+# destination whose identities are all cooling down keeps receiving its own portion
+# instead of quietly moving it to the other one.
+weighted_payload='{"pattern":"weighted-model","targets":[{"provider_id":"failover-a","endpoint_id":"main","credential_id":"","upstream_model":"weighted-model","weight":50},{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"weighted-model","weight":50}]}'
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d "$weighted_payload") == 204 ]]
+for _ in 1 2; do
+  [[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"weighted-model","messages":[]}') == 429 ]]
+  weighted_healthy=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"weighted-model","messages":[]}')
+  [[ $(printf '%s' "$weighted_healthy" | jq -r .endpoint) == two ]]
+done
+# When every destination is cooling down the route still uses the highest-priority
+# group, so the Provider's own answer reaches the caller instead of an invented
+# gateway failure.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"failover-c\",\"name\":\"Failover C\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-dry","mode":"failover","targets":[{"provider_id":"failover-a","endpoint_id":"main","credential_id":"","upstream_model":"failover-dry","weight":100,"priority":1},{"provider_id":"failover-c","endpoint_id":"main","credential_id":"","upstream_model":"failover-dry","weight":100,"priority":2}]}' >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-dry","messages":[]}') == 429 ]]
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-dry","messages":[]}') == 429 ]]
+failover_dry_activity=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$failover_dry_activity" | jq '[.[] | select(.model == "failover-dry" and .provider == "failover-c" and .status == 429 and .route_priority == 2 and .route_failover == true)] | length') -ge 1 ]]
+[[ $(printf '%s' "$failover_dry_activity" | jq '[.[] | select(.model == "failover-dry" and .provider == "failover-a" and .status == 429 and .route_priority == 1 and .route_failover == false and .credential_cooling == true)] | length') -ge 1 ]]
+# A destination that cannot serve because of its configuration is not exhaustion,
+# so a standby group never hides it and the request fails on it as it always did.
+admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"failover-broken\",\"name\":\"Failover broken\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"one\"}}" >/dev/null
+admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-broken","mode":"failover","targets":[{"provider_id":"failover-broken","endpoint_id":"main","credential_id":"","upstream_model":"failover-broken","weight":100,"priority":1},{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-broken","weight":100,"priority":2}]}' >/dev/null
+admin -f -X PATCH "$base/admin/providers/failover-broken/endpoints/main/credentials/default" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
+[[ $(admin -f "$base/admin/routes" | jq -r '.[] | select(.pattern == "failover-broken") | [.targets[0].state, .targets[1].state] | join(",")') == unusable,standby ]]
+[[ $(status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"failover-broken","messages":[]}') == 409 ]]
+[[ $(jq -r '.error.message' response.json) == "Endpoint 'main' has no enabled credential" ]]
+# A failover route is validated in its own mode's terms.
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-short","mode":"failover","targets":[{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-short","weight":50,"priority":1}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Every priority group's enabled destinations must total 100%, and at least one destination must be enabled" ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-zero","mode":"failover","targets":[{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-zero","weight":100,"priority":0}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Route destination priority must be at least 1" ]]
+[[ $(admin_status -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"failover-weighted-total","targets":[{"provider_id":"failover-b","endpoint_id":"main","credential_id":"","upstream_model":"failover-weighted-total","weight":100,"priority":1},{"provider_id":"failover-c","endpoint_id":"main","credential_id":"","upstream_model":"failover-weighted-total","weight":100,"priority":2}]}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Enabled route target traffic percentages must total 100" ]]
+# The published contract states the mode, the priority a failover destination
+# carries, and the selection facts an Activity record exposes.
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/routes"].post.requestBody.content["application/json"].schema.properties.mode.enum | join(",")') == weighted,failover ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.paths["/admin/routes/{pattern}"].patch.requestBody.content["application/json"].schema.properties.targets.items.properties.priority.minimum') == 1 ]]
+[[ $(curl -fsS "$base/openapi.json" | jq -r '.components.schemas.RequestLog.properties.route_mode.enum | join(",")') == weighted,failover ]]
+
 # When every pool member is cooling down Yabane still sends the request, so the
 # Provider's own answer reaches the caller instead of an invented gateway failure.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"solo-pool\",\"name\":\"Solo pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":600,\"mode\":\"fixed\"}}}" >/dev/null
@@ -977,8 +1085,18 @@ admin -f -X DELETE "$base/admin/providers/multi" >/dev/null
 [[ $(admin -f "$base/admin/routes" | jq -c '[.[] | select(.pattern == "provider-deletion-shared") | .targets[] | [.provider_id, .weight]]') == '[["allowed",100]]' ]]
 # Every route on disk still describes how one request splits across the destinations
 # that exist, so deleting a Provider, Endpoint, or key cannot leave a file that fails
-# to load after a restart.
-[[ -z $(jq -r '.[] | select((.targets | map(.weight) | add) != 100) | .pattern' data/routes.json) ]]
+# to load after a restart. A failover route gives every priority group its own split,
+# so a standby group may add to more than 100% across the whole route.
+[[ -z $(jq -r '.[]
+| select(
+    if .mode == "failover" then
+      ([.targets[] | select(.enabled and .weight > 0)] | group_by(.priority)) as $groups
+      | ($groups | length == 0) or ($groups | any(map(.weight) | add != 100))
+    else
+      (.targets | map(.weight) | add) != 100
+    end
+  )
+| .pattern' data/routes.json) ]]
 [[ $(admin_status -X PATCH "$base/admin/pricing/providers/multi" -H 'content-type: application/json' -d '{"models":{}}') == 404 ]]
 [[ $(jq '[.[] | select(.id == "multi") | .pricing] | length' data/providers.json) == 0 ]]
 [[ $(admin -f "$base/admin/pricing" | jq -r '.models["claude*"].input_per_million == 1') == true ]]

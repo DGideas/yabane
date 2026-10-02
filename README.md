@@ -18,6 +18,7 @@ Yabane is a small, performance-oriented LLM gateway written in Rust. Its first r
 - Optional per-Endpoint `socks5://` or `socks5h://` proxying
 - Provider routing through `provider/model` IDs
 - Optional exact-name and trailing-wildcard model routes to a specific Endpoint, optionally pinning one credential instead of using the Endpoint's automatic selection
+- Two model-route selection modes: `weighted` shares traffic across interchangeable destinations, while `failover` keeps a preferred priority group until every identity behind it is cooling down and then uses the next group, with a request that meets the rate limit still receiving the Provider's own answer
 - Gateway API-key authentication with expiration and provider scopes
 - Separate one-time-secret Management API keys for control-plane automation
 - Activity analytics with tokens, latency, routing metadata, upstream-reported cost, and explicitly configured cost estimates

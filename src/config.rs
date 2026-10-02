@@ -15,7 +15,7 @@ use crate::{
     activity::ActivityStore,
     admin_user::AdminState,
     auth::{AuthConfig, SharedAuth},
-    routes::{ModelRoute, RouteStore},
+    routes::{DestinationAvailability, ModelRoute, RouteStore},
 };
 
 pub const PROVIDERS_FILE: &str = "data/providers.json";
@@ -408,6 +408,40 @@ impl ApiEndpoint {
             .clone()
     }
 
+    /// What a request that delegates identity selection would find here,
+    /// without choosing one: asking must not advance the rotation a later
+    /// request depends on, and it must not be confused with a decision.
+    ///
+    /// An Endpoint with no usable identity is unusable rather than exhausted:
+    /// turning every identity off is a configuration that cannot serve, and
+    /// treating it as a rate limit would let it hide behind a standby group.
+    pub fn credential_availability(
+        &self,
+        health: &crate::health::CredentialHealth,
+        provider_id: &str,
+    ) -> DestinationAvailability {
+        let mut usable = false;
+        for credential in self
+            .credentials
+            .iter()
+            .filter(|credential| credential.is_usable())
+        {
+            usable = true;
+            if !health.is_cooling(&crate::health::credential_key(
+                provider_id,
+                &self.id,
+                &credential.id,
+            )) {
+                return DestinationAvailability::Eligible;
+            }
+        }
+        if usable {
+            DestinationAvailability::Cooling
+        } else {
+            DestinationAvailability::Unusable
+        }
+    }
+
     /// Chooses the identity a request leaves with.
     ///
     /// Identities are grouped by priority, and only the lowest-numbered group
@@ -471,6 +505,65 @@ impl ApiEndpoint {
                 credential,
                 all_exhausted,
             })
+    }
+}
+
+/// What Yabane knows about one route destination before choosing it.
+///
+/// A pinned identity answers for itself. A destination that delegates identity is
+/// out only while every identity its Endpoint could use is cooling down: one
+/// rate-limited identity among several is the Endpoint's own rotation to solve,
+/// not a reason to leave the destination. Anything that stops a destination from
+/// serving at all is unusable rather than exhausted, so a standby group can
+/// never hide a broken destination. Shared by the proxy path and the console so
+/// both describe the same state.
+pub fn destination_availability(
+    providers: &HashMap<String, Provider>,
+    extensions: &crate::extensions::ExtensionRegistry,
+    health: &crate::health::CredentialHealth,
+    target: &crate::routes::RouteTarget,
+) -> DestinationAvailability {
+    let Some(provider) = providers.get(&target.provider_id) else {
+        return DestinationAvailability::Unusable;
+    };
+    let Some(endpoint) = provider
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.id == target.endpoint_id)
+    else {
+        return DestinationAvailability::Unusable;
+    };
+    if let Some(endpoint_type) = endpoint.extension_endpoint_type()
+        && extensions.provider_endpoint(endpoint_type).is_none()
+    {
+        return DestinationAvailability::Unusable;
+    }
+    if !endpoint.requires_credential {
+        // Nothing about a request to an Endpoint without identities can be
+        // rate-limited here, so there is no exhaustion to observe.
+        return DestinationAvailability::Eligible;
+    }
+    if target.credential_id.is_empty() {
+        return endpoint.credential_availability(health, &provider.id);
+    }
+    let Some(credential) = endpoint
+        .credentials
+        .iter()
+        .find(|credential| credential.id == target.credential_id)
+    else {
+        return DestinationAvailability::Unusable;
+    };
+    if !credential.enabled {
+        return DestinationAvailability::Unusable;
+    }
+    if health.is_cooling(&crate::health::credential_key(
+        &provider.id,
+        &endpoint.id,
+        &credential.id,
+    )) {
+        DestinationAvailability::Cooling
+    } else {
+        DestinationAvailability::Eligible
     }
 }
 
@@ -1027,12 +1120,14 @@ mod tests {
         };
         let route = |provider_id: &str, endpoint_id: &str, credential_id: &str| ModelRoute {
             pattern: "alias".to_owned(),
+            mode: crate::routes::RouteMode::Weighted,
             targets: vec![RouteTarget {
                 provider_id: provider_id.to_owned(),
                 endpoint_id: endpoint_id.to_owned(),
                 credential_id: credential_id.to_owned(),
                 upstream_model: "model".to_owned(),
                 weight: 100,
+                priority: 1,
                 enabled: true,
             }],
             cursor: Default::default(),

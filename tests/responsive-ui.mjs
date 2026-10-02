@@ -152,6 +152,7 @@ for (const project of projects) {
         timestamp: Math.floor(Date.now() / 1000), request_id: `ui-unchanged-model-${project.name}`, source_instance_id: 'responsive-remote-instance',
         path: '/v1/responses', model: 'activity-only-model', upstream_model: 'activity-only-model',
         provider: 'ui-subscription', endpoint: 'chatgpt', upstream_credential_id: 'account', upstream_credential_name: 'OpenAI account', credential_cooling: true,
+        route_mode: 'failover', route_priority: 2, route_failover: true,
         caller_protocol: 'openai_responses', upstream_protocol: 'openai_responses',
         status: 200, latency_ms: 110, gateway_ms: 4, upstream_response_ms: 18, first_byte_ms: 28, generation_ms: 82,
         input_tokens: 100, output_tokens: 30, cached_tokens: 10, cost: null, finish_reason: 'completed', streaming: false,
@@ -568,6 +569,17 @@ for (const project of projects) {
     if (!(await agentSelect.isVisible())) throw new Error(`${project.name}: returning to Agent setup does not restore the Agent selector`);
     await page.locator('#help-agent').selectOption('codex');
     await page.locator('#help-dialog [data-help-panel="codex"]').waitFor({state: 'visible'});
+    await page.locator('#help-agent').selectOption('claude');
+    const claudePanel = page.locator('#help-dialog [data-help-panel="claude"]');
+    await claudePanel.waitFor({state: 'visible'});
+    const claudeGuide = (await page.locator('#help-claude-env').textContent()).split('\n');
+    const guideKey = await page.locator('#help-api-key').textContent();
+    const consoleOrigin = new URL(page.url()).origin;
+    if (claudeGuide[0] !== `export ANTHROPIC_BASE_URL='${consoleOrigin}'`) throw new Error(`${project.name}: Claude Code guide points Claude Code at a base URL that already carries the /v1 path Claude Code appends itself`);
+    if (claudeGuide[1] !== `export ANTHROPIC_AUTH_TOKEN='${guideKey}'`) throw new Error(`${project.name}: Claude Code guide does not put the Gateway key where Claude Code sends Authorization: Bearer`);
+    if (claudeGuide[2] !== `claude --model '${await page.locator('#help-model-id').textContent()}'`) throw new Error(`${project.name}: Claude Code guide does not start Claude Code on the selected Yabane model`);
+    if (claudeGuide.some(line => line.includes('ANTHROPIC_API_KEY'))) throw new Error(`${project.name}: Claude Code guide hands the Gateway key to the x-api-key header Yabane does not authenticate`);
+    if (!(await claudePanel.innerText()).includes('x-api-key')) throw new Error(`${project.name}: Claude Code panel does not name the key header Yabane reads instead`);
     await page.locator('#help-dialog .close-help').first().click();
     await page.evaluate(() => document.querySelector('.open-about').click());
     await assertDialog(page, '#about-dialog', project.name);
@@ -1197,6 +1209,19 @@ for (const project of projects) {
       const routeCounts = await page.locator('#routes tr').evaluateAll(rows => rows.map(row => ({destinations: row.querySelectorAll('.route-destination').length, summary: (row.querySelector('.route-model-cell small')?.textContent || '').trim()})));
       if (routeCounts.some(row => row.destinations === 1 && row.summary)) throw new Error(`${project.name}: a single-destination rule states a destination count (${JSON.stringify(routeCounts)})`);
       if (routeCounts.filter(row => row.destinations > 1).some(row => !row.summary.includes(`${row.destinations} destinations`))) throw new Error(`${project.name}: a rule that splits traffic does not state how many destinations it has (${JSON.stringify(routeCounts)})`);
+      // A failover rule is read in the order its groups carry traffic, and every
+      // destination states what the route would do with it now instead of leaving
+      // "the second Provider" to be inferred from the list order.
+      const failoverRow = page.locator('#routes tr').filter({has: page.locator('.route-group-mark')}).first();
+      if (!(await failoverRow.count())) throw new Error(`${project.name}: the routing list shows no failover rule and its priority groups`);
+      {
+        const groupNames = (await failoverRow.locator('.route-group-mark').allTextContents()).map(text => text.trim());
+        const priorities = groupNames.map(text => Number(text.replace(/\D+/g, '')));
+        if (priorities.some((priority, index) => index && priority < priorities[index - 1])) throw new Error(`${project.name}: a failover rule lists its priority groups out of order (${groupNames.join(', ')})`);
+        const destinationStates = (await failoverRow.locator('.route-destination-state').allTextContents()).map(text => text.trim());
+        const knownStates = ['standby', 'cooling down', 'cannot serve'];
+        if (!destinationStates.length || destinationStates.some(text => !knownStates.includes(text))) throw new Error(`${project.name}: a failover destination does not state what the route does with it (${destinationStates.join(', ')})`);
+      }
       // Rules are found by the names an operator thinks in, and a filter that
       // hides everything has to say so instead of looking like an empty page.
       const rulePatterns = () => page.locator('#routes .route-model-cell code').allTextContents();
@@ -1226,6 +1251,35 @@ for (const project of projects) {
         if (!identity.includes('Endpoint policy')) throw new Error(`${project.name}: a destination that uses the Endpoint credential policy does not say so (${identity})`);
         if (/Credential (No identity|Endpoint policy)/.test(identity)) throw new Error(`${project.name}: route destination identity repeats the identity label (${identity})`);
       }
+    }
+    // A failover rule reopens as the mode it uses, keeps every destination's own
+    // priority group, and still fits the dialog: the mode, the groups, and their
+    // split have to survive a round trip through the editor.
+    const editableFailoverRow = page.locator('#routes tr').filter({has: page.locator('.route-group-mark')}).first();
+    if (await editableFailoverRow.count()) {
+      await editableFailoverRow.locator('.edit-route').click();
+      await assertDialog(page, '#route-dialog', project.name);
+      if (!(await page.locator('#route-mode-choice input[value="failover"]').isChecked())) throw new Error(`${project.name}: editing a failover rule does not open it in failover mode`);
+      const priorityFields = page.locator('#route-targets .route-priority-field');
+      if (await priorityFields.count() !== await page.locator('#route-targets .route-target-editor').count() || await priorityFields.first().isHidden()) throw new Error(`${project.name}: a failover rule does not offer a priority for every destination`);
+      const priorityValues = await page.locator('#route-targets [name="target_priority"]').evaluateAll(selects => selects.map(select => select.value));
+      if (priorityValues.join(',') !== '1,2') throw new Error(`${project.name}: reopening a failover rule loses its priority groups (${priorityValues.join(',')})`);
+      const groupHeads = await page.locator('#route-targets .route-group-head strong').allTextContents();
+      if (groupHeads.join(',') !== 'Priority 1,Priority 2') throw new Error(`${project.name}: the editor does not present the groups in the order they carry traffic (${groupHeads.join(',')})`);
+      const editorOverflow = await page.locator('#route-targets').evaluate(element => element.scrollWidth > element.clientWidth + 1);
+      if (editorOverflow) throw new Error(`${project.name}: the failover destination row overflows the route dialog`);
+      const labelsFit = await page.locator('#route-targets .route-target-row .field-label').evaluateAll(labels => labels.every(label => label.scrollWidth <= label.clientWidth + 1));
+      if (!labelsFit) throw new Error(`${project.name}: route field labels overlap adjacent controls`);
+      const separatedModel = await page.locator('#route-targets .route-target-row').first().evaluate(row => row.querySelector('.route-model-field').getBoundingClientRect().bottom <= row.querySelector('.route-weight-field').getBoundingClientRect().top);
+      if (!separatedModel) throw new Error(`${project.name}: model and traffic controls share the same crowded row`);
+      if ((await page.locator('.route-group-total').allTextContents()).some(text => text !== '100% of this group')) throw new Error(`${project.name}: group totals are missing from their group headings`);
+      const policyDetails = page.locator('#route-targets .route-policy-details').first();
+      if (await policyDetails.getAttribute('open') !== null) throw new Error(`${project.name}: repeated policy details start expanded`);
+      await policyDetails.locator('summary').click();
+      await policyDetails.locator('.route-destination-effect').waitFor({state: 'visible'});
+      await policyDetails.locator('summary').click();
+      await page.locator('#route-dialog .close-route').first().click();
+      await page.locator('#route-dialog').waitFor({state: 'hidden'});
     }
     await page.evaluate(() => document.querySelector('#open-route').click());
     await assertDialog(page, '#route-dialog', project.name);
@@ -1789,6 +1843,11 @@ for (const project of projects) {
       if (!(await page.locator('#activity-detail-api-route').getByText('Client API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('Provider API', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-api-route').getByText('No API conversion', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not explain the client and Provider API formats`);
       if (!(await page.locator('#activity-detail-destination').getByText('Provider', { exact: true }).isVisible()) || !(await page.locator('#activity-detail-destination').getByText('Endpoint', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail does not group Provider and Endpoint under the routing destination`);
       if (!(await page.locator('#activity-detail-destination').getByText('Carried the request while cooling down · no eligible identity was left', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail presents an identity that was out of the pool as a healthy carrier`);
+      // A failover selection stays explainable after the cooldown it caused has
+      // expired, so the summary names the group that carried the request and that
+      // a group above it was left behind.
+      const routeSummary = await page.locator('#activity-detail-route').textContent();
+      if (!routeSummary.includes('Priority 2') || !routeSummary.includes('switched after every destination above it cooled down')) throw new Error(`${project.name}: request detail does not explain a destination chosen by failover (${routeSummary})`);
       if (await page.locator('#activity-detail-request').getByText('Caller protocol', { exact: true }).count() || await page.locator('#activity-detail-request').getByText('Upstream protocol', { exact: true }).count()) throw new Error(`${project.name}: request metadata still uses unexplained protocol terminology`);
       if (!(await page.locator('#activity-detail-request').getByText('Provider finish reason', { exact: true }).isVisible())) throw new Error(`${project.name}: request detail dialog omits the Provider finish reason`);
       const detailTypography = await page.locator('#activity-detail-dialog').evaluate(dialog => {

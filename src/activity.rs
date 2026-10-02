@@ -96,6 +96,21 @@ pub struct RequestLog {
     /// instead of surprising. Older imported or retained records read as false.
     #[serde(default)]
     pub credential_cooling: bool,
+    /// Selection mode of the model route that chose this destination: `weighted`
+    /// for a route that splits by configured share, `failover` for one that uses
+    /// priority groups. A request that named its Provider directly, and every
+    /// record written before routes carried modes, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_mode: Option<String>,
+    /// Priority group the chosen destination belongs to. Only a failover route
+    /// stores one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_priority: Option<u32>,
+    /// True when the destination was chosen while a lower-numbered group could
+    /// not serve because every destination in it was cooling down. Older
+    /// imported or retained records read as false.
+    #[serde(default)]
+    pub route_failover: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1451,6 +1466,9 @@ mod tests {
             upstream_credential_id: None,
             upstream_credential_name: None,
             credential_cooling: false,
+            route_mode: None,
+            route_priority: None,
+            route_failover: false,
             source_instance_id: None,
             gateway_api_key_id: None,
             gateway_api_key_note: None,

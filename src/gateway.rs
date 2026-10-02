@@ -18,13 +18,14 @@ use crate::{
     auth,
     config::{
         ApiEndpoint, ApiType, AppState, Credential, CredentialChoice, Provider, RateLimitCooldown,
-        RateLimitCooldownMode,
+        RateLimitCooldownMode, destination_availability,
     },
     endpoint_signin,
     error::{self, api_error},
     health, pricing,
     protocol::{self, Protocol},
     protocol_stream::StreamConverter,
+    routes::RouteMode,
     usage::{TokenUsage, UsageTracker},
 };
 
@@ -145,6 +146,7 @@ async fn route_proxied(
         model,
         upstream_model,
         body,
+        route,
     } = match resolve_provider(&state, &body, surface, allowed_providers.as_deref()).await {
         Ok(resolved) => resolved,
         Err(err) => return api_error(err.status, err.message),
@@ -209,6 +211,7 @@ async fn route_proxied(
             upstream_model,
             parts,
             body,
+            route,
             requested_streaming,
             request_started,
             caller_protocol: surface.protocol(),
@@ -237,8 +240,25 @@ async fn resolve_provider(
             message: "Request body must contain a model".to_owned(),
         })?
         .to_owned();
-    let route_target = state.routes.resolve(&model).await;
-    let (provider_id, upstream_model) = if let Some(target) = &route_target {
+    let route_choice = {
+        // The Provider snapshot is taken before the route lock, which is the
+        // order Provider and Endpoint mutations use, so a route decision that
+        // reads Endpoint health can never deadlock with a console write.
+        let providers = state.providers.read().await;
+        state
+            .routes
+            .resolve(&model, |target| {
+                destination_availability(
+                    &providers,
+                    &state.extensions,
+                    &state.credential_health,
+                    target,
+                )
+            })
+            .await
+    };
+    let route_target = route_choice.as_ref().map(|choice| &choice.target);
+    let (provider_id, upstream_model) = if let Some(target) = route_target {
         (target.provider_id.as_str(), target.upstream_model.as_str())
     } else {
         model.split_once('/').ok_or_else(|| RoutingError {
@@ -251,6 +271,16 @@ async fn resolve_provider(
             status: StatusCode::BAD_REQUEST,
             message: "Model must match a model route or use the provider/model format".to_owned(),
         });
+    }
+    if route_choice
+        .as_ref()
+        .is_some_and(|choice| choice.all_cooling)
+    {
+        warn!(
+            %model,
+            provider = provider_id,
+            "every destination of the model route is cooling down; serving the request from the preferred one"
+        );
     }
 
     if allowed_providers.is_some_and(|allowed| {
@@ -270,7 +300,7 @@ async fn resolve_provider(
             status: StatusCode::BAD_REQUEST,
             message: format!("Unknown provider '{provider_id}' in model"),
         })?;
-    let endpoint = if let Some(target) = &route_target {
+    let endpoint = if let Some(target) = route_target {
         provider
             .endpoints
             .iter()
@@ -328,7 +358,7 @@ async fn resolve_provider(
     })?;
     let (credential, credential_cooling) = if !endpoint.requires_credential {
         (None, false)
-    } else if let Some(target) = &route_target {
+    } else if let Some(target) = route_target {
         if target.credential_id.is_empty() {
             // An omitted identity means the Endpoint owns credential selection.
             let choice = select_endpoint_credential(state, endpoint, provider_id)?;
@@ -375,7 +405,22 @@ async fn resolve_provider(
         model,
         upstream_model,
         body,
+        route: route_choice.as_ref().map(|choice| RouteFacts {
+            mode: choice.mode,
+            priority: choice.target.priority,
+            failover: choice.failover,
+        }),
     })
+}
+
+/// How the model route that chose this destination decided. Recorded as facts so
+/// a `429` from a preferred destination stays explainable after its cooldown
+/// expires; a request that named its Provider directly carries none.
+#[derive(Clone, Copy, Debug)]
+struct RouteFacts {
+    mode: RouteMode,
+    priority: u32,
+    failover: bool,
 }
 
 /// One request's route decision. `credential_cooling` is the exhaustion fact
@@ -388,6 +433,7 @@ struct ResolvedRoute {
     model: String,
     upstream_model: String,
     body: Vec<u8>,
+    route: Option<RouteFacts>,
 }
 
 /// Applies the Endpoint's credential policy. Every usable credential that is not
@@ -444,6 +490,9 @@ struct ProxyActivity {
     credential_name: Option<String>,
     /// Whether that identity was exhausted when it carried the request.
     credential_cooling: bool,
+    /// Selection facts of the model route that chose this destination, when one
+    /// did, so the record explains a switch after a rate limit.
+    route: Option<RouteFacts>,
     pricing: Option<pricing::ResolvedPricing>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     caller_protocol: Protocol,
@@ -527,6 +576,9 @@ impl ProxyActivity {
                 upstream_credential_id: self.credential_id.clone(),
                 upstream_credential_name: self.credential_name.clone(),
                 credential_cooling: self.credential_cooling,
+                route_mode: self.route.map(|route| route.mode.name().to_owned()),
+                route_priority: self.route.map(|route| route.priority),
+                route_failover: self.route.is_some_and(|route| route.failover),
                 caller_protocol: Some(self.caller_protocol.name().to_owned()),
                 upstream_protocol: Some(self.upstream_protocol.name().to_owned()),
                 status: status.as_u16(),
@@ -574,6 +626,9 @@ struct ForwardRequest {
     endpoint: ApiEndpoint,
     credential: Option<Credential>,
     credential_cooling: bool,
+    /// Selection facts of the model route that chose this destination, when a
+    /// model route did.
+    route: Option<RouteFacts>,
     gateway_api_key: Option<auth::AuthorizedGatewayKey>,
     model: String,
     upstream_model: String,
@@ -592,6 +647,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         endpoint,
         credential,
         credential_cooling,
+        route,
         gateway_api_key,
         model,
         upstream_model: resolved_upstream_model,
@@ -841,6 +897,9 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                         .as_ref()
                         .map(|credential| credential.name.clone()),
                     credential_cooling,
+                    route_mode: route.map(|route| route.mode.name().to_owned()),
+                    route_priority: route.map(|route| route.priority),
+                    route_failover: route.is_some_and(|route| route.failover),
                     caller_protocol: Some(caller_protocol.name().to_owned()),
                     upstream_protocol: Some(upstream_protocol.name().to_owned()),
                     status: StatusCode::BAD_GATEWAY.as_u16(),
@@ -926,6 +985,7 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             .as_ref()
             .map(|credential| credential.name.clone()),
         credential_cooling,
+        route,
         pricing: activity_pricing,
         gateway_api_key,
         caller_protocol,
