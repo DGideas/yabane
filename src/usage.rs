@@ -1,6 +1,9 @@
 use crate::protocol::Protocol;
 
 const MAX_JSON_USAGE_BODY: usize = 1024 * 1024;
+/// Usage observation must not grow with traffic it cannot parse: a line this long
+/// is dropped instead of being buffered until the Provider ends the response.
+const MAX_PENDING_USAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TokenUsage {
@@ -28,6 +31,8 @@ struct EventStreamDecoder {
     pending: Vec<u8>,
     data: Vec<u8>,
     discard_event: bool,
+    /// True while skipping the remainder of a line that exceeded the cap.
+    discarding_line: bool,
 }
 
 impl UsageTracker {
@@ -66,22 +71,32 @@ impl UsageTracker {
         }
     }
 
-    pub fn finish(mut self) -> (TokenUsage, bool) {
-        match &mut self.payload {
+    /// Finishes observation and returns what was seen. Taking `&mut self` lets the
+    /// proxy record a caller that disconnected mid-stream from a drop handler just
+    /// like a completed exchange.
+    pub fn finish(&mut self) -> (TokenUsage, bool) {
+        let payload = std::mem::replace(
+            &mut self.payload,
+            Payload::Json {
+                body: Vec::new(),
+                overflowed: false,
+            },
+        );
+        match payload {
             Payload::Json { body, overflowed } => {
-                if !*overflowed {
-                    self.protocol_failed |= event_reports_failure(self.protocol, body);
-                    merge_event_usage(self.protocol, body, &mut self.usage);
+                if !overflowed {
+                    self.protocol_failed |= event_reports_failure(self.protocol, &body);
+                    merge_event_usage(self.protocol, &body, &mut self.usage);
                 }
             }
-            Payload::EventStream(decoder) => {
+            Payload::EventStream(mut decoder) => {
                 for event in decoder.finish() {
                     self.protocol_failed |= event_reports_failure(self.protocol, &event);
                     merge_event_usage(self.protocol, &event, &mut self.usage);
                 }
             }
         }
-        (self.usage, self.protocol_failed)
+        (std::mem::take(&mut self.usage), self.protocol_failed)
     }
 }
 
@@ -98,6 +113,15 @@ impl EventStreamDecoder {
     fn consume_lines(&mut self, finish: bool) -> Vec<Vec<u8>> {
         let mut events = Vec::new();
         while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            if self.discarding_line {
+                // The over-long line just ended; drop it and keep reading normally.
+                // Its event is still discarded: the data already collected for it
+                // was cleared when the line was dropped.
+                self.pending.drain(..=newline);
+                self.discarding_line = false;
+                self.discard_event = false;
+                continue;
+            }
             let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
             line.pop();
             if line.last() == Some(&b'\r') {
@@ -115,7 +139,19 @@ impl EventStreamDecoder {
             }
             self.dispatch(&mut events);
         }
+        self.trim_pending();
         events
+    }
+
+    /// A line longer than the cap cannot belong to a usage event, so drop it and
+    /// the event it belongs to rather than buffering traffic that cannot be read.
+    fn trim_pending(&mut self) {
+        if self.pending.len() > MAX_PENDING_USAGE_BYTES {
+            self.pending.clear();
+            self.discarding_line = true;
+            self.data.clear();
+            self.discard_event = true;
+        }
     }
 
     fn observe_line(&mut self, line: &[u8], events: &mut Vec<Vec<u8>>) {
@@ -306,6 +342,30 @@ fn first_u64(value: &serde_json::Value, paths: &[&[&str]]) -> u64 {
 mod tests {
     use super::{TokenUsage, UsageTracker};
     use crate::protocol::Protocol;
+
+    /// Usage observation follows a stream that may be arbitrarily long, so a line
+    /// longer than the cap is dropped instead of buffered, and later events are
+    /// still read normally.
+    #[test]
+    fn an_overlong_streaming_line_is_dropped_without_losing_later_usage() {
+        let mut tracker = UsageTracker::new(Protocol::OpenAiChat, true);
+        tracker.observe(&vec![b'x'; super::MAX_PENDING_USAGE_BYTES + 1]);
+        if let super::Payload::EventStream(decoder) = &tracker.payload {
+            assert!(
+                decoder.pending.is_empty(),
+                "the over-long line is not buffered"
+            );
+            assert!(decoder.discarding_line);
+        } else {
+            panic!("expected an event-stream decoder");
+        }
+        tracker.observe(b"\n");
+        tracker.observe(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n");
+        let (usage, failed) = tracker.finish();
+        assert_eq!(usage.input, 7);
+        assert_eq!(usage.output, 3);
+        assert!(!failed);
+    }
 
     #[test]
     fn extracts_openai_chat_json_usage() {

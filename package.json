@@ -21,5 +21,8 @@
   "homepage": "https://github.com/DGideas/yabane#readme",
   "devDependencies": {
     "playwright": "1.62.1"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

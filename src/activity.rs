@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::ErrorKind,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -255,6 +256,10 @@ pub struct ActivityStore {
 #[derive(Default)]
 struct ActivityData {
     persisted: Vec<RequestLog>,
+    /// Records a running flush has taken out of `pending` but has not appended
+    /// yet. They stay readable here so a query never observes a gap between
+    /// "no longer pending" and "not yet persisted".
+    flushing: Vec<RequestLog>,
     pending: Vec<RequestLog>,
     /// UTC days present in `persisted`, so a periodic flush decides which day
     /// files expired without scanning the retained history.
@@ -444,6 +449,7 @@ impl ActivityStore {
             inner: Arc::new(Mutex::new(ActivityData {
                 days: persisted.iter().map(|log| day_of(log.timestamp)).collect(),
                 persisted,
+                flushing: Vec::new(),
                 pending: Vec::new(),
             })),
             flush_lock: Arc::new(Mutex::new(())),
@@ -474,6 +480,7 @@ impl ActivityStore {
         let data = self.inner.lock().await;
         data.persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .filter(|log| log.timestamp >= since && log.timestamp <= until && filters.matches(log))
             .rev()
@@ -520,12 +527,14 @@ impl ActivityStore {
         let total = data
             .persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .filter(matches)
             .count();
         let logs = data
             .persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .rev()
             .filter(matches)
@@ -546,6 +555,7 @@ impl ActivityStore {
         let mut records: Vec<_> = data
             .persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .filter(|record| record.timestamp >= since)
             .cloned()
@@ -611,6 +621,8 @@ impl ActivityStore {
         data.days.retain(|day| remaining.contains(day));
         data.persisted
             .retain(|log| remaining.contains(&day_of(log.timestamp)));
+        data.flushing
+            .retain(|log| day_of(log.timestamp) >= cutoff_day);
         data.pending
             .retain(|log| day_of(log.timestamp) >= cutoff_day);
         self.retention_days.store(days, Ordering::Relaxed);
@@ -639,77 +651,97 @@ impl ActivityStore {
         F: Fn(&RequestLog) -> CostRecalculationResolution,
     {
         let _flush_guard = self.flush_lock.lock().await;
-        let mut data = self.inner.lock().await;
-        let mut records: Vec<_> = data
-            .persisted
-            .iter()
-            .chain(&data.pending)
-            .cloned()
-            .collect();
-        let mut result = CostRecalculationResult::default();
-        let mut updated_days = BTreeSet::new();
-        for log in &mut records {
-            if record.is_some_and(|(request_id, source_instance_id)| {
-                request_id != log.request_id
-                    || source_instance_id != log.source_instance_id.as_deref()
-            }) {
-                continue;
-            }
-            if matches!(CostSource::for_log(log), Some(CostSource::Reported)) {
-                result.reported_preserved += 1;
-                continue;
-            }
-            result.candidates += 1;
-            if log.input_tokens == 0 && log.output_tokens == 0 && log.cached_tokens == 0 {
-                result.skipped_missing_usage += 1;
-                continue;
-            }
-            let resolution = pricing_for(log);
-            let resolved = match resolution {
-                CostRecalculationResolution::Available(resolved) => *resolved,
-                CostRecalculationResolution::MissingRoute => {
-                    result.skipped_missing_route += 1;
+        // The snapshot is prepared under the in-memory lock, but the day files are
+        // rewritten without it, so a long recalculation cannot stall request
+        // recording or console queries. Only `record` can add to `pending` while the
+        // write runs, and `included` remembers which in-flight records the snapshot
+        // already carries so publishing cannot drop a newer one.
+        let (records, result, updated_days, included) = {
+            let data = self.inner.lock().await;
+            let mut records: Vec<_> = data
+                .persisted
+                .iter()
+                .chain(&data.flushing)
+                .chain(&data.pending)
+                .cloned()
+                .collect();
+            let included: std::collections::HashSet<(String, Option<String>)> = data
+                .flushing
+                .iter()
+                .chain(&data.pending)
+                .map(record_identity)
+                .collect();
+            let mut result = CostRecalculationResult::default();
+            let mut updated_days = BTreeSet::new();
+            for log in &mut records {
+                if record.is_some_and(|(request_id, source_instance_id)| {
+                    request_id != log.request_id
+                        || source_instance_id != log.source_instance_id.as_deref()
+                }) {
                     continue;
                 }
-                CostRecalculationResolution::MissingPricing => {
+                if matches!(CostSource::for_log(log), Some(CostSource::Reported)) {
+                    result.reported_preserved += 1;
+                    continue;
+                }
+                result.candidates += 1;
+                if log.input_tokens == 0 && log.output_tokens == 0 && log.cached_tokens == 0 {
+                    result.skipped_missing_usage += 1;
+                    continue;
+                }
+                let resolution = pricing_for(log);
+                let resolved = match resolution {
+                    CostRecalculationResolution::Available(resolved) => *resolved,
+                    CostRecalculationResolution::MissingRoute => {
+                        result.skipped_missing_route += 1;
+                        continue;
+                    }
+                    CostRecalculationResolution::MissingPricing => {
+                        result.skipped_missing_pricing += 1;
+                        continue;
+                    }
+                };
+                let usage = crate::usage::TokenUsage {
+                    input: log.input_tokens,
+                    output: log.output_tokens,
+                    cached: log.cached_tokens,
+                    cost: None,
+                    finish_reason: None,
+                };
+                let Some(cost) = crate::pricing::calculate(&resolved.pricing, &usage) else {
                     result.skipped_missing_pricing += 1;
                     continue;
+                };
+                let recalculated = log.cost.is_some();
+                log.cost = Some(cost);
+                log.cost_source = Some(CostSource::Estimated);
+                log.pricing_sources = Some(resolved.sources);
+                updated_days.insert(day_of(log.timestamp));
+                result.updated += 1;
+                if recalculated {
+                    result.recalculated += 1;
+                } else {
+                    result.filled += 1;
                 }
-            };
-            let usage = crate::usage::TokenUsage {
-                input: log.input_tokens,
-                output: log.output_tokens,
-                cached: log.cached_tokens,
-                cost: None,
-                finish_reason: None,
-            };
-            let Some(cost) = crate::pricing::calculate(&resolved.pricing, &usage) else {
-                result.skipped_missing_pricing += 1;
-                continue;
-            };
-            let recalculated = log.cost.is_some();
-            log.cost = Some(cost);
-            log.cost_source = Some(CostSource::Estimated);
-            log.pricing_sources = Some(resolved.sources);
-            updated_days.insert(day_of(log.timestamp));
-            result.updated += 1;
-            if recalculated {
-                result.recalculated += 1;
-            } else {
-                result.filled += 1;
             }
-        }
+            // Every day a pending record belongs to is rewritten, because the
+            // snapshot takes those records to disk as part of this update.
+            updated_days.extend(data.flushing.iter().map(|log| day_of(log.timestamp)));
+            updated_days.extend(data.pending.iter().map(|log| day_of(log.timestamp)));
+            (records, result, updated_days, included)
+        };
         if result.updated == 0 {
             return Ok(result);
         }
-        // Only the days whose records changed are rewritten, and pending records
-        // share that write so clearing them cannot drop anything from disk.
-        updated_days.extend(data.pending.iter().map(|log| day_of(log.timestamp)));
         let writes = day_writes(paths.directory, &records, &updated_days)?;
         crate::storage::write_transaction(paths.transaction, &writes).await?;
+        let mut data = self.inner.lock().await;
         data.days = records.iter().map(|log| day_of(log.timestamp)).collect();
         data.persisted = records;
-        data.pending.clear();
+        data.flushing
+            .retain(|log| !included.contains(&record_identity(log)));
+        data.pending
+            .retain(|log| !included.contains(&record_identity(log)));
         Ok(result)
     }
 
@@ -734,20 +766,35 @@ impl ActivityStore {
         self.validate_import(&import)
             .map_err(ActivityImportError::Invalid)?;
         let _flush_guard = self.flush_lock.lock().await;
-        let mut data = self.inner.lock().await;
-        let (result, imported) = self.classify_import(&import, &data);
-        if !imported.is_empty() {
+        // The merged snapshot is prepared under the in-memory lock, but the day
+        // files are replaced without it, so a large import cannot stall request
+        // recording or console queries. Only `record` can add to `pending` while
+        // the write runs, and `included` keeps those newer records pending.
+        let (result, records, days, included) = {
+            let data = self.inner.lock().await;
+            let (result, imported) = self.classify_import(&import, &data);
+            if imported.is_empty() {
+                return Ok(result);
+            }
             // Memory already mirrors the day files exactly, so an import only has to
             // merge the accepted records into the days it touches.
             let mut records: Vec<_> = data
                 .persisted
                 .iter()
+                .chain(&data.flushing)
                 .chain(&data.pending)
                 .cloned()
                 .collect();
-            // Imported records join the day files they belong to, and every pending
-            // record shares that write so clearing it cannot lose anything.
+            let included: std::collections::HashSet<(String, Option<String>)> = data
+                .flushing
+                .iter()
+                .chain(&data.pending)
+                .map(record_identity)
+                .collect();
+            // Imported records join the day files they belong to, and every in-flight
+            // record shares that write so publishing cannot lose anything.
             let mut days: BTreeSet<_> = imported.iter().map(|log| day_of(log.timestamp)).collect();
+            days.extend(data.flushing.iter().map(|log| day_of(log.timestamp)));
             days.extend(data.pending.iter().map(|log| day_of(log.timestamp)));
             records.extend(imported);
             records.sort_by(|a, b| {
@@ -755,15 +802,20 @@ impl ActivityStore {
                     .cmp(&b.timestamp)
                     .then_with(|| a.request_id.cmp(&b.request_id))
             });
-            let writes = day_writes(paths.directory, &records, &days)
-                .map_err(ActivityImportError::Persist)?;
-            crate::storage::write_transaction(paths.transaction, &writes)
-                .await
-                .map_err(ActivityImportError::Persist)?;
-            data.days = records.iter().map(|log| day_of(log.timestamp)).collect();
-            data.persisted = records;
-            data.pending.clear();
-        }
+            (result, records, days, included)
+        };
+        let writes =
+            day_writes(paths.directory, &records, &days).map_err(ActivityImportError::Persist)?;
+        crate::storage::write_transaction(paths.transaction, &writes)
+            .await
+            .map_err(ActivityImportError::Persist)?;
+        let mut data = self.inner.lock().await;
+        data.days = records.iter().map(|log| day_of(log.timestamp)).collect();
+        data.persisted = records;
+        data.flushing
+            .retain(|log| !included.contains(&record_identity(log)));
+        data.pending
+            .retain(|log| !included.contains(&record_identity(log)));
         Ok(result)
     }
 
@@ -799,6 +851,7 @@ impl ActivityStore {
         let mut existing: std::collections::HashSet<(String, String)> = data
             .persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .map(|record| {
                 (
@@ -863,6 +916,7 @@ impl ActivityStore {
         let range_logs: Vec<_> = data
             .persisted
             .iter()
+            .chain(&data.flushing)
             .chain(&data.pending)
             .filter(|log| log.timestamp >= since && log.timestamp <= until)
             .collect();
@@ -1118,7 +1172,7 @@ impl ActivityStore {
         let _flush_guard = self.flush_lock.lock().await;
         // An idle periodic flush only reads memory: nothing is written unless records
         // are pending or a whole day has left the retention window.
-        let (pending, expired_days) = {
+        let (batch, expired_days) = {
             let mut data = self.inner.lock().await;
             let cutoff_day = day_of(retention_cutoff(self.retention_days()));
             data.pending
@@ -1127,7 +1181,11 @@ impl ActivityStore {
             if data.pending.is_empty() && expired_days.is_empty() {
                 return;
             }
-            (std::mem::take(&mut data.pending), expired_days)
+            // The batch stays visible in `flushing` while it is appended, so a query
+            // issued during the write sees the same records as before it.
+            let batch = std::mem::take(&mut data.pending);
+            data.flushing = batch.clone();
+            (batch, expired_days)
         };
 
         // A day outside the window leaves as a whole file, and its records leave
@@ -1150,8 +1208,7 @@ impl ActivityStore {
         // day boundary is still a pair of appends instead of a rewrite.
         let mut appended = Vec::new();
         let mut appended_days = Vec::new();
-        let mut failed = Vec::new();
-        for (day, records) in group_by_day(pending) {
+        for (day, records) in group_by_day(batch) {
             match append_day_records(paths.directory, day, &records).await {
                 Ok(()) => {
                     appended_days.push(day);
@@ -1159,7 +1216,6 @@ impl ActivityStore {
                 }
                 Err(err) => {
                     error!(%err, day = %day_file_name(day), "failed to flush request activity");
-                    failed.extend(records);
                 }
             }
         }
@@ -1169,7 +1225,15 @@ impl ActivityStore {
         data.days.extend(appended_days);
         data.persisted
             .retain(|log| !removed_days.contains(&day_of(log.timestamp)));
+        let appended_keys: std::collections::HashSet<(String, Option<String>)> =
+            appended.iter().map(record_identity).collect();
         data.persisted.extend(appended);
+        // What failed the append returns to `pending` ahead of records that arrived
+        // while the write ran, so retrying keeps their original order and the batch
+        // is never both persisted and pending.
+        data.flushing
+            .retain(|log| !appended_keys.contains(&record_identity(log)));
+        let failed = std::mem::take(&mut data.flushing);
         let newer = std::mem::take(&mut data.pending);
         data.pending = failed;
         data.pending.extend(newer);
@@ -1190,6 +1254,80 @@ impl ActivityStore {
     }
 }
 
+/// Test-only fault injection. Like the storage hold, injected appends are
+/// registered per path prefix under one lock, so tests that run in parallel
+/// cannot consume or observe each other's injection.
+#[cfg(test)]
+#[derive(Clone)]
+struct AppendFaults {
+    prefix: String,
+    partial_bytes: usize,
+    hold_ms: u64,
+    reached: bool,
+}
+
+#[cfg(test)]
+static APPEND_FAULTS: std::sync::Mutex<Vec<AppendFaults>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn append_faults() -> std::sync::MutexGuard<'static, Vec<AppendFaults>> {
+    APPEND_FAULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn arm_append_faults(prefix: &str, partial_bytes: usize, hold_ms: u64) {
+    let mut faults = append_faults();
+    faults.retain(|fault| fault.prefix != prefix);
+    faults.push(AppendFaults {
+        prefix: prefix.to_owned(),
+        partial_bytes,
+        hold_ms,
+        reached: false,
+    });
+}
+
+/// Whether the hold armed for this prefix was reached. It stays true until the
+/// prefix is armed again.
+#[cfg(test)]
+pub(crate) fn append_hold_reached(prefix: &str) -> bool {
+    append_faults()
+        .iter()
+        .any(|fault| fault.prefix == prefix && fault.reached)
+}
+
+#[cfg(test)]
+fn take_append_hold(path: &Path) -> Option<u64> {
+    let mut faults = append_faults();
+    let fault = faults
+        .iter_mut()
+        .find(|fault| path.to_string_lossy().starts_with(&fault.prefix))?;
+    if fault.hold_ms == 0 {
+        return None;
+    }
+    fault.reached = true;
+    Some(std::mem::take(&mut fault.hold_ms))
+}
+
+#[cfg(test)]
+fn take_partial_append(path: &Path) -> usize {
+    append_faults()
+        .iter_mut()
+        .find(|fault| path.to_string_lossy().starts_with(&fault.prefix))
+        .map_or(0, |fault| std::mem::take(&mut fault.partial_bytes))
+}
+
+#[cfg(not(test))]
+fn take_append_hold(_path: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(not(test))]
+fn take_partial_append(_path: &Path) -> usize {
+    0
+}
+
 async fn append_day_records(
     directory: &str,
     day: i64,
@@ -1200,13 +1338,76 @@ async fn append_day_records(
     }
     tokio::fs::create_dir_all(directory).await?;
     let contents = serialize_logs(records);
-    OpenOptions::new()
+    append_bytes(Path::new(&day_path(directory, day)), &contents).await
+}
+
+/// Appends one batch and makes it durable. A failed append is truncated back to
+/// its previous length, because retrying a partial write would otherwise
+/// duplicate the prefix that already reached the file.
+async fn append_bytes(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(day_path(directory, day))
-        .await?
-        .write_all(&contents)
-        .await
+        .open(path)
+        .await?;
+    let previous_len = file.metadata().await?.len();
+    if let Some(hold_ms) = take_append_hold(path) {
+        tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+    }
+    let partial = take_partial_append(path);
+    let result = async {
+        write_batch(&mut file, contents, partial).await?;
+        file.sync_data().await
+    }
+    .await;
+    if let Err(error) = result {
+        if let Err(rollback) = rollback_append(&mut file, previous_len).await {
+            return Err(std::io::Error::new(
+                rollback.kind(),
+                format!("{error}; could not truncate the partial append: {rollback}"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn rollback_append(
+    file: &mut tokio::fs::File,
+    previous_len: u64,
+) -> Result<(), std::io::Error> {
+    // Flush first so the truncation also discards whatever the failed write buffered.
+    file.flush().await?;
+    file.set_len(previous_len).await?;
+    file.sync_data().await
+}
+
+#[cfg(not(test))]
+async fn write_batch(
+    file: &mut tokio::fs::File,
+    contents: &[u8],
+    _partial: usize,
+) -> Result<(), std::io::Error> {
+    file.write_all(contents).await
+}
+
+/// Writes only `partial` bytes when a test armed a partial append, which is the
+/// shape of a disk-full or interrupted write.
+#[cfg(test)]
+async fn write_batch(
+    file: &mut tokio::fs::File,
+    contents: &[u8],
+    partial: usize,
+) -> Result<(), std::io::Error> {
+    if partial == 0 || partial >= contents.len() {
+        return file.write_all(contents).await;
+    }
+    file.write_all(&contents[..partial]).await?;
+    Err(std::io::Error::other("injected partial append"))
+}
+
+fn record_identity(log: &RequestLog) -> (String, Option<String>) {
+    (log.request_id.clone(), log.source_instance_id.clone())
 }
 
 fn group_by_day(records: Vec<RequestLog>) -> Vec<(i64, Vec<RequestLog>)> {
@@ -1267,20 +1468,63 @@ async fn load_day_files(directory: &str, cutoff: u64) -> Result<Vec<RequestLog>,
     retained.sort_by_key(|(day, _)| *day);
     let mut persisted = Vec::new();
     for (_, path) in retained {
-        let contents = tokio::fs::read_to_string(&path)
+        let contents = tokio::fs::read(&path)
             .await
             .map_err(|err| format!("read {path}: {err}"))?;
-        let records = contents
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                serde_json::from_str::<RequestLog>(line)
-                    .map_err(|err| format!("parse {path}: {err}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        persisted.extend(records);
+        persisted.extend(read_day_records(&path, &contents).await?);
     }
     Ok(persisted)
+}
+
+/// Reads one day file. A JSON Lines file whose final record is cut short is what
+/// a crash during an append produces: the complete prefix stays, the fragment
+/// moves to a `.truncated-*` sibling, and startup continues with the records that
+/// were whole. Damage anywhere else is not a crash artifact, so loading fails
+/// with the exact file and line instead of guessing at a repair.
+async fn read_day_records(path: &str, contents: &[u8]) -> Result<Vec<RequestLog>, String> {
+    let complete = contents.is_empty() || contents.ends_with(b"\n");
+    let lines: Vec<&[u8]> = contents
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut records = Vec::with_capacity(lines.len());
+    for (index, raw) in lines.iter().enumerate() {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        match serde_json::from_slice::<RequestLog>(line) {
+            Ok(record) => records.push(record),
+            Err(error) if index + 1 == lines.len() && !complete => {
+                let fragment_start = contents.len() - raw.len();
+                let quarantine = format!("{path}.truncated-{}", crate::auth::now());
+                crate::storage::write_atomic(&quarantine, raw)
+                    .await
+                    .map_err(|err| format!("quarantine {path}: {err}"))?;
+                let mut options = OpenOptions::new();
+                options.write(true);
+                let file = options
+                    .open(path)
+                    .await
+                    .map_err(|err| format!("repair {path}: {err}"))?;
+                file.set_len(fragment_start as u64)
+                    .await
+                    .map_err(|err| format!("repair {path}: {err}"))?;
+                file.sync_data()
+                    .await
+                    .map_err(|err| format!("repair {path}: {err}"))?;
+                error!(
+                    %path,
+                    %quarantine,
+                    %error,
+                    bytes = raw.len(),
+                    "quarantined a truncated Activity record from an interrupted append"
+                );
+                return Ok(records);
+            }
+            Err(error) => {
+                return Err(format!("parse {path} line {}: {error}", index + 1));
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// Removes the day files outside the window and reports which days remain, so
@@ -1528,6 +1772,7 @@ mod tests {
             inner: Arc::new(Mutex::new(ActivityData {
                 days: logs.iter().map(|log| day_of(log.timestamp)).collect(),
                 persisted: logs,
+                flushing: Vec::new(),
                 pending: Vec::new(),
             })),
             flush_lock: Arc::new(Mutex::new(())),
@@ -1545,6 +1790,7 @@ mod tests {
     }
 
     /// Points the storage logic at a temporary directory instead of `data/`.
+    #[derive(Clone)]
     struct TestPaths {
         directory: String,
         settings: String,
@@ -1597,6 +1843,170 @@ mod tests {
         ] {
             assert_eq!(parse_day_file_name(invalid), None, "{invalid}");
         }
+    }
+
+    /// Fault injection in `append_bytes` writes only a prefix and fails, which is
+    /// the shape of a disk-full or interrupted append. The retry must not leave a
+    /// duplicated or unparsable prefix behind, and the batch must stay queryable.
+    #[tokio::test]
+    async fn a_failed_append_leaves_no_partial_record_and_the_batch_stays_visible() {
+        let now = crate::auth::now();
+        let directory = test_directory("append-rollback");
+        let paths = TestPaths::new(&directory);
+        let store = store(Vec::new());
+        store.record(request(now, "first", "alpha", 200)).await;
+
+        arm_append_faults(directory.to_str().unwrap(), 64, 0);
+        store.flush_at(paths.as_paths()).await;
+
+        let today = paths.day_file(now);
+        let partial = tokio::fs::read_to_string(&today).await.unwrap();
+        assert!(
+            partial.is_empty(),
+            "a failed append must not leave a fragment: {partial:?}"
+        );
+        assert_eq!(
+            store.export_records(0).await.len(),
+            1,
+            "the record stays queryable after a failed append"
+        );
+        assert_eq!(store.inner.lock().await.pending.len(), 1);
+
+        store.flush_at(paths.as_paths()).await;
+        let contents = tokio::fs::read_to_string(&today).await.unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.ends_with('\n'));
+        assert_eq!(store.export_records(0).await.len(), 1);
+        assert!(store.inner.lock().await.pending.is_empty());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A record being appended must stay visible, so a console query issued during
+    /// a flush never observes a gap between `pending` and `persisted`.
+    #[tokio::test]
+    async fn records_stay_queryable_while_a_flush_is_in_flight() {
+        let now = crate::auth::now();
+        let directory = test_directory("flush-visibility");
+        let paths = TestPaths::new(&directory);
+        let store = store(Vec::new());
+        store.record(request(now, "inflight", "alpha", 200)).await;
+
+        arm_append_faults(directory.to_str().unwrap(), 0, 1_000);
+        let flushing = {
+            let store = store.clone();
+            let paths = paths.clone();
+            tokio::spawn(async move { store.flush_at(paths.as_paths()).await })
+        };
+        while !append_hold_reached(directory.to_str().unwrap()) {
+            tokio::task::yield_now().await;
+        }
+
+        let visible = store
+            .logs(0, u64::MAX, ActivityFilters::default(), 10)
+            .await;
+        assert_eq!(
+            visible.len(),
+            1,
+            "the record being appended is still visible"
+        );
+        assert_eq!(visible[0].request_id, "inflight");
+        flushing.await.unwrap();
+
+        // After the append publishes it, the same record is visible exactly once.
+        let after = store.export_records(0).await;
+        assert_eq!(after.len(), 1);
+        let contents = tokio::fs::read_to_string(&paths.day_file(now))
+            .await
+            .unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(store.inner.lock().await.flushing.is_empty());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A crash during an append leaves a cut-off final record: the complete prefix
+    /// is kept, the fragment is quarantined, and loading continues instead of
+    /// failing the whole process.
+    #[tokio::test]
+    async fn a_truncated_tail_is_quarantined_and_the_complete_prefix_is_kept() {
+        let now = crate::auth::now();
+        let directory = test_directory("tail-quarantine");
+        let directory_path = format!("{}/", directory.display());
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = day_path(&directory_path, day_of(now));
+        let prefix = serialize_logs(&[request(now, "kept", "alpha", 200)]);
+        let fragment = br#"{"timestamp":1,"request_id":"interrupted","path":"/v1/responses","model":"alpha/x","provider":"alpha","endpoint":"e","status":200,"latency_ms":1,"input_tokens":0,"output_tokens":0,"cached_tokens":0,"streaming":fal"#;
+        let mut truncated = prefix.clone();
+        truncated.extend_from_slice(fragment);
+        tokio::fs::write(&path, &truncated).await.unwrap();
+
+        let persisted = load_day_files(&directory_path, now - 30 * 86_400)
+            .await
+            .expect("a truncated tail is repaired instead of failing startup");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].request_id, "kept");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), prefix);
+
+        let quarantined: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| entry.to_string_lossy().contains(".truncated-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the fragment is preserved for inspection"
+        );
+        assert_eq!(std::fs::read(&quarantined[0]).unwrap(), fragment);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// Damage that no append can produce must fail loudly with the file and the
+    /// line, because treating it as a truncated tail would silently drop history.
+    #[tokio::test]
+    async fn mid_file_corruption_fails_the_load_with_the_file_and_line() {
+        let now = crate::auth::now();
+        let directory = test_directory("mid-file-corruption");
+        let directory_path = format!("{}/", directory.display());
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = day_path(&directory_path, day_of(now));
+        let mut contents = serialize_logs(&[request(now, "first", "alpha", 200)]);
+        contents.extend_from_slice(b"{not json}\n");
+        contents.extend_from_slice(&serialize_logs(&[request(now, "second", "alpha", 200)]));
+        tokio::fs::write(&path, &contents).await.unwrap();
+
+        let error = load_day_files(&directory_path, now - 30 * 86_400)
+            .await
+            .expect_err("mid-file corruption must not be repaired silently");
+        assert!(
+            error.contains(&path),
+            "the failing file must be named: {error}"
+        );
+        assert!(
+            error.contains("line 2"),
+            "the failing line must be named: {error}"
+        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A malformed line that the writer did finish (the file ends with a newline)
+    /// is corruption, not a cut-off append.
+    #[tokio::test]
+    async fn a_malformed_complete_last_line_is_not_treated_as_a_truncated_tail() {
+        let now = crate::auth::now();
+        let directory = test_directory("complete-corruption");
+        let directory_path = format!("{}/", directory.display());
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = day_path(&directory_path, day_of(now));
+        let mut contents = serialize_logs(&[request(now, "first", "alpha", 200)]);
+        contents.extend_from_slice(b"{not json}\n");
+        tokio::fs::write(&path, &contents).await.unwrap();
+
+        let error = load_day_files(&directory_path, now - 30 * 86_400)
+            .await
+            .expect_err("a completed malformed line must fail the load");
+        assert!(error.contains("line 2"), "{error}");
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[tokio::test]
@@ -1840,6 +2250,131 @@ mod tests {
                 .count(),
             4
         );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A large import rewrites day files without holding the in-memory lock, so
+    /// request recording and console queries keep working while it runs, and a
+    /// record that arrives during the write survives the publish.
+    #[tokio::test]
+    async fn a_running_import_does_not_block_recording_or_queries() {
+        let now = crate::auth::now();
+        let directory = test_directory("import-concurrency");
+        let paths = TestPaths::new(&directory);
+        let store = store(Vec::new());
+        let import = ActivityImport {
+            format: "yabane-activity".to_owned(),
+            version: 1,
+            instance_id: Some("remote-instance".to_owned()),
+            records: vec![request(now, "imported", "alpha", 200)],
+        };
+
+        crate::storage::arm_write_hold(directory.to_str().unwrap(), 1, 1_000);
+        let importing = {
+            let store = store.clone();
+            let paths = paths.clone();
+            tokio::spawn(async move { store.import_at(paths.as_paths(), import).await })
+        };
+        while !crate::storage::write_hold_reached(directory.to_str().unwrap()) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.record(request(now, "during", "alpha", 200)),
+        )
+        .await
+        .expect("recording must not wait for an import to finish");
+        let visible = tokio::time::timeout(Duration::from_secs(5), store.export_records(0))
+            .await
+            .expect("queries must not wait for an import to finish");
+        assert_eq!(
+            visible.len(),
+            1,
+            "the record added during the write is queryable"
+        );
+        assert_eq!(visible[0].request_id, "during");
+
+        importing.await.unwrap().expect("import succeeds");
+        let after = store.export_records(0).await;
+        assert_eq!(after.len(), 2);
+        assert!(after.iter().any(|record| record.request_id == "imported"));
+        assert!(
+            after.iter().any(|record| record.request_id == "during"),
+            "a record added during the import must not be lost by publishing the snapshot"
+        );
+        // The record added after the snapshot was taken is still pending, and a
+        // later flush persists it without duplicating the imported record.
+        let pending: Vec<_> = store
+            .inner
+            .lock()
+            .await
+            .pending
+            .iter()
+            .map(|record| record.request_id.clone())
+            .collect();
+        assert_eq!(pending, vec!["during".to_owned()]);
+        store.flush_at(paths.as_paths()).await;
+        let day = tokio::fs::read_to_string(paths.day_file(now))
+            .await
+            .unwrap();
+        assert_eq!(day.lines().count(), 2);
+        assert!(store.inner.lock().await.pending.is_empty());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// The same guarantee holds for a cost recalculation, which can rewrite every
+    /// day file that has an estimate.
+    #[tokio::test]
+    async fn a_running_cost_recalculation_does_not_block_recording_or_queries() {
+        let now = crate::auth::now();
+        let mut record = request(now, "priced", "provider", 200);
+        record.input_tokens = 1_000;
+        let store = store(vec![record]);
+        let directory = test_directory("recalculate-concurrency");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let paths = TestPaths::new(&directory);
+
+        crate::storage::arm_write_hold(directory.to_str().unwrap(), 1, 1_000);
+        let recalculating = {
+            let store = store.clone();
+            let paths = paths.clone();
+            tokio::spawn(async move {
+                store
+                    .recalculate_non_reported_costs_at(paths.as_paths(), None, |_| {
+                        CostRecalculationResolution::Available(complete_pricing())
+                    })
+                    .await
+            })
+        };
+        while !crate::storage::write_hold_reached(directory.to_str().unwrap()) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.record(request(now, "during", "provider", 200)),
+        )
+        .await
+        .expect("recording must not wait for a recalculation to finish");
+        let visible = tokio::time::timeout(Duration::from_secs(5), store.export_records(0))
+            .await
+            .expect("queries must not wait for a recalculation to finish");
+        assert_eq!(visible.len(), 2);
+
+        let result = recalculating
+            .await
+            .unwrap()
+            .expect("recalculation succeeds");
+        assert_eq!(result.updated, 1);
+        let after = store.export_records(0).await;
+        assert_eq!(after.len(), 2);
+        let priced = after
+            .iter()
+            .find(|record| record.request_id == "priced")
+            .unwrap();
+        assert_eq!(priced.cost, Some(0.001));
+        assert!(after.iter().any(|record| record.request_id == "during"));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

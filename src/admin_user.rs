@@ -1,4 +1,12 @@
-use std::{collections::HashMap, io::ErrorKind, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
@@ -25,11 +33,16 @@ const SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
 const TURNSTILE_SITEVERIFY: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const TURNSTILE_TEST_SITE_KEY: &str = "1x00000000000000000000AA";
 const TURNSTILE_TEST_SECRET_PREFIX: &str = "1x0000000000000000000000000000000";
+/// Persisting a last-use time rewrites the whole administrator file, so a burst
+/// of control-API calls with the same Management API key records at most one
+/// write per minute instead of one per request.
+const MANAGEMENT_KEY_LAST_USE_INTERVAL_SECONDS: u64 = 60;
 
 #[derive(Clone, Default)]
 pub struct AdminState {
     pub user: Arc<RwLock<Option<AdminUser>>>,
     pub(crate) sessions: Arc<RwLock<HashMap<String, u64>>>,
+    pub(crate) last_management_key_use_write: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -153,6 +166,48 @@ fn validate_management_key_identities(user: &AdminUser) -> Result<(), String> {
     Ok(())
 }
 
+/// Argon2 is deliberately slow, so hashing and verification run on the blocking
+/// pool: an unauthenticated caller must not be able to occupy async worker
+/// threads by repeating a login attempt.
+async fn hash_password(password: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+async fn password_matches(password: String, stored: Option<String>) -> bool {
+    tokio::task::spawn_blocking(move || {
+        let stored = stored.unwrap_or_else(dummy_password_hash);
+        PasswordHash::new(&stored).is_ok_and(|hash| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// A valid Argon2 hash computed once, so an unknown username costs the same
+/// verification work as a known one and login timing does not enumerate users.
+fn dummy_password_hash() -> String {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"yabane dummy password", &salt)
+            .expect("hash dummy password")
+            .to_string()
+    })
+    .clone()
+}
+
 pub async fn turnstile_config() -> axum::Json<TurnstileConfig> {
     let site_key = turnstile_credentials().map(|(_, site_key)| site_key);
     axum::Json(TurnstileConfig {
@@ -197,11 +252,15 @@ pub async fn setup(
             "Username and a password of at least 8 characters are required",
         );
     }
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = Argon2::default()
-        .hash_password(input.password.as_bytes(), &salt)
-        .expect("hash password")
-        .to_string();
+    let password_hash = match hash_password(input.password.clone()).await {
+        Ok(password_hash) => password_hash,
+        Err(err) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not hash password: {err}"),
+            );
+        }
+    };
     let user = AdminUser {
         username: input.username.trim().to_owned(),
         email: email.to_owned(),
@@ -231,15 +290,14 @@ pub async fn login(
         return *response;
     }
     let user = state.admin.user.read().await.clone();
-    let valid = user.as_ref().is_some_and(|user| {
-        (user.username == input.username.trim() || user.email == input.username.trim())
-            && PasswordHash::new(&user.password_hash).is_ok_and(|hash| {
-                Argon2::default()
-                    .verify_password(input.password.as_bytes(), &hash)
-                    .is_ok()
-            })
+    let identified = user.as_ref().filter(|user| {
+        user.username == input.username.trim() || user.email == input.username.trim()
     });
-    if !valid {
+    // The hash is verified for a matching username too, so a wrong password and
+    // an unknown username take the same work and the same answer.
+    let stored = identified.map(|user| user.password_hash.clone());
+    let verified = password_matches(input.password.clone(), stored).await;
+    if identified.is_none() || !verified {
         return api_error(
             StatusCode::UNAUTHORIZED,
             "Invalid username, email, or password",
@@ -274,19 +332,23 @@ pub async fn update_profile(
     let password_hash = if input.new_password.is_empty() {
         current.password_hash.clone()
     } else {
-        let valid = PasswordHash::new(&current.password_hash).is_ok_and(|hash| {
-            Argon2::default()
-                .verify_password(input.current_password.as_bytes(), &hash)
-                .is_ok()
-        });
-        if !valid {
+        if !password_matches(
+            input.current_password.clone(),
+            Some(current.password_hash.clone()),
+        )
+        .await
+        {
             return api_error(StatusCode::FORBIDDEN, "Current password is incorrect");
         }
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(input.new_password.as_bytes(), &salt)
-            .expect("hash password")
-            .to_string()
+        match hash_password(input.new_password.clone()).await {
+            Ok(password_hash) => password_hash,
+            Err(err) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Could not hash password: {err}"),
+                );
+            }
+        }
     };
     let updated = AdminUser {
         username: username.to_owned(),
@@ -550,10 +612,26 @@ async fn authenticate_management_key(state: &AppState, headers: &axum::http::Hea
         return false;
     };
     let key_id = user.management_api_keys[key_index].id.clone();
-    if let Err(err) = persist_management_key_use(user, key_index, now, ADMIN_FILE).await {
+    // Only one caller may be due to write, and memory is updated inside the write
+    // so the published value never gets ahead of the file.
+    if state.admin.management_key_use_write_is_due(now)
+        && let Err(err) = persist_management_key_use(user, key_index, now, ADMIN_FILE).await
+    {
         warn!(%err, %key_id, "could not persist Management API key usage");
     }
     true
+}
+
+impl AdminState {
+    fn management_key_use_write_is_due(&self, now: u64) -> bool {
+        let previous = self.last_management_key_use_write.load(Ordering::Relaxed);
+        if now < previous.saturating_add(MANAGEMENT_KEY_LAST_USE_INTERVAL_SECONDS) {
+            return false;
+        }
+        self.last_management_key_use_write
+            .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
 }
 
 async fn persist_management_key_use(
@@ -635,7 +713,7 @@ use axum::response::IntoResponse;
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminUser, ManagementApiKey, persist_management_key_use};
+    use super::{AdminState, AdminUser, ManagementApiKey, persist_management_key_use};
 
     #[test]
     fn rejects_ambiguous_management_api_key_identities() {
@@ -689,5 +767,29 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(user.management_api_keys[0].last_used_at, None);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A burst of control-API calls with one Management API key must not rewrite
+    /// the administrator file on every request.
+    #[test]
+    fn management_key_last_use_writes_are_rate_limited() {
+        let state = AdminState::default();
+        assert!(
+            state.management_key_use_write_is_due(1_000),
+            "the first use is persisted"
+        );
+        assert!(
+            !state.management_key_use_write_is_due(1_000),
+            "a concurrent use waits"
+        );
+        assert!(!state.management_key_use_write_is_due(1_030));
+        assert!(
+            state.management_key_use_write_is_due(1_060),
+            "the interval refreshes the value"
+        );
+        assert!(
+            !state.management_key_use_write_is_due(1_000),
+            "a clock that went backwards must not unlock another write"
+        );
     }
 }

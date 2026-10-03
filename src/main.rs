@@ -47,10 +47,11 @@ Options:
   -V, --version     Print commit information
 
 Environment:
-  YABANE_ACTIVITY_RETENTION_DAYS         Initial Activity retention before a setting is saved [default: 30]
+  YABANE_ACTIVITY_RETENTION_DAYS          Initial Activity retention before a setting is saved [default: 30]
   YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS Provider connection deadline [default: 15]
   YABANE_UPSTREAM_READ_TIMEOUT_SECONDS    Provider per-read deadline [default: 300]
   YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS   Provider total request deadline [default: 28800]
+  YABANE_SHUTDOWN_GRACE_SECONDS           Shutdown grace before interrupting requests [default: 60]
   TURNSTILE_SITE_KEY              Cloudflare Turnstile widget site key
   TURNSTILE_SECRET                Cloudflare Turnstile server secret
   TURNSTILE_HOSTNAMES             Comma-separated accepted hostnames
@@ -194,12 +195,8 @@ async fn main() {
             .expect("validate configuration references");
     }
     let state = AppState {
-        client: reqwest::Client::builder()
-            .connect_timeout(upstream_timeouts.connect)
-            .read_timeout(upstream_timeouts.read)
-            .timeout(upstream_timeouts.total)
-            .pool_max_idle_per_host(64)
-            .tcp_nodelay(true)
+        client: upstream_timeouts
+            .client_builder()
             .build()
             .expect("build HTTP client"),
         upstream_timeouts,
@@ -296,11 +293,35 @@ async fn main() {
         ip => ip.to_string(),
     };
     let admin_url = format!("http://{browser_host}:{}/", address.port());
+    let shutdown_grace = timeout_from_env("YABANE_SHUTDOWN_GRACE_SECONDS", 60);
     info!(%address, %admin_url, "Yabane is ready");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("serve Yabane");
+    let (stopping, stopped) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = stopping.send(());
+    });
+    tokio::select! {
+        result = server => result.expect("serve Yabane"),
+        () = async move {
+            if stopped.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(shutdown_grace).await;
+        } => {
+            // Long generations are interrupted rather than holding the process
+            // open indefinitely; each one is still recorded before the flush.
+            crate::gateway::mark_shutting_down();
+            tracing::warn!(
+                grace_seconds = shutdown_grace.as_secs(),
+                "Shutdown grace period ended; requests still in flight were interrupted"
+            );
+        }
+    }
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while crate::gateway::active_stream_records() > 0 && std::time::Instant::now() < settle_deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     state.activity.flush().await;
     #[cfg(feature = "extension-traffic-capture")]
     if let Err(error) = state.traffic_capture.flush().await {

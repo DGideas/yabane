@@ -207,9 +207,82 @@ async fn rollback_unlocked(journal: &RollbackJournal) -> io::Result<()> {
     Ok(())
 }
 
+/// Test-only fault injection. Injected holds are registered per path prefix and
+/// every decision is made under one lock, so tests that run in parallel cannot
+/// consume or observe each other's hold.
+#[cfg(test)]
+#[derive(Clone)]
+struct WriteHold {
+    prefix: String,
+    skip: usize,
+    hold_ms: u64,
+    reached: bool,
+}
+
+#[cfg(test)]
+static WRITE_HOLDS: std::sync::Mutex<Vec<WriteHold>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn write_holds() -> std::sync::MutexGuard<'static, Vec<WriteHold>> {
+    WRITE_HOLDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+pub(crate) fn arm_write_hold(prefix: &str, skip: usize, hold_ms: u64) {
+    let mut holds = write_holds();
+    holds.retain(|hold| hold.prefix != prefix);
+    holds.push(WriteHold {
+        prefix: prefix.to_owned(),
+        skip,
+        hold_ms,
+        reached: false,
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fault_injection() {
+    write_holds().clear();
+}
+
+/// Whether the hold armed for this prefix was reached. It stays true until the
+/// prefix is armed again, so a test can wait for it and then inspect the store.
+#[cfg(test)]
+pub(crate) fn write_hold_reached(prefix: &str) -> bool {
+    write_holds()
+        .iter()
+        .any(|hold| hold.prefix == prefix && hold.reached)
+}
+
+#[cfg(test)]
+fn take_write_hold(path: &Path) -> Option<u64> {
+    let mut holds = write_holds();
+    let hold = holds
+        .iter_mut()
+        .find(|hold| path.to_string_lossy().starts_with(&hold.prefix))?;
+    if hold.skip > 0 {
+        hold.skip -= 1;
+        return None;
+    }
+    if hold.hold_ms == 0 {
+        return None;
+    }
+    hold.reached = true;
+    Some(std::mem::take(&mut hold.hold_ms))
+}
+
+#[cfg(not(test))]
+fn take_write_hold(_path: &Path) -> Option<u64> {
+    None
+}
+
 async fn write_atomic_unlocked(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     tokio::fs::create_dir_all(parent).await?;
+    if let Some(hold_ms) = take_write_hold(path) {
+        tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+    }
 
     let file_name = path
         .file_name()
@@ -502,6 +575,108 @@ mod tests {
             assert_eq!(tokio::fs::read(&outside).await.unwrap(), b"untouched");
             tokio::fs::remove_file(&journal).await.unwrap();
         }
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A rollback that cannot finish must keep its journal, so the next startup
+    /// retries instead of accepting a partly restored configuration.
+    #[tokio::test]
+    async fn a_failed_recovery_keeps_its_journal_for_the_next_attempt() {
+        let directory = directory("failed-recovery");
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let good = directory.join("good.json");
+        let blocking_parent = directory.join("not-a-directory");
+        let blocked = blocking_parent.join("blocked.json");
+        let journal = directory.join("transaction.json");
+        tokio::fs::write(&good, b"new-good").await.unwrap();
+        tokio::fs::write(&blocking_parent, b"file").await.unwrap();
+        write_json_atomic(
+            &journal,
+            &RollbackJournal {
+                version: TRANSACTION_VERSION,
+                entries: vec![
+                    RollbackEntry {
+                        path: good.to_str().unwrap().to_owned(),
+                        previous: Some(b"old-good".to_vec()),
+                    },
+                    RollbackEntry {
+                        path: blocked.to_str().unwrap().to_owned(),
+                        previous: Some(b"old-blocked".to_vec()),
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+        let allowed = [good.to_str().unwrap(), blocked.to_str().unwrap()];
+
+        let error = recover_transaction(&journal, &allowed).await.unwrap_err();
+
+        assert!(error.contains("restore interrupted configuration transaction"));
+        assert!(journal.exists(), "an unfinished rollback keeps its journal");
+        assert_eq!(tokio::fs::read(&good).await.unwrap(), b"new-good");
+
+        // Once the obstacle is gone the same journal recovers completely.
+        tokio::fs::remove_file(&blocking_parent).await.unwrap();
+        recover_transaction(&journal, &allowed).await.unwrap();
+        assert_eq!(tokio::fs::read(&good).await.unwrap(), b"old-good");
+        assert_eq!(tokio::fs::read(&blocked).await.unwrap(), b"old-blocked");
+        assert!(!journal.exists());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    /// A transaction whose future is cancelled mid-write leaves files untouched by
+    /// the caller, and the journal restores every target to its old contents.
+    #[tokio::test]
+    async fn a_cancelled_transaction_is_fully_recovered_from_its_journal() {
+        let directory = directory("cancelled-transaction");
+        let first = directory.join("first.json");
+        let second = directory.join("second.json");
+        let journal = directory.join("transaction.json");
+        write_json_atomic(&first, &Value { name: "old-first" })
+            .await
+            .unwrap();
+        write_json_atomic(&second, &Value { name: "old-second" })
+            .await
+            .unwrap();
+        let allowed = [first.to_str().unwrap(), second.to_str().unwrap()];
+
+        super::arm_write_hold(directory.to_str().unwrap(), 1, 30_000);
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            write_transaction(
+                &journal,
+                &[
+                    AtomicWrite::json(&first, &Value { name: "new-first" }).unwrap(),
+                    AtomicWrite::json(&second, &Value { name: "new-second" }).unwrap(),
+                ],
+            ),
+        )
+        .await;
+        super::reset_fault_injection();
+
+        assert!(
+            cancelled.is_err(),
+            "the held write keeps the transaction in flight"
+        );
+        assert!(
+            journal.exists(),
+            "a cancelled transaction leaves its journal"
+        );
+        recover_transaction(&journal, &allowed).await.unwrap();
+        assert!(
+            tokio::fs::read_to_string(&first)
+                .await
+                .unwrap()
+                .contains("old-first")
+        );
+        assert!(
+            tokio::fs::read_to_string(&second)
+                .await
+                .unwrap()
+                .contains("old-second")
+        );
+        assert!(!journal.exists());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

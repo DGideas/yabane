@@ -27,6 +27,20 @@ pub struct UpstreamTimeouts {
     pub total: Duration,
 }
 
+impl UpstreamTimeouts {
+    pub fn client_builder(self) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            // Redirects can replay prompts and nonstandard authentication headers
+            // to another origin. The caller must see the Provider's response.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(self.connect)
+            .read_timeout(self.read)
+            .timeout(self.total)
+            .pool_max_idle_per_host(64)
+            .tcp_nodelay(true)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub client: reqwest::Client,
@@ -56,6 +70,11 @@ pub enum ApiType {
     /// sign-in flows all come from that declaration.
     Extension(&'static str),
 }
+
+/// Upper bound on Endpoint type identifiers remembered for the life of the
+/// process. Bundled Endpoint types are matched before interning and never count
+/// against it.
+const MAX_INTERNED_ENDPOINT_TYPES: usize = 256;
 
 impl ApiType {
     /// The Endpoint types Core implements itself.
@@ -111,9 +130,29 @@ impl ApiType {
 
     /// Remembers an Endpoint type identifier for the life of the process, so an
     /// Endpoint type stays a cheap copyable value while its identifier may come
-    /// from configuration.
-    fn intern(endpoint_type: &str) -> &'static str {
-        Box::leak(endpoint_type.to_owned().into_boxed_str())
+    /// from configuration. The table is bounded because the identifier is also
+    /// read from API input: an unknown type must not grow memory for the life of
+    /// the process each time one is submitted.
+    fn intern(endpoint_type: &str) -> Result<&'static str, String> {
+        static INTERNED: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<&'static str>>,
+        > = std::sync::OnceLock::new();
+        let interned =
+            INTERNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut interned = interned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = interned.get(endpoint_type) {
+            return Ok(existing);
+        }
+        if interned.len() >= MAX_INTERNED_ENDPOINT_TYPES {
+            return Err(format!(
+                "At most {MAX_INTERNED_ENDPOINT_TYPES} distinct Endpoint types are supported"
+            ));
+        }
+        let identifier: &'static str = Box::leak(endpoint_type.to_owned().into_boxed_str());
+        interned.insert(identifier);
+        Ok(identifier)
     }
 }
 
@@ -131,7 +170,9 @@ impl<'de> Deserialize<'de> for ApiType {
             "openai_chat_completions" => Self::OpenaiChatCompletions,
             "openai_responses" => Self::OpenaiResponses,
             "anthropic" => Self::Anthropic,
-            endpoint_type => Self::Extension(Self::intern(endpoint_type)),
+            endpoint_type => {
+                Self::Extension(Self::intern(endpoint_type).map_err(serde::de::Error::custom)?)
+            }
         })
     }
 }
@@ -395,13 +436,9 @@ impl ApiEndpoint {
                 let proxy = reqwest::Proxy::all(proxy_url).map_err(|err| {
                     format!("invalid SOCKS5 proxy for endpoint '{}': {err}", self.id)
                 })?;
-                reqwest::Client::builder()
+                timeouts
+                    .client_builder()
                     .proxy(proxy)
-                    .connect_timeout(timeouts.connect)
-                    .read_timeout(timeouts.read)
-                    .timeout(timeouts.total)
-                    .pool_max_idle_per_host(64)
-                    .tcp_nodelay(true)
                     .build()
                     .map_err(|err| format!("build client for endpoint '{}': {err}", self.id))
             })
@@ -887,6 +924,39 @@ mod tests {
         routes::{ModelRoute, RouteTarget},
     };
 
+    /// An Endpoint type identifier from configuration is remembered, but the
+    /// table is bounded: API input cannot grow memory for the life of the process.
+    #[test]
+    fn unknown_endpoint_types_are_remembered_until_the_table_is_full() {
+        let first: ApiType = serde_json::from_str("\"config-test-acme\"").unwrap();
+        let second: ApiType = serde_json::from_str("\"config-test-acme\"").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.id(), "config-test-acme");
+        // Built-in types never touch the table, so they keep working after it is full.
+        assert_eq!(
+            serde_json::from_str::<ApiType>("\"openai_responses\"").unwrap(),
+            ApiType::OpenaiResponses
+        );
+        let mut refused = None;
+        for index in 0..super::MAX_INTERNED_ENDPOINT_TYPES + 8 {
+            let identifier = format!("config-test-overflow-{index}");
+            match serde_json::from_str::<ApiType>(&format!("\"{identifier}\"")) {
+                Ok(api_type) => assert_eq!(api_type.id(), identifier),
+                Err(error) => {
+                    refused = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let message = refused.expect("the intern table must refuse unbounded identifiers");
+        assert!(message.contains("distinct Endpoint types"), "{message}");
+        assert_eq!(
+            serde_json::from_str::<ApiType>("\"config-test-acme\"").unwrap(),
+            first,
+            "known identifiers still deserialize after the table is full"
+        );
+    }
+
     fn credential(id: &str, weight: u32, enabled: bool) -> Credential {
         Credential {
             id: id.to_owned(),
@@ -969,17 +1039,17 @@ mod tests {
         let unavailable = crate::extensions::ExtensionRegistry::without_endpoint_types();
         // The test asks the declaration for the kind identifier instead of naming
         // one itself, exactly as Core does.
-        let declared = crate::extensions::ExtensionRegistry::for_tests();
+        let declared = crate::extensions::tests::registry_with_an_acme_endpoint();
         let declared_kind = declared
-            .endpoint_type_declaration("openai_codex")
+            .endpoint_type_declaration("acme_plan")
             .expect("the compiled Endpoint type")
             .credential_kinds
             .first()
             .expect("a declared account kind")
             .id;
         let account_on_an_extension_endpoint = provider(ApiEndpoint {
-            id: "chatgpt".to_owned(),
-            api_type: ApiType::Extension("openai_codex"),
+            id: "account".to_owned(),
+            api_type: ApiType::Extension("acme_plan"),
             credentials: vec![account(declared_kind)],
             ..ApiEndpoint::default()
         });
@@ -998,8 +1068,8 @@ mod tests {
                 .is_ok()
         );
         let secret_on_an_account_endpoint = provider(ApiEndpoint {
-            id: "chatgpt".to_owned(),
-            api_type: ApiType::Extension("openai_codex"),
+            id: "account".to_owned(),
+            api_type: ApiType::Extension("acme_plan"),
             credentials: vec![credential("secret", 100, true)],
             ..ApiEndpoint::default()
         });

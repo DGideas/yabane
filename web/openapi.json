@@ -21,7 +21,7 @@
     },
     {
       "name": "Inference",
-      "description": "LLM proxy endpoints. Authenticated with Gateway API keys when gateway authentication is enabled."
+      "description": "LLM proxy endpoints. Authenticated with Gateway API keys when gateway authentication is enabled. Yabane never follows Provider HTTP redirects: native protocol paths preserve the original 3xx status, Location, and body rather than replaying prompts or credentials to another origin."
     },
     {
       "name": "Administrator",
@@ -3180,93 +3180,6 @@
         "description": "Adds an Endpoint to an existing Provider. The request supplies connection settings for Endpoint types that accept them; an Endpoint type whose declaration owns its base URL or sign-in flow is created through its sign-in operation instead."
       }
     },
-    "/admin/providers/{provider_id}/credentials": {
-      "post": {
-        "tags": [
-          "Providers"
-        ],
-        "summary": "Add a weighted Provider credential to an Endpoint",
-        "security": [
-          {
-            "managementKey": []
-          },
-          {
-            "adminSession": []
-          }
-        ],
-        "parameters": [
-          {
-            "name": "provider_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "endpoint_id",
-                  "name",
-                  "secret",
-                  "weight"
-                ],
-                "properties": {
-                  "endpoint_id": {
-                    "type": "string"
-                  },
-                  "name": {
-                    "type": "string"
-                  },
-                  "secret": {
-                    "type": "string"
-                  },
-                  "weight": {
-                    "type": "integer",
-                    "minimum": 1
-                  },
-                  "priority": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "default": 1,
-                    "description": "Priority group, lowest first, default 1. Traffic uses the lowest-numbered group that still has an eligible identity, so a higher-numbered group carries nothing while a preferred identity can serve. Group membership is not part of the traffic percentages; it decides which percentages apply."
-                  }
-                },
-                "example": {
-                  "endpoint_id": "openai",
-                  "name": "Account A",
-                  "secret": "sk-…",
-                  "weight": 100,
-                  "priority": 1
-                }
-              },
-              "example": {
-                "endpoint_id": "openai",
-                "name": "Account A",
-                "secret": "sk-…",
-                "weight": 100
-              }
-            }
-          }
-        },
-        "responses": {
-          "204": {
-            "$ref": "#/components/responses/NoContent"
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          }
-        }
-      }
-    },
     "/admin/providers/{id}/models/refresh": {
       "post": {
         "tags": [
@@ -3987,6 +3900,93 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/admin/providers/{id}/credentials": {
+      "post": {
+        "tags": [
+          "Providers"
+        ],
+        "summary": "Add a weighted Provider credential to an Endpoint",
+        "security": [
+          {
+            "managementKey": []
+          },
+          {
+            "adminSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "endpoint_id",
+                  "name",
+                  "secret",
+                  "weight"
+                ],
+                "properties": {
+                  "endpoint_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "secret": {
+                    "type": "string"
+                  },
+                  "weight": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "priority": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                    "description": "Priority group, lowest first, default 1. Traffic uses the lowest-numbered group that still has an eligible identity, so a higher-numbered group carries nothing while a preferred identity can serve. Group membership is not part of the traffic percentages; it decides which percentages apply."
+                  }
+                },
+                "example": {
+                  "endpoint_id": "openai",
+                  "name": "Account A",
+                  "secret": "sk-…",
+                  "weight": 100,
+                  "priority": 1
+                }
+              },
+              "example": {
+                "endpoint_id": "openai",
+                "name": "Account A",
+                "secret": "sk-…",
+                "weight": 100
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"

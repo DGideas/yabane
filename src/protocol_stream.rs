@@ -5,6 +5,10 @@ use serde_json::{Value, json};
 use crate::protocol::Protocol;
 
 const MAX_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
+/// A non-streaming caller, or a Responses terminal event, needs the whole
+/// converted answer in memory. The per-frame limit does not bound that total, so
+/// accumulated output has its own ceiling instead of growing without limit.
+const MAX_AGGREGATED_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct StreamConverter {
     source: Protocol,
@@ -30,6 +34,9 @@ struct StreamState {
     output_tokens: u64,
     cached_tokens: u64,
     tools: HashMap<usize, ToolState>,
+    /// Bytes of text, tool names, and tool arguments retained for an aggregated
+    /// response. Streaming conversion keeps only the running state it needs.
+    collected: usize,
 }
 
 #[derive(Default)]
@@ -192,6 +199,20 @@ impl StreamConverter {
             Protocol::OpenAiResponses => self.parse_responses(&value),
             Protocol::AnthropicMessages => self.parse_anthropic(&value),
         };
+        if self.collect_output {
+            for event in &events {
+                let size = match event {
+                    Event::Text(text) => text.len(),
+                    Event::ToolStart { id, name, .. } => id.len() + name.len(),
+                    Event::ToolArguments { delta, .. } => delta.len(),
+                    _ => 0,
+                };
+                self.state.collected = self.state.collected.saturating_add(size);
+            }
+            if self.state.collected > MAX_AGGREGATED_OUTPUT_BYTES {
+                return Err("Provider response exceeded the conversion limit".to_owned());
+            }
+        }
         for event in events {
             self.render(event, output)?;
         }
@@ -962,6 +983,97 @@ mod tests {
         assert!(output.contains("overloaded"));
         assert!(!output.contains("message_stop"));
         assert!(converter.non_stream_response().is_err());
+    }
+
+    /// Network chunk boundaries are arbitrary, so conversion must not depend on
+    /// them. One-byte chunks and deterministic pseudo-random splits must produce
+    /// exactly the same converted stream as a single chunk.
+    #[test]
+    fn conversion_output_does_not_depend_on_chunk_boundaries() {
+        let input = concat!(
+            "data: {\"id\":\"chat_1\",\"model\":\"gpt\",\"created\":12,\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"model\":\"gpt\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"a\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"model\":\"gpt\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let bytes = input.as_bytes();
+        let baseline = {
+            let mut converter =
+                StreamConverter::new(Protocol::OpenAiChat, Protocol::OpenAiResponses);
+            let mut output = converter.push(bytes).unwrap();
+            output.extend(converter.finish().unwrap());
+            output
+        };
+        let mut cases = vec![(1..bytes.len()).collect::<Vec<_>>()];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..300 {
+            let mut points: Vec<usize> = (0..3)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state % bytes.len() as u64) as usize
+                })
+                .collect();
+            points.sort_unstable();
+            points.dedup();
+            cases.push(points);
+        }
+        for points in cases {
+            let mut converter =
+                StreamConverter::new(Protocol::OpenAiChat, Protocol::OpenAiResponses);
+            let mut output = Vec::new();
+            let mut previous = 0;
+            for point in points.into_iter().chain(std::iter::once(bytes.len())) {
+                if point > previous {
+                    output.extend(converter.push(&bytes[previous..point]).unwrap());
+                }
+                previous = point;
+            }
+            output.extend(converter.finish().unwrap());
+            assert_eq!(
+                output, baseline,
+                "a different chunk split changed the conversion"
+            );
+        }
+    }
+
+    #[test]
+    fn aggregated_output_past_the_memory_limit_fails_instead_of_growing() {
+        let mut converter =
+            StreamConverter::new_aggregating(Protocol::OpenAiChat, Protocol::OpenAiResponses);
+        let chunk = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "c", "model": "gpt",
+                "choices": [{"delta": {"content": "x".repeat(1024 * 1024)}, "finish_reason": null}]
+            })
+        );
+        let mut failure = None;
+        for _ in 0..40 {
+            if let Err(error) = converter.push(chunk.as_bytes()) {
+                failure = Some(error);
+                break;
+            }
+        }
+        let error = failure.expect("the aggregate limit must stop an unbounded response");
+        assert!(error.contains("conversion limit"), "{error}");
+    }
+
+    /// A caller that receives events does not need the whole answer, so a target
+    /// that does not embed it retains nothing and the aggregate bound is not
+    /// reachable, however long the stream is. `Protocol::OpenAiResponses` as a
+    /// target is the exception, because its terminal events carry the output text.
+    #[test]
+    fn streaming_conversion_retains_no_aggregated_output() {
+        let chunk = format!(
+            "data: {}\n\n",
+            serde_json::json!({"choices": [{"delta": {"content": "x".repeat(4096)}, "finish_reason": null}]})
+        );
+        let mut converter = StreamConverter::new(Protocol::OpenAiChat, Protocol::AnthropicMessages);
+        converter.push(chunk.as_bytes()).unwrap();
+        assert_eq!(converter.state.collected, 0);
+        assert!(converter.state.text.is_empty());
     }
 
     #[test]

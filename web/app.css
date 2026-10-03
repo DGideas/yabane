@@ -103,6 +103,7 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 @media(max-width:760px){.routes-table{display:block}}/* Credential health, the Endpoint cooldown policy, and the per-credential kind label
    are console additions on top of the Endpoint card that already existed. */
 .credential-cooldown{display:inline-flex;flex-wrap:wrap;align-items:center;gap:8px;width:max-content;padding:3px 9px;color:#8a5300;background:#fef3d7;border-radius:10px;font-size:11px}
+.provider-cooling{max-width:100%;padding:2px 8px;color:#8a5300;background:#fef3d7;border-radius:9px;font-size:11px;line-height:1.4}
 .credential-tier{width:max-content;margin-top:4px;padding:2px 7px;color:#0842a0;background:#e8f0fe;border-radius:7px;font-size:10px;font-weight:500}
 .credential-tier[data-tone=standby]{color:#654600;background:#fff4d6}.credential-cooldown .text-link{font-size:11px}.traffic-row small{color:var(--muted);font-size:11px}
 /* A pool that only describes a configured policy is a note and takes the

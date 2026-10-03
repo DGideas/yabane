@@ -474,6 +474,148 @@ fn request_id() -> String {
     id
 }
 
+/// Set once Yabane is stopping and its grace period has ended, so an interrupted
+/// response is explained as a shutdown instead of blaming the caller.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling for a Provider response that has to be held in memory to convert it to
+/// another protocol. Streaming callers are unaffected.
+const MAX_NON_STREAMING_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Streaming exchanges that have not written their terminal Activity record yet.
+/// Shutdown waits briefly for this to reach zero so an exchange it interrupted is
+/// still part of the final flush.
+static ACTIVE_STREAM_RECORDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn shutdown_notice_channel() -> &'static tokio::sync::watch::Sender<bool> {
+    static NOTICE: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> =
+        std::sync::OnceLock::new();
+    NOTICE.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+fn shutdown_notice() -> tokio::sync::watch::Receiver<bool> {
+    shutdown_notice_channel().subscribe()
+}
+
+/// Announces that the grace period is over. In-flight responses end themselves
+/// through this notice, which lets each one record its own interruption instead
+/// of being dropped mid-await when the process stops.
+pub(crate) fn mark_shutting_down() {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = shutdown_notice_channel().send(true);
+}
+
+pub(crate) fn active_stream_records() -> usize {
+    ACTIVE_STREAM_RECORDS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Resolves when Yabane announces that it is stopping, including the case where
+/// the notice was already sent before this response started.
+async fn wait_for_shutdown(notice: &mut tokio::sync::watch::Receiver<bool>) {
+    if *notice.borrow() {
+        return;
+    }
+    while notice.changed().await.is_ok() {
+        if *notice.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// A non-streaming cross-protocol conversion needs the whole Provider response in
+/// memory, so it is bounded like aggregated output instead of buffering whatever a
+/// broken or hostile Provider sends.
+async fn read_non_streaming_response(
+    mut response: reqwest::Response,
+) -> Result<bytes::Bytes, RequestFailure> {
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_NON_STREAMING_RESPONSE_BYTES {
+                    return Err(RequestFailure::new(
+                        "protocol_conversion",
+                        "response_too_large",
+                        "Provider response exceeded the conversion limit",
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(bytes::Bytes::from(body)),
+            Err(err) => return Err(upstream_read_failure(&err, false)),
+        }
+    }
+}
+
+fn shutdown_failure() -> RequestFailure {
+    RequestFailure::new(
+        "gateway",
+        "shutdown",
+        "Yabane stopped before the Provider response finished",
+    )
+}
+
+/// Owns everything that has to be finalized exactly once when a Provider response
+/// body ends: normally, on a read or conversion failure, or because the caller
+/// disconnected mid-stream and the body was dropped before the exchange finished.
+/// The proxy builds it before the response body is created, so a caller that goes
+/// away still leaves one Activity record and one observer completion behind.
+struct StreamCompletion {
+    observers: Vec<Box<dyn yabane_extension_api::UpstreamExchangeObserver>>,
+    activity: Option<ProxyActivity>,
+    usage: UsageTracker,
+    streaming: bool,
+    first_byte_ms: Option<u64>,
+    completed: bool,
+}
+
+impl Drop for StreamCompletion {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        complete_exchange_observers(
+            &mut self.observers,
+            yabane_extension_api::ExchangeOutcome::Interrupted,
+        );
+        let Some(activity) = self.activity.take() else {
+            return;
+        };
+        let (usage, _) = self.usage.finish();
+        let streaming = self.streaming;
+        let first_byte_ms = self.first_byte_ms;
+        let failure = if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            shutdown_failure()
+        } else {
+            RequestFailure::new(
+                "client",
+                "disconnected",
+                "Client disconnected before the Provider response finished",
+            )
+        };
+        // Dropping the body happens on a runtime thread, but the Activity store
+        // still has to be written, so the record is spawned rather than skipped.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        handle.spawn(async move {
+            activity
+                .record_failure(
+                    StatusCode::BAD_GATEWAY,
+                    usage,
+                    streaming,
+                    first_byte_ms,
+                    failure,
+                )
+                .await;
+            ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+}
+
 struct ProxyActivity {
     store: ActivityStore,
     request_id: String,
@@ -1006,7 +1148,18 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         let mut failure = None;
         let mut failure_record = None;
         let mut first_byte_ms = None;
-        while let Some(chunk) = upstream.next().await {
+        let mut shutdown = shutdown_notice();
+        while let Some(chunk) = tokio::select! {
+            chunk = upstream.next() => chunk,
+            () = wait_for_shutdown(&mut shutdown) => {
+                // The caller is not waiting any more: stop reading the Provider
+                // stream and record why the exchange has no answer.
+                let record = shutdown_failure();
+                failure = Some(record.message.clone());
+                failure_record = Some(record);
+                None
+            }
+        } {
             let chunk = match chunk {
                 Ok(chunk) => {
                     first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
@@ -1088,11 +1241,16 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     }
 
     if converting && !event_stream {
-        let bytes = match upstream_response.bytes().await {
+        let bytes = match read_non_streaming_response(upstream_response).await {
             Ok(bytes) => bytes,
-            Err(err) => {
-                error!(provider = %provider.id, endpoint = %endpoint.id, %err, "could not read upstream response for protocol conversion");
-                let failure = upstream_read_failure(&err, false);
+            Err(failure) => {
+                error!(
+                    provider = %provider.id,
+                    endpoint = %endpoint.id,
+                    stage = %failure.stage,
+                    category = %failure.category,
+                    "could not read the Provider response for protocol conversion"
+                );
                 let message = failure.message.clone();
                 activity
                     .record_failure(
@@ -1173,19 +1331,36 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         return response;
     }
 
+    ACTIVE_STREAM_RECORDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let stream_state = StreamCompletion {
+        observers: exchange_observers,
+        activity: Some(activity),
+        usage: UsageTracker::new(upstream_protocol, event_stream),
+        streaming: requested_streaming || event_stream,
+        first_byte_ms: None,
+        completed: false,
+    };
     let stream = async_stream::stream! {
-        let mut exchange_observers = exchange_observers;
+        let mut state = stream_state;
         let mut upstream = upstream_response.bytes_stream();
-        let mut usage = UsageTracker::new(upstream_protocol, event_stream);
         let mut converter = converting.then(|| StreamConverter::new(upstream_protocol, caller_protocol));
         let mut conversion_failed = false;
-        let mut first_byte_ms = None;
-        while let Some(chunk) = upstream.next().await {
+        let mut interrupted_by_shutdown = false;
+        let mut shutdown = shutdown_notice();
+        while let Some(chunk) = tokio::select! {
+            chunk = upstream.next() => chunk,
+            () = wait_for_shutdown(&mut shutdown) => {
+                interrupted_by_shutdown = true;
+                None
+            }
+        } {
             match chunk {
                 Ok(chunk) => {
-                    first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
-                    observe_response_chunk(&mut exchange_observers, &chunk);
-                    usage.observe(&chunk);
+                    state
+                        .first_byte_ms
+                        .get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                    observe_response_chunk(&mut state.observers, &chunk);
+                    state.usage.observe(&chunk);
                     if let Some(converter) = &mut converter {
                         match converter.push(&chunk) {
                             Ok(converted) => {
@@ -1217,23 +1392,35 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     let failure = upstream_read_failure(&err, true);
                     let message = failure.message.clone();
                     complete_exchange_observers(
-                        &mut exchange_observers,
+                        &mut state.observers,
                         yabane_extension_api::ExchangeOutcome::Interrupted,
                     );
-                    let (usage, _) = usage.finish();
-                    activity.record_failure(
-                        StatusCode::BAD_GATEWAY,
-                        usage,
-                        requested_streaming || event_stream,
-                        first_byte_ms,
-                        failure,
-                    ).await;
+                    let (usage, _) = state.usage.finish();
+                    let first_byte_ms = state.first_byte_ms;
+                    let streaming = state.streaming;
+                    let activity = state.activity.take().expect("one terminal Activity record");
+                    // The record is already being written, so a cancelled generator
+                    // must not write a second one for the same request.
+                    state.completed = true;
+                    activity
+                        .record_failure(
+                            StatusCode::BAD_GATEWAY,
+                            usage,
+                            streaming,
+                            first_byte_ms,
+                            failure,
+                        )
+                        .await;
+                    ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     yield Err(std::io::Error::new(kind, message));
                     return;
                 }
             }
         }
-        if !conversion_failed && let Some(converter) = &mut converter {
+        if !conversion_failed
+            && !interrupted_by_shutdown
+            && let Some(converter) = &mut converter
+        {
             match converter.finish() {
                 Ok(converted) => {
                     conversion_failed = converter.has_failed();
@@ -1247,19 +1434,39 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 }
             }
         }
-        let exchange_outcome = if conversion_failed {
+        let exchange_outcome = if conversion_failed || interrupted_by_shutdown {
             yabane_extension_api::ExchangeOutcome::Interrupted
         } else {
             yabane_extension_api::ExchangeOutcome::Complete
         };
-        complete_exchange_observers(&mut exchange_observers, exchange_outcome);
-        let (usage, protocol_failed) = usage.finish();
-        let recorded_status = if conversion_failed || protocol_failed { StatusCode::BAD_GATEWAY } else { status };
-        if conversion_failed {
+        complete_exchange_observers(&mut state.observers, exchange_outcome);
+        let (usage, protocol_failed) = state.usage.finish();
+        let first_byte_ms = state.first_byte_ms;
+        let streaming = state.streaming;
+        let activity = state.activity.take().expect("one terminal Activity record");
+        // Recorded below: the drop guard must not repeat it if this generator is
+        // cancelled after the response finished.
+        state.completed = true;
+        let recorded_status = if conversion_failed || protocol_failed || interrupted_by_shutdown {
+            StatusCode::BAD_GATEWAY
+        } else {
+            status
+        };
+        if interrupted_by_shutdown {
+            activity
+                .record_failure(
+                    recorded_status,
+                    usage,
+                    streaming,
+                    first_byte_ms,
+                    shutdown_failure(),
+                )
+                .await;
+        } else if conversion_failed {
             activity.record_failure(
                 recorded_status,
                 usage,
-                requested_streaming || event_stream,
+                streaming,
                 first_byte_ms,
                 RequestFailure::new(
                     "upstream_stream",
@@ -1271,16 +1478,16 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             activity.record_failure(
                 recorded_status,
                 usage,
-                requested_streaming || event_stream,
+                streaming,
                 first_byte_ms,
                 RequestFailure::new(
-                    if requested_streaming || event_stream {
+                    if streaming {
                         "upstream_stream"
                     } else {
                         "upstream_response"
                     },
                     "protocol_failure",
-                    if requested_streaming || event_stream {
+                    if streaming {
                         "Provider stream reported a failure"
                     } else {
                         "Provider response reported a failure"
@@ -1291,13 +1498,14 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
             activity.record_failure(
                 status,
                 usage,
-                requested_streaming || event_stream,
+                streaming,
                 first_byte_ms,
                 upstream_http_failure(status),
             ).await;
         } else {
-            activity.record(status, usage, requested_streaming || event_stream, first_byte_ms).await;
+            activity.record(status, usage, streaming, first_byte_ms).await;
         }
+        ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -1731,31 +1939,38 @@ fn upstream_http_failure(status: StatusCode) -> RequestFailure {
 }
 
 fn stream_failure(message: &str) -> RequestFailure {
-    let (stage, category, safe_message) = if message.contains("8 MiB") {
-        (
-            "protocol_conversion",
-            "frame_too_large",
-            "Provider stream exceeded the conversion limit",
-        )
-    } else if message.contains("valid JSON") || message.contains("convert") {
-        (
-            "protocol_conversion",
-            "invalid_response",
-            "Could not convert the Provider stream",
-        )
-    } else if message.contains("terminal event") {
-        (
-            "upstream_stream",
-            "truncated",
-            "Provider stream ended before completion",
-        )
-    } else {
-        (
-            "upstream_stream",
-            "failed",
-            "Provider stream reported a failure",
-        )
-    };
+    let (stage, category, safe_message) =
+        if message.contains("memory limit") || message.contains("conversion limit") {
+            (
+                "protocol_conversion",
+                "response_too_large",
+                "Provider response exceeded the conversion limit",
+            )
+        } else if message.contains("8 MiB") {
+            (
+                "protocol_conversion",
+                "frame_too_large",
+                "Provider stream exceeded the conversion limit",
+            )
+        } else if message.contains("valid JSON") || message.contains("convert") {
+            (
+                "protocol_conversion",
+                "invalid_response",
+                "Could not convert the Provider stream",
+            )
+        } else if message.contains("terminal event") {
+            (
+                "upstream_stream",
+                "truncated",
+                "Provider stream ended before completion",
+            )
+        } else {
+            (
+                "upstream_stream",
+                "failed",
+                "Provider stream reported a failure",
+            )
+        };
     RequestFailure::new(stage, category, safe_message)
 }
 
@@ -1998,14 +2213,12 @@ mod tests {
     fn an_endpoint_type_serves_only_the_caller_surfaces_it_declares() {
         // The declaration decides which caller APIs an Extension-owned Endpoint
         // accepts and which protocol Core speaks upstream for it.
-        let registry = crate::extensions::ExtensionRegistry::for_tests();
-        assert!(
-            ApiSurface::OpenAiResponses.supports(ApiType::Extension("openai_codex"), &registry)
-        );
-        assert!(!ApiSurface::OpenAiChat.supports(ApiType::Extension("openai_codex"), &registry));
-        assert!(!ApiSurface::Anthropic.supports(ApiType::Extension("openai_codex"), &registry));
+        let registry = crate::extensions::tests::registry_with_an_acme_endpoint();
+        assert!(ApiSurface::OpenAiResponses.supports(ApiType::Extension("acme_plan"), &registry));
+        assert!(!ApiSurface::OpenAiChat.supports(ApiType::Extension("acme_plan"), &registry));
+        assert!(!ApiSurface::Anthropic.supports(ApiType::Extension("acme_plan"), &registry));
         assert!(!ApiSurface::OpenAiResponses.supports(
-            ApiType::Extension("openai_codex"),
+            ApiType::Extension("acme_plan"),
             &crate::extensions::ExtensionRegistry::without_endpoint_types()
         ));
     }

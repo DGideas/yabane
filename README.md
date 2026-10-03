@@ -27,12 +27,16 @@ Yabane is a small, performance-oriented LLM gateway written in Rust. Its first r
 
 ## Run
 
+Building Yabane needs Rust 1.88 or newer and Node.js 20 or newer (Node is only used by the test tooling). No database or external service is required: configuration, credentials, and Activity live in the local `data/` directory.
+
 ```bash
 cp .env.example .env
 cargo run --release
 ```
 
 Yabane automatically loads local environment variables from the repository-root `.env` file, which is ignored by Git. Open <http://127.0.0.1:8080>, add a provider, then send requests to Yabane. Use `yabane --addr 127.0.0.1:9090` to change the listen address, or `yabane --help` to see all command-line options. Logs default to `info`; set `YABANE_LOG` or pass `--log` to use another tracing filter. Request activity metadata is buffered and persisted into one JSON Lines file per UTC day under `data/activity/`. Retention is configurable from Activity → Manage data and removes whole day files once they fall outside the window; `YABANE_ACTIVITY_RETENTION_DAYS` changes the initial 30-day default before a setting has been saved.
+
+Shutdown is bounded. `Ctrl-C` or `SIGTERM` stops accepting new connections and lets requests already in flight finish; after `YABANE_SHUTDOWN_GRACE_SECONDS` (an integer from 1 to 86400, default 60) Yabane interrupts whatever is left, records each interrupted exchange in Activity with failure stage `gateway` and category `shutdown`, and flushes pending Activity before exiting. Errors from interrupted protocol conversion are recorded the same way, so a stop does not leave Activity claiming a completed answer.
 
 Upstream inference connections have three process-wide safety deadlines. Connecting defaults to 15 seconds, each read must make progress within 300 seconds, and the complete request must finish within 28800 seconds (8 hours). A successful read resets only the per-read deadline, so normal long-running streams can continue while a connection that sends only keepalives remains bounded by the total deadline. Override these defaults with `YABANE_UPSTREAM_CONNECT_TIMEOUT_SECONDS`, `YABANE_UPSTREAM_READ_TIMEOUT_SECONDS`, and `YABANE_UPSTREAM_TOTAL_TIMEOUT_SECONDS`; each value must be an integer from 1 through 86400.
 
@@ -49,15 +53,19 @@ To use a ChatGPT Plus, Pro, or Business subscription, choose a subscription Endp
 
 Provider credentials—including OpenAI subscription OAuth tokens—are stored locally in the private `data/providers.json` file and are never returned by the management API; gateway access configuration is stored in `data/auth.json`; the administrator and hashed Management API keys are stored in `data/admin.json`. Configuration files are atomically replaced, and operations spanning Provider, route, and Gateway-key files use a private rollback journal that is recovered before configuration is loaded after an interrupted process. Gateway API-key authentication is enabled by default, so generate a key in **API access** before calling `/v1/*`. Use a separately generated Management API key for control endpoints, or use the browser session. Management-key creation and revocation remain browser-session-only.
 
+Back up Yabane by copying the whole `data/` directory while the process is stopped; it contains every Provider, credential, route, pricing entry, administrator hash, Management API key, and Activity day file, and nothing outside it is required to restore an instance. Run exactly one Yabane process per data directory: the files are replaced atomically and an interrupted multi-file configuration update is rolled back from its journal on the next start, but concurrent processes would overwrite each other's writes without an interlock. Activity day files are append-only JSON Lines, so a backup can also be taken while Yabane runs if the copy tolerates a partial final line; an interrupted final record is quarantined on the next start and never silently dropped.
+
 On first use, the admin console asks you to create its administrator account without a CAPTCHA. Login CAPTCHA is optional: configure a matching Cloudflare Turnstile widget pair with `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET`; if either value is unavailable, CAPTCHA is disabled. Optionally set `TURNSTILE_HOSTNAMES` to a comma-separated list of allowed frontend hostnames (defaults to `localhost,127.0.0.1`). The widget must allow the hostname used in the browser. When Cloudflare's documented always-pass test secret is used for local/E2E testing, Yabane automatically serves its matching test site key unless `TURNSTILE_SITE_KEY` is explicitly set. Never commit the Turnstile secret.
 
-End-to-end behavior requirements are maintained in [`GATEWAY_BEHAVIORS.md`](GATEWAY_BEHAVIORS.md). Run the automated authentication E2E suite with:
+End-to-end behavior requirements are maintained in [`GATEWAY_BEHAVIORS.md`](GATEWAY_BEHAVIORS.md). Run `bash tests/check.sh` for the local quality gate — formatting, linting, unit tests, every Extension feature combination, OpenAPI/router drift, HTTP redirect isolation, Activity recovery, client disconnect, and bounded shutdown — or `bash tests/check.sh --full` to add browser and authentication E2E coverage. `bash tests/check.sh --load` adds a capacity baseline (latency percentiles and resident memory) after the gate passes, and `bash tests/behavior-map.sh` reports which rules are named by a test or by the source. Prerequisites and network dependencies are documented in [`tests/README.md`](tests/README.md); engineering findings and follow-up priorities are in [`ENGINEERING_REVIEW.md`](ENGINEERING_REVIEW.md).
+
+Run the automated authentication E2E suite alone with:
 
 ```bash
 tests/e2e.sh
 ```
 
-With no argument, the suite rebuilds the debug binary first so embedded console assets match the working tree. Pass an explicit binary path, such as `tests/e2e.sh target/release/yabane`, only when testing an already-built artifact.
+With no argument, the suite rebuilds the debug binary first so embedded console assets match the working tree. Pass an explicit binary path, such as `tests/e2e.sh target/release/yabane`, only when testing an already-built artifact. Set `YABANE_E2E_KEEP=1` to keep the temporary data directory and logs of a failing run for inspection.
 
 ## Usage value estimates
 

@@ -1,4 +1,5 @@
 import { chromium, webkit } from 'playwright';
+import { openConsoleView } from './console-view-helper.mjs';
 
 const base = process.env.YABANE_UI_BASE || 'http://127.0.0.1:8080';
 const sessionCookie = process.env.YABANE_SESSION_COOKIE;
@@ -29,9 +30,15 @@ for (const project of projects) {
     if (project.name === 'desktop-chrome') await context.grantPermissions(['clipboard-read', 'clipboard-write'], {origin: base});
     if (sessionCookie) {
       await context.addCookies([{ name: 'yabane_session', value: sessionCookie, url: base, httpOnly: true, sameSite: 'Strict' }]);
+      const session = await context.request.get(`${base}/admin/session`, {timeout: 5000});
+      if (!session.ok() || !(await session.json()).authenticated) throw new Error(`${project.name}: supplied administrator session did not authenticate; refusing to skip authenticated coverage`);
     }
     const page = await context.newPage();
-    page.on('pageerror', error => console.error(`${project.name}: page error: ${error.stack || error.message}`));
+    const pageErrors = [];
+    page.on('pageerror', error => pageErrors.push(error));
+    const assertNoPageErrors = () => {
+      if (pageErrors.length) throw new AggregateError(pageErrors, `${project.name}: uncaught browser errors`);
+    };
     await page.route('https://models.dev/api.json', async route => {
       await route.fulfill({
         status: 200,
@@ -252,6 +259,7 @@ for (const project of projects) {
     await page.goto(base, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => !document.querySelector('#login-screen')?.hidden || !document.querySelector('#admin-app')?.hidden);
     if (await page.locator('#login-screen').isVisible()) {
+      if (sessionCookie) throw new Error(`${project.name}: supplied administrator session did not authenticate; refusing to skip authenticated coverage`);
       await page.locator('#login-form [name="username"]').waitFor();
       await page.waitForFunction(() => document.querySelector('#login-form [name="username"]') === document.activeElement);
       const authBackdrop = page.locator('#login-screen > .auth-backdrop');
@@ -266,6 +274,7 @@ for (const project of projects) {
       await page.emulateMedia({ reducedMotion: 'no-preference' });
       await assertNoPageOverflow(page, project.name, 'login page');
       await assertNoUpstreamCopy(page, project.name, 'login page');
+      assertNoPageErrors();
       console.log(`${project.name}: login layout checked (authenticated dialog checks skipped)`);
       await context.close();
       continue;
@@ -495,6 +504,17 @@ for (const project of projects) {
     if (!(await providerActivity.isVisible()) || !(await providerActivity.getByText(/requests · 24h/).isVisible())) throw new Error(`${project.name}: Provider list does not show its 24-hour activity sparkline`);
     if (!await providerActivity.getAttribute('aria-label').then(label => /requests? in the last 24 hours/.test(label || ''))) throw new Error(`${project.name}: Provider activity sparkline lacks an accessible request summary`);
     await assertCodeChipsHugContent(page, '.provider-list-main code', project.name, 'Provider model labels');
+    // A credential the Provider rate-limited is out of its Endpoint's rotation, so
+    // the row states that and when it returns instead of leaving the condition to
+    // be found by opening the Provider.
+    const coolingProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-subscription/model-id'})});
+    if (await coolingProvider.count()) {
+      const coolingNote = coolingProvider.locator('.provider-cooling');
+      const coolingText = (await coolingNote.textContent()).trim();
+      if (await coolingNote.count() !== 1 || !coolingText.includes('1 credential cooling down') || !coolingText.includes('resumes in 1 minute 30 seconds')) throw new Error(`${project.name}: the Provider list does not state a cooling credential and when it returns (${coolingText})`);
+      const coolingTitle = (await coolingNote.getAttribute('title')) || '';
+      if (!coolingTitle.includes('chatgpt · OpenAI account resumes in 1 minute 30 seconds')) throw new Error(`${project.name}: the Provider cooling note does not name the Endpoint and credential that are out (${coolingTitle})`);
+    }
     await page.evaluate(() => document.querySelector('[data-view="home"]').click());
     const homeCommand = page.locator('#home-view .home-command');
     if (!(await homeCommand.isVisible()) || !(await page.locator('#home-traffic-chart').isVisible())) throw new Error(`${project.name}: Home is missing its operational header or traffic visualization`);
@@ -529,9 +549,14 @@ for (const project of projects) {
     const misalignedBars = homeChartResult.barCenterOffsets.map(offset => Math.abs(offset)).filter(offset => offset > 0.5);
     if (misalignedBars.length) throw new Error(`${project.name}: ${misalignedBars.length} Home chart bars are not centered on their interval (up to ${Math.max(...misalignedBars).toFixed(2)}px off)`);
 
+    // Read the interval from the running page, not possibly mismatched local assets.
+    const liveRefreshIntervalMs = testLiveRefresh ? await page.evaluate(() => {
+      if (!Number.isFinite(LIVE_REFRESH_INTERVAL_MS) || LIVE_REFRESH_INTERVAL_MS <= 0) throw new Error('Invalid console live-refresh interval');
+      return LIVE_REFRESH_INTERVAL_MS;
+    }) : null;
     if (testLiveRefresh) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
-      await page.clock.fastForward(10000);
+      await page.clock.fastForward(liveRefreshIntervalMs);
       await homeRefresh;
     }
 
@@ -1251,6 +1276,27 @@ for (const project of projects) {
         if (!identity.includes('Endpoint policy')) throw new Error(`${project.name}: a destination that uses the Endpoint credential policy does not say so (${identity})`);
         if (/Credential (No identity|Endpoint policy)/.test(identity)) throw new Error(`${project.name}: route destination identity repeats the identity label (${identity})`);
       }
+      // A delegated destination whose Endpoint has one enabled identity has no
+      // rotation to describe, so the row names the identity that carries the traffic
+      // instead of leaving the policy label to stand for it.
+      await page.evaluate(() => {
+        providers.push({
+          id: 'ui-sole-policy', name: 'UI sole policy', extra_headers: {}, extra_body: {}, defaults_endpoint_ids: [],
+          endpoints: [{id: 'main', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null, extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 0, mode: 'fixed'}, credentials: [{id: 'solo', name: 'Solo account', weight: 100, enabled: true, kind: 'secret'}]}],
+          discovered_models: [], model_endpoints: {}, model_endpoint_preferences: [], models_discovered_at: 1, model_discovery_error: null,
+        });
+        modelRoutes.push({pattern: 'ui-sole-policy-model', mode: 'weighted', targets: [{provider_id: 'ui-sole-policy', endpoint_id: 'main', credential_id: '', upstream_model: 'solo-model', weight: 100, priority: 1, enabled: true, state: 'serving'}]});
+        renderRoutes();
+      });
+      const solePolicy = page.locator('#routes .route-destination').filter({has: page.locator('.route-destination-route', {hasText: 'ui-sole-policy'})}).first();
+      const soleIdentity = (await solePolicy.locator('.route-identity').textContent()).trim();
+      if (!soleIdentity.includes('Endpoint policy') || !soleIdentity.includes('Solo account')) throw new Error(`${project.name}: a delegated destination does not name the only identity that can carry its traffic (${soleIdentity})`);
+      if (await solePolicy.locator('.route-identity-mark').count()) throw new Error(`${project.name}: a delegated destination is marked like a pinned identity (${soleIdentity})`);
+      await page.evaluate(() => {
+        modelRoutes.splice(modelRoutes.findIndex(route => route.pattern === 'ui-sole-policy-model'), 1);
+        providers.splice(providers.findIndex(provider => provider.id === 'ui-sole-policy'), 1);
+        renderRoutes();
+      });
     }
     // A failover rule reopens as the mode it uses, keeps every destination's own
     // priority group, and still fits the dialog: the mode, the groups, and their
@@ -1606,7 +1652,7 @@ for (const project of projects) {
         page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48') && response.url().includes('until=')),
         page.waitForResponse(response => response.url().includes('/admin/activity/logs?since=') && response.url().includes('limit=100')),
       ]);
-      await page.clock.fastForward(30000);
+      await page.clock.fastForward(liveRefreshIntervalMs);
       await activityRefresh;
     }
     const timelineColumns = page.locator('#activity-chart .chart-column');
@@ -1949,11 +1995,11 @@ for (const project of projects) {
     await page.locator('#activity-data-dialog .close-activity-data').first().click();
     const consoleViews = await page.locator('#console-sidebar [data-view]').evaluateAll(nodes => [...new Set(nodes.map(node => node.dataset.view))]);
     for (const view of consoleViews) {
-      await page.evaluate(view => document.querySelector(`[data-view="${view}"]`).click(), view);
-      await page.waitForTimeout(250);
+      await openConsoleView(page, view);
       await assertNoUpstreamCopy(page, project.name, `console view ${view}`);
     }
     await assertNoPageOverflow(page, project.name, 'console');
+    assertNoPageErrors();
     console.log(`${project.name}: responsive console and dialogs passed`);
     await context.close();
   } finally {

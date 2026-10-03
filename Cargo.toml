@@ -12,6 +12,7 @@ resolver = "2"
 name = "yabane"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A clear, reliable gateway to every LLM."
 license = "MIT"
 

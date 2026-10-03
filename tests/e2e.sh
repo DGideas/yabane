@@ -17,7 +17,19 @@ upstream_port=$(available_port)
 while [[ $upstream_port == "$port" ]]; do upstream_port=$(available_port); done
 pid=
 upstream_pid=
-cleanup() { [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true; [[ -n "$upstream_pid" ]] && kill "$upstream_pid" 2>/dev/null || true; rm -rf "$work"; }
+# A failing run keeps its temporary data directory and logs when YABANE_E2E_KEEP=1,
+# so the failure can be inspected without rerunning the whole suite.
+cleanup() {
+  status=$?
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  [[ -n "$upstream_pid" ]] && kill "$upstream_pid" 2>/dev/null || true
+  if [[ $status -ne 0 && ${YABANE_E2E_KEEP:-} == 1 ]]; then
+    echo "E2E failed; keeping $work (YABANE_E2E_KEEP=1)" >&2
+  else
+    rm -rf "$work"
+  fi
+  return $status
+}
 trap cleanup EXIT
 cd "$work"
 # Activity is stored as one JSON Lines file per UTC day, so every count spans the
@@ -27,6 +39,7 @@ version_output=$("$binary" --version)
 [[ $version_output =~ ^yabane\ ([0-9a-f]{8}|unknown)\ \(.+\)$ ]]
 [[ $("$binary" --help) == *"Initial Activity retention before a setting is saved"* ]]
 [[ $("$binary" --help) == *"Provider total request deadline [default: 28800]"* ]]
+[[ $("$binary" --help) == *"Shutdown grace before interrupting requests [default: 60]"* ]]
 [[ $("$binary" --help) == *"--no-extensions"* ]]
 if YABANE_ACTIVITY_RETENTION_DAYS=0 "$binary" --addr "127.0.0.1:$port" >invalid-retention.log 2>&1; then
   echo "invalid activity retention unexpectedly started" >&2; exit 1
@@ -1252,8 +1265,15 @@ admin -f -X DELETE "$base/admin/management-keys/$management_id" >/dev/null
 # Live API docs and the embedded OpenAPI spec are public.
 [[ $(curl -sS -o /dev/null -w '%{http_code}' "$base/docs") == 200 ]]
 [[ $(curl -sS "$base/openapi.json" | jq -r .openapi) == 3.0.3 ]]
+# Verify browser readiness waiting against a held HTTP response body before UI scans.
+node "$repo/tests/console-view-readiness.mjs"
 session_cookie=$(awk '$6 == "yabane_session" { print $7 }' "$cookie" | tail -1)
 YABANE_UI_BASE="$base" YABANE_SESSION_COOKIE="$session_cookie" node "$repo/tests/responsive-ui.mjs"
+# A stale session must fail authenticated verification, not silently pass a login-only run.
+if YABANE_UI_BASE="$base" YABANE_SESSION_COOKIE=invalid-fixture-session node "$repo/tests/responsive-ui.mjs" >invalid-ui-session.log 2>&1; then
+  echo 'Browser verification silently accepted an invalid administrator session' >&2; exit 1
+fi
+grep -q 'refusing to skip authenticated coverage' invalid-ui-session.log
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":false}' >/dev/null
 [[ $(status "$base/v1/models") == 200 ]]
 admin -f -X PATCH "$base/admin/auth" -H 'content-type: application/json' -d '{"enabled":true}' >/dev/null

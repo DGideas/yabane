@@ -248,6 +248,7 @@ impl ExtensionRegistry {
             #[cfg(feature = "extension-openai-subscription")]
             extension_info(yabane_extension_openai_subscription::metadata()).unwrap(),
         ];
+        #[allow(unused_mut)]
         let mut registry = Self::new(
             infos,
             ExtensionSettings::default(),
@@ -769,7 +770,7 @@ pub fn execution_error(failure: HookFailure) -> axum::response::Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use bytes::Bytes;
     use yabane_extension_api::{
@@ -828,7 +829,7 @@ mod tests {
         }
     }
 
-    fn registry_with_an_acme_endpoint() -> ExtensionRegistry {
+    pub(crate) fn registry_with_an_acme_endpoint() -> ExtensionRegistry {
         let mut registry = ExtensionRegistry::for_tests();
         let implementation: &'static AcmeEndpoint = Box::leak(Box::new(AcmeEndpoint));
         registry.provider_endpoints.push(implementation);

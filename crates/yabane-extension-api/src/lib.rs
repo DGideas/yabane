@@ -203,8 +203,7 @@ pub struct ProviderEndpointType {
     /// of inferring capability from an API type name.
     pub surfaces: &'static [Protocol],
     /// Identity kinds an Endpoint of this type may own. An empty slice means the
-    /// type carries no Extension-owned identity, so Core's own `secret` kind
-    /// applies.
+    /// type accepts no identity; it does not inherit Core's `secret` kind.
     pub credential_kinds: &'static [ProviderCredentialKind],
     pub sign_in: Option<ProviderSignIn>,
 }

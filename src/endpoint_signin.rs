@@ -964,14 +964,6 @@ mod tests {
         assert!(input.provider_name.is_none() && input.socks5_proxy.is_none());
     }
 
-    /// The declaration the OpenAI Subscription Extension publishes, as Core sees
-    /// it: one account kind, connected through sign-in.
-    fn declaration() -> yabane_extension_api::ProviderEndpointType {
-        <yabane_extension_openai_subscription::OpenAiSubscriptionEndpoint as yabane_extension_api::ProviderEndpoint>::endpoint_type(
-            &yabane_extension_openai_subscription::ENDPOINT,
-        )
-    }
-
     const DECLARATION_KINDS: &[yabane_extension_api::ProviderCredentialKind] =
         &[yabane_extension_api::ProviderCredentialKind {
             id: "account",
@@ -980,9 +972,22 @@ mod tests {
         }];
 
     fn test_declaration() -> yabane_extension_api::ProviderEndpointType {
-        let mut declaration = declaration();
-        declaration.credential_kinds = DECLARATION_KINDS;
-        declaration
+        // Core's identity lifecycle must be testable without a bundled Extension.
+        yabane_extension_api::ProviderEndpointType {
+            id: "openai_codex",
+            display_name: "Test account Endpoint",
+            description: "Test-only sign-in declaration",
+            default_endpoint_id: "account",
+            fixed_base_url: Some("https://accounts.example.test/api"),
+            upstream_protocol: yabane_extension_api::Protocol::OpenAiResponses,
+            always_event_stream: true,
+            surfaces: &[yabane_extension_api::Protocol::OpenAiResponses],
+            credential_kinds: DECLARATION_KINDS,
+            sign_in: Some(yabane_extension_api::ProviderSignIn {
+                device_code: true,
+                browser: true,
+            }),
+        }
     }
 
     fn subscription_endpoint(id: &str) -> crate::config::ApiEndpoint {
@@ -1211,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             endpoint.base_url,
-            yabane_extension_openai_subscription::BASE_URL
+            test_declaration().fixed_base_url.unwrap()
         );
         assert!(endpoint.requires_credential);
         assert_eq!(endpoint.credentials.len(), 1);

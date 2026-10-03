@@ -603,7 +603,15 @@ function renderProviders() {
     const activity = providerActivity.get(provider.id) || [];
     const requests = activity.reduce((total, value) => total + value, 0);
     const activityLabel = `${requests.toLocaleString()} request${requests === 1 ? '' : 's'} in the last 24 hours`;
-    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code></span><span class="provider-list-activity" aria-label="${escapeHtml(activityLabel)}"><span class="provider-sparkline">${sparkline(activity.length ? activity : [0, 0], '#0b57d0')}</span><small>${compactNumber(requests)} requests · 24h</small></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
+    // A credential the Provider rate-limited is out of its Endpoint's rotation
+    // until the cooldown ends, which is capacity this Provider does not currently
+    // offer. The row states that count and the next return instead of leaving an
+    // operator to open every Endpoint.
+    const cooling = provider.endpoints.flatMap(endpoint => endpoint.credentials.filter(credential => credential.enabled && credential.cooldown_seconds_remaining).map(credential => ({endpoint, credential})));
+    const cooldownNote = cooling.length
+      ? `<span class="provider-cooling" title="${escapeHtml(cooling.map(entry => `${entry.endpoint.id} · ${entry.credential.name} resumes in ${formatCooldown(entry.credential.cooldown_seconds_remaining)}`).join(' · '))}">${cooling.length} credential${cooling.length === 1 ? '' : 's'} cooling down · ${cooling.length === 1 ? 'resumes' : 'next resumes'} in ${formatCooldown(Math.min(...cooling.map(entry => entry.credential.cooldown_seconds_remaining)))}</span>`
+      : '';
+    card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code>${cooldownNote}</span><span class="provider-list-activity" aria-label="${escapeHtml(activityLabel)}"><span class="provider-sparkline">${sparkline(activity.length ? activity : [0, 0], '#0b57d0')}</span><small>${compactNumber(requests)} requests · 24h</small></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
     card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); });
     return card;
   }));
@@ -2595,17 +2603,23 @@ function routeTargetSummary(route, target, activeWeightTotal) {
     const groups = identityGroups(endpoint);
     const rotating = groups[0]?.members.length || 0;
     const standby = groups.length - 1;
+    // A policy with one enabled identity has nothing to rotate and nothing to
+    // hand over to, so the row names that identity instead of leaving a policy
+    // label where the reader expects the identity that carries the traffic.
+    const sole = rotating === 1 && !standby ? groups[0].members[0] : null;
     // A destination that keeps the Endpoint policy states the group that carries
     // the traffic and, when the Endpoint separates them, that another group waits
     // instead of presenting every identity as part of one rotation.
     const policyTitle = standby
       ? 'Endpoint policy — uses Priority 1 first, shares it by weight, and hands over to a standby group only while every identity above it is cooling down'
-      : 'Endpoint policy — rotates the Endpoint\'s eligible identities by weight and skips one that is cooling down';
+      : sole
+        ? 'Endpoint policy — every request leaves with this Endpoint\'s only enabled identity'
+        : 'Endpoint policy — rotates the Endpoint\'s eligible identities by weight and skips one that is cooling down';
     // An Endpoint that needs an identity and has none enabled cannot serve at all,
     // so the row states that instead of describing a rotation of nothing.
     identity = groups.length === 0
       ? '<span class="route-identity is-policy" title="This Endpoint requires an identity and has none enabled">No enabled identity</span>'
-      : `<span class="route-identity is-policy" title="${policyTitle}">Endpoint policy${rotating > 1 ? ` · <strong>${rotating} rotating</strong>` : ''}${standby ? ` · <strong>${standby} standby ${standby === 1 ? 'group' : 'groups'}</strong>` : ''}</span>`;
+      : `<span class="route-identity is-policy" title="${policyTitle}">Endpoint policy${sole ? ` · <strong>${escapeHtml(sole.name)}</strong>` : rotating > 1 ? ` · <strong>${rotating} rotating</strong>` : ''}${standby ? ` · <strong>${standby} standby ${standby === 1 ? 'group' : 'groups'}</strong>` : ''}</span>`;
   }
   const state = enabled ? 'Receives traffic' : 'Inactive, 0% share';
   const shareLabel = enabled ? `${share}%` : `${share}% <small>inactive</small>`;
