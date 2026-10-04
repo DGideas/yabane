@@ -22,14 +22,14 @@ use crate::{
     },
     endpoint_signin,
     error::{self, api_error},
-    health, pricing,
+    health,
+    limits::MAX_BUFFERED_BODY_BYTES,
+    pricing,
     protocol::{self, Protocol},
     protocol_stream::StreamConverter,
     routes::RouteMode,
     usage::{TokenUsage, UsageTracker},
 };
-
-const MAX_REQUEST_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 struct RoutingError {
@@ -120,6 +120,18 @@ async fn route_request(state: AppState, request: Request, surface: ApiSurface) -
     response
 }
 
+/// Reads a caller body up to `limit` bytes. `None` means the body is unusable,
+/// either past the limit or failed mid-stream; both are answered as Yabane's own
+/// `413` so a caller never mistakes it for a Provider answer. The limit is a
+/// parameter so a test can cross it without materializing the production ceiling.
+async fn read_body(body: Body, limit: usize) -> Option<bytes::Bytes> {
+    axum::body::to_bytes(body, limit).await.ok()
+}
+
+fn request_body_too_large() -> Response {
+    api_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body is too large")
+}
+
 async fn route_proxied(
     state: AppState,
     request: Request,
@@ -130,9 +142,9 @@ async fn route_proxied(
     let allowed_providers = auth::authorized_provider_ids(&request).map(<[String]>::to_vec);
     let gateway_api_key = auth::authorized_gateway_key(&request).cloned();
     let (parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY_SIZE).await {
-        Ok(body) => body,
-        Err(_) => return api_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body is too large"),
+    let body = match read_body(body, MAX_BUFFERED_BODY_BYTES).await {
+        Some(body) => body,
+        None => return request_body_too_large(),
     };
     let requested_streaming = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
@@ -478,10 +490,6 @@ fn request_id() -> String {
 /// response is explained as a shutdown instead of blaming the caller.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Ceiling for a Provider response that has to be held in memory to convert it to
-/// another protocol. Streaming callers are unaffected.
-const MAX_NON_STREAMING_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-
 /// Streaming exchanges that have not written their terminal Activity record yet.
 /// Shutdown waits briefly for this to reach zero so an exchange it interrupted is
 /// still part of the final flush.
@@ -534,7 +542,7 @@ async fn read_non_streaming_response(
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > MAX_NON_STREAMING_RESPONSE_BYTES {
+                if body.len().saturating_add(chunk.len()) > MAX_BUFFERED_BODY_BYTES {
                     return Err(RequestFailure::new(
                         "protocol_conversion",
                         "response_too_large",
@@ -2014,7 +2022,10 @@ fn to_reqwest_method(method: &Method) -> reqwest::Method {
 mod tests {
     use std::time::Duration;
 
-    use axum::http::{HeaderMap, HeaderValue};
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, StatusCode},
+    };
     use reqwest::header;
 
     use crate::config::{RateLimitCooldown, RateLimitCooldownMode};
@@ -2023,9 +2034,31 @@ mod tests {
     use super::provider_endpoint_base_url;
     use super::{
         ApiSurface, ApiType, Protocol, apply_core_upstream_headers, cooldown_duration,
-        copy_response_headers, response_is_event_stream, sanitize_request_headers,
+        copy_response_headers, read_body, response_is_event_stream, sanitize_request_headers,
         strip_transformed_response_headers, upstream_transport_failure,
     };
+
+    /// PROXY-41: crossing the buffered-body ceiling is a Yabane-authored `413`,
+    /// and a body at the limit still passes.
+    #[tokio::test]
+    async fn request_body_past_the_limit_is_rejected_as_a_yabane_413() {
+        assert!(
+            read_body(Body::from("12345"), 4).await.is_none(),
+            "a body past the limit must be refused"
+        );
+        assert!(
+            read_body(Body::from("1234"), 4).await.is_some(),
+            "a body at the limit is accepted"
+        );
+        let response = super::request_body_too_large();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the error body");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("error body JSON");
+        assert_eq!(value["error"]["message"], "Request body is too large");
+        assert_eq!(value["error"]["type"], "yabane_error");
+    }
 
     #[test]
     fn cooldown_duration_reads_the_delay_source_and_only_integer_retry_after() {

@@ -2,13 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::protocol::Protocol;
+use crate::{limits::MAX_BUFFERED_BODY_BYTES, protocol::Protocol};
 
 const MAX_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
-/// A non-streaming caller, or a Responses terminal event, needs the whole
-/// converted answer in memory. The per-frame limit does not bound that total, so
-/// accumulated output has its own ceiling instead of growing without limit.
-const MAX_AGGREGATED_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct StreamConverter {
     source: Protocol,
@@ -209,7 +205,11 @@ impl StreamConverter {
                 };
                 self.state.collected = self.state.collected.saturating_add(size);
             }
-            if self.state.collected > MAX_AGGREGATED_OUTPUT_BYTES {
+            // A non-streaming caller, or a Responses terminal event, needs the
+            // whole converted answer in memory. The per-frame limit does not
+            // bound that total, so it shares the buffered-body ceiling instead
+            // of growing without limit.
+            if self.state.collected > MAX_BUFFERED_BODY_BYTES {
                 return Err("Provider response exceeded the conversion limit".to_owned());
             }
         }
@@ -924,7 +924,7 @@ fn read_responses_usage(usage: Option<&Value>, state: &mut StreamState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SSE_FRAME_SIZE, StreamConverter};
+    use super::{MAX_BUFFERED_BODY_BYTES, MAX_SSE_FRAME_SIZE, StreamConverter};
     use crate::protocol::Protocol;
 
     #[test]
@@ -1050,7 +1050,9 @@ mod tests {
             })
         );
         let mut failure = None;
-        for _ in 0..40 {
+        // Each push carries one MiB, so this covers the shared ceiling plus a
+        // margin; the bound must stop the loop before it runs out of attempts.
+        for _ in 0..MAX_BUFFERED_BODY_BYTES / (1024 * 1024) + 4 {
             if let Err(error) = converter.push(chunk.as_bytes()) {
                 failure = Some(error);
                 break;

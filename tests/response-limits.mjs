@@ -1,5 +1,6 @@
-// PROXY-46: response observation and conversion are bounded, while native
-// passthrough stays byte-transparent even for a response the observer must skip.
+// PROXY-46: response observation and conversion are bounded by the shared
+// buffered-body ceiling, while native passthrough stays byte-transparent even
+// for a response the observer must skip.
 // Uses only loopback servers, fake credentials, and a temporary data directory.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -22,7 +23,9 @@ const servers = [];
 let child;
 let serverLog = '';
 const mebibyte = 1024 * 1024;
-const conversionLimit = 32 * mebibyte;
+// The same ceiling bounds a buffered request body, a non-streaming response
+// conversion, and accumulated conversion output (src/limits.rs).
+const payloadLimit = 128 * mebibyte;
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const listen = async handler => {
   const server = http.createServer(handler);
@@ -56,7 +59,7 @@ try {
     }
     if (req.url.startsWith('/aggregate')) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
-      for (let index = 0; index < 40; index++) {
+      for (let index = 0; index < payloadLimit / mebibyte + 8; index++) {
         res.write(`data: ${JSON.stringify({ id: 'chat_1', model: 'limits-test', choices: [{ delta: { content: 'y'.repeat(mebibyte) }, finish_reason: null }] })}\n\n`);
       }
       res.write('data: [DONE]\n\n');
@@ -64,7 +67,7 @@ try {
       return;
     }
     if (req.url.startsWith('/oversized')) {
-      const padding = 'z'.repeat(conversionLimit + mebibyte);
+      const padding = 'z'.repeat(payloadLimit + mebibyte);
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         id: 'chat_1', object: 'chat.completion', model: 'limits-test',
