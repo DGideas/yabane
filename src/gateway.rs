@@ -2193,7 +2193,7 @@ mod tests {
     #[test]
     fn codex_adapter_applies_required_response_fields() {
         let mut body =
-            br#"{"model":"gpt-5.4","input":"hello","stream":true,"store":true}"#.to_vec();
+            br#"{"model":"gpt-5.4","input":"hello","stream":true,"store":true,"temperature":0.2,"top_p":0.9,"truncation":"disabled","metadata":{"trace":"caller"},"service_tier":"auto","user":"caller","safety_identifier":"caller-id","prompt_cache_options":{"mode":"implicit"},"prompt_cache_retention":"24h","previous_response_id":"resp_caller"}"#.to_vec();
         yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["stream"], true);
@@ -2201,11 +2201,43 @@ mod tests {
         assert_eq!(value["instructions"], "You are a helpful assistant.");
         assert_eq!(value["input"][0]["role"], "user");
         assert_eq!(value["input"][0]["content"][0]["text"], "hello");
-        assert!(value.get("max_output_tokens").is_none());
+        for dropped in [
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "metadata",
+            "service_tier",
+            "user",
+            "safety_identifier",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+        ] {
+            assert!(
+                value.get(dropped).is_none(),
+                "unsupported field '{dropped}' must not reach Codex"
+            );
+        }
+        // Dropping this one would silently discard the caller's conversation.
+        assert_eq!(value["previous_response_id"], "resp_caller");
         assert_eq!(value["text"]["verbosity"], "low");
         assert_eq!(value["tool_choice"], "auto");
         assert_eq!(value["parallel_tool_calls"], true);
         assert_eq!(value["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[cfg(feature = "extension-openai-subscription")]
+    #[test]
+    fn codex_adapter_folds_array_content_system_messages_into_instructions() {
+        // VS Code's native Responses mode sends the system prompt as a message
+        // item whose content is a list of input_text parts, which the Codex
+        // backend refuses with `400 System messages are not allowed`.
+        let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"system","content":"Late note."}]}"#.to_vec();
+        yabane_extension_openai_subscription::adapt_body(&mut body);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instructions"], "Be terse.\n\nLate note.");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["role"], "user");
     }
 
     #[cfg(feature = "extension-openai-subscription")]

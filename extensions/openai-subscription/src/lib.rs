@@ -451,6 +451,23 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Reads the text of a Responses input message, whether it uses the string
+/// shorthand or the list of `input_text` parts.
+fn input_message_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 pub fn adapt_body(body: &mut Vec<u8>) {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return;
@@ -458,30 +475,47 @@ pub fn adapt_body(body: &mut Vec<u8>) {
     if let Some(object) = value.as_object_mut() {
         object.insert("store".to_owned(), serde_json::Value::Bool(false));
         object.insert("stream".to_owned(), serde_json::Value::Bool(true));
-        let leading_instructions = object
+        // The Codex backend rejects the `system` role anywhere in `input`, so
+        // every instruction message is folded into `instructions` the way
+        // pi-ai replays its transcript, whatever content shape it arrives in.
+        let mut system_instructions = Vec::new();
+        if let Some(input) = object
             .get_mut("input")
             .and_then(serde_json::Value::as_array_mut)
-            .and_then(|input| {
-                let first = input.first()?.as_object()?;
-                let role = first.get("role")?.as_str()?;
-                if !matches!(role, "developer" | "system") {
-                    return None;
+        {
+            input.retain(|item| {
+                let Some(message) = item.as_object() else {
+                    return true;
+                };
+                if !matches!(
+                    message.get("role").and_then(serde_json::Value::as_str),
+                    Some("developer" | "system")
+                ) {
+                    return true;
                 }
-                let instructions = first.get("content")?.as_str()?.to_owned();
-                input.remove(0);
-                Some(instructions)
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(input_message_text)
+                    .filter(|text| !text.is_empty())
+                {
+                    system_instructions.push(text);
+                }
+                false
             });
+        }
         if object
             .get("instructions")
             .and_then(serde_json::Value::as_str)
             .is_none()
         {
+            let instructions = if system_instructions.is_empty() {
+                "You are a helpful assistant.".to_owned()
+            } else {
+                system_instructions.join("\n\n")
+            };
             object.insert(
                 "instructions".to_owned(),
-                serde_json::Value::String(
-                    leading_instructions
-                        .unwrap_or_else(|| "You are a helpful assistant.".to_owned()),
-                ),
+                serde_json::Value::String(instructions),
             );
         }
         if let Some(input) = object
@@ -494,7 +528,25 @@ pub fn adapt_body(body: &mut Vec<u8>) {
                 serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": input}]}]),
             );
         }
-        object.remove("max_output_tokens");
+        // Tuning, cache, truncation, and caller-identifier fields the Codex
+        // backend answers with `400 Unsupported parameter: <name>`. A field
+        // whose absence would change the answer, such as
+        // `previous_response_id`, stays in the body so the Provider's own
+        // error reaches the caller instead of silently dropping behavior.
+        for name in [
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "metadata",
+            "service_tier",
+            "user",
+            "safety_identifier",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+        ] {
+            object.remove(name);
+        }
         object
             .entry("text")
             .or_insert_with(|| serde_json::json!({"verbosity": "low"}));
@@ -612,7 +664,7 @@ mod tests {
             HeaderName::from_static("chatgpt-account-id"),
             HeaderValue::from_static("caller-account"),
         );
-        let mut body = br#"{"model":"gpt-5.4","input":"hello","store":true,"stream":false,"max_output_tokens":100,"prompt_cache_key":"session"}"#.to_vec();
+        let mut body = br#"{"model":"gpt-5.4","input":"hello","store":true,"stream":false,"max_output_tokens":100,"temperature":0.2,"top_p":0.9,"truncation":"disabled","metadata":{"trace":"caller"},"service_tier":"auto","user":"caller","safety_identifier":"caller-id","prompt_cache_options":{"mode":"implicit"},"prompt_cache_retention":"24h","previous_response_id":"resp_caller","prompt_cache_key":"session"}"#.to_vec();
         let mut target_path = "/caller/path".to_owned();
 
         ENDPOINT
@@ -639,7 +691,25 @@ mod tests {
         assert_eq!(headers["x-client-request-id"], "session");
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
-        assert!(value.get("max_output_tokens").is_none());
+        for dropped in [
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "metadata",
+            "service_tier",
+            "user",
+            "safety_identifier",
+            "prompt_cache_options",
+            "prompt_cache_retention",
+        ] {
+            assert!(
+                value.get(dropped).is_none(),
+                "unsupported field '{dropped}' must not reach Codex"
+            );
+        }
+        // Dropping this one would silently discard the caller's conversation.
+        assert_eq!(value["previous_response_id"], "resp_caller");
         assert_eq!(value["input"][0]["content"][0]["text"], "hello");
         assert!(
             value["include"]
@@ -648,6 +718,30 @@ mod tests {
                 .iter()
                 .any(|item| item == "reasoning.encrypted_content")
         );
+    }
+
+    #[test]
+    fn folds_every_system_or_developer_input_message_into_instructions() {
+        let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"developer","content":"Late note."}]}"#.to_vec();
+
+        adapt_body(&mut body);
+
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instructions"], "Be terse.\n\nLate note.");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn caller_instructions_win_over_input_instruction_messages() {
+        let mut body = br#"{"model":"gpt-6-astra","instructions":"Caller prompt","input":[{"role":"system","content":"Input prompt"},{"role":"user","content":"hello"}]}"#.to_vec();
+
+        adapt_body(&mut body);
+
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instructions"], "Caller prompt");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["role"], "user");
     }
 
     #[test]
