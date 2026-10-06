@@ -15,6 +15,7 @@ let extensions = [];
 let endpointTypes = [];
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
+const $$in = (root, selector) => [...root.querySelectorAll(selector)];
 const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
 const providerDialog = $('#provider-dialog');
 const providerForm = $('#provider-form');
@@ -42,6 +43,7 @@ const activityFilters = {providers: new Set(), models: new Set(), apiKeys: new S
 let activityFilterOptions = {providers: [], models: [], api_keys: []};
 let dashboardLoadPromise = null;
 let providerActivityLoadPromise = null;
+let providerStateLoadPromise = null;
 let providerActivity = new Map();
 let homeTrafficBuckets = [];
 let homeTrafficBucketSize = 0;
@@ -161,6 +163,9 @@ function showView(name, updateHistory = true) {
   indicator.style.transform = `translateY(${active.offsetTop}px)`;
   selectedProviderId = name === 'providers' ? selectedProviderId : null;
   if (name === 'providers') renderProviderPage();
+  // Opening the Providers view is a read of runtime state as much as of configuration:
+  // a cooldown that began while the administrator was elsewhere has to be on screen.
+  if (name === 'providers' && adminSession?.authenticated) refreshProviderState();
   if (name === 'providers' && adminSession?.authenticated && !selectedProviderId) loadProviderActivity();
   if (name === 'home' && adminSession?.authenticated) loadDashboard();
   if (name === 'pricing') { showPricingList(); renderPricingPage(); }
@@ -592,6 +597,15 @@ function credentialRows(provider, endpoint) {
 }
 
 function renderProviders() {
+  renderProviderList();
+  renderProviderPage();
+  renderRoutes();
+}
+
+/// The Provider list rows. They are their own function because a live refresh redraws
+/// the list from current runtime state without repainting the Provider page the
+/// administrator may be reading.
+function renderProviderList() {
   $('#provider-count').textContent = `${providers.length} provider${providers.length === 1 ? '' : 's'}`;
   $('#empty').hidden = providers.length > 0;
   $('#providers').hidden = providers.length === 0;
@@ -612,11 +626,52 @@ function renderProviders() {
       ? `<span class="provider-cooling" title="${escapeHtml(cooling.map(entry => `${entry.endpoint.id} · ${entry.credential.name} resumes in ${formatCooldown(entry.credential.cooldown_seconds_remaining)}`).join(' · '))}">${cooling.length} credential${cooling.length === 1 ? '' : 's'} cooling down · ${cooling.length === 1 ? 'resumes' : 'next resumes'} in ${formatCooldown(Math.min(...cooling.map(entry => entry.credential.cooldown_seconds_remaining)))}</span>`
       : '';
     card.innerHTML = `<span class="provider-avatar">${escapeHtml(provider.name.slice(0, 1).toUpperCase())}</span><span class="provider-list-main"><strong>${escapeHtml(provider.name)}</strong><code>${escapeHtml(provider.id)}/model-id</code>${cooldownNote}</span><span class="provider-list-activity" aria-label="${escapeHtml(activityLabel)}"><span class="provider-sparkline">${sparkline(activity.length ? activity : [0, 0], '#0b57d0')}</span><small>${compactNumber(requests)} requests · 24h</small></span><span class="provider-list-meta">${provider.endpoints.length} endpoint${provider.endpoints.length === 1 ? '' : 's'} · ${credentialCount(provider)} credential${credentialCount(provider) === 1 ? '' : 's'}<small class="${provider.model_discovery_error ? 'error-text' : ''}">${escapeHtml(modelStatus)}</small></span><span class="chevron">${icon('chevron-right')}</span>`;
-    card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); });
+    card.addEventListener('click', () => { selectedProviderId = provider.id; history.pushState({}, '', `/providers/${encodeURIComponent(provider.id)}`); renderProviderPage(); refreshProviderState(); });
     return card;
   }));
-  renderProviderPage();
-  renderRoutes();
+}
+
+/// One Endpoint card: the connection facts, the identity pool those identities form,
+/// and one row per identity. A live refresh redraws a card through this same
+/// function, so the page never shows two kinds of the same card.
+function endpointCard(provider, endpoint, index) {
+  const endpointModels = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length;
+  const enabled = enabledCredentials(endpoint);
+  // The Endpoint itself reports whether its declaration owns a sign-in flow.
+  const subscription = Boolean(endpoint.sign_in);
+  const credentialLabel = subscription ? 'account' : 'credential';
+  const credentialFact = endpoint.requires_credential
+    ? `<span><strong>${enabled.length}</strong> of ${endpoint.credentials.length} ${credentialLabel}s enabled</span>`
+    : '<span>No credential</span>';
+  const cooldownSeconds = endpoint.rate_limit_cooldown?.seconds || 0;
+  const cooldownSource = cooldownPolicyLabel(endpoint.rate_limit_cooldown);
+  const cooldownPolicy = cooldownSeconds > 0
+    ? `<span>Rate-limit cooldown <strong>${formatCooldown(cooldownSeconds)}</strong>${cooldownSource ? ` · ${cooldownSource}` : ''}</span>`
+    : '';
+  const rows = credentialRows(provider, endpoint);
+  const poolSummary = endpointPoolSummary(endpoint);
+  const headCopy = !subscription
+    ? `<h4>Credentials</h4><p>${endpoint.requires_credential ? `Credentials belong only to <code>${escapeHtml(endpoint.id)}</code>. ${identityGroups(endpoint).length > 1 ? 'Each priority group splits its own traffic between the credentials in it.' : 'Traffic is distributed between enabled credentials.'}` : 'This Endpoint sends requests without an identity.'}</p>`
+    : enabled.length
+      ? `<h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or the Provider revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(accountCredentialDetail(endpoint))} Access and refresh tokens are never shown in the console or API.</p></details>`
+      : '<h4>Reconnect required</h4><p>No account is connected. Use Connect account to sign in and resume requests through this Endpoint.</p>';
+  const renewalStatus = subscription
+    ? enabled.length
+      ? '<span class="renewal-status">Automatic renewal</span>'
+      : '<span class="renewal-status attention">Not connected</span>'
+    : '';
+  const emptyRow = !endpoint.requires_credential
+    ? ''
+    : endpoint.credentials.length
+      ? ''
+      : `<div class="endpoint-key-empty"><p>${subscription ? `No ${escapeHtml(endpointTypeLabel(endpoint.api_type))} account is connected to this Endpoint yet. Use Connect account to sign in.` : 'No credential belongs to this Endpoint yet. Add one to start serving traffic.'}</p></div>`;
+  const addAction = !endpoint.requires_credential
+    ? ''
+    : subscription
+      ? `<button class="button secondary connect-account" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Connect account</button>`
+      : `<button class="button secondary add-credential" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add credential</button>`;
+  const endpointKind = endpoint.endpoint_type_label || formatType(endpoint.api_type);
+  return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}" data-endpoint="${escapeHtml(endpoint.id)}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header>${poolSummary}<section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
 }
 
 function renderProviderPage() {
@@ -624,45 +679,7 @@ function renderProviderPage() {
   $('#provider-list-page').hidden = Boolean(provider);
   $('#provider-detail-page').hidden = !provider;
   if (!provider) return;
-  const endpointHtml = provider.endpoints.map((endpoint, index) => {
-    const endpointModels = Object.values(provider.model_endpoints).filter(ids => ids.includes(endpoint.id)).length;
-    const enabled = enabledCredentials(endpoint);
-    // The Endpoint itself reports whether its declaration owns a sign-in flow.
-    const subscription = Boolean(endpoint.sign_in);
-    const credentialLabel = subscription ? 'account' : 'credential';
-    const credentialFact = endpoint.requires_credential
-      ? `<span><strong>${enabled.length}</strong> of ${endpoint.credentials.length} ${credentialLabel}s enabled</span>`
-      : '<span>No credential</span>';
-    const cooldownSeconds = endpoint.rate_limit_cooldown?.seconds || 0;
-    const cooldownSource = cooldownPolicyLabel(endpoint.rate_limit_cooldown);
-    const cooldownPolicy = cooldownSeconds > 0
-      ? `<span>Rate-limit cooldown <strong>${formatCooldown(cooldownSeconds)}</strong>${cooldownSource ? ` · ${cooldownSource}` : ''}</span>`
-      : '';
-    const rows = credentialRows(provider, endpoint);
-    const poolSummary = endpointPoolSummary(endpoint);
-    const headCopy = !subscription
-      ? `<h4>Credentials</h4><p>${endpoint.requires_credential ? `Credentials belong only to <code>${escapeHtml(endpoint.id)}</code>. ${identityGroups(endpoint).length > 1 ? 'Each priority group splits its own traffic between the credentials in it.' : 'Traffic is distributed between enabled credentials.'}` : 'This Endpoint sends requests without an identity.'}</p>`
-      : enabled.length
-        ? `<h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or the Provider revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(accountCredentialDetail(endpoint))} Access and refresh tokens are never shown in the console or API.</p></details>`
-        : '<h4>Reconnect required</h4><p>No account is connected. Use Connect account to sign in and resume requests through this Endpoint.</p>';
-    const renewalStatus = subscription
-      ? enabled.length
-        ? '<span class="renewal-status">Automatic renewal</span>'
-        : '<span class="renewal-status attention">Not connected</span>'
-      : '';
-    const emptyRow = !endpoint.requires_credential
-      ? ''
-      : endpoint.credentials.length
-        ? ''
-        : `<div class="endpoint-key-empty"><p>${subscription ? `No ${escapeHtml(endpointTypeLabel(endpoint.api_type))} account is connected to this Endpoint yet. Use Connect account to sign in.` : 'No credential belongs to this Endpoint yet. Add one to start serving traffic.'}</p></div>`;
-    const addAction = !endpoint.requires_credential
-      ? ''
-      : subscription
-        ? `<button class="button secondary connect-account" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Connect account</button>`
-        : `<button class="button secondary add-credential" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add credential</button>`;
-    const endpointKind = endpoint.endpoint_type_label || formatType(endpoint.api_type);
-    return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header>${poolSummary}<section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
-  }).join('');
+  const endpointHtml = provider.endpoints.map((endpoint, index) => endpointCard(provider, endpoint, index)).join('');
   const variants = modelEndpointVariants(provider);
   const sharedVariants = variants.filter(variant => variant.endpointIds.length > 1);
   const configuredPreferences = provider.model_endpoint_preferences?.length || 0;
@@ -946,8 +963,17 @@ function bindProviderActions() {
     selectedProviderId = null;
     await Promise.all([loadProviders(), loadRoutes(), loadAuth()]);
   }));
-  $$('.endpoint-edit').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider, button.dataset.endpoint)));
-  $$('.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
+  bindEndpointCardActions(document);
+  $$('.refresh-models').forEach(button => button.addEventListener('click', () => refreshModels(button.dataset.provider, button)));
+  $$('.add-endpoint').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider)));
+}
+
+/// Actions that belong to one Endpoint card. They are bound inside the container that
+/// holds them instead of document-wide, so a live refresh rebinds exactly the markup
+/// it replaced and the rest of the page keeps its listeners.
+function bindEndpointCardActions(root) {
+  $$in(root, '.endpoint-edit').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider, button.dataset.endpoint)));
+  $$in(root, '.endpoint-delete').forEach(button => button.addEventListener('click', async () => {
     const provider = providers.find(item => item.id === button.dataset.provider);
     const endpoint = provider.endpoints.find(item => item.id === button.dataset.endpoint);
     const credentialImpact = endpoint.credentials.length
@@ -965,33 +991,88 @@ function bindProviderActions() {
     if (!response.ok) return showApiError(response, null);
     await Promise.all([loadProviders(), loadRoutes()]);
   }));
-  $$('.add-credential').forEach(button => button.addEventListener('click', () => openCredentialDialog(button.dataset.provider, button.dataset.endpoint)));
+  $$in(root, '.add-credential').forEach(button => button.addEventListener('click', () => openCredentialDialog(button.dataset.provider, button.dataset.endpoint)));
   // Connecting one more account is addressed by Endpoint type, which the Endpoint
   // itself reports; the sign-in request reuses the Endpoint's own proxy.
-  $$('.connect-account').forEach(button => button.addEventListener('click', () => {
+  $$in(root, '.connect-account').forEach(button => button.addEventListener('click', () => {
     const endpoint = providers.find(item => item.id === button.dataset.provider)?.endpoints.find(item => item.id === button.dataset.endpoint);
     if (!endpoint?.sign_in) return;
     beginEndpointSignIn({endpoint_type: endpoint.api_type, provider_id: button.dataset.provider, endpoint_id: button.dataset.endpoint}, null);
   }));
-  $$('.edit-traffic').forEach(button => button.addEventListener('click', () => openTrafficDialog(button.dataset.provider, button.dataset.endpoint)));
-  $$('.credential-rename').forEach(button => button.addEventListener('click', () => openCredentialNameDialog(button.dataset.provider, button.dataset.endpoint, button.dataset.credential)));
-  $$('.credential-toggle').forEach(button => button.addEventListener('click', async () => {
+  $$in(root, '.edit-traffic').forEach(button => button.addEventListener('click', () => openTrafficDialog(button.dataset.provider, button.dataset.endpoint)));
+  $$in(root, '.credential-rename').forEach(button => button.addEventListener('click', () => openCredentialNameDialog(button.dataset.provider, button.dataset.endpoint, button.dataset.credential)));
+  $$in(root, '.credential-toggle').forEach(button => button.addEventListener('click', async () => {
     await patchCredential(button.dataset.provider, button.dataset.endpoint, button.dataset.credential, {enabled: button.dataset.enabled !== 'true'});
   }));
-  $$('.credential-delete').forEach(button => button.addEventListener('click', async () => {
+  $$in(root, '.credential-delete').forEach(button => button.addEventListener('click', async () => {
     if (!confirm(`Delete credential “${button.dataset.name}”?\n\nModel-route destinations pinning this exact credential will also be removed.`)) return;
     const response = await fetch(`/admin/providers/${button.dataset.provider}/endpoints/${button.dataset.endpoint}/credentials/${button.dataset.credential}`, {method: 'DELETE'});
     if (!response.ok) return showApiError(response, null);
     await Promise.all([loadProviders(), loadRoutes()]);
   }));
-  $$('.clear-cooldown').forEach(button => button.addEventListener('click', async () => {
+  $$in(root, '.clear-cooldown').forEach(button => button.addEventListener('click', async () => {
     const response = await fetch(`/admin/providers/${button.dataset.provider}/endpoints/${button.dataset.endpoint}/credentials/${button.dataset.credential}/cooldown`, {method: 'DELETE'});
     if (!response.ok) return showApiError(response, null);
     await loadProviders();
   }));
-  $$('.refresh-models').forEach(button => button.addEventListener('click', () => refreshModels(button.dataset.provider, button)));
-  $$('.add-endpoint').forEach(button => button.addEventListener('click', () => openEndpointDialog(button.dataset.provider)));
 }
+
+/// Provider runtime state — which identity is cooling down, how long it stays out,
+/// and what each Endpoint's cooldown policy has observed — changes without any
+/// console action, so the Providers view re-reads it instead of keeping the snapshot
+/// the page loaded with. The Provider list and the open Provider page follow the same
+/// read, and a page whose configuration did not change is redrawn in place.
+async function refreshProviderState() {
+  if (providerStateLoadPromise) return providerStateLoadPromise;
+  providerStateLoadPromise = (async () => {
+    const response = await fetch('/admin/providers');
+    if (!response.ok) return;
+    const fresh = await response.json();
+    const rendered = selectedProviderId ? providers.find(provider => provider.id === selectedProviderId) : null;
+    const updated = selectedProviderId ? fresh.find(provider => provider.id === selectedProviderId) : null;
+    providers = fresh;
+    renderProviderList();
+    if (!selectedProviderId) return;
+    // The page the administrator is reading is only rebuilt when something other
+    // than runtime state changed; otherwise each Endpoint card is rebuilt in place
+    // and the model catalog around it keeps the state it was left in.
+    if (rendered && updated && providerRuntimeStateOnly(rendered, updated)) renderProviderRuntimeState(updated);
+    else renderProviderPage();
+  })().finally(() => { providerStateLoadPromise = null; });
+  return providerStateLoadPromise;
+}
+
+/// Whether two reads of one Provider differ only in the state this refresh exists
+/// for. Anything else — an Endpoint or credential added, renamed, or reconfigured, a
+/// changed cooldown policy, a new model catalog — changes what the hero and the
+/// summary cards state, so the whole page is rebuilt instead of updated card by card.
+function providerRuntimeStateOnly(before, after) {
+  const runtimeKeys = new Set(['cooldown_seconds_remaining', 'rate_limit_cooldown_activity']);
+  const signature = provider => JSON.stringify(provider, (key, value) => runtimeKeys.has(key) ? undefined : value);
+  return signature(before) === signature(after);
+}
+
+/// Redraws each Endpoint card of the open Provider through the function that drew it,
+/// keeping what the card itself was holding — an expanded credential detail and the
+/// control that had focus — because a cooldown ending changes none of them.
+function renderProviderRuntimeState(provider) {
+  $$('#provider-detail .endpoint-card').forEach(card => {
+    const index = provider.endpoints.findIndex(endpoint => endpoint.id === card.dataset.endpoint);
+    if (index < 0) return;
+    const active = card.contains(document.activeElement) ? controlIdentity(document.activeElement) : null;
+    const expanded = [...card.querySelectorAll('details')].map(details => details.open);
+    card.innerHTML = endpointCard(provider, provider.endpoints[index], index);
+    [...card.querySelectorAll('details')].forEach((details, position) => { details.open = Boolean(expanded[position]); });
+    if (active) cardControls(card).find(control => controlIdentity(control) === active)?.focus({preventScroll: true});
+  });
+  bindEndpointCardActions($('#provider-detail .endpoint-stack'));
+}
+
+/// The controls one card hands the keyboard. One is found again after the card is
+/// redrawn by what it addresses rather than by its position, because a cooldown
+/// ending adds or removes the Resume action the row around it holds.
+function cardControls(card) { return [...card.querySelectorAll('button, summary, a[href], input, select, textarea')]; }
+function controlIdentity(control) { return `${control.tagName}|${control.className}|${control.dataset?.credential || ''}`; }
 
 function openProviderIdentityDialog(providerId) {
   const provider = providers.find(item => item.id === providerId);
@@ -3713,7 +3794,10 @@ function refreshVisibleView() {
   if (!adminSession?.authenticated || document.hidden) return;
   if (!$('#home-view').hidden) loadDashboard();
   else if (!$('#activity-view').hidden) loadActivity();
-  else if (!$('#providers-view').hidden && !selectedProviderId) loadProviderActivity();
+  else if (!$('#providers-view').hidden) {
+    refreshProviderState();
+    if (!selectedProviderId) loadProviderActivity();
+  }
 }
 setInterval(refreshVisibleView, LIVE_REFRESH_INTERVAL_MS);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisibleView(); });

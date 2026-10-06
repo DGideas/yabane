@@ -93,6 +93,10 @@ for (const project of projects) {
       });
       await route.fulfill({response, json: body});
     });
+    // Provider runtime state that changes between reads, so the live-refresh checks
+    // can end a cooldown the console already fetched instead of only changing it
+    // across a reload.
+    const providerRuntimeFixture = {chatgptAccountCooldown: 90};
     await page.route('**/admin/providers', async route => {
       if (route.request().method() !== 'GET') return route.continue();
       const response = await route.fetch();
@@ -105,7 +109,7 @@ for (const project of projects) {
           sign_in: {device_code: true, browser: true}, base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
           extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, mode: 'prefer_provider'},
           rate_limit_cooldown_activity: {applied: 3, skipped: 1, last_seconds: 120, last_applied_at: 1700000000, last_observed_at: 1700000600},
-          credentials: [{id: 'account', name: 'OpenAI account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, cooldown_seconds_remaining: 90}, {id: 'account-2', name: 'Second account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1}],
+          credentials: [{id: 'account', name: 'OpenAI account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, ...(providerRuntimeFixture.chatgptAccountCooldown ? {cooldown_seconds_remaining: providerRuntimeFixture.chatgptAccountCooldown} : {})}, {id: 'account-2', name: 'Second account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1}],
         }],
         discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
@@ -558,6 +562,41 @@ for (const project of projects) {
       const homeRefresh = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since='));
       await page.clock.fastForward(liveRefreshIntervalMs);
       await homeRefresh;
+      // SVC-61: Provider runtime state is re-read rather than kept from page load: a
+      // credential whose cooldown ends is shown back in rotation without a reload,
+      // while an open model catalog, a search in progress, and expanded details keep
+      // their state.
+      const providerListRead = page.waitForResponse(response => response.request().method() === 'GET' && new URL(response.url()).pathname === '/admin/providers');
+      await page.evaluate(() => document.querySelector('[data-view="providers"]').click());
+      await providerListRead;
+      const liveProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-subscription/model-id'})});
+      const providerRead = page.waitForResponse(response => response.request().method() === 'GET' && new URL(response.url()).pathname === '/admin/providers');
+      await liveProvider.click();
+      await providerRead;
+      const liveCredential = page.locator('.subscription-credential');
+      await liveCredential.locator('.credential-cooldown').waitFor({state: 'visible'});
+      await page.locator('#provider-detail .credential-details summary').click();
+      await page.locator('.browse-provider-models').click();
+      await page.locator('#provider-detail .provider-model-browser').waitFor({state: 'visible'});
+      await page.locator('.model-browser-toolbar [role="searchbox"]').fill('gpt');
+      providerRuntimeFixture.chatgptAccountCooldown = 0;
+      await page.clock.fastForward(liveRefreshIntervalMs);
+      await page.waitForFunction(() => !document.querySelector('.subscription-credential .credential-cooldown'));
+      const livePool = await page.locator('.subscription-endpoint .endpoint-pool').textContent();
+      if (livePool.includes('is out until')) throw new Error(`${project.name}: a live refresh kept a credential out after its cooldown ended (${livePool})`);
+      const liveShares = await liveCredential.locator('.traffic-share').allTextContents();
+      if (!liveShares.some(text => text.includes('50%') && !text.includes('while cooling down'))) throw new Error(`${project.name}: a live refresh kept the cooling share (${liveShares.join(' | ')})`);
+      if (await page.locator('#provider-detail .provider-model-browser').isHidden()) throw new Error(`${project.name}: a live refresh closed the model catalog it redrew around`);
+      if (await page.locator('.model-browser-toolbar [role="searchbox"]').inputValue() !== 'gpt') throw new Error(`${project.name}: a live refresh discarded the model catalog search`);
+      if (await page.locator('#provider-detail .credential-details').getAttribute('open') === null) throw new Error(`${project.name}: a live refresh collapsed expanded credential details`);
+      if (await page.locator('#providers .provider-cooling').count()) throw new Error(`${project.name}: the Provider list kept its cooling note after the cooldown ended`);
+      // Restore the fixture and let the same refresh pick the cooldown up again: a
+      // cooldown that begins while the page stays open is shown without a reload, and
+      // the later checks still find the cooling credential they describe.
+      providerRuntimeFixture.chatgptAccountCooldown = 90;
+      await page.clock.fastForward(liveRefreshIntervalMs);
+      await liveCredential.locator('.credential-cooldown').waitFor({state: 'visible'});
+      if (!(await liveCredential.locator('.credential-cooldown').textContent()).includes('1 minute 30 seconds')) throw new Error(`${project.name}: a live refresh did not state the cooldown that just began`);
     }
 
     await page.evaluate(() => document.querySelector('[data-view="access"]').click());

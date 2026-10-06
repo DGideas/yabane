@@ -3,7 +3,7 @@
 // Keep this map in sync with showView; loader promises cover JSON parsing + render.
 const viewLoaders = {
   home: ['loadDashboard'],
-  providers: ['loadProviderActivity'],
+  providers: ['loadProviderActivity', 'refreshProviderState'],
   activity: ['loadActivity', 'loadActivityPage'], // The overview can start an unawaited page load.
   management: ['loadManagementKeys'],
   models: [], pricing: [], extensions: [], access: [],
