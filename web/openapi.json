@@ -1390,7 +1390,7 @@
       },
       "RateLimitCooldownActivity": {
         "type": "object",
-        "description": "What an Endpoint's cooldown policy has done since this process started. Present on an Endpoint only while its policy is enabled, so a policy that can be configured correctly and still never fire is distinguishable from a working one.",
+        "description": "What an Endpoint's cooldown policy has done since this process started, including the delay the Provider's own answer asked for when it armed the most recent cooldown. Present on an Endpoint only while its policy is enabled, so a policy that can be configured correctly and still never fire is distinguishable from a working one.",
         "required": [
           "applied",
           "skipped"
@@ -1398,7 +1398,7 @@
         "properties": {
           "applied": {
             "type": "integer",
-            "description": "How many 429 answers from the Provider armed a cooldown."
+            "description": "How many 429 answers selected a cooldown duration, including a reported zero-second delay that starts no new cooldown."
           },
           "skipped": {
             "type": "integer",
@@ -1408,13 +1408,22 @@
             "type": "integer",
             "description": "How long the most recent applied cooldown lasted, in seconds."
           },
+          "last_reported_seconds": {
+            "type": "integer",
+            "description": "The delay the Provider's own answer asked for, in integer seconds. Zero is a reported delay, not a missing value. Absent when the answer carried no delay Yabane reads. Recorded even under fixed, which does not use it to choose the duration."
+          },
+          "last_source": {
+            "type": "string",
+            "enum": ["fixed", "provider", "capped", "fallback"],
+            "description": "Why the most recent delay was selected at response time: fixed configured duration, unchanged Provider delay (including zero), Provider delay capped by the configured maximum, or configured maximum used because no delay was reported. Later policy edits do not reinterpret this observation. Absent before any delay has been selected."
+          },
           "last_applied_at": {
             "type": "integer",
             "description": "Unix timestamp of the most recent applied cooldown. This is runtime state and is not persisted: it resets when the process restarts."
           },
           "last_observed_at": {
             "type": "integer",
-            "description": "Unix timestamp of the most recent 429 answer that changed nothing. Runtime state, reset on restart."
+            "description": "Unix timestamp of the most recent 429 answer observed on this Endpoint, whether it armed a cooldown or changed nothing. Runtime state, reset on restart."
           }
         }
       },

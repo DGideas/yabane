@@ -839,10 +839,35 @@ function cooldownPolicyLabel(policy) {
 function formatClock(seconds) {
   return new Date(seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
 }
+/// What the Provider itself asked for when the most recent cooldown was armed,
+/// stated next to the length that was actually used: a number the configured
+/// ceiling held down and a missing delay that fell back to it are two different
+/// answers, and neither is readable from the armed length alone.
+function cooldownProviderNote(activity) {
+  const reported = activity.last_reported_seconds;
+  const asked = reported == null ? '' : ` The Provider asked for ${formatCooldown(reported)}`;
+  // These are facts recorded with the answer. The Endpoint's current policy
+  // may have changed while that history remains visible.
+  switch (activity.last_source) {
+    case 'fixed':
+      return asked
+        ? `${asked}, but the fixed duration configured at the time was used.`
+        : ' The fixed duration configured at the time was used.';
+    case 'provider':
+      return asked ? `${asked}, which was used unchanged.` : ' The Provider’s reported delay was used.';
+    case 'capped':
+      return asked ? `${asked}, so this cooldown was capped.` : ' The delay was capped by the maximum configured at the time.';
+    case 'fallback':
+      return ' The Provider’s answer carried no usable delay, so the configured maximum at the time was used.';
+    default:
+      return `${asked ? `${asked}.` : ''} The source of this recorded delay is not available.`;
+  }
+}
 /// What this instance has observed of the Endpoint's cooldown policy. A policy
 /// whose length comes from the Provider can be configured correctly and still
-/// never arm, so the console reports what happened instead of leaving the
-/// administrator unable to tell a working policy from a dead one.
+/// never arm, so the console reports what happened, including what the Provider
+/// itself asked for, instead of leaving the administrator unable to tell a
+/// working policy from a dead one or a capped number from a missing one.
 function endpointPolicyActivity(endpoint) {
   const activity = endpoint.rate_limit_cooldown_activity;
   if (!activity || !endpoint.rate_limit_cooldown?.seconds) return '';
@@ -852,10 +877,12 @@ function endpointPolicyActivity(endpoint) {
   if (!applied && !skipped) return 'No rate-limit answer has reached this Endpoint since Yabane started.';
   if (!applied) return `${plural(skipped, 'rate-limit answer')} reported no usable delay, so no identity has been taken out yet.`;
   const last = activity.last_applied_at
-    ? ` Most recently it took an identity out for ${formatCooldown(activity.last_seconds)} at ${formatClock(activity.last_applied_at)}.`
+    ? activity.last_seconds === 0
+      ? ` Most recently it selected a 0-second delay at ${formatClock(activity.last_applied_at)}; no new cooldown was started.${cooldownProviderNote(activity)}`
+      : ` Most recently it took an identity out for ${formatCooldown(activity.last_seconds)} at ${formatClock(activity.last_applied_at)}.${cooldownProviderNote(activity)}`
     : '';
   const skippedNote = skipped ? ` ${plural(skipped, 'rate-limit answer')} reported no usable delay.` : '';
-  return `This policy has taken an identity out ${plural(applied, 'time')} since Yabane started.${last}${skippedNote}`;
+  return `This Endpoint has selected a cooldown duration ${plural(applied, 'time')} since Yabane started.${last}${skippedNote}`;
 }
 /// How a group splits its own traffic, named the way the pool states it: a single
 /// identity is just itself, because 100% of one group states nothing.

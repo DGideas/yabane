@@ -108,7 +108,7 @@ for (const project of projects) {
           id: 'chatgpt', api_type: 'openai_codex', endpoint_type_label: 'OpenAI subscription', fixed_base_url: 'https://chatgpt.com/backend-api',
           sign_in: {device_code: true, browser: true}, base_url: 'https://chatgpt.com/backend-api', socks5_proxy: null,
           extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, mode: 'prefer_provider'},
-          rate_limit_cooldown_activity: {applied: 3, skipped: 1, last_seconds: 120, last_applied_at: 1700000000, last_observed_at: 1700000600},
+          rate_limit_cooldown_activity: {applied: 3, skipped: 1, last_seconds: 3600, last_reported_seconds: 7200, last_source: 'capped', last_applied_at: 1700000000, last_observed_at: 1700000600},
           credentials: [{id: 'account', name: 'OpenAI account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1, ...(providerRuntimeFixture.chatgptAccountCooldown ? {cooldown_seconds_remaining: providerRuntimeFixture.chatgptAccountCooldown} : {})}, {id: 'account-2', name: 'Second account', weight: 50, enabled: true, kind: 'openai_subscription', kind_label: 'OAuth account', subscription_expires_at: 1}],
         }],
         discovered_models: ['gpt-fixture'], model_endpoints: {'gpt-fixture': ['chatgpt']}, model_endpoint_preferences: [],
@@ -135,7 +135,7 @@ for (const project of projects) {
         endpoints: [{
           id: 'pool', api_type: 'openai_compatible', base_url: 'http://127.0.0.1:18080/v1', socks5_proxy: null,
           extra_headers: {}, extra_body: {}, requires_credential: true, rate_limit_cooldown: {seconds: 3600, mode: 'prefer_provider'},
-          rate_limit_cooldown_activity: {applied: 1, skipped: 0, last_seconds: 3600, last_applied_at: 1700000000, last_observed_at: 1700000600},
+          rate_limit_cooldown_activity: {applied: 1, skipped: 0, last_seconds: 3600, last_reported_seconds: 3600, last_source: 'provider', last_applied_at: 1700000000, last_observed_at: 1700000600},
           credentials: [
             {id: 'primary', name: 'Primary account', weight: 100, priority: 1, enabled: true, kind: 'secret'},
             {id: 'standby', name: 'Standby account', weight: 100, priority: 2, enabled: true, kind: 'secret'},
@@ -589,7 +589,7 @@ for (const project of projects) {
       if (await page.locator('#provider-detail .provider-model-browser').isHidden()) throw new Error(`${project.name}: a live refresh closed the model catalog it redrew around`);
       if (await page.locator('.model-browser-toolbar [role="searchbox"]').inputValue() !== 'gpt') throw new Error(`${project.name}: a live refresh discarded the model catalog search`);
       if (await page.locator('#provider-detail .credential-details').getAttribute('open') === null) throw new Error(`${project.name}: a live refresh collapsed expanded credential details`);
-      if (await page.locator('#providers .provider-cooling').count()) throw new Error(`${project.name}: the Provider list kept its cooling note after the cooldown ended`);
+      if (await liveProvider.locator('.provider-cooling').count()) throw new Error(`${project.name}: the Provider list kept its cooling note after the cooldown ended`);
       // Restore the fixture and let the same refresh pick the cooldown up again: a
       // cooldown that begins while the page stays open is shown without a reload, and
       // the later checks still find the cooling credential they describe.
@@ -758,8 +758,9 @@ for (const project of projects) {
     if (!poolText.includes('leaves the pool for the delay the Provider reports') || !poolText.includes('never longer than 1 hour')) throw new Error(`${project.name}: the identity pool does not state what a Provider rate limit does to the rotation (${poolText})`);
     if (!poolText.includes('is out until') || !poolText.includes('carries every request')) throw new Error(`${project.name}: the identity pool does not state which identity is out now and who carries the traffic instead (${poolText})`);
     // A policy whose length can come from the Provider may never fire, so the
-    // Endpoint states what it has actually done instead of only what it allows.
-    if (!poolText.includes('taken an identity out 3 times') || !poolText.includes('2 minutes') || !poolText.includes('reported no usable delay')) throw new Error(`${project.name}: the identity pool does not report what the cooldown policy has observed (${poolText})`);
+    // Endpoint states what it has actually done instead of only what it allows,
+    // including whether the Provider's own number was capped by the ceiling.
+    if (!poolText.includes('selected a cooldown duration 3 times') || !poolText.includes('took an identity out for 1 hour') || !poolText.includes('The Provider asked for 2 hours') || !poolText.includes('so this cooldown was capped') || !poolText.includes('reported no usable delay')) throw new Error(`${project.name}: the identity pool does not report what the cooldown policy has observed (${poolText})`);
     const identityShares = await credential.locator('.traffic-share').allTextContents();
     if (!identityShares.some(text => text.includes('0%') && text.includes('while cooling down'))) throw new Error(`${project.name}: a cooling identity keeps presenting its configured share as what it carries (${identityShares.join(' | ')})`);
     if (!identityShares.some(text => text.includes('100%') && text.includes('normally 50%'))) throw new Error(`${project.name}: an identity carrying the whole pool does not state both the effective and the configured share (${identityShares.join(' | ')})`);
@@ -949,6 +950,7 @@ for (const project of projects) {
       const tieredPool = await tieredCard.locator('.endpoint-pool').textContent();
       if (!tieredPool.includes('Traffic always uses Priority 1 first (Primary account)')) throw new Error(`${project.name}: a tiered pool does not state which group carries traffic (${tieredPool})`);
       if (!tieredPool.includes('Priority 2 (Standby account) only carries it while every identity in the group above it is cooling down')) throw new Error(`${project.name}: a standby group is not stated as a standby (${tieredPool})`);
+      if (!tieredPool.includes('took an identity out for 1 hour') || !tieredPool.includes('which was used unchanged')) throw new Error(`${project.name}: a tiered pool does not state that the Provider's own delay armed the last cooldown (${tieredPool})`);
       // The list itself says the numbers are read per group, so a standby row's
       // 0% is not mistaken for a sharing mistake.
       const tierCopy = await tieredCard.locator('.endpoint-keys-head p').first().textContent();

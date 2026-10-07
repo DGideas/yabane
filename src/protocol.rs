@@ -48,7 +48,7 @@ pub fn convert_response(
         "Provider response body must be valid JSON for protocol conversion".to_owned()
     })?;
     let response = CanonicalResponse::parse(value, source)?;
-    serde_json::to_vec(&response.render(target))
+    serde_json::to_vec(&response.render(target)?)
         .map_err(|err| format!("Could not serialize converted response: {err}"))
 }
 
@@ -59,7 +59,7 @@ struct CanonicalResponse {
     created: u64,
     text: String,
     tool_calls: Vec<CanonicalToolCall>,
-    stop_reason: Option<String>,
+    termination: ResponseTermination,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
@@ -100,10 +100,12 @@ impl CanonicalResponse {
             model: string_field(&value, "model"),
             created: value.get("created").and_then(Value::as_u64).unwrap_or(0),
             text: text_content(message.get("content")),
-            stop_reason: value
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            termination: ResponseTermination::from_reason(
+                value
+                    .pointer("/choices/0/finish_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
             ..Self::default()
         };
         response.tool_calls = message
@@ -146,10 +148,12 @@ impl CanonicalResponse {
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join(""),
-            stop_reason: value
-                .get("stop_reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            termination: ResponseTermination::from_reason(
+                value
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
             ..Self::default()
         };
         response.tool_calls = content
@@ -187,15 +191,7 @@ impl CanonicalResponse {
             id: string_field(&value, "id"),
             model: string_field(&value, "model"),
             created: value.get("created_at").and_then(Value::as_u64).unwrap_or(0),
-            stop_reason: value
-                .get("stop_reason")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    value
-                        .pointer("/incomplete_details/reason")
-                        .and_then(Value::as_str)
-                })
-                .map(str::to_owned),
+            termination: ResponseTermination::from_responses(&value),
             ..Self::default()
         };
         for item in output {
@@ -270,15 +266,15 @@ impl CanonicalResponse {
             .unwrap_or(0);
     }
 
-    fn render(&self, protocol: Protocol) -> Value {
+    fn render(&self, protocol: Protocol) -> Result<Value, String> {
         match protocol {
             Protocol::OpenAiChat => self.render_chat(),
-            Protocol::OpenAiResponses => self.render_responses(),
+            Protocol::OpenAiResponses => Ok(self.render_responses()),
             Protocol::AnthropicMessages => self.render_anthropic(),
         }
     }
 
-    fn render_chat(&self) -> Value {
+    fn render_chat(&self) -> Result<Value, String> {
         let tool_calls: Vec<_> = self
             .tool_calls
             .iter()
@@ -295,22 +291,32 @@ impl CanonicalResponse {
         if !tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(tool_calls);
         }
-        json!({
+        Ok(json!({
             "id": self.id,
             "object": "chat.completion",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "message": message, "finish_reason": chat_finish_reason(self.stop_reason.as_deref(), !self.tool_calls.is_empty())}],
+            "choices": [{"index": 0, "message": message, "finish_reason": self.termination.chat_reason(!self.tool_calls.is_empty())?}],
             "usage": {
                 "prompt_tokens": self.input_tokens,
                 "completion_tokens": self.output_tokens,
                 "total_tokens": self.input_tokens + self.output_tokens,
                 "prompt_tokens_details": {"cached_tokens": self.cached_tokens}
             }
-        })
+        }))
     }
 
-    fn render_anthropic(&self) -> Value {
+    fn render_anthropic(&self) -> Result<Value, String> {
+        if self
+            .tool_calls
+            .iter()
+            .any(|call| !call.arguments.is_object())
+        {
+            return Err(
+                "Provider tool arguments cannot be represented as an Anthropic input object"
+                    .to_owned(),
+            );
+        }
         let mut content = Vec::new();
         if !self.text.is_empty() {
             content.push(json!({"type": "text", "text": self.text}));
@@ -320,44 +326,44 @@ impl CanonicalResponse {
                 "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments
             })
         }));
-        json!({
+        Ok(json!({
             "id": self.id,
             "type": "message",
             "role": "assistant",
             "model": self.model,
             "content": content,
-            "stop_reason": anthropic_stop_reason(self.stop_reason.as_deref(), !self.tool_calls.is_empty()),
+            "stop_reason": self.termination.anthropic_reason(!self.tool_calls.is_empty())?,
             "stop_sequence": null,
             "usage": {
                 "input_tokens": self.input_tokens.saturating_sub(self.cached_tokens),
                 "output_tokens": self.output_tokens,
                 "cache_read_input_tokens": self.cached_tokens
             }
-        })
+        }))
     }
 
     fn render_responses(&self) -> Value {
         let mut output = Vec::new();
         if !self.text.is_empty() {
             output.push(json!({
-                "id": format!("msg_{}", self.id), "type": "message", "status": "completed", "role": "assistant",
+                "id": format!("msg_{}", self.id), "type": "message", "status": self.termination.responses_status(), "role": "assistant",
                 "content": [{"type": "output_text", "text": self.text, "annotations": []}]
             }));
         }
         output.extend(self.tool_calls.iter().map(|call| json!({
-            "id": format!("fc_{}", call.id), "type": "function_call", "status": "completed",
+            "id": format!("fc_{}", call.id), "type": "function_call", "status": self.termination.responses_status(),
             "call_id": call.id, "name": call.name, "arguments": arguments_string(&call.arguments)
         })));
         json!({
             "id": self.id,
             "object": "response",
             "created_at": self.created,
-            "status": "completed",
+            "status": self.termination.responses_status(),
             "model": self.model,
             "output": output,
             "parallel_tool_calls": true,
             "error": null,
-            "incomplete_details": null,
+            "incomplete_details": self.termination.incomplete_details,
             "usage": {
                 "input_tokens": self.input_tokens,
                 "input_tokens_details": {"cached_tokens": self.cached_tokens},
@@ -366,6 +372,85 @@ impl CanonicalResponse {
                 "total_tokens": self.input_tokens + self.output_tokens
             }
         })
+    }
+}
+
+/// Shared by JSON conversion, SSE conversion, and SSE aggregation. A generation
+/// limit is not a normal stop, even when the partial answer contains tool calls.
+#[derive(Clone, Default)]
+pub(super) struct ResponseTermination {
+    reason: Option<String>,
+    incomplete: bool,
+    pub incomplete_details: Value,
+}
+
+impl ResponseTermination {
+    pub fn from_reason(reason: Option<String>) -> Self {
+        let incomplete_reason = match reason.as_deref() {
+            Some("length" | "max_tokens" | "max_output_tokens") => Some("max_output_tokens"),
+            Some("content_filter") => Some("content_filter"),
+            _ => None,
+        };
+        let incomplete_details =
+            incomplete_reason.map_or(Value::Null, |reason| json!({"reason": reason}));
+        Self {
+            reason,
+            incomplete: incomplete_reason.is_some(),
+            incomplete_details,
+        }
+    }
+
+    pub fn from_responses(response: &Value) -> Self {
+        let mut end = Self::from_reason(
+            response
+                .pointer("/incomplete_details/reason")
+                .or_else(|| response.get("stop_reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+            end.incomplete = true;
+            end.incomplete_details = response
+                .get("incomplete_details")
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
+        end
+    }
+
+    pub fn responses_status(&self) -> &'static str {
+        if self.incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        }
+    }
+
+    pub fn chat_reason(&self, has_tools: bool) -> Result<&'static str, String> {
+        if self.incomplete {
+            return match self.reason.as_deref() {
+                Some("length" | "max_tokens" | "max_output_tokens") => Ok("length"),
+                Some("content_filter") => Ok("content_filter"),
+                _ => Err(
+                    "Provider incomplete reason cannot be represented in Chat Completions"
+                        .to_owned(),
+                ),
+            };
+        }
+        Ok(chat_finish_reason(self.reason.as_deref(), has_tools))
+    }
+
+    pub fn anthropic_reason(&self, has_tools: bool) -> Result<&'static str, String> {
+        if self.incomplete {
+            return match self.reason.as_deref() {
+                Some("length" | "max_tokens" | "max_output_tokens") => Ok("max_tokens"),
+                _ => Err(
+                    "Provider incomplete reason cannot be represented in Anthropic Messages"
+                        .to_owned(),
+                ),
+            };
+        }
+        Ok(anthropic_stop_reason(self.reason.as_deref(), has_tools))
     }
 }
 
@@ -632,10 +717,18 @@ fn chat_messages_to_responses(messages: Value) -> Result<Value, String> {
     for message in messages {
         let mut message = object(message.clone())?;
         if message.get("role").and_then(Value::as_str) == Some("tool") {
+            let content = message
+                .remove("content")
+                .unwrap_or(Value::String(String::new()));
+            let content = if content.is_null() {
+                Value::String(String::new())
+            } else {
+                drop_empty_content_array(chat_content_to_responses(content)?)
+            };
             input.push(json!({
                 "type": "function_call_output",
                 "call_id": message.remove("tool_call_id").unwrap_or(Value::Null),
-                "output": message.remove("content").unwrap_or(Value::String(String::new()))
+                "output": content
             }));
             continue;
         }
@@ -714,10 +807,18 @@ fn anthropic_input_to_responses(source: &Map<String, Value>) -> Result<Value, St
                         "name": block.get("name").cloned().unwrap_or(Value::Null),
                         "arguments": serde_json::to_string(block.get("input").unwrap_or(&Value::Null)).unwrap_or_else(|_| "{}".to_owned())
                     })),
-                    Some("tool_result") => input.push(json!({
-                        "type": "function_call_output", "call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                        "output": block.get("content").cloned().unwrap_or(Value::String(String::new()))
-                    })),
+                    Some("tool_result") => {
+                        let content = block.get("content").cloned().unwrap_or(Value::Null);
+                        let output = if content.is_null() {
+                            Value::String(String::new())
+                        } else {
+                            drop_empty_content_array(anthropic_content_to_responses(content, false)?)
+                        };
+                        input.push(json!({
+                            "type": "function_call_output", "call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                            "output": output
+                        }));
+                    }
                     Some("thinking") => input.push(json!({
                         "type": "reasoning", "summary": [{"type": "summary_text", "text": block.get("thinking").cloned().unwrap_or(Value::String(String::new()))}],
                         "encrypted_content": block.get("signature").cloned().unwrap_or(Value::Null)
@@ -775,36 +876,92 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
         .as_array()
         .ok_or_else(|| "Responses input must be a string or array".to_owned())?;
     let mut messages = Vec::new();
+    let mut pending_calls: Vec<Value> = Vec::new();
     for item in items {
-        match item.get("type").and_then(Value::as_str) {
-            Some("function_call") => messages.push(json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
-                    "type": "function",
-                    "function": {
-                        "name": item.get("name").cloned().unwrap_or(Value::Null),
-                        "arguments": item.get("arguments").cloned().unwrap_or(Value::String("{}".to_owned()))
-                    }
-                }]
+        let kind = item
+            .get("type")
+            .map(|kind| {
+                kind.as_str()
+                    .ok_or_else(|| "Responses input item type must be a string".to_owned())
+            })
+            .transpose()?;
+        match kind {
+            // PROXY-47: generic Chat has no standard reasoning replay field. Do
+            // not invent a role, expose it as visible text, or forward opaque
+            // provider state. Native Responses requests bypass this adapter.
+            Some("reasoning") => continue,
+            // PROXY-51: consecutive calls are one assistant turn. Collect them
+            // and flush the batch as a single message before the first non-call
+            // item, because Chat requires each call to be answered by the tool
+            // messages that immediately follow its assistant message.
+            Some("function_call") => pending_calls.push(json!({
+                "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": item.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": item.get("arguments").cloned().unwrap_or(Value::String("{}".to_owned()))
+                }
             })),
-            Some("function_call_output") => messages.push(json!({
-                "role": "tool",
-                "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
-                "content": item.get("output").cloned().unwrap_or(Value::String(String::new()))
-            })),
-            _ => {
+            Some("function_call_output") => {
+                flush_pending_tool_calls(&mut messages, &mut pending_calls);
+                let content = item.get("output").cloned().unwrap_or(Value::String(String::new()));
+                let content = if content.is_null() {
+                    Value::String(String::new())
+                } else {
+                    drop_empty_content_array(responses_content_to_chat(content)?)
+                };
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                    "content": content
+                }));
+            }
+            Some("message") | None => {
+                flush_pending_tool_calls(&mut messages, &mut pending_calls);
+                if !matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("system" | "developer" | "user" | "assistant")
+                ) {
+                    return Err("Responses input message must have a supported role".to_owned());
+                }
                 let mut message = object(item.clone())?;
-                message.remove("type");
+                remove_fields(&mut message, &["type", "id", "status", "phase"]);
                 if let Some(content) = message.remove("content") {
                     message.insert("content".to_owned(), responses_content_to_chat(content)?);
                 }
                 messages.push(Value::Object(message));
             }
+            Some(_) => {
+                return Err(
+                    "Responses input item type is not supported for cross-protocol conversion"
+                        .to_owned(),
+                );
+            }
         }
     }
+    flush_pending_tool_calls(&mut messages, &mut pending_calls);
+    if !items.is_empty() && messages.is_empty() {
+        return Err(
+            "Responses input contains no messages or function calls after omitting reasoning items"
+                .to_owned(),
+        );
+    }
     Ok(Value::Array(messages))
+}
+
+/// PROXY-51: consecutive Responses function calls belong to one assistant turn.
+/// Chat Completions requires every tool call of an assistant message to be
+/// answered by the tool messages that follow it, so a parallel batch must be
+/// flushed as one message instead of one message per call.
+fn flush_pending_tool_calls(messages: &mut Vec<Value>, calls: &mut Vec<Value>) {
+    if calls.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": Value::Array(std::mem::take(calls))
+    }));
 }
 
 fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value), String> {
@@ -824,6 +981,7 @@ fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value),
         .collect();
     let mut system = Vec::new();
     let mut converted = Vec::new();
+    let mut pending_tool_results: Vec<Value> = Vec::new();
     for item in messages {
         let mut message = object(item.clone())?;
         let role = message
@@ -832,6 +990,7 @@ fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value),
             .unwrap_or("user")
             .to_owned();
         if role == "system" || role == "developer" {
+            flush_pending_tool_results(&mut converted, &mut pending_tool_results);
             system.extend(content_to_anthropic_blocks(
                 message.remove("content").unwrap_or(Value::Null),
             )?);
@@ -842,18 +1001,27 @@ fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value),
             let content = message
                 .remove("content")
                 .unwrap_or(Value::String(String::new()));
+            let content = if content.is_array() {
+                drop_empty_content_array(Value::Array(content_to_anthropic_blocks(content)?))
+            } else {
+                content
+            };
             if call_id
                 .as_str()
                 .is_some_and(|id| known_call_ids.iter().any(|known| known == id))
             {
-                converted.push(json!({"role": "user", "content": [{
+                // PROXY-51: consecutive results answer one assistant batch, so
+                // they share the user message that immediately follows it.
+                pending_tool_results.push(json!({
                     "type": "tool_result", "tool_use_id": call_id, "content": content
-                }]}));
+                }));
             } else {
+                flush_pending_tool_results(&mut converted, &mut pending_tool_results);
                 converted.push(json!({"role": "user", "content": content}));
             }
             continue;
         }
+        flush_pending_tool_results(&mut converted, &mut pending_tool_results);
         let mut content =
             content_to_anthropic_blocks(message.remove("content").unwrap_or(Value::Null))?;
         if let Some(calls) = message.remove("tool_calls") {
@@ -876,8 +1044,22 @@ fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value),
         }
         converted.push(json!({"role": role, "content": content}));
     }
+    flush_pending_tool_results(&mut converted, &mut pending_tool_results);
     let system = (!system.is_empty()).then_some(Value::Array(system));
     Ok((system, Value::Array(converted)))
+}
+
+/// PROXY-51: consecutive Chat tool results answer one assistant tool-call batch,
+/// so they share the single Anthropic user message that immediately follows the
+/// assistant's tool_use blocks instead of becoming one user message per result.
+fn flush_pending_tool_results(converted: &mut Vec<Value>, results: &mut Vec<Value>) {
+    if results.is_empty() {
+        return;
+    }
+    converted.push(json!({
+        "role": "user",
+        "content": Value::Array(std::mem::take(results))
+    }));
 }
 
 fn anthropic_messages_to_chat(messages: Value) -> Result<Vec<Value>, String> {
@@ -904,7 +1086,7 @@ fn anthropic_messages_to_chat(messages: Value) -> Result<Vec<Value>, String> {
                     Some("tool_result") => converted.push(json!({
                         "role": "tool",
                         "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                        "content": block.get("content").cloned().unwrap_or(Value::String(String::new()))
+                        "content": anthropic_tool_content_to_chat(block.get("content").cloned().unwrap_or(Value::String(String::new())))?
                     })),
                     Some("text") => normal.push(json!({"type": "text", "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))})),
                     Some("image") => normal.push(anthropic_image_to_chat(block)),
@@ -944,6 +1126,40 @@ fn content_to_anthropic_blocks(content: Value) -> Result<Vec<Value>, String> {
         Some("file") => chat_file_to_anthropic(part),
         _ => None,
     }).collect())
+}
+
+/// A tool result that lost every part in conversion falls back to the empty
+/// string, because an empty part array is not valid in any of the protocols.
+fn drop_empty_content_array(content: Value) -> Value {
+    match content {
+        Value::Array(parts) if parts.is_empty() => Value::String(String::new()),
+        other => other,
+    }
+}
+
+/// Anthropic tool results carry text and images like message content does, so
+/// their blocks map onto Chat Completions parts instead of crossing protocols
+/// verbatim (PROXY-09).
+fn anthropic_tool_content_to_chat(content: Value) -> Result<Value, String> {
+    if !content.is_array() {
+        return Ok(if content.is_null() {
+            Value::String(String::new())
+        } else {
+            content
+        });
+    }
+    Ok(drop_empty_content_array(Value::Array(
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => Some(json!({"type": "text", "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))})),
+                Some("image") => Some(anthropic_image_to_chat(block)),
+                _ => None,
+            })
+            .collect(),
+    )))
 }
 
 fn responses_content_to_chat(content: Value) -> Result<Value, String> {
@@ -1561,6 +1777,507 @@ mod tests {
         assert_eq!(converted["tool_choice"]["name"], "lookup");
         assert_eq!(converted["tools"][0]["name"], "lookup");
         assert!(converted.get("instructions").is_none());
+    }
+
+    #[test]
+    fn responses_tool_result_image_maps_to_chat_image_part() {
+        // PROXY-09: tool results keep their media when crossing protocols.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "input": [
+                    {"type": "function_call", "call_id": "call-1", "name": "shot", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call-1", "output": [
+                        {"type": "input_text", "text": "screen"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+                    ]}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(converted["messages"][1]["role"], "tool");
+        assert_eq!(converted["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(converted["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            converted["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
+    }
+
+    #[test]
+    fn chat_tool_result_image_maps_to_responses_image_part() {
+        // PROXY-09: tool results keep their media when crossing protocols.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "messages": [{"role": "tool", "tool_call_id": "call-1", "content": [
+                    {"type": "text", "text": "screen"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]}]
+            }),
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+        );
+        assert_eq!(converted["input"][0]["type"], "function_call_output");
+        assert_eq!(converted["input"][0]["output"][0]["type"], "input_text");
+        assert_eq!(converted["input"][0]["output"][1]["type"], "input_image");
+        assert_eq!(
+            converted["input"][0]["output"][1]["image_url"],
+            "data:image/png;base64,abc"
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_result_image_maps_to_responses_image_part() {
+        // PROXY-09: tool results keep their media when crossing protocols.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt", "max_tokens": 100,
+                "messages": [{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call-1", "content": [
+                        {"type": "text", "text": "screen"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    ]}
+                ]}]
+            }),
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        );
+        assert_eq!(converted["input"][0]["type"], "function_call_output");
+        assert_eq!(converted["input"][0]["output"][0]["type"], "input_text");
+        assert_eq!(converted["input"][0]["output"][1]["type"], "input_image");
+        assert_eq!(
+            converted["input"][0]["output"][1]["image_url"],
+            "data:image/png;base64,abc"
+        );
+    }
+
+    #[test]
+    fn chat_tool_result_image_maps_to_anthropic_image_block() {
+        // PROXY-09: tool results keep their media when crossing protocols.
+        let converted = convert(
+            serde_json::json!({
+                "model": "claude", "max_tokens": 100,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "shot", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "call-1", "content": [
+                        {"type": "text", "text": "screen"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                    ]}
+                ]
+            }),
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+        );
+        let result = &converted["messages"][1]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["source"]["type"], "base64");
+        assert_eq!(result["content"][1]["source"]["data"], "abc");
+    }
+
+    #[test]
+    fn responses_tool_result_image_reaches_anthropic_image_block() {
+        // PROXY-09: the composed Responses-to-Anthropic path keeps tool media too.
+        let converted = convert(
+            serde_json::json!({
+                "model": "claude",
+                "input": [
+                    {"type": "function_call", "call_id": "call-1", "name": "shot", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call-1", "output": [
+                        {"type": "input_text", "text": "screen"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+                    ]}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        );
+        let result = &converted["messages"][1]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["source"]["type"], "base64");
+        assert_eq!(result["content"][1]["source"]["data"], "abc");
+    }
+
+    #[test]
+    fn anthropic_tool_result_image_maps_to_chat_image_part() {
+        // PROXY-09: tool results keep their media when crossing protocols.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt", "max_tokens": 100,
+                "messages": [
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "call-1", "name": "shot", "input": {}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [
+                        {"type": "text", "text": "screen"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                    ]}]}
+                ]
+            }),
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(converted["messages"][1]["role"], "tool");
+        assert_eq!(converted["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(converted["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            converted["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,abc"
+        );
+    }
+
+    #[test]
+    fn tool_result_without_recognized_parts_becomes_empty_string() {
+        // PROXY-09: an empty converted part array is not a valid tool result.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "input": [
+                    {"type": "function_call", "call_id": "call-1", "name": "shot", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call-1", "output": [{"type": "vendor_specific"}]}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(converted["messages"][1]["content"], "");
+    }
+
+    #[test]
+    fn responses_reasoning_history_keeps_messages_tools_and_images_in_order() {
+        // PROXY-47: source-only reasoning must never become a role-less message.
+        let converted = convert(
+            serde_json::json!({
+                "model": "native",
+                "input": [
+                    {"role": "user", "content": "Inspect the screenshot"},
+                    {"type": "reasoning", "id": "rs_1", "summary": [], "content": [
+                        {"type": "reasoning_text", "text": "private reasoning"}
+                    ]},
+                    {"type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Checking"}]},
+                    {"type": "function_call", "call_id": "call_1", "name": "shot", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+                    ]},
+                    {"type": "reasoning", "id": "rs_2", "summary": [
+                        {"type": "summary_text", "text": "private summary"}
+                    ], "encrypted_content": "opaque-provider-state"},
+                    {"type": "message", "role": "assistant", "content": [
+                        {"type": "output_text", "text": "883"}
+                    ]},
+                    {"role": "user", "content": "Continue"}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(
+            converted["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "Inspect the screenshot"},
+                {"role": "assistant", "content": [{"type": "text", "text": "Checking"}]},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "shot", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]},
+                {"role": "assistant", "content": [{"type": "text", "text": "883"}]},
+                {"role": "user", "content": "Continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn responses_parallel_tool_calls_replay_as_one_assistant_message() {
+        // PROXY-51: consecutive function calls are one assistant turn; a Chat
+        // Provider requires every call to be answered by the messages after it.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "input": [
+                    {"role": "user", "content": "check both"},
+                    {"type": "function_call", "call_id": "call_a", "name": "bash", "arguments": "{\"c\":1}"},
+                    {"type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{\"p\":2}"},
+                    {"type": "function_call_output", "call_id": "call_a", "output": "one"},
+                    {"type": "function_call_output", "call_id": "call_b", "output": "two"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(
+            converted["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "check both"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "bash", "arguments": "{\"c\":1}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "read", "arguments": "{\"p\":2}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "one"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "two"},
+                {"role": "user", "content": "continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn responses_sequential_tool_calls_stay_separate_assistant_turns() {
+        // PROXY-51: only genuinely adjacent calls share a message; a call whose
+        // result follows it starts a new turn and must not be merged backwards.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "input": [
+                    {"role": "user", "content": "step"},
+                    {"type": "function_call", "call_id": "first", "name": "bash", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "first", "output": "one"},
+                    {"type": "function_call", "call_id": "second", "name": "read", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "second", "output": "two"}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(
+            converted["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "step"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "first", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "first", "content": "one"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "second", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "second", "content": "two"}
+            ])
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_and_text_before_parallel_calls_keep_batch_together() {
+        // PROXY-47 / PROXY-51: omitted reasoning does not split a batch, and the
+        // text that precedes the calls stays a message before the answerable turn.
+        let converted = convert(
+            serde_json::json!({
+                "model": "gpt",
+                "input": [
+                    {"role": "user", "content": "go"},
+                    {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+                    {"type": "message", "id": "msg_1", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "checking"}]},
+                    {"type": "function_call", "call_id": "call_a", "name": "bash", "arguments": "{}"},
+                    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "between"}]},
+                    {"type": "function_call", "call_id": "call_b", "name": "read", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_a", "output": "one"},
+                    {"type": "function_call_output", "call_id": "call_b", "output": "two"},
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(
+            converted["messages"],
+            serde_json::json!([
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [{"type": "text", "text": "checking"}]},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "one"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "two"},
+                {"role": "user", "content": "continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_parallel_tool_results_share_one_anthropic_user_message() {
+        // PROXY-51: the reverse direction must keep a batch together too, since
+        // Anthropic requires a tool_result for every tool_use in one turn.
+        let converted = convert(
+            serde_json::json!({
+                "model": "claude", "max_tokens": 100,
+                "messages": [
+                    {"role": "user", "content": "check both"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "call_a", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                        {"id": "call_b", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "call_a", "content": "one"},
+                    {"role": "tool", "tool_call_id": "call_b", "content": "two"}
+                ]
+            }),
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+        );
+        assert_eq!(
+            converted["messages"],
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "text", "text": "check both"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "call_a", "name": "bash", "input": {}},
+                    {"type": "tool_use", "id": "call_b", "name": "read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_a", "content": "one"},
+                    {"type": "tool_result", "tool_use_id": "call_b", "content": "two"}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn chat_sequential_tool_results_keep_their_own_anthropic_messages() {
+        // PROXY-51: results split by an intervening turn are not conflated.
+        let converted = convert(
+            serde_json::json!({
+                "model": "claude", "max_tokens": 100,
+                "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "first", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "first", "content": "one"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "second", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "second", "content": "two"}
+                ]
+            }),
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+        );
+        let messages = converted["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "first");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[3]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[3]["content"][0]["tool_use_id"], "second");
+    }
+
+    #[test]
+    fn responses_reasoning_is_omitted_for_both_non_native_targets() {
+        // PROXY-47: summaries, plaintext, encrypted state, and empty reasoning have
+        // no standard cross-provider replay representation in the generic adapter.
+        for reasoning in [
+            serde_json::json!({"type": "reasoning", "summary": []}),
+            serde_json::json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "summary"}]}),
+            serde_json::json!({"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]}),
+            serde_json::json!({"type": "reasoning", "encrypted_content": "opaque"}),
+        ] {
+            for target in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+                let converted = convert(
+                    serde_json::json!({"input": [
+                        {"role": "user", "content": "Question"},
+                        reasoning,
+                        {"type": "message", "role": "assistant", "content": "Answer"}
+                    ]}),
+                    Protocol::OpenAiResponses,
+                    target,
+                );
+                let expected = if target == Protocol::AnthropicMessages {
+                    serde_json::json!([
+                        {"role": "user", "content": [{"type": "text", "text": "Question"}]},
+                        {"role": "assistant", "content": [{"type": "text", "text": "Answer"}]}
+                    ])
+                } else {
+                    serde_json::json!([
+                        {"role": "user", "content": "Question"},
+                        {"role": "assistant", "content": "Answer"}
+                    ])
+                };
+                assert_eq!(converted["messages"], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn responses_message_roles_and_shorthand_remain_supported() {
+        // PROXY-09 / PROXY-47: validation must accept both Responses message forms.
+        for role in ["system", "developer", "user", "assistant"] {
+            for typed in [false, true] {
+                let mut message = serde_json::json!({"role": role, "content": "text"});
+                if typed {
+                    message["type"] = "message".into();
+                    message["id"] = "msg_1".into();
+                    message["status"] = "completed".into();
+                    message["phase"] = "final_answer".into();
+                }
+                let converted = convert(
+                    serde_json::json!({"input": [message]}),
+                    Protocol::OpenAiResponses,
+                    Protocol::OpenAiChat,
+                );
+                assert_eq!(
+                    converted["messages"],
+                    serde_json::json!([
+                        {"role": role, "content": "text"}
+                    ])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn responses_non_message_items_and_invalid_roles_fail_before_forwarding() {
+        // PROXY-47: unknown items are not silently dropped or relabelled as messages.
+        for item in [
+            serde_json::json!({"type": "item_reference", "id": "private-reference"}),
+            serde_json::json!({"type": "future_item", "role": "assistant", "content": "private-text"}),
+            serde_json::json!({"type": "message", "content": "missing role"}),
+            serde_json::json!({"content": "missing type and role"}),
+            serde_json::json!({"role": null, "content": "null role"}),
+            serde_json::json!({"role": "future_role", "content": "unknown role"}),
+            serde_json::json!({"type": 123, "role": "user", "content": "bad type"}),
+            serde_json::json!({"type": null, "role": "user", "content": "null type"}),
+        ] {
+            for target in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+                let error = convert_request(
+                    &serde_json::to_vec(&serde_json::json!({"input": [item]})).unwrap(),
+                    Protocol::OpenAiResponses,
+                    target,
+                )
+                .unwrap_err();
+                assert!(error.starts_with("Responses input"), "{error}");
+                assert!(!error.contains("private-"), "must not echo input: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_only_input_fails_instead_of_sending_empty_history() {
+        // PROXY-47: omission cannot turn non-empty history into an empty request.
+        for target in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+            let error = convert_request(
+                br#"{"input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"}]}"#,
+                Protocol::OpenAiResponses,
+                target,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Responses input contains no messages or function calls after omitting reasoning items"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_native_passthrough_preserves_exact_bytes() {
+        // PROXY-08 / PROXY-47: no reasoning or signature is rewritten on a native path.
+        let input = br#"{ "input": [{"type":"reasoning","id":"rs_1","summary":[],"content":[{"type":"reasoning_text","text":"thought"}],"encrypted_content":"opaque"},{"type":"future_item","id":"ref"}] }"#;
+        assert_eq!(
+            convert_request(input, Protocol::OpenAiResponses, Protocol::OpenAiResponses).unwrap(),
+            input
+        );
     }
 
     #[test]

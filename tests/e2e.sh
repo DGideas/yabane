@@ -751,8 +751,10 @@ admin -f -X DELETE "$base/admin/providers/multi/endpoints/two/credentials/routed
 # A policy written in the earlier shape keeps its meaning, so an honored
 # Retry-After stays the Provider-first source instead of a fixed duration.
 # What a cooldown policy has done is reported for the policy that is enabled, in
-# both the number of cooldowns it armed and the delay it used.
+# both the number of cooldowns it armed, the delay it used, and the delay the
+# Provider's own answer asked for.
 cooldown_activity() { admin -f "$base/admin/providers" | jq -r --arg id "$1" '.[] | select(.id == $id) | .endpoints[0].rate_limit_cooldown_activity | [.applied, .skipped, (.last_seconds // -1)] | join(",")'; }
+cooldown_reported() { admin -f "$base/admin/providers" | jq -r --arg id "$1" '.[] | select(.id == $id) | .endpoints[0].rate_limit_cooldown_activity | (.last_reported_seconds // -1)'; }
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"pool\",\"name\":\"Credential pool\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_name\":\"Throttled account\",\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":3600,\"honor_retry_after\":true}}}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 3600,prefer_provider ]]
 [[ $(cooldown_activity pool) == 0,0,-1 ]]
@@ -778,8 +780,11 @@ pool_cooling=$(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "po
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].credentials[] | select(.id == "healthy-account") | has("cooldown_seconds_remaining")') == false ]]
 [[ $pool_cooling =~ ^[0-9]+$ && $pool_cooling -gt 0 && $pool_cooling -le 120 ]]
 # The Provider's own delay is preferred over the configured length, and Activity
-# reports which of the two armed the cooldown.
+# reports which of the two armed the cooldown, next to the number the Provider
+# itself asked for.
 [[ $(cooldown_activity pool) == 1,0,120 ]]
+[[ $(cooldown_reported pool) == 120 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "pool") | .endpoints[0].rate_limit_cooldown_activity.last_source') == provider ]]
 # The credential that exhausted its quota stays out of selection for as many requests
 # as the pool receives, so no manual route or credential edit is needed.
 for _ in $(seq 1 3); do
@@ -851,6 +856,11 @@ admin -f -X PATCH "$base/admin/providers/tiered/endpoints/main/credentials/stand
 # answer, and only the requests after it use the standby group.
 [[ $(admin -f "$base/admin/activity/logs?since=0&limit=1000" | jq '[.[] | select(.model == "tiered-model" and .upstream_credential_id == "standby-account" and .status == 429 and .credential_cooling == false)] | length') -ge 1 ]]
 [[ $(cooldown_activity tiered) == 1,0,600 ]]
+# A policy that does not read the Provider's delay still reports what the answer
+# asked for, so its configured length is never mistaken for the Provider's own
+# number.
+[[ $(cooldown_reported tiered) == 120 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "tiered") | .endpoints[0].rate_limit_cooldown_activity.last_source') == fixed ]]
 for _ in $(seq 1 3); do
   tiered_body=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"tiered-model","messages":[]}')
   [[ $(printf '%s' "$tiered_body" | jq -r .endpoint) == healthy ]]
@@ -990,7 +1000,15 @@ admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"
 [[ $(jq -r '.error.message' response.json) == "quota exhausted" ]]
 [[ $(admin -f "$base/admin/providers" | jq '[.[] | select(.id == "header-only") | .endpoints[0].credentials[] | has("cooldown_seconds_remaining")] | any') == false ]]
 [[ $(cooldown_activity header-only) == 0,1,-1 ]]
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-only") | .endpoints[0].rate_limit_cooldown_activity | [has("last_applied_at"), (.last_observed_at > 0)] | join(",")') == false,true ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-only") | .endpoints[0].rate_limit_cooldown_activity | [has("last_applied_at"), has("last_reported_seconds"), (.last_observed_at > 0)] | join(",")') == false,false,true ]]
+# A Provider-first policy that meets the same silent answer falls back to the
+# configured maximum, and the report keeps that fallback distinct from a delay
+# the Provider actually supplied.
+admin -f -X PATCH "$base/admin/providers/header-only/endpoints/main" -H 'content-type: application/json' -d "{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"socks5_proxy\":null,\"requires_credential\":true,\"rate_limit_cooldown\":{\"seconds\":3600,\"mode\":\"prefer_provider\"}}" >/dev/null
+[[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"header-only-model","messages":[]}') == 429 ]]
+[[ $(cooldown_activity header-only) == 1,1,3600 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-only") | .endpoints[0].rate_limit_cooldown_activity.last_source') == fallback ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-only") | .endpoints[0].rate_limit_cooldown_activity | has("last_reported_seconds")') == false ]]
 # The same source does follow a delay the Provider reports, capped by the
 # configured length the administrator accepted.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"header-delay\",\"name\":\"Header delay\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":60,\"mode\":\"provider_only\"}}}" >/dev/null
@@ -998,12 +1016,17 @@ admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"header-delay-model","messages":[]}') == 429 ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-delay") | .endpoints[0].credentials[0].cooldown_seconds_remaining') == 60 ]]
 [[ $(cooldown_activity header-delay) == 1,0,60 ]]
+# The Provider asked for longer than the configured length, so the ceiling held it
+# down while the report keeps the number the Provider itself asked for.
+[[ $(cooldown_reported header-delay) == 120 ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "header-delay") | .endpoints[0].rate_limit_cooldown_activity.last_source') == capped ]]
 # The ceiling holds when the preferred source reports a longer delay than the
 # configured length, so a cooldown never outlasts what was accepted.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"prefer-cap\",\"name\":\"Prefer cap\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\",\"rate_limit_cooldown\":{\"seconds\":60,\"mode\":\"prefer_provider\"}}}" >/dev/null
 admin -f -X POST "$base/admin/routes" -H 'content-type: application/json' -d '{"pattern":"prefer-cap-model","targets":[{"provider_id":"prefer-cap","endpoint_id":"main","credential_id":"","upstream_model":"prefer-cap-model","weight":100}]}' >/dev/null
 [[ $(admin_status -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"prefer-cap-model","messages":[]}') == 429 ]]
 [[ $(cooldown_activity prefer-cap) == 1,0,60 ]]
+[[ $(cooldown_reported prefer-cap) == 120 ]]
 # Without an explicit policy a 429 only reaches the caller: Yabane never infers exhaustion.
 admin -f -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"no-cooldown\",\"name\":\"No cooldown\",\"endpoint\":{\"id\":\"main\",\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v1\",\"requires_credential\":true,\"credential_secret\":\"throttled\"}}" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "no-cooldown") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 0,fixed ]]

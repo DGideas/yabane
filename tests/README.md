@@ -10,7 +10,11 @@ bash tests/check.sh --load
 
 Both offline modes check Rust formatting, JS/shell syntax, strict Clippy, workspace tests, and all eight combinations of the three optional Extensions. They then rebuild the default binary and run the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
 
+- `tests/cooldown-copy.mjs` — console history copy uses recorded delay sources, stays unchanged after policy edits, distinguishes zero from missing, and avoids guessing older observations (ENDPOINT-42).
+- `tests/cooldown-history.mjs` — a real process records fixed/Provider/capped/fallback decisions, preserves them across policy edits and skipped answers, handles zero without a new cooldown, and keeps Provider 429 bytes and request counts unchanged (ENDPOINT-42 / PROXY-43).
 - `tests/http-redirects.mjs` — credential isolation and redirect transparency across all three native protocol surfaces (PROXY-43 / PROXY-44).
+- `tests/reasoning-conversion.mjs` — Responses history containing reasoning reaches a Chat-only Endpoint with valid ordered messages and tool images in JSON and SSE modes; a parallel tool-call batch replays as one answerable assistant message under a strict Provider check, and unsupported items fail locally without a Provider request (PROXY-47 / PROXY-09 / PROXY-51).
+- `tests/stream-semantics.mjs` — JSON/SSE/aggregation retain token-limit termination and final usage, tool events agree with terminal output, mixed-newline frames convert correctly, and native requests/responses stay unchanged (PROXY-48 / PROXY-49 / PROXY-50).
 - `tests/activity-recovery.mjs` — a torn final Activity record is quarantined at startup while mid-file corruption fails startup with the file and line (ACTIVITY-52).
 - `tests/client-disconnect.mjs` — a caller that disconnects mid-stream still produces one explained Activity record, completes its observers, and returns capture quota (PROXY-45).
 - `tests/shutdown.mjs` — `SIGTERM` is bounded by the grace period and the request it interrupts is recorded as a shutdown and flushed before exit (SVC-60).
@@ -24,6 +28,8 @@ The gate needs Rust/Cargo and Node.js; `cargo audit` runs when it is installed, 
 `--full` additionally runs `tests/e2e.sh`, which needs Python 3, jq, curl, Playwright, system Chrome, and Playwright WebKit. This existing suite also calls Cloudflare's real Turnstile test service, so it is not an offline test. It checks API behavior, restart/recovery, and authenticated and logged-out UI paths. A supplied but invalid browser session is a failure, not permission to skip authenticated coverage; uncaught page exceptions also fail browser verification.
 
 `tests/e2e.sh` is not replaced by `check.sh`: it remains the standalone API, browser, and authentication E2E suite, and `bash tests/check.sh --full` is only "offline gate first, then that same suite". Run it on its own (`bash tests/e2e.sh`, optionally with a binary path) whenever the full gate is too heavy, but UI- or auth-visible changes still need it before they are considered verified.
+
+For the targeted cooldown-history UI regression, run `YABANE_COOLDOWN_BROWSER=1 node tests/cooldown-history.mjs`. It rebuilds first, requires the Playwright package and system Chrome, and tests desktop, tablet, and two phone-sized viewports using isolated contexts and a real temporary administrator session. It verifies historical-source and zero-delay copy in the rendered Endpoint page, browser errors, and horizontal overflow. Phone-sized Chrome coverage is not WebKit/Safari coverage and does not replace the full browser suite.
 
 Run a process-level test alone with `node tests/http-redirects.mjs` (rebuilds first), or pass an explicit freshly built binary path to test that artifact. No dependency installation or browser download is performed by the quality gate.
 

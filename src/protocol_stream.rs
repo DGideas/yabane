@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use crate::{limits::MAX_BUFFERED_BODY_BYTES, protocol::Protocol};
+use crate::{
+    limits::MAX_BUFFERED_BODY_BYTES,
+    protocol::{Protocol, ResponseTermination},
+};
 
 const MAX_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
 
@@ -26,6 +29,11 @@ struct StreamState {
     done: bool,
     truncated: bool,
     failure: Option<String>,
+    termination: ResponseTermination,
+    // Responses indices describe emitted output items, not source block indices.
+    response_items: Vec<ResponseItem>,
+    text_output_index: Option<usize>,
+    sequence_number: u64,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
@@ -42,6 +50,12 @@ struct ToolState {
     arguments: String,
     arguments_started: bool,
     started: bool,
+    output_index: Option<usize>,
+}
+
+enum ResponseItem {
+    Text,
+    Tool(usize),
 }
 
 enum Event {
@@ -56,7 +70,7 @@ enum Event {
         index: usize,
         delta: String,
     },
-    Finish(Option<String>),
+    Finish(ResponseTermination),
     Failure(String),
     Done,
 }
@@ -117,21 +131,21 @@ impl StreamConverter {
         if !self.collect_output {
             return Err("Stream converter was not configured for response aggregation".to_owned());
         }
-        if self.state.truncated {
+        if self.state.truncated || !self.state.done {
             return Err("Provider stream ended before a terminal event".to_owned());
         }
         if let Some(message) = &self.state.failure {
             return Err(format!("Provider stream failed: {message}"));
         }
         let value = match self.target {
-            Protocol::OpenAiResponses => completed_response(&self.state),
+            Protocol::OpenAiResponses => terminal_response(&self.state),
             Protocol::OpenAiChat => {
                 let tools: Vec<_> = sorted_tools(&self.state)
                     .into_iter()
                     .map(|(_, tool)| json!({
                         "id": tool.id, "type": "function", "function": {
                             "name": tool.name,
-                            "arguments": if tool.arguments.is_empty() { "{}" } else { &tool.arguments }
+                            "arguments": if tool.arguments.is_empty() && self.state.termination.responses_status() == "completed" { "{}" } else { &tool.arguments }
                         }
                     }))
                     .collect();
@@ -142,7 +156,7 @@ impl StreamConverter {
                 json!({
                     "id": self.state.id, "object": "chat.completion", "created": self.state.created,
                     "model": self.state.model,
-                    "choices": [{"index": 0, "message": message, "finish_reason": chat_finish(None, !self.state.tools.is_empty())}],
+                    "choices": [{"index": 0, "message": message, "finish_reason": self.state.termination.chat_reason(!self.state.tools.is_empty())?}],
                     "usage": openai_usage(&self.state)
                 })
             }
@@ -151,13 +165,21 @@ impl StreamConverter {
                 if !self.state.text.is_empty() {
                     content.push(json!({"type": "text", "text": self.state.text}));
                 }
-                content.extend(sorted_tools(&self.state).into_iter().map(|(_, tool)| {
-                    let input = serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}));
-                    json!({"type": "tool_use", "id": tool.id, "name": tool.name, "input": input})
-                }));
+                for (_, tool) in sorted_tools(&self.state) {
+                    let arguments = if tool.arguments.is_empty()
+                        && self.state.termination.responses_status() == "completed"
+                    {
+                        "{}"
+                    } else {
+                        &tool.arguments
+                    };
+                    let input = serde_json::from_str::<Value>(arguments).ok().filter(Value::is_object)
+                        .ok_or_else(|| "Provider tool arguments cannot be represented as an Anthropic input object".to_owned())?;
+                    content.push(json!({"type": "tool_use", "id": tool.id, "name": tool.name, "input": input}));
+                }
                 json!({
                     "id": self.state.id, "type": "message", "role": "assistant", "model": self.state.model,
-                    "content": content, "stop_reason": anthropic_finish(None, !self.state.tools.is_empty()), "stop_sequence": null,
+                    "content": content, "stop_reason": self.state.termination.anthropic_reason(!self.state.tools.is_empty())?, "stop_sequence": null,
                     "usage": {"input_tokens": self.state.input_tokens.saturating_sub(self.state.cached_tokens), "output_tokens": self.state.output_tokens,
                         "cache_read_input_tokens": self.state.cached_tokens}
                 })
@@ -167,10 +189,12 @@ impl StreamConverter {
     }
 
     fn convert_frame(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Result<(), String> {
+        if self.state.done {
+            return Ok(());
+        }
         let data = frame
-            .split(|byte| *byte == b'\n')
+            .split(|byte| matches!(byte, b'\n' | b'\r'))
             .filter_map(|line| {
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
                 line.strip_prefix(b"data:").map(|data| {
                     if data.first() == Some(&b' ') {
                         &data[1..]
@@ -220,6 +244,15 @@ impl StreamConverter {
     }
 
     fn parse_chat(&mut self, value: &Value) -> Vec<Event> {
+        if let Some(error) = value.get("error") {
+            return vec![Event::Failure(
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Provider stream failed")
+                    .to_owned(),
+            )];
+        }
         self.read_metadata(value, "created");
         read_chat_usage(value.get("usage"), &mut self.state);
         let mut events = vec![Event::Start];
@@ -257,7 +290,9 @@ impl StreamConverter {
             .get("finish_reason")
             .and_then(Value::as_str)
         {
-            events.push(Event::Finish(Some(reason.to_owned())));
+            events.push(Event::Finish(ResponseTermination::from_reason(Some(
+                reason.to_owned(),
+            ))));
         }
         events
     }
@@ -294,14 +329,23 @@ impl StreamConverter {
             }
             Some("message_delta") => {
                 read_anthropic_usage(value.get("usage"), &mut self.state);
-                vec![Event::Finish(
-                    value
-                        .pointer("/delta/stop_reason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                )]
+                value
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| {
+                        Event::Finish(ResponseTermination::from_reason(Some(reason.to_owned())))
+                    })
+                    .into_iter()
+                    .collect()
             }
             Some("message_stop") => vec![Event::Done],
+            Some("error") => vec![Event::Failure(
+                value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Provider stream failed")
+                    .to_owned(),
+            )],
             _ => Vec::new(),
         }
     }
@@ -347,15 +391,17 @@ impl StreamConverter {
             "response.completed" | "response.incomplete" => {
                 read_responses_usage(response.get("usage"), &mut self.state);
                 vec![
-                    Event::Finish(
-                        response
-                            .get("stop_reason")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    ),
+                    Event::Finish(ResponseTermination::from_responses(response)),
                     Event::Done,
                 ]
             }
+            "error" => vec![Event::Failure(
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Provider stream failed")
+                    .to_owned(),
+            )],
             "response.failed" => vec![
                 Event::Failure(
                     response
@@ -386,6 +432,23 @@ impl StreamConverter {
     }
 
     fn render(&mut self, event: Event, output: &mut Vec<u8>) -> Result<(), String> {
+        if self.state.done {
+            return Ok(());
+        }
+        // Finish ends generation, not necessarily the stream. Chat can deliver
+        // usage afterwards. Delay target terminal events until Done (PROXY-48).
+        if let Event::Finish(termination) = event {
+            self.state.termination = termination;
+            return Ok(());
+        }
+        if matches!(event, Event::Done) && !self.state.finished {
+            let finish = Event::Finish(self.state.termination.clone());
+            match self.target {
+                Protocol::OpenAiChat => self.render_chat(finish, output)?,
+                Protocol::OpenAiResponses => self.render_responses(finish, output)?,
+                Protocol::AnthropicMessages => self.render_anthropic(finish, output)?,
+            }
+        }
         if let Event::Failure(message) = event {
             self.state.failure = Some(message.clone());
             self.state.finished = true;
@@ -400,10 +463,10 @@ impl StreamConverter {
                     "error",
                     &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
                 ),
-                Protocol::OpenAiResponses => emit_event(
+                Protocol::OpenAiResponses => self.emit_responses_event(
                     output,
                     "response.failed",
-                    &json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": {"code": "upstream_error", "message": message}}}),
+                    json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": {"code": "upstream_error", "message": message}}}),
                 ),
             };
         }
@@ -426,10 +489,10 @@ impl StreamConverter {
                 "error",
                 &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
             ),
-            Protocol::OpenAiResponses => emit_event(
+            Protocol::OpenAiResponses => self.emit_responses_event(
                 output,
                 "response.failed",
-                &json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": {"code": "upstream_stream_error", "message": message}}}),
+                json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": {"code": "upstream_stream_error", "message": message}}}),
             ),
         }
     }
@@ -501,13 +564,16 @@ impl StreamConverter {
                     }),
                 )?;
             }
-            Event::Finish(reason) if !self.state.finished => {
+            Event::Finish(termination) if !self.state.finished => {
+                let finish = termination.chat_reason(!self.state.tools.is_empty())?;
                 self.ensure_started(output)?;
                 let empty_tools: Vec<_> = self
                     .state
                     .tools
                     .iter()
-                    .filter(|(_, tool)| !tool.arguments_started)
+                    .filter(|(_, tool)| {
+                        !tool.arguments_started && termination.responses_status() == "completed"
+                    })
                     .map(|(index, _)| *index)
                     .collect();
                 for index in empty_tools {
@@ -521,7 +587,6 @@ impl StreamConverter {
                         }),
                     )?;
                 }
-                let finish = chat_finish(reason.as_deref(), !self.state.tools.is_empty());
                 emit_data(
                     output,
                     &json!({
@@ -535,7 +600,7 @@ impl StreamConverter {
             Event::Finish(_) => {}
             Event::Done if !self.state.done => {
                 if !self.state.finished {
-                    self.render_chat(Event::Finish(None), output)?;
+                    self.render_chat(Event::Finish(self.state.termination.clone()), output)?;
                 }
                 output.extend_from_slice(b"data: [DONE]\n\n");
                 self.state.done = true;
@@ -605,7 +670,8 @@ impl StreamConverter {
                     }),
                 )?;
             }
-            Event::Finish(reason) if !self.state.finished => {
+            Event::Finish(termination) if !self.state.finished => {
+                let stop = termination.anthropic_reason(!self.state.tools.is_empty())?;
                 self.ensure_anthropic_started(output)?;
                 if self.state.text_started {
                     emit_event(
@@ -629,13 +695,13 @@ impl StreamConverter {
                         &json!({"type": "content_block_stop", "index": index + 1}),
                     )?;
                 }
-                let stop = anthropic_finish(reason.as_deref(), !self.state.tools.is_empty());
                 emit_event(
                     output,
                     "message_delta",
                     &json!({
                         "type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": null},
-                        "usage": {"output_tokens": self.state.output_tokens}
+                        "usage": {"input_tokens": self.state.input_tokens.saturating_sub(self.state.cached_tokens),
+                            "output_tokens": self.state.output_tokens, "cache_read_input_tokens": self.state.cached_tokens}
                     }),
                 )?;
                 self.state.finished = true;
@@ -643,7 +709,7 @@ impl StreamConverter {
             Event::Finish(_) => {}
             Event::Done if !self.state.done => {
                 if !self.state.finished {
-                    self.render_anthropic(Event::Finish(None), output)?;
+                    self.render_anthropic(Event::Finish(self.state.termination.clone()), output)?;
                 }
                 emit_event(output, "message_stop", &json!({"type": "message_stop"}))?;
                 self.state.done = true;
@@ -659,33 +725,31 @@ impl StreamConverter {
             Event::Start => self.ensure_responses_started(output)?,
             Event::Text(text) => {
                 self.ensure_responses_started(output)?;
+                let item_id = format!("msg_{}", self.state.id);
                 if !self.state.text_started {
                     self.state.text_started = true;
-                    emit_event(
-                        output,
-                        "response.output_item.added",
-                        &json!({
-                            "type": "response.output_item.added", "output_index": 0,
-                            "item": {"id": format!("msg_{}", self.state.id), "type": "message", "status": "in_progress", "role": "assistant", "content": []}
-                        }),
-                    )?;
-                    emit_event(
+                    let index = self.state.response_items.len();
+                    self.state.text_output_index = Some(index);
+                    self.state.response_items.push(ResponseItem::Text);
+                    self.emit_responses_event(output, "response.output_item.added", json!({
+                        "type": "response.output_item.added", "output_index": index,
+                        "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
+                    }))?;
+                    self.emit_responses_event(
                         output,
                         "response.content_part.added",
-                        &json!({
-                            "type": "response.content_part.added", "output_index": 0, "content_index": 0,
+                        json!({
+                            "type": "response.content_part.added", "item_id": item_id,
+                            "output_index": index, "content_index": 0,
                             "part": {"type": "output_text", "text": "", "annotations": []}
                         }),
                     )?;
                 }
                 self.state.text.push_str(&text);
-                emit_event(
-                    output,
-                    "response.output_text.delta",
-                    &json!({
-                        "type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text
-                    }),
-                )?;
+                self.emit_responses_event(output, "response.output_text.delta", json!({
+                    "type": "response.output_text.delta", "item_id": item_id,
+                    "output_index": self.state.text_output_index, "content_index": 0, "delta": text
+                }))?;
             }
             Event::ToolStart { index, id, name } => {
                 self.ensure_responses_started(output)?;
@@ -698,50 +762,96 @@ impl StreamConverter {
                 }
                 if !tool.started {
                     tool.started = true;
-                    emit_event(
-                        output,
-                        "response.output_item.added",
-                        &json!({
-                            "type": "response.output_item.added", "output_index": index + 1,
-                            "item": {"id": format!("fc_{}", tool.id), "type": "function_call", "status": "in_progress", "call_id": tool.id, "name": tool.name, "arguments": ""}
-                        }),
-                    )?;
+                    let output_index = self.state.response_items.len();
+                    tool.output_index = Some(output_index);
+                    self.state.response_items.push(ResponseItem::Tool(index));
+                    let event = json!({
+                        "type": "response.output_item.added", "output_index": output_index,
+                        "item": {"id": format!("fc_{}", tool.id), "type": "function_call", "status": "in_progress", "call_id": tool.id, "name": tool.name, "arguments": ""}
+                    });
+                    self.emit_responses_event(output, "response.output_item.added", event)?;
                 }
             }
             Event::ToolArguments { index, delta } => {
                 self.ensure_responses_started(output)?;
-                let tool = self.state.tools.entry(index).or_default();
+                let tool = self
+                    .state
+                    .tools
+                    .get_mut(&index)
+                    .filter(|tool| tool.started)
+                    .ok_or_else(|| {
+                        "Provider tool arguments arrived before the tool start".to_owned()
+                    })?;
                 tool.arguments_started |= !delta.is_empty();
                 tool.arguments.push_str(&delta);
-                emit_event(
-                    output,
-                    "response.function_call_arguments.delta",
-                    &json!({
-                        "type": "response.function_call_arguments.delta", "output_index": index + 1, "delta": delta
-                    }),
-                )?;
+                let event = json!({
+                    "type": "response.function_call_arguments.delta", "item_id": format!("fc_{}", tool.id),
+                    "output_index": tool.output_index, "delta": delta
+                });
+                self.emit_responses_event(output, "response.function_call_arguments.delta", event)?;
             }
             Event::Finish(_) if !self.state.finished => {
                 self.ensure_responses_started(output)?;
-                let response = completed_response(&self.state);
-                emit_event(
+                let response = terminal_response(&self.state);
+                // PROXY-49: done events and terminal output share exactly the
+                // same item ordering, identity, arguments, and completion state.
+                for (index, item) in response["output"]
+                    .as_array()
+                    .expect("output is an array")
+                    .iter()
+                    .enumerate()
+                {
+                    if item["type"] == "message" {
+                        self.emit_responses_event(output, "response.output_text.done", json!({
+                            "type": "response.output_text.done", "item_id": item["id"],
+                            "output_index": index, "content_index": 0, "text": item["content"][0]["text"]
+                        }))?;
+                        self.emit_responses_event(output, "response.content_part.done", json!({
+                            "type": "response.content_part.done", "item_id": item["id"],
+                            "output_index": index, "content_index": 0, "part": item["content"][0]
+                        }))?;
+                    } else {
+                        self.emit_responses_event(output, "response.function_call_arguments.done", json!({
+                            "type": "response.function_call_arguments.done", "item_id": item["id"],
+                            "output_index": index, "name": item["name"], "arguments": item["arguments"]
+                        }))?;
+                    }
+                    self.emit_responses_event(
+                        output,
+                        "response.output_item.done",
+                        json!({
+                            "type": "response.output_item.done", "output_index": index, "item": item
+                        }),
+                    )?;
+                }
+                let kind = if self.state.termination.responses_status() == "incomplete" {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
+                self.emit_responses_event(
                     output,
-                    "response.completed",
-                    &json!({"type": "response.completed", "response": response}),
+                    kind,
+                    json!({"type": kind, "response": response}),
                 )?;
                 self.state.finished = true;
             }
             Event::Finish(_) => {}
-            Event::Done if !self.state.done => {
-                if !self.state.finished {
-                    self.render_responses(Event::Finish(None), output)?;
-                }
-                self.state.done = true;
-            }
-            Event::Done => {}
+            Event::Done => self.state.done = true,
             Event::Failure(_) => unreachable!("failure events are handled before target rendering"),
         }
         Ok(())
+    }
+
+    fn emit_responses_event(
+        &mut self,
+        output: &mut Vec<u8>,
+        event: &str,
+        mut value: Value,
+    ) -> Result<(), String> {
+        value["sequence_number"] = self.state.sequence_number.into();
+        self.state.sequence_number += 1;
+        emit_event(output, event, &value)
     }
 
     fn ensure_started(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
@@ -770,10 +880,10 @@ impl StreamConverter {
     fn ensure_responses_started(&mut self, output: &mut Vec<u8>) -> Result<(), String> {
         if !self.state.started {
             self.state.started = true;
-            emit_event(
+            self.emit_responses_event(
                 output,
                 "response.created",
-                &json!({"type": "response.created", "response": response_shell(&self.state, "in_progress")}),
+                json!({"type": "response.created", "response": response_shell(&self.state, "in_progress")}),
             )?;
         }
         Ok(())
@@ -805,43 +915,25 @@ fn response_shell(state: &StreamState, status: &str) -> Value {
         "model": state.model, "output": [], "error": null, "incomplete_details": null})
 }
 
-fn completed_response(state: &StreamState) -> Value {
-    let mut output = Vec::new();
-    if state.text_started {
-        output.push(json!({"id": format!("msg_{}", state.id), "type": "message", "status": "completed", "role": "assistant",
-            "content": [{"type": "output_text", "text": state.text, "annotations": []}]}));
-    }
-    let mut tools: Vec<_> = state.tools.iter().collect();
-    tools.sort_by_key(|(index, _)| **index);
-    output.extend(tools.into_iter().map(|(_, tool)| {
-        json!({"id": format!("fc_{}", tool.id), "type": "function_call", "status": "completed",
-        "call_id": tool.id, "name": tool.name, "arguments": tool.arguments})
-    }));
-    let mut response = response_shell(state, "completed");
+fn terminal_response(state: &StreamState) -> Value {
+    let status = state.termination.responses_status();
+    let output = state.response_items.iter().map(|item| match item {
+        ResponseItem::Text => json!({
+            "id": format!("msg_{}", state.id), "type": "message", "status": status, "role": "assistant",
+            "content": [{"type": "output_text", "text": state.text, "annotations": []}]
+        }),
+        ResponseItem::Tool(index) => {
+            let tool = &state.tools[index];
+            json!({"id": format!("fc_{}", tool.id), "type": "function_call", "status": status,
+                "call_id": tool.id, "name": tool.name, "arguments": tool.arguments})
+        }
+    }).collect();
+    let mut response = response_shell(state, status);
+    response["incomplete_details"] = state.termination.incomplete_details.clone();
     response["output"] = Value::Array(output);
     response["usage"] = json!({"input_tokens": state.input_tokens, "input_tokens_details": {"cached_tokens": state.cached_tokens},
         "output_tokens": state.output_tokens, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": state.input_tokens + state.output_tokens});
     response
-}
-
-fn chat_finish(reason: Option<&str>, has_tools: bool) -> &'static str {
-    if has_tools || matches!(reason, Some("tool_use" | "tool_calls")) {
-        "tool_calls"
-    } else if matches!(reason, Some("max_tokens" | "length")) {
-        "length"
-    } else {
-        "stop"
-    }
-}
-
-fn anthropic_finish(reason: Option<&str>, has_tools: bool) -> &'static str {
-    if has_tools || matches!(reason, Some("tool_use" | "tool_calls")) {
-        "tool_use"
-    } else if matches!(reason, Some("max_tokens" | "length")) {
-        "max_tokens"
-    } else {
-        "end_turn"
-    }
 }
 
 fn sorted_tools(state: &StreamState) -> Vec<(usize, &ToolState)> {
@@ -855,16 +947,29 @@ fn sorted_tools(state: &StreamState) -> Vec<(usize, &ToolState)> {
 }
 
 fn next_frame(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|end| (end, 2))
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|end| (end, 4))
-        })
+    // PROXY-50: recognize the first empty line, regardless of newline style.
+    // A trailing CR may be half of CRLF, so leave it until the next push/EOF.
+    let mut previous_newline = None;
+    let mut index = 0;
+    while index < buffer.len() {
+        let width = match buffer[index] {
+            b'\r' if index + 1 == buffer.len() => return None,
+            b'\r' if buffer[index + 1] == b'\n' => 2,
+            b'\r' | b'\n' => 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if let Some((start, end)) = previous_newline
+            && end == index
+        {
+            return Some((start, index + width - start));
+        }
+        previous_newline = Some((index, index + width));
+        index += width;
+    }
+    None
 }
 
 fn field(value: &Value, name: &str) -> String {
@@ -921,6 +1026,9 @@ fn read_responses_usage(usage: Option<&Value>, state: &mut StreamState) {
         .and_then(Value::as_u64)
         .unwrap_or(state.cached_tokens);
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {

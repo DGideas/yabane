@@ -200,6 +200,8 @@ fn event_reports_failure(protocol: Protocol, bytes: &[u8]) -> bool {
             // A streaming event carries the response under `response`, while a
             // non-streaming body is the response object itself, so its terminal
             // status is a top-level field. Both are the same protocol failure.
+            // PROXY-48: incomplete is a generation outcome (e.g. token limit),
+            // not a Provider failure; preserve its reason without forcing 502.
             let response_status = value
                 .pointer("/response/status")
                 .or_else(|| value.get("status"))
@@ -207,7 +209,8 @@ fn event_reports_failure(protocol: Protocol, bytes: &[u8]) -> bool {
             matches!(
                 value.get("type").and_then(serde_json::Value::as_str),
                 Some("error" | "response.failed")
-            ) || matches!(response_status, Some("failed" | "incomplete"))
+            ) || response_status == Some("failed")
+                || value.get("error").is_some_and(|error| !error.is_null())
         }
         Protocol::AnthropicMessages => {
             value.get("type").and_then(serde_json::Value::as_str) == Some("error")
@@ -430,6 +433,33 @@ mod tests {
             responses.finish().0.finish_reason.as_deref(),
             Some("max_output_tokens")
         );
+    }
+
+    #[test]
+    fn incomplete_responses_are_not_provider_failures() {
+        // PROXY-48: JSON and SSE limits keep usage and their original reason.
+        for reason in ["max_output_tokens", "content_filter", "future_reason"] {
+            let response = serde_json::json!({"status":"incomplete", "incomplete_details":{"reason":reason}, "usage":{"input_tokens":10,"output_tokens":5}});
+            for event_stream in [false, true] {
+                let body = if event_stream {
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::json!({"type":"response.incomplete","response":response})
+                    )
+                } else {
+                    response.to_string()
+                };
+                let mut tracker = UsageTracker::new(Protocol::OpenAiResponses, event_stream);
+                tracker.observe(body.as_bytes());
+                let (usage, failed) = tracker.finish();
+                assert!(!failed);
+                assert_eq!(usage.finish_reason.as_deref(), Some(reason));
+                assert_eq!((usage.input, usage.output), (10, 5));
+            }
+        }
+        let mut tracker = UsageTracker::new(Protocol::OpenAiChat, true);
+        tracker.observe(b"data: {\"error\":{\"message\":\"fixture\"}}\n\ndata: [DONE]\n\n");
+        assert!(tracker.finish().1);
     }
 
     #[test]

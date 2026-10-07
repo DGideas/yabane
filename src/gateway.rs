@@ -1080,15 +1080,19 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
     // The credential's own answer is the only evidence Yabane accepts that an
     // identity is exhausted, and only an explicitly configured policy turns it
     // into a cooldown. The response itself stays untouched, and a policy that
-    // relies on the Provider's own delay arms nothing when there is none.
+    // relies on the Provider's own delay arms nothing when there is none. What
+    // the answer asked for is recorded next to the length that was used, so a
+    // number the ceiling held down is not lost and a missing delay stays
+    // readable as the fallback it was.
     if status == StatusCode::TOO_MANY_REQUESTS
         && endpoint.rate_limit_cooldown.enabled()
         && let Some(credential) = &credential
     {
         let observed_at = crate::auth::now();
         let endpoint_key = health::endpoint_key(&provider.id, &endpoint.id);
-        match cooldown_duration(&endpoint.rate_limit_cooldown, &response_headers) {
-            Some(duration) => {
+        let reported = reported_retry_after(&response_headers);
+        match cooldown_decision(&endpoint.rate_limit_cooldown, reported) {
+            Some((duration, source)) => {
                 state.credential_health.cool_down(
                     health::credential_key(&provider.id, &endpoint.id, &credential.id),
                     duration,
@@ -1096,6 +1100,8 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 state.credential_health.record_cooldown_applied(
                     endpoint_key,
                     duration.as_secs(),
+                    reported,
+                    source,
                     observed_at,
                 );
             }
@@ -1305,18 +1311,34 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                 return api_error(StatusCode::BAD_GATEWAY, err);
             }
         };
-        if protocol_failed || status.is_client_error() || status.is_server_error() {
-            let failure = if protocol_failed {
-                RequestFailure::new(
-                    "upstream_response",
-                    "protocol_failure",
-                    "Provider response reported a failure",
-                )
-            } else {
-                upstream_http_failure(status)
-            };
+        // An answer that already carries an HTTP error is passed through and
+        // recorded as that error; a Protocol failure is only a gateway failure
+        // when the Provider claimed success. Otherwise a rate-limit body that
+        // names its error would make Activity disagree with the answer the
+        // caller actually received.
+        if status.is_client_error() || status.is_server_error() {
             activity
-                .record_failure(status, usage, requested_streaming, None, failure)
+                .record_failure(
+                    status,
+                    usage,
+                    requested_streaming,
+                    None,
+                    upstream_http_failure(status),
+                )
+                .await;
+        } else if protocol_failed {
+            activity
+                .record_failure(
+                    status,
+                    usage,
+                    requested_streaming,
+                    None,
+                    RequestFailure::new(
+                        "upstream_response",
+                        "protocol_failure",
+                        "Provider response reported a failure",
+                    ),
+                )
                 .await;
         } else {
             activity
@@ -1455,7 +1477,15 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         // Recorded below: the drop guard must not repeat it if this generator is
         // cancelled after the response finished.
         state.completed = true;
-        let recorded_status = if conversion_failed || protocol_failed || interrupted_by_shutdown {
+        let http_error = status.is_client_error() || status.is_server_error();
+        // A Protocol failure only becomes a gateway status when the Provider
+        // claimed success; an answer that already carries an HTTP error keeps
+        // the status the caller received, so a rate-limit body that names its
+        // error is not recorded as a Yabane failure.
+        let recorded_status = if conversion_failed
+            || interrupted_by_shutdown
+            || (protocol_failed && !http_error)
+        {
             StatusCode::BAD_GATEWAY
         } else {
             status
@@ -1482,6 +1512,14 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                     "Provider stream ended or could not be converted",
                 ),
             ).await;
+        } else if http_error {
+            activity.record_failure(
+                status,
+                usage,
+                streaming,
+                first_byte_ms,
+                upstream_http_failure(status),
+            ).await;
         } else if protocol_failed {
             activity.record_failure(
                 recorded_status,
@@ -1501,14 +1539,6 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                         "Provider response reported a failure"
                     },
                 ),
-            ).await;
-        } else if status.is_client_error() || status.is_server_error() {
-            activity.record_failure(
-                status,
-                usage,
-                streaming,
-                first_byte_ms,
-                upstream_http_failure(status),
             ).await;
         } else {
             activity.record(status, usage, streaming, first_byte_ms).await;
@@ -1700,35 +1730,42 @@ fn apply_core_upstream_headers(
     }
 }
 
+/// The delay the Provider's own answer suggests for later requests, when its
+/// `Retry-After` carries an integer number of seconds. Every other shape — a
+/// date, an unparseable value, a missing header — is not a delay this instance
+/// reads, so it never becomes a duration by accident.
+fn reported_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// Resolves how long a credential stays out of selection, or `None` when the
 /// policy arms nothing for this answer. The configured length is the ceiling in
-/// every mode, and the Provider's `Retry-After` only supplies a number when the
-/// policy chose a source that reads it and the header carries an integer number
-/// of seconds.
-fn cooldown_duration(
+/// every mode, and the Provider's reported delay only supplies a number when the
+/// policy chose a source that reads it.
+fn cooldown_decision(
     policy: &RateLimitCooldown,
-    headers: &reqwest::header::HeaderMap,
-) -> Option<Duration> {
+    reported: Option<u64>,
+) -> Option<(Duration, health::CooldownSource)> {
     if !policy.enabled() {
         return None;
     }
-    let reported = || {
-        headers
-            .get(header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-    };
     // The configured length is the ceiling in every mode, so an identity can
     // never stay out longer than the administrator accepted.
-    match policy.mode {
-        RateLimitCooldownMode::Fixed => Some(Duration::from_secs(policy.seconds)),
-        RateLimitCooldownMode::PreferProvider => Some(Duration::from_secs(
-            reported().unwrap_or(policy.seconds).min(policy.seconds),
-        )),
-        RateLimitCooldownMode::ProviderOnly => {
-            reported().map(|seconds| Duration::from_secs(seconds.min(policy.seconds)))
+    let (seconds, source) = match (policy.mode, reported) {
+        (RateLimitCooldownMode::Fixed, _) => (policy.seconds, health::CooldownSource::Fixed),
+        (RateLimitCooldownMode::PreferProvider, None) => {
+            (policy.seconds, health::CooldownSource::Fallback)
         }
-    }
+        (RateLimitCooldownMode::ProviderOnly, None) => return None,
+        (_, Some(seconds)) if seconds > policy.seconds => {
+            (policy.seconds, health::CooldownSource::Capped)
+        }
+        (_, Some(seconds)) => (seconds, health::CooldownSource::Provider),
+    };
+    Some((Duration::from_secs(seconds), source))
 }
 
 /// The refusal used whenever an Endpoint's Extension is not enabled. Core names
@@ -2033,9 +2070,9 @@ mod tests {
     #[cfg(feature = "extension-openai-subscription")]
     use super::provider_endpoint_base_url;
     use super::{
-        ApiSurface, ApiType, Protocol, apply_core_upstream_headers, cooldown_duration,
-        copy_response_headers, read_body, response_is_event_stream, sanitize_request_headers,
-        strip_transformed_response_headers, upstream_transport_failure,
+        ApiSurface, ApiType, Protocol, apply_core_upstream_headers, cooldown_decision,
+        copy_response_headers, read_body, reported_retry_after, response_is_event_stream,
+        sanitize_request_headers, strip_transformed_response_headers, upstream_transport_failure,
     };
 
     /// PROXY-41: crossing the buffered-body ceiling is a Yabane-authored `413`,
@@ -2061,20 +2098,107 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_duration_reads_the_delay_source_and_only_integer_retry_after() {
-        let policy = |seconds, mode| RateLimitCooldown { seconds, mode };
+    fn cooldown_decision_records_the_source_used_at_response_time() {
+        // ENDPOINT-42: never reinterpret a historical decision under a new policy.
+        use crate::health::CooldownSource;
+        for (mode, reported, expected_seconds, expected_source) in [
+            (
+                RateLimitCooldownMode::Fixed,
+                Some(120),
+                300,
+                CooldownSource::Fixed,
+            ),
+            (
+                RateLimitCooldownMode::Fixed,
+                None,
+                300,
+                CooldownSource::Fixed,
+            ),
+            (
+                RateLimitCooldownMode::PreferProvider,
+                Some(120),
+                120,
+                CooldownSource::Provider,
+            ),
+            (
+                RateLimitCooldownMode::PreferProvider,
+                Some(300),
+                300,
+                CooldownSource::Provider,
+            ),
+            (
+                RateLimitCooldownMode::PreferProvider,
+                Some(600),
+                300,
+                CooldownSource::Capped,
+            ),
+            (
+                RateLimitCooldownMode::PreferProvider,
+                None,
+                300,
+                CooldownSource::Fallback,
+            ),
+            (
+                RateLimitCooldownMode::PreferProvider,
+                Some(0),
+                0,
+                CooldownSource::Provider,
+            ),
+            (
+                RateLimitCooldownMode::ProviderOnly,
+                Some(0),
+                0,
+                CooldownSource::Provider,
+            ),
+            (
+                RateLimitCooldownMode::ProviderOnly,
+                Some(600),
+                300,
+                CooldownSource::Capped,
+            ),
+        ] {
+            assert_eq!(
+                cooldown_decision(&RateLimitCooldown { seconds: 300, mode }, reported),
+                Some((Duration::from_secs(expected_seconds), expected_source))
+            );
+        }
+    }
+
+    #[test]
+    fn reported_retry_after_reads_only_an_integer_number_of_seconds() {
         let mut headers = header::HeaderMap::new();
+        assert_eq!(reported_retry_after(&headers), None);
+
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
+        assert_eq!(reported_retry_after(&headers), Some(120));
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static(" 120 "));
+        assert_eq!(reported_retry_after(&headers), Some(120));
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(reported_retry_after(&headers), Some(0));
+
+        // A date, a negative number, and an arbitrary value are not delays.
+        for value in ["Wed, 21 Oct 2015 07:28:00 GMT", "-1", "1.5", "not a delay"] {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static(value));
+            assert_eq!(reported_retry_after(&headers), None);
+        }
+    }
+
+    #[test]
+    fn cooldown_duration_reads_the_delay_source_under_the_configured_ceiling() {
+        let cooldown_duration = |policy: &RateLimitCooldown, reported| {
+            cooldown_decision(policy, reported).map(|(duration, _)| duration)
+        };
+        let policy = |seconds, mode| RateLimitCooldown { seconds, mode };
         let reported = Duration::from_secs(120);
         let configured = Duration::from_secs(300);
 
         // A fixed policy ignores anything the Provider reports.
         assert_eq!(
-            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), &headers),
+            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), Some(120)),
             Some(configured)
         );
-        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
         assert_eq!(
-            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), &headers),
+            cooldown_duration(&policy(300, RateLimitCooldownMode::Fixed), None),
             Some(configured)
         );
 
@@ -2083,56 +2207,43 @@ mod tests {
         assert_eq!(
             cooldown_duration(
                 &policy(300, RateLimitCooldownMode::PreferProvider),
-                &headers
+                Some(120)
             ),
             Some(reported)
         );
         assert_eq!(
-            cooldown_duration(&policy(60, RateLimitCooldownMode::PreferProvider), &headers),
+            cooldown_duration(
+                &policy(60, RateLimitCooldownMode::PreferProvider),
+                Some(120)
+            ),
             Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            cooldown_duration(&policy(300, RateLimitCooldownMode::PreferProvider), None),
+            Some(configured)
         );
 
         // The Provider-only policy never invents a length for the Provider, so
         // an unusable or absent delay arms nothing at all.
         assert_eq!(
-            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &headers),
+            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), Some(120)),
             Some(reported)
         );
         assert_eq!(
-            cooldown_duration(&policy(60, RateLimitCooldownMode::ProviderOnly), &headers),
+            cooldown_duration(&policy(60, RateLimitCooldownMode::ProviderOnly), Some(120)),
             Some(Duration::from_secs(60))
         );
-        let absent = header::HeaderMap::new();
         assert_eq!(
-            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &absent),
-            None
-        );
-
-        // A Retry-After date is not an integer number of seconds.
-        headers.insert(
-            header::RETRY_AFTER,
-            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
-        );
-        assert_eq!(
-            cooldown_duration(
-                &policy(300, RateLimitCooldownMode::PreferProvider),
-                &headers
-            ),
-            Some(configured)
-        );
-        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("not a delay"));
-        assert_eq!(
-            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), &headers),
+            cooldown_duration(&policy(300, RateLimitCooldownMode::ProviderOnly), None),
             None
         );
 
         // The configured length is the ceiling even when the Provider asks for
         // longer, so a cooldown can never outlast what the administrator accepted.
-        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("999999999"));
         assert_eq!(
             cooldown_duration(
                 &policy(300, RateLimitCooldownMode::PreferProvider),
-                &headers
+                Some(999_999_999)
             ),
             Some(configured)
         );
@@ -2142,14 +2253,18 @@ mod tests {
                     RateLimitCooldown::MAX_SECONDS,
                     RateLimitCooldownMode::ProviderOnly
                 ),
-                &headers
+                Some(999_999_999)
             ),
             Some(Duration::from_secs(RateLimitCooldown::MAX_SECONDS))
         );
 
         // A policy of zero seconds disables the cooldown entirely.
         assert_eq!(
-            cooldown_duration(&policy(0, RateLimitCooldownMode::PreferProvider), &absent),
+            cooldown_duration(&policy(0, RateLimitCooldownMode::PreferProvider), Some(120)),
+            None
+        );
+        assert_eq!(
+            cooldown_duration(&policy(0, RateLimitCooldownMode::PreferProvider), None),
             None
         );
     }

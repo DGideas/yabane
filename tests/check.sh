@@ -39,7 +39,11 @@ done
 # and the current embedded assets, never a previous Core-only binary.
 cargo build --locked
 node tests/openapi-paths.mjs
+node tests/cooldown-copy.mjs
+node tests/cooldown-history.mjs "$repo/target/debug/yabane"
 node tests/http-redirects.mjs "$repo/target/debug/yabane"
+node tests/reasoning-conversion.mjs "$repo/target/debug/yabane"
+node tests/stream-semantics.mjs "$repo/target/debug/yabane"
 node tests/activity-recovery.mjs "$repo/target/debug/yabane"
 node tests/client-disconnect.mjs "$repo/target/debug/yabane"
 node tests/response-limits.mjs "$repo/target/debug/yabane"

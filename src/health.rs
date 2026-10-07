@@ -24,6 +24,16 @@ pub fn endpoint_key(provider_id: &str, endpoint_id: &str) -> String {
     format!("{provider_id}/{endpoint_id}")
 }
 
+/// Why a delay was selected at the time of the answer, not under today's policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CooldownSource {
+    Fixed,
+    Provider,
+    Capped,
+    Fallback,
+}
+
 /// What an Endpoint's cooldown policy has done since this instance started.
 ///
 /// A policy whose length comes from the Provider can be configured correctly and
@@ -31,7 +41,7 @@ pub fn endpoint_key(provider_id: &str, endpoint_id: &str) -> String {
 /// an administrator unable to tell a working policy from a dead one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct CooldownActivity {
-    /// Rate-limit answers that took an identity out of selection.
+    /// Rate-limit answers that selected a duration, including zero (no new cooldown).
     pub applied: u64,
     /// Rate-limit answers the policy deliberately did nothing about, which is
     /// possible only when the Provider reported no usable delay.
@@ -39,6 +49,16 @@ pub struct CooldownActivity {
     /// Length of the most recent cooldown this policy armed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seconds: Option<u64>,
+    /// The delay the Provider's own answer asked for when that cooldown was
+    /// armed, when the answer carried an integer number of seconds. `None`
+    /// means it carried no delay this instance reads, so a length the Provider
+    /// suggested, one the configured ceiling held down, and the configured
+    /// fallback stay distinguishable from each other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reported_seconds: Option<u64>,
+    /// The reason the most recent delay was selected. Policy edits do not rewrite it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_source: Option<CooldownSource>,
     /// When that cooldown was armed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_applied_at: Option<u64>,
@@ -106,11 +126,20 @@ impl CredentialHealth {
             .unwrap_or_default()
     }
 
-    pub fn record_cooldown_applied(&self, key: String, seconds: u64, at: u64) {
+    pub fn record_cooldown_applied(
+        &self,
+        key: String,
+        seconds: u64,
+        reported: Option<u64>,
+        source: CooldownSource,
+        at: u64,
+    ) {
         let mut activity = self.activity.lock().expect("credential health lock");
         let entry = activity.entry(key).or_default();
         entry.applied += 1;
         entry.last_seconds = Some(seconds);
+        entry.last_reported_seconds = reported;
+        entry.last_source = Some(source);
         entry.last_applied_at = Some(at);
         entry.last_observed_at = Some(at);
     }
@@ -141,7 +170,7 @@ impl CredentialHealth {
 mod tests {
     use std::time::Duration;
 
-    use super::{CooldownActivity, CredentialHealth, credential_key, endpoint_key};
+    use super::{CooldownActivity, CooldownSource, CredentialHealth, credential_key, endpoint_key};
 
     #[test]
     fn cooldown_expires_and_can_be_cleared() {
@@ -182,13 +211,50 @@ mod tests {
 
         assert_eq!(health.activity(&key), CooldownActivity::default());
         health.record_cooldown_skipped(key.clone(), 1_700_000_000);
-        health.record_cooldown_applied(key.clone(), 120, 1_700_000_060);
+        health.record_cooldown_applied(
+            key.clone(),
+            120,
+            Some(300),
+            CooldownSource::Capped,
+            1_700_000_060,
+        );
         let activity = health.activity(&key);
         assert_eq!(activity.applied, 1);
         assert_eq!(activity.skipped, 1);
         assert_eq!(activity.last_seconds, Some(120));
+        assert_eq!(activity.last_reported_seconds, Some(300));
+        assert_eq!(activity.last_source, Some(CooldownSource::Capped));
         assert_eq!(activity.last_applied_at, Some(1_700_000_060));
         assert_eq!(activity.last_observed_at, Some(1_700_000_060));
+        // A later arming with no reported delay replaces the number instead of
+        // leaving a stale one next to the length that was actually used.
+        health.record_cooldown_applied(
+            key.clone(),
+            60,
+            None,
+            CooldownSource::Fallback,
+            1_700_000_120,
+        );
+        assert_eq!(health.activity(&key).last_reported_seconds, None);
+        assert_eq!(
+            health.activity(&key).last_source,
+            Some(CooldownSource::Fallback)
+        );
+        // Zero is a reported delay, not a missing value. Serialization keeps it.
+        health.record_cooldown_applied(
+            key.clone(),
+            0,
+            Some(0),
+            CooldownSource::Provider,
+            1_700_000_180,
+        );
+        let before_skip = health.activity(&key);
+        let serialized = serde_json::to_value(before_skip).unwrap();
+        assert_eq!(serialized["last_reported_seconds"], 0);
+        assert_eq!(serialized["last_source"], "provider");
+        health.record_cooldown_skipped(key.clone(), 1_700_000_240);
+        assert_eq!(health.activity(&key).last_source, before_skip.last_source);
+        assert_eq!(health.activity(&key).last_seconds, before_skip.last_seconds);
         // A skipped answer is observed but arms nothing.
         let skipped = CredentialHealth::default();
         skipped.record_cooldown_skipped(endpoint_key("openai", "zen"), 1_700_000_000);
@@ -205,7 +271,13 @@ mod tests {
         let health = CredentialHealth::default();
         let key = credential_key("openai", "zen", "account");
         health.cool_down(key.clone(), Duration::from_secs(60));
-        health.record_cooldown_applied(endpoint_key("openai", "zen"), 60, 1);
+        health.record_cooldown_applied(
+            endpoint_key("openai", "zen"),
+            60,
+            None,
+            CooldownSource::Fixed,
+            1,
+        );
 
         health.forget_endpoint(&endpoint_key("openai", "zen"));
         assert!(!health.is_cooling(&key));
