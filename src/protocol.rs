@@ -1,4 +1,8 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
+
+#[cfg(test)]
+mod regression_tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
@@ -58,6 +62,7 @@ struct CanonicalResponse {
     model: String,
     created: u64,
     text: String,
+    refusal: String,
     tool_calls: Vec<CanonicalToolCall>,
     termination: ResponseTermination,
     input_tokens: u64,
@@ -84,6 +89,16 @@ impl CanonicalResponse {
                 "Provider OpenAI Responses result failed: {message}"
             ));
         }
+        if protocol == Protocol::OpenAiResponses
+            && value
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| !matches!(status, "completed" | "incomplete"))
+        {
+            return Err(
+                "Provider Responses result is not a completed or incomplete generation".to_owned(),
+            );
+        }
         match protocol {
             Protocol::OpenAiChat => Self::from_chat(value),
             Protocol::OpenAiResponses => Self::from_responses(value),
@@ -100,6 +115,7 @@ impl CanonicalResponse {
             model: string_field(&value, "model"),
             created: value.get("created").and_then(Value::as_u64).unwrap_or(0),
             text: text_content(message.get("content")),
+            refusal: string_field(message, "refusal"),
             termination: ResponseTermination::from_reason(
                 value
                     .pointer("/choices/0/finish_reason")
@@ -125,8 +141,8 @@ impl CanonicalResponse {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
-                    arguments: serde_json::from_str(raw)
-                        .unwrap_or_else(|_| Value::String(raw.to_owned())),
+                    // PROXY-57: OpenAI arguments are an opaque JSON string.
+                    arguments: Value::String(raw.to_owned()),
                 }
             })
             .collect();
@@ -197,6 +213,16 @@ impl CanonicalResponse {
         for item in output {
             match item.get("type").and_then(Value::as_str) {
                 Some("message") => {
+                    for part in item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if part["type"] == "refusal" {
+                            response.refusal.push_str(&string_field(part, "refusal"));
+                        }
+                    }
                     response.text.push_str(
                         &item
                             .get("content")
@@ -222,12 +248,7 @@ impl CanonicalResponse {
                         .unwrap_or_default()
                         .to_owned(),
                     name: string_field(item, "name"),
-                    arguments: item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .and_then(|raw| serde_json::from_str(raw).ok())
-                        .or_else(|| item.get("arguments").cloned())
-                        .unwrap_or_else(|| json!({})),
+                    arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
                 }),
                 _ => {}
             }
@@ -288,6 +309,9 @@ impl CanonicalResponse {
             })
             .collect();
         let mut message = json!({"role": "assistant", "content": self.text});
+        if !self.refusal.is_empty() {
+            message["refusal"] = json!(self.refusal);
+        }
         if !tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(tool_calls);
         }
@@ -307,25 +331,27 @@ impl CanonicalResponse {
     }
 
     fn render_anthropic(&self) -> Result<Value, String> {
-        if self
-            .tool_calls
-            .iter()
-            .any(|call| !call.arguments.is_object())
-        {
-            return Err(
-                "Provider tool arguments cannot be represented as an Anthropic input object"
-                    .to_owned(),
-            );
-        }
         let mut content = Vec::new();
         if !self.text.is_empty() {
             content.push(json!({"type": "text", "text": self.text}));
         }
-        content.extend(self.tool_calls.iter().map(|call| {
-            json!({
-                "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments
-            })
-        }));
+        if !self.refusal.is_empty() {
+            content.push(json!({"type":"text", "text":self.refusal}));
+        }
+        for call in &self.tool_calls {
+            let input = match &call.arguments {
+                Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
+                value => Some(value.clone()),
+            }
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                "Provider tool arguments cannot be represented as an Anthropic input object"
+                    .to_owned()
+            })?;
+            content.push(json!({
+                "type": "tool_use", "id": call.id, "name": call.name, "input": input
+            }));
+        }
         Ok(json!({
             "id": self.id,
             "type": "message",
@@ -349,6 +375,10 @@ impl CanonicalResponse {
                 "id": format!("msg_{}", self.id), "type": "message", "status": self.termination.responses_status(), "role": "assistant",
                 "content": [{"type": "output_text", "text": self.text, "annotations": []}]
             }));
+        }
+        if !self.refusal.is_empty() {
+            output.push(json!({"id":format!("msg_refusal_{}", self.id), "type":"message", "status":self.termination.responses_status(), "role":"assistant",
+                "content":[{"type":"refusal", "refusal":self.refusal}]}));
         }
         output.extend(self.tool_calls.iter().map(|call| json!({
             "id": format!("fc_{}", call.id), "type": "function_call", "status": self.termination.responses_status(),
@@ -518,9 +548,8 @@ fn chat_to_responses(value: Value) -> Result<Value, String> {
         .remove("messages")
         .ok_or_else(|| "Chat Completions request must contain messages".to_owned())?;
     source.insert("input".to_owned(), chat_messages_to_responses(messages)?);
-    let max_output_tokens = source
-        .remove("max_completion_tokens")
-        .or_else(|| source.remove("max_tokens"));
+    let legacy_max_tokens = source.remove("max_tokens");
+    let max_output_tokens = source.remove("max_completion_tokens").or(legacy_max_tokens);
     if let Some(max_output_tokens) = max_output_tokens {
         source.insert("max_output_tokens".to_owned(), max_output_tokens);
     }
@@ -565,6 +594,14 @@ fn chat_to_responses(value: Value) -> Result<Value, String> {
 
 fn responses_to_chat(value: Value) -> Result<Value, String> {
     let mut source = object(value)?;
+    // PROXY-56: the adapter has no access to another protocol's stored history.
+    for field in ["previous_response_id", "conversation"] {
+        if source.remove(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!(
+                "Responses {field} is not supported for cross-protocol conversion; send the full input history"
+            ));
+        }
+    }
     let input = source
         .remove("input")
         .ok_or_else(|| "Responses request must contain input".to_owned())?;
@@ -603,7 +640,6 @@ fn responses_to_chat(value: Value) -> Result<Value, String> {
         "background",
         "include",
         "max_tool_calls",
-        "previous_response_id",
         "prompt_cache_key",
         "safety_identifier",
         "truncation",
@@ -628,7 +664,16 @@ fn chat_to_anthropic(value: Value) -> Result<Value, String> {
         .or_else(|| source.remove("max_tokens"))
         .unwrap_or_else(|| Value::Number(4096.into()));
     source.insert("max_tokens".to_owned(), max_tokens);
-    rename(&mut source, "stop", "stop_sequences");
+    if let Some(stop) = source.remove("stop") {
+        source.insert(
+            "stop_sequences".to_owned(),
+            if stop.is_string() {
+                json!([stop])
+            } else {
+                stop
+            },
+        );
+    }
     if let Some(tools) = source.remove("tools") {
         source.insert("tools".to_owned(), chat_tools_to_anthropic(tools)?);
     }
@@ -638,6 +683,25 @@ fn chat_to_anthropic(value: Value) -> Result<Value, String> {
             chat_tool_choice_to_anthropic(choice),
         );
     }
+    if let Some(parallel) = source
+        .remove("parallel_tool_calls")
+        .and_then(|v| v.as_bool())
+        && source
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        let choice = source
+            .entry("tool_choice")
+            .or_insert_with(|| json!({"type":"auto"}));
+        if choice.get("type").and_then(Value::as_str) != Some("none") {
+            choice
+                .as_object_mut()
+                .ok_or_else(|| "Tool choice must be an object for Anthropic conversion".to_owned())?
+                .insert("disable_parallel_tool_use".to_owned(), json!(!parallel));
+        }
+    }
+    source.remove("reasoning_effort");
     source.remove("n");
     source.remove("response_format");
     source.remove("stream_options");
@@ -667,7 +731,10 @@ fn anthropic_to_chat(value: Value) -> Result<Value, String> {
         .ok_or_else(|| "Anthropic Messages request must contain messages".to_owned())?;
     let mut messages = anthropic_messages_to_chat(messages)?;
     if let Some(system) = source.remove("system") {
-        messages.insert(0, json!({"role": "system", "content": system}));
+        messages.insert(
+            0,
+            json!({"role": "system", "content": anthropic_tool_content_to_chat(system)?}),
+        );
     }
     source.insert("messages".to_owned(), Value::Array(messages));
     rename(&mut source, "max_tokens", "max_completion_tokens");
@@ -676,6 +743,12 @@ fn anthropic_to_chat(value: Value) -> Result<Value, String> {
         source.insert("tools".to_owned(), anthropic_tools_to_chat(tools)?);
     }
     if let Some(choice) = source.remove("tool_choice") {
+        if let Some(disabled) = choice
+            .get("disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+        {
+            source.insert("parallel_tool_calls".to_owned(), json!(!disabled));
+        }
         source.insert(
             "tool_choice".to_owned(),
             anthropic_tool_choice_to_chat(choice),
@@ -723,7 +796,7 @@ fn chat_messages_to_responses(messages: Value) -> Result<Value, String> {
             let content = if content.is_null() {
                 Value::String(String::new())
             } else {
-                drop_empty_content_array(chat_content_to_responses(content)?)
+                drop_empty_content_array(chat_content_to_responses(content, false)?)
             };
             input.push(json!({
                 "type": "function_call_output",
@@ -732,6 +805,29 @@ fn chat_messages_to_responses(messages: Value) -> Result<Value, String> {
             }));
             continue;
         }
+        let output = message.get("role").and_then(Value::as_str) == Some("assistant");
+        if let Some(content) = message.remove("content") {
+            message.insert(
+                "content".to_owned(),
+                chat_content_to_responses(content, output)?,
+            );
+        }
+        if let Some(refusal) = message
+            .remove("refusal")
+            .filter(|v| v.as_str().is_some_and(|text| !text.is_empty()))
+        {
+            let mut parts = match message.remove("content") {
+                Some(Value::Array(parts)) => parts,
+                Some(Value::String(text)) if !text.is_empty() => {
+                    vec![json!({"type":"output_text", "text":text})]
+                }
+                _ => Vec::new(),
+            };
+            parts.push(json!({"type":"refusal", "refusal":refusal}));
+            message.insert("content".to_owned(), Value::Array(parts));
+        }
+        // These are provider-specific reasoning fields, not Responses input.
+        remove_fields(&mut message, &["reasoning_content", "reasoning"]);
         if let Some(tool_calls) = message.remove("tool_calls") {
             if message.get("content").is_some_and(|content| {
                 !content.is_null() && content.as_array().is_none_or(|parts| !parts.is_empty())
@@ -749,15 +845,12 @@ fn chat_messages_to_responses(messages: Value) -> Result<Value, String> {
             }
             continue;
         }
-        if let Some(content) = message.remove("content") {
-            message.insert("content".to_owned(), chat_content_to_responses(content)?);
-        }
         input.push(Value::Object(message));
     }
     Ok(Value::Array(input))
 }
 
-fn chat_content_to_responses(content: Value) -> Result<Value, String> {
+fn chat_content_to_responses(content: Value, output: bool) -> Result<Value, String> {
     if content.is_string() || content.is_null() {
         return Ok(content);
     }
@@ -768,8 +861,8 @@ fn chat_content_to_responses(content: Value) -> Result<Value, String> {
         parts
             .iter()
             .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-                Some("text") => Some(json!({"type": "input_text", "text": part.get("text").cloned().unwrap_or(Value::String(String::new()))})),
-                Some("image_url") => Some(json!({"type": "input_image", "image_url": part.pointer("/image_url/url").cloned().unwrap_or(Value::Null)})),
+                Some("text") => Some(json!({"type": if output { "output_text" } else { "input_text" }, "text": part.get("text").cloned().unwrap_or(Value::String(String::new()))})),
+                Some("image_url") => Some(json!({"type": "input_image", "image_url": part.pointer("/image_url/url").cloned().unwrap_or(Value::Null), "detail": part.pointer("/image_url/detail").cloned().unwrap_or(json!("auto"))})),
                 Some("file") => chat_file_to_responses(part),
                 _ => None,
             })
@@ -819,13 +912,9 @@ fn anthropic_input_to_responses(source: &Map<String, Value>) -> Result<Value, St
                             "output": output
                         }));
                     }
-                    Some("thinking") => input.push(json!({
-                        "type": "reasoning", "summary": [{"type": "summary_text", "text": block.get("thinking").cloned().unwrap_or(Value::String(String::new()))}],
-                        "encrypted_content": block.get("signature").cloned().unwrap_or(Value::Null)
-                    })),
-                    Some("redacted_thinking") => input.push(json!({
-                        "type": "reasoning", "summary": [], "encrypted_content": block.get("data").cloned().unwrap_or(Value::Null)
-                    })),
+                    // PROXY-55: Anthropic signatures cannot be replayed as
+                    // OpenAI encrypted reasoning; do not expose thoughts as text.
+                    Some("thinking" | "redacted_thinking") => {},
                     _ => {}
                 }
             }
@@ -877,6 +966,7 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
         .ok_or_else(|| "Responses input must be a string or array".to_owned())?;
     let mut messages = Vec::new();
     let mut pending_calls: Vec<Value> = Vec::new();
+    let mut pending_text: Vec<Value> = Vec::new();
     for item in items {
         let kind = item
             .get("type")
@@ -890,10 +980,9 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
             // not invent a role, expose it as visible text, or forward opaque
             // provider state. Native Responses requests bypass this adapter.
             Some("reasoning") => continue,
-            // PROXY-51: consecutive calls are one assistant turn. Collect them
-            // and flush the batch as a single message before the first non-call
-            // item, because Chat requires each call to be answered by the tool
-            // messages that immediately follow its assistant message.
+            // PROXY-51 / PROXY-53: calls and intervening assistant text share a
+            // turn. Flush before results or a non-assistant message so Chat's
+            // tool results immediately follow the assistant tool-call batch.
             Some("function_call") => pending_calls.push(json!({
                 "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or(Value::Null),
                 "type": "function",
@@ -903,7 +992,7 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
                 }
             })),
             Some("function_call_output") => {
-                flush_pending_tool_calls(&mut messages, &mut pending_calls);
+                flush_pending_tool_calls(&mut messages, &mut pending_calls, &mut pending_text);
                 let content = item.get("output").cloned().unwrap_or(Value::String(String::new()));
                 let content = if content.is_null() {
                     Value::String(String::new())
@@ -917,7 +1006,6 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
                 }));
             }
             Some("message") | None => {
-                flush_pending_tool_calls(&mut messages, &mut pending_calls);
                 if !matches!(
                     item.get("role").and_then(Value::as_str),
                     Some("system" | "developer" | "user" | "assistant")
@@ -929,7 +1017,18 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
                 if let Some(content) = message.remove("content") {
                     message.insert("content".to_owned(), responses_content_to_chat(content)?);
                 }
-                messages.push(Value::Object(message));
+                if message.get("role").and_then(Value::as_str) == Some("assistant") && !pending_calls.is_empty() {
+                    // PROXY-53: Chat has no separate message item inside an
+                    // assistant tool-call turn. Keep its text in that same turn.
+                    match message.remove("content") {
+                        Some(Value::String(text)) => pending_text.push(json!({"type":"text", "text":text})),
+                        Some(Value::Array(parts)) => pending_text.extend(parts),
+                        _ => {}
+                    }
+                } else {
+                    flush_pending_tool_calls(&mut messages, &mut pending_calls, &mut pending_text);
+                    messages.push(Value::Object(message));
+                }
             }
             Some(_) => {
                 return Err(
@@ -939,7 +1038,7 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
             }
         }
     }
-    flush_pending_tool_calls(&mut messages, &mut pending_calls);
+    flush_pending_tool_calls(&mut messages, &mut pending_calls, &mut pending_text);
     if !items.is_empty() && messages.is_empty() {
         return Err(
             "Responses input contains no messages or function calls after omitting reasoning items"
@@ -949,17 +1048,21 @@ fn responses_input_to_chat(input: Value) -> Result<Value, String> {
     Ok(Value::Array(messages))
 }
 
-/// PROXY-51: consecutive Responses function calls belong to one assistant turn.
+/// PROXY-51 / PROXY-53: Responses calls and their assistant text form one turn.
 /// Chat Completions requires every tool call of an assistant message to be
 /// answered by the tool messages that follow it, so a parallel batch must be
 /// flushed as one message instead of one message per call.
-fn flush_pending_tool_calls(messages: &mut Vec<Value>, calls: &mut Vec<Value>) {
+fn flush_pending_tool_calls(
+    messages: &mut Vec<Value>,
+    calls: &mut Vec<Value>,
+    text: &mut Vec<Value>,
+) {
     if calls.is_empty() {
         return;
     }
     messages.push(json!({
         "role": "assistant",
-        "content": null,
+        "content": if text.is_empty() { Value::Null } else { Value::Array(std::mem::take(text)) },
         "tool_calls": Value::Array(std::mem::take(calls))
     }));
 }
@@ -1024,6 +1127,13 @@ fn chat_messages_to_anthropic(messages: Value) -> Result<(Option<Value>, Value),
         flush_pending_tool_results(&mut converted, &mut pending_tool_results);
         let mut content =
             content_to_anthropic_blocks(message.remove("content").unwrap_or(Value::Null))?;
+        if let Some(refusal) = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            content.push(json!({"type":"text", "text":refusal}));
+        }
         if let Some(calls) = message.remove("tool_calls") {
             for call in calls.as_array().into_iter().flatten() {
                 let arguments = call["function"]
@@ -1090,13 +1200,25 @@ fn anthropic_messages_to_chat(messages: Value) -> Result<Vec<Value>, String> {
                     })),
                     Some("text") => normal.push(json!({"type": "text", "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))})),
                     Some("image") => normal.push(anthropic_image_to_chat(block)),
+                    Some("document") => {
+                        if let Some(file) = anthropic_document_to_responses(block).and_then(|file| responses_file_to_chat(&file)) {
+                            normal.push(file);
+                        }
+                    }
                     _ => {}
                 }
             }
             if !normal.is_empty() || !calls.is_empty() {
                 let mut message = Map::new();
                 message.insert("role".to_owned(), Value::String(role.to_owned()));
-                message.insert("content".to_owned(), Value::Array(normal));
+                message.insert(
+                    "content".to_owned(),
+                    if normal.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Array(normal)
+                    },
+                );
                 if !calls.is_empty() {
                     message.insert("tool_calls".to_owned(), Value::Array(calls));
                 }
@@ -1114,18 +1236,33 @@ fn content_to_anthropic_blocks(content: Value) -> Result<Vec<Value>, String> {
         return Ok(Vec::new());
     }
     if let Some(text) = content.as_str() {
-        return Ok(vec![json!({"type": "text", "text": text})]);
+        return Ok(if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "text", "text": text})]
+        });
     }
     let parts = content
         .as_array()
         .ok_or_else(|| "Message content must be a string or array".to_owned())?;
-    Ok(parts.iter().filter_map(|part| match part.get("type").and_then(Value::as_str) {
-        Some("text") | Some("input_text") => Some(json!({"type": "text", "text": part.get("text").cloned().unwrap_or(Value::String(String::new()))})),
-        Some("image_url") => chat_image_to_anthropic(part),
-        Some("input_image") => responses_image_to_anthropic(part),
-        Some("file") => chat_file_to_anthropic(part),
-        _ => None,
-    }).collect())
+    let mut blocks = Vec::new();
+    for part in parts {
+        let block = match part.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text") => part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| json!({"type":"text", "text":text})),
+            Some("image_url") => chat_image_to_anthropic(part),
+            Some("input_image") => responses_image_to_anthropic(part),
+            Some("file") => Some(chat_file_to_anthropic(part)?),
+            _ => None,
+        };
+        if let Some(block) = block {
+            blocks.push(block);
+        }
+    }
+    Ok(blocks)
 }
 
 /// A tool result that lost every part in conversion falls back to the empty
@@ -1156,6 +1293,7 @@ fn anthropic_tool_content_to_chat(content: Value) -> Result<Value, String> {
             .filter_map(|block| match block.get("type").and_then(Value::as_str) {
                 Some("text") => Some(json!({"type": "text", "text": block.get("text").cloned().unwrap_or(Value::String(String::new()))})),
                 Some("image") => Some(anthropic_image_to_chat(block)),
+                Some("document") => anthropic_document_to_responses(block).and_then(|file| responses_file_to_chat(&file)),
                 _ => None,
             })
             .collect(),
@@ -1171,6 +1309,7 @@ fn responses_content_to_chat(content: Value) -> Result<Value, String> {
         .ok_or_else(|| "Responses message content must be a string or array".to_owned())?;
     Ok(Value::Array(parts.iter().filter_map(|part| match part.get("type").and_then(Value::as_str) {
         Some("input_text") | Some("output_text") | Some("text") => Some(json!({"type": "text", "text": part.get("text").cloned().unwrap_or(Value::String(String::new()))})),
+        Some("refusal") => Some(json!({"type":"text", "text":part.get("refusal").cloned().unwrap_or(json!(""))})),
         Some("input_image") => Some(json!({"type": "image_url", "image_url": {"url": part.get("image_url").cloned().unwrap_or(Value::Null)}})),
         Some("input_file") => responses_file_to_chat(part),
         _ => None,
@@ -1185,8 +1324,20 @@ fn anthropic_document_to_responses(block: &Value) -> Option<Value> {
         Some("url") => {
             file.insert("file_url".to_owned(), source.get("url")?.clone());
         }
-        Some("base64" | "text") => {
-            file.insert("file_data".to_owned(), source.get("data")?.clone());
+        Some("base64") => {
+            let media_type = source.get("media_type")?.as_str()?;
+            let data = source.get("data")?.as_str()?;
+            file.insert(
+                "file_data".to_owned(),
+                json!(format!("data:{media_type};base64,{data}")),
+            );
+        }
+        Some("text") => {
+            let data = STANDARD.encode(source.get("data")?.as_str()?);
+            file.insert(
+                "file_data".to_owned(),
+                json!(format!("data:text/plain;base64,{data}")),
+            );
         }
         Some("file") => {
             file.insert("file_id".to_owned(), source.get("file_id")?.clone());
@@ -1221,23 +1372,42 @@ fn responses_file_to_chat(part: &Value) -> Option<Value> {
     (!file.is_empty()).then(|| json!({"type": "file", "file": file}))
 }
 
-fn chat_file_to_anthropic(part: &Value) -> Option<Value> {
-    let file = part.get("file")?;
+fn chat_file_to_anthropic(part: &Value) -> Result<Value, String> {
+    let invalid = || {
+        "File content requires a URL, file ID, or base64 data with an explicit media type for Anthropic conversion".to_owned()
+    };
+    let file = part.get("file").ok_or_else(invalid)?;
     let source = if let Some(url) = file.get("file_url") {
         json!({"type": "url", "url": url})
+    } else if let Some(id) = file.get("file_id") {
+        json!({"type": "file", "file_id": id})
     } else {
-        let data = file.get("file_data")?;
-        json!({
-            "type": "base64",
-            "media_type": file.get("file_type")?.clone(),
-            "data": data
-        })
+        let raw = file
+            .get("file_data")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let (media_type, data) = raw
+            .strip_prefix("data:")
+            .and_then(|raw| raw.split_once(";base64,"))
+            .or_else(|| {
+                file.get("file_type")
+                    .and_then(Value::as_str)
+                    .map(|mime| (mime, raw))
+            })
+            .ok_or_else(invalid)?;
+        if media_type == "text/plain" {
+            let text = String::from_utf8(STANDARD.decode(data).map_err(|_| invalid())?)
+                .map_err(|_| invalid())?;
+            json!({"type":"text", "media_type":"text/plain", "data":text})
+        } else {
+            json!({"type":"base64", "media_type":media_type, "data":data})
+        }
     };
     let mut document = json!({"type": "document", "source": source});
     if let Some(filename) = file.get("filename") {
         document["title"] = filename.clone();
     }
-    Some(document)
+    Ok(document)
 }
 
 fn chat_image_to_anthropic(part: &Value) -> Option<Value> {
@@ -1480,7 +1650,10 @@ mod tests {
             responses["input"][0]["content"][0]["filename"],
             "report.pdf"
         );
-        assert_eq!(responses["input"][0]["content"][1]["file_data"], "JVBERi0=");
+        assert_eq!(
+            responses["input"][0]["content"][1]["file_data"],
+            "data:application/pdf;base64,JVBERi0="
+        );
         assert!(!responses["input"][0]["content"][1]["file_data"].is_object());
 
         let anthropic = convert(
@@ -1721,14 +1894,7 @@ mod tests {
             .collect();
         assert_eq!(
             types,
-            [
-                "reasoning",
-                "message",
-                "function_call",
-                "reasoning",
-                "message",
-                "function_call"
-            ]
+            ["message", "function_call", "message", "function_call"]
         );
     }
 

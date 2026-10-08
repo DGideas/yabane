@@ -34,7 +34,7 @@ password-hash = { version = "0.5", features = ["rand_core", "getrandom"] }
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "socks", "json"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "time", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

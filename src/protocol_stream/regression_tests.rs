@@ -29,6 +29,305 @@ fn convert_stream(input: &str, source: Protocol, target: Protocol) -> (Vec<Value
 }
 
 #[test]
+fn anthropic_blocks_use_dense_target_indices_and_match_aggregation() {
+    // PROXY-58: SDKs append starts to an array then address deltas by index.
+    for text_position in ["none", "before", "after"] {
+        let mut input = frame(chat_delta(json!({"content":""}), Value::Null));
+        if text_position == "before" {
+            input += &frame(chat_delta(json!({"content":"Checking"}), Value::Null));
+        }
+        for (index, id) in [(3, "a"), (8, "b")] {
+            input += &frame(chat_delta(
+                json!({"tool_calls":[{"index":index,"id":id,"function":{"name":"lookup","arguments":"{"}}]}),
+                Value::Null,
+            ));
+        }
+        for index in [8, 3] {
+            input += &frame(chat_delta(
+                json!({"tool_calls":[{"index":index,"function":{"arguments":"\"x\":1}"}}]}),
+                Value::Null,
+            ));
+        }
+        if text_position == "after" {
+            input += &frame(chat_delta(json!({"content":"Checking"}), Value::Null));
+        }
+        input += &frame(chat_delta(json!({"content":""}), json!("tool_calls")));
+        input += "data: [DONE]\n\n";
+        let (events, aggregate) =
+            convert_stream(&input, Protocol::OpenAiChat, Protocol::AnthropicMessages);
+        let mut blocks = Vec::new();
+        let mut arguments: Vec<String> = Vec::new();
+        let mut stopped = Vec::new();
+        for event in events {
+            let index = event["index"].as_u64().unwrap_or(0) as usize;
+            match event["type"].as_str() {
+                Some("content_block_start") => {
+                    assert_eq!(index, blocks.len(), "sparse or reordered start: {event}");
+                    blocks.push(event["content_block"].clone());
+                    arguments.push(String::new());
+                    stopped.push(false);
+                }
+                Some("content_block_delta") => {
+                    assert!(!stopped[index]);
+                    match event["delta"]["type"].as_str().unwrap() {
+                        "text_delta" => {
+                            assert_eq!(blocks[index]["type"], "text");
+                            let text = blocks[index]["text"].as_str().unwrap().to_owned()
+                                + event["delta"]["text"].as_str().unwrap();
+                            blocks[index]["text"] = json!(text);
+                        }
+                        "input_json_delta" => {
+                            assert_eq!(blocks[index]["type"], "tool_use");
+                            arguments[index]
+                                .push_str(event["delta"]["partial_json"].as_str().unwrap());
+                        }
+                        other => panic!("unexpected delta {other}"),
+                    }
+                }
+                Some("content_block_stop") => {
+                    assert!(!stopped[index]);
+                    stopped[index] = true;
+                    if blocks[index]["type"] == "tool_use" {
+                        blocks[index]["input"] = serde_json::from_str(&arguments[index]).unwrap();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(stopped.iter().all(|closed| *closed));
+        assert_eq!(json!(blocks), aggregate["content"]);
+    }
+}
+
+#[test]
+fn argument_deltas_without_a_call_start_fail_for_every_target() {
+    // PROXY-58: do not emit deltas for nonexistent SDK content blocks/tools.
+    for target in [
+        Protocol::OpenAiChat,
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        let mut converter = StreamConverter::new(Protocol::OpenAiResponses, target);
+        let input = frame(
+            json!({"type":"response.function_call_arguments.delta","output_index":7,"delta":"{}"}),
+        );
+        assert!(converter.push(input.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn responses_terminal_arguments_supplement_deltas_without_duplication() {
+    // PROXY-59: gateways may supply all or the missing suffix of arguments in
+    // done events. Never silently execute an empty/different argument object.
+    for initial in ["", "{", "{\"x\":1}"] {
+        for target in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+            let tool = json!({"type":"function_call","id":"fc_a","call_id":"a","name":"lookup","arguments":initial});
+            let mut input =
+                frame(json!({"type":"response.output_item.added","output_index":4,"item":tool}));
+            input += &frame(
+                json!({"type":"response.function_call_arguments.done","output_index":4,"arguments":"{\"x\":1}"}),
+            );
+            input += &frame(
+                json!({"type":"response.output_item.done","output_index":4,"item":{"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"x\":1}"}}),
+            );
+            input += &frame(json!({"type":"response.completed","response":{"status":"completed"}}));
+            let (events, aggregate) = convert_stream(&input, Protocol::OpenAiResponses, target);
+            if target == Protocol::OpenAiChat {
+                assert_eq!(
+                    aggregate["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                    "{\"x\":1}"
+                );
+                let arguments: String = events
+                    .iter()
+                    .filter_map(|e| {
+                        e.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                            .and_then(Value::as_str)
+                    })
+                    .collect();
+                assert_eq!(arguments, "{\"x\":1}");
+            } else {
+                assert_eq!(aggregate["content"][0]["input"], json!({"x":1}));
+                let arguments: String = events
+                    .iter()
+                    .filter_map(|e| e.pointer("/delta/partial_json").and_then(Value::as_str))
+                    .collect();
+                assert_eq!(arguments, "{\"x\":1}");
+            }
+        }
+    }
+    for final_arguments in ["", "{\"y\":2}"] {
+        let mut converter = StreamConverter::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+        converter.push(frame(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"x\":"}})).as_bytes()).unwrap();
+        assert!(converter.push(frame(json!({"type":"response.function_call_arguments.done","output_index":0,"arguments":final_arguments})).as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn terminal_text_and_output_only_responses_are_not_lost_or_duplicated() {
+    // PROXY-59: verify UTF-8 prefixes and repeated cumulative done snapshots.
+    for prefix in ["", "你", "你好"] {
+        let output = json!([
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"你好"}]},
+            {"type":"function_call","call_id":"a","name":"lookup","arguments":"{\"x\":1}"}
+        ]);
+        let input = frame(
+            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":prefix}),
+        ) + &frame(
+            json!({"type":"response.output_text.done","output_index":0,"content_index":0,"text":"你好"}),
+        ) + &frame(
+            json!({"type":"response.completed","response":{"status":"completed","output":output}}),
+        );
+        for target in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+            let (_, result) = convert_stream(&input, Protocol::OpenAiResponses, target);
+            if target == Protocol::OpenAiChat {
+                assert_eq!(result["choices"][0]["message"]["content"], "你好");
+                assert_eq!(
+                    result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                    "{\"x\":1}"
+                );
+            } else {
+                assert_eq!(result["content"][0]["text"], "你好");
+                assert_eq!(result["content"][1]["input"], json!({"x":1}));
+            }
+        }
+    }
+    for terminal in ["你", "不同"] {
+        let mut converter = StreamConverter::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+        converter
+            .push(
+                frame(json!({"type":"response.output_text.delta","output_index":0,"delta":"你好"}))
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert!(
+            converter
+                .push(
+                    frame(
+                        json!({"type":"response.output_text.done","output_index":0,"text":terminal})
+                    )
+                    .as_bytes()
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn anthropic_initial_content_and_argumentless_tools_are_not_lost() {
+    // PROXY-59: content_block_start can contain content; {} is a real input for
+    // an Anthropic tool with no input_json_delta, not an empty JSON string.
+    for input in [json!({}), json!({"x":1})] {
+        let stream = frame(json!({"type":"message_start","message":{"id":"m","model":"fixture"}}))
+            + &frame(
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"initial"}}),
+            )
+            + &frame(
+                json!({"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"a","name":"lookup","input":input}}),
+            )
+            + &frame(json!({"type":"content_block_stop","index":4}))
+            + &frame(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}))
+            + &frame(json!({"type":"message_stop"}));
+        let (_, response) = convert_stream(
+            &stream,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+        );
+        assert_eq!(response["output"][0]["content"][0]["text"], "initial");
+        assert_eq!(response["output"][1]["arguments"], input.to_string());
+    }
+}
+
+#[test]
+fn terminal_marker_without_generation_finish_is_not_success() {
+    // PROXY-60: a source that never completed a generation cannot produce a
+    // completed answer merely because a transport terminator was received.
+    for (source, input) in [
+        (Protocol::OpenAiChat, "data: [DONE]\n\n".to_owned()),
+        (
+            Protocol::AnthropicMessages,
+            frame(json!({"type":"message_stop"})),
+        ),
+    ] {
+        for target in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            let mut converter = StreamConverter::new_aggregating(source, target);
+            converter.push(input.as_bytes()).unwrap();
+            assert!(converter.has_failed());
+            assert!(converter.non_stream_response().is_err());
+        }
+    }
+}
+
+#[test]
+fn streaming_identity_state_is_bounded_and_cannot_be_reassigned() {
+    // PROXY-58 / PROXY-59: bounds apply even when no text/arguments accumulate.
+    for tools in [false, true] {
+        let mut converter = StreamConverter::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+        for index in 0..=super::MAX_STREAM_ITEMS {
+            let event = if tools {
+                json!({"type":"response.output_item.added","output_index":index,"item":{"type":"function_call","call_id":format!("a{index}"),"name":"lookup","arguments":""}})
+            } else {
+                json!({"type":"response.output_text.delta","output_index":index,"delta":""})
+            };
+            let result = converter.push(frame(event).as_bytes());
+            assert_eq!(result.is_err(), index == super::MAX_STREAM_ITEMS);
+        }
+    }
+    let mut converter = StreamConverter::new(Protocol::OpenAiChat, Protocol::AnthropicMessages);
+    converter.push(frame(chat_delta(json!({"tool_calls":[{"index":3,"id":"a","function":{"name":"read","arguments":""}}]}), Value::Null)).as_bytes()).unwrap();
+    assert!(converter.push(frame(chat_delta(json!({"tool_calls":[{"index":3,"id":"b","function":{"name":"write","arguments":""}}]}), Value::Null)).as_bytes()).is_err());
+}
+
+#[test]
+fn refusal_streams_keep_the_reason_and_correct_part_lifecycle() {
+    // PROXY-63: a refusal is neither an error nor an empty successful answer.
+    let chat =
+        frame(chat_delta(json!({"refusal":"Cannot help"}), json!("stop"))) + "data: [DONE]\n\n";
+    let responses = frame(
+        json!({"type":"response.refusal.delta","output_index":0,"content_index":0,"delta":"Cannot "}),
+    ) + &frame(
+        json!({"type":"response.refusal.done","output_index":0,"content_index":0,"refusal":"Cannot help"}),
+    ) + &frame(
+        json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"Cannot help"}]}]}}),
+    );
+    for (source, input) in [
+        (Protocol::OpenAiChat, chat),
+        (Protocol::OpenAiResponses, responses),
+    ] {
+        for target in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            let (events, result) = convert_stream(&input, source, target);
+            let reason = match target {
+                Protocol::OpenAiChat => &result["choices"][0]["message"]["refusal"],
+                Protocol::OpenAiResponses => &result["output"][0]["content"][0]["refusal"],
+                Protocol::AnthropicMessages => &result["content"][0]["text"],
+            };
+            assert_eq!(reason, "Cannot help");
+            if target == Protocol::OpenAiResponses {
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| e["type"] == "response.refusal.done"
+                            && e["refusal"] == "Cannot help")
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| e["type"] == "response.output_text.done")
+                );
+                assert_eq!(events.last().unwrap()["response"], result);
+            }
+        }
+    }
+}
+
+#[test]
 fn incomplete_reason_survives_json_sse_and_aggregation() {
     // PROXY-48: a token-limited answer never becomes a normal stop, even with tools.
     for with_tool in [false, true] {
@@ -43,6 +342,8 @@ fn incomplete_reason_survives_json_sse_and_aggregation() {
             let tool =
                 json!({"type":"function_call","call_id":"call_1","name":"f","arguments":"{}"});
             output.push(tool.clone());
+            let mut tool = tool;
+            tool["arguments"] = json!("");
             input +=
                 &frame(json!({"type":"response.output_item.added","output_index":1,"item":tool}));
             input += &frame(
@@ -187,6 +488,78 @@ fn finish_without_done_or_followed_by_failure_never_emits_success() {
             assert!(!output.contains("response.completed"));
             assert!(!output.contains("message_stop"));
             assert!(!output.contains("\"finish_reason\":\"stop\""));
+        }
+    }
+}
+
+#[test]
+fn empty_chat_text_deltas_do_not_create_responses_messages() {
+    // PROXY-52: empty deltas before, between, or after calls must not split a
+    // parallel batch or insert an assistant message before its tool results.
+    for text in [None, Some(" "), Some("Checking")] {
+        let mut input = frame(chat_delta(
+            json!({"role":"assistant","content":""}),
+            Value::Null,
+        ));
+        if let Some(text) = text {
+            input += &frame(chat_delta(json!({"content":text}), Value::Null));
+        }
+        for (index, id) in [(2, "call_a"), (7, "call_b")] {
+            input += &frame(chat_delta(
+                json!({"content":"","tool_calls":[{"index":index,"id":id,"function":{"name":"lookup","arguments":"{}"}}]}),
+                Value::Null,
+            ));
+            input += &frame(chat_delta(json!({"content":""}), Value::Null));
+        }
+        input += &frame(chat_delta(json!({"content":""}), json!("tool_calls")));
+        input += "data: [DONE]\n\n";
+        for aggregating in [false, true] {
+            let mut converter = if aggregating {
+                StreamConverter::new_aggregating(Protocol::OpenAiChat, Protocol::OpenAiResponses)
+            } else {
+                StreamConverter::new(Protocol::OpenAiChat, Protocol::OpenAiResponses)
+            };
+            // Exercise incremental delivery, not just a whole buffered response.
+            let mut output = Vec::new();
+            for byte in input.as_bytes() {
+                output.extend(converter.push(std::slice::from_ref(byte)).unwrap());
+            }
+            output.extend(converter.finish().unwrap());
+            let events = events(&output);
+            let response = &events.last().unwrap()["response"];
+            let items = response["output"].as_array().unwrap();
+            let offset = usize::from(text.is_some());
+            assert_eq!(items.len(), offset + 2);
+            if let Some(text) = text {
+                assert_eq!(items[0]["content"][0]["text"], text);
+            }
+            assert_eq!(items[offset]["call_id"], "call_a");
+            assert_eq!(items[offset + 1]["call_id"], "call_b");
+            let starts: Vec<_> = events
+                .iter()
+                .filter(|e| e["type"] == "response.output_item.added")
+                .collect();
+            let ends: Vec<_> = events
+                .iter()
+                .filter(|e| e["type"] == "response.output_item.done")
+                .collect();
+            assert_eq!(starts.len(), items.len());
+            assert_eq!(ends.len(), items.len());
+            for (index, item) in items.iter().enumerate() {
+                assert_eq!(starts[index]["output_index"], index);
+                assert_eq!(starts[index]["item"]["id"], item["id"]);
+                assert_eq!(ends[index]["item"], *item);
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["type"] == "response.output_text.delta" && e["delta"] == "")
+            );
+            if aggregating {
+                let aggregate: Value =
+                    serde_json::from_slice(&converter.non_stream_response().unwrap()).unwrap();
+                assert_eq!(*response, aggregate);
+            }
         }
     }
 }

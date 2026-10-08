@@ -193,27 +193,51 @@ try {
     { role: 'user', content: 'Continue' },
   ];
   for (const stream of [false, true]) {
+    // PROXY-53: text between calls and before results must stay inside the
+    // assistant batch, including the empty item emitted by older Yabane builds.
+    for (const text of [null, '', 'Checking']) {
+      const replay = structuredClone(parallelInput);
+      if (text !== null) {
+        replay.splice(2, 0, { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+        replay.splice(4, 0, { type: 'message', role: 'assistant', content: 'after' });
+      }
+      const before = received.length;
+      const response = await request(`${base}/v1/responses`, {
+        method: 'POST', ...json({ model: 'chat/fixture', input: replay, stream }),
+      });
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(received.length - before, 1);
+      const messages = received.at(-1).body.messages;
+      assert.equal(messages.length, 5);
+      assert.equal(messages[0].role, 'user');
+      assert.equal(messages[1].role, 'assistant');
+      assert.deepEqual(messages[1].tool_calls.map(call => call.id), ['call_a', 'call_b']);
+      assert.deepEqual(messages[1].tool_calls.map(call => call.function.name), ['bash', 'read']);
+      assert.deepEqual(messages.slice(2, 4).map(message => [message.role, message.tool_call_id]), [['tool', 'call_a'], ['tool', 'call_b']]);
+      if (text !== null) assert.deepEqual(messages[1].content, [{ type: 'text', text }, { type: 'text', text: 'after' }]);
+      if (stream) {
+        const events = (await response.text()).split('\n')
+          .filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)));
+        const completed = events.find(event => event.type === 'response.completed');
+        assert.equal(completed?.response.output[0].content[0].text, 'ok');
+      } else {
+        assert.equal((await response.json()).output[0].content[0].text, 'ok');
+      }
+    }
+  }
+
+  // PROXY-56: never turn server-side history into a successful stateless call.
+  for (const field of ['previous_response_id', 'conversation']) {
     const before = received.length;
     const response = await request(`${base}/v1/responses`, {
-      method: 'POST', ...json({ model: 'chat/fixture', input: parallelInput, stream }),
+      method: 'POST', ...json({ model: 'chat/fixture', input: 'continue', [field]: 'private-state' }),
     });
-    assert.equal(response.status, 200, await response.clone().text());
-    assert.equal(received.length - before, 1);
-    const messages = received.at(-1).body.messages;
-    assert.equal(messages.length, 5);
-    assert.equal(messages[0].role, 'user');
-    assert.equal(messages[1].role, 'assistant');
-    assert.deepEqual(messages[1].tool_calls.map(call => call.id), ['call_a', 'call_b']);
-    assert.deepEqual(messages[1].tool_calls.map(call => call.function.name), ['bash', 'read']);
-    assert.deepEqual(messages.slice(2, 4).map(message => [message.role, message.tool_call_id]), [['tool', 'call_a'], ['tool', 'call_b']]);
-    if (stream) {
-      const events = (await response.text()).split('\n')
-        .filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)));
-      const completed = events.find(event => event.type === 'response.completed');
-      assert.equal(completed?.response.output[0].content[0].text, 'ok');
-    } else {
-      assert.equal((await response.json()).output[0].content[0].text, 'ok');
-    }
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get('x-yabane-error-origin'), 'yabane');
+    const error = await response.text();
+    assert.ok(error.includes(field));
+    assert.ok(!error.includes('private-state'));
+    assert.equal(received.length, before);
   }
 
   // Unsupported items and malformed messages fail locally, never as a Provider 400.
