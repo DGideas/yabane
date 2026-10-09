@@ -2716,14 +2716,7 @@ fn validate_extra_headers(
 }
 
 fn validate_endpoint_base_url(value: &str) -> Result<(), &'static str> {
-    let path = value
-        .split_once("://")
-        .map(|(_, rest)| rest.split_once('/').map_or("", |(_, path)| path))
-        .unwrap_or(value)
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('/');
+    let path = crate::config::base_url_path(value);
     if ["/chat/completions", "/responses", "/messages", "/models"]
         .iter()
         .any(|suffix| path.ends_with(suffix))

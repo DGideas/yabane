@@ -134,10 +134,14 @@ class Handler(BaseHTTPRequestHandler):
             body = str(Handler.posts).encode()
             self.send_response(200); self.send_header('content-type', 'text/plain'); self.end_headers(); self.wfile.write(body); return
         endpoint = self.headers.get('authorization', 'Bearer unknown').removeprefix('Bearer ')
-        if self.path not in ['/v1/models', '/nested/v1/models']:
+        if self.path not in ['/v1/models', '/nested/v1/models', '/v2/models']:
             self.send_response(404); self.end_headers(); return
-        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared'], 'nested': ['nested-model'], 'namespaced': ['google/gemma-3-27b-it', 'plain-model']}.get(endpoint, [])
+        models = {'one': ['model-a', 'shared'], 'two': ['model-b', 'shared'], 'nested': ['nested-model'], 'namespaced': ['google/gemma-3-27b-it', 'plain-model'], 'versioned': ['versioned-model']}.get(endpoint, [])
         if self.path == '/nested/v1/models' and endpoint != 'nested':
+            models = []
+        # A Provider that versions its API itself serves the same catalog at its
+        # own root, never below a repeated `/v1`.
+        if self.path == '/v2/models' and endpoint != 'versioned':
             models = []
         body = json.dumps({'object': 'list', 'data': [{'id': model} for model in models]}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body)
@@ -230,6 +234,9 @@ class Handler(BaseHTTPRequestHandler):
         if request.get('model') == 'provider-error':
             body = json.dumps({'error': {'message': 'provider exploded', 'type': 'server_error'}}).encode()
             self.send_response(500); self.send_header('content-type', 'application/json'); self.send_header('x-yabane-error-origin', 'yabane'); self.send_header('x-yabane-request-id', 'req-forged'); self.end_headers(); self.wfile.write(body); return
+        if endpoint == 'versioned' and self.path != '/v2/chat/completions':
+            # A Provider that versions its API itself has no `/v2/v1/...` route.
+            self.send_response(404); self.end_headers(); return
         body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
@@ -427,6 +434,15 @@ unrestricted=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: applic
 unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
 unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
+
+# A Provider that versions its API itself owns that version segment: a `/v2` root is
+# called at `/v2/chat/completions` and `/v2/models`, never at `/v2/v1/...`.
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"versioned-root\",\"name\":\"Versioned root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v2\",\"requires_credential\":true,\"credential_secret\":\"versioned\"}}") == 204 ]]
+admin -f -X POST "$base/admin/providers/versioned-root/models/refresh" >/dev/null
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "versioned-root") | .discovered_models[0]') == versioned-model ]]
+versioned_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"versioned-root/versioned-model","messages":[]}')
+[[ $(printf '%s' "$versioned_call" | jq -r .endpoint) == versioned ]]
+admin -f -X DELETE "$base/admin/providers/versioned-root" >/dev/null
 
 # A Provider model ID removes only Yabane's first `provider/` segment, so a native
 # namespace that begins with the Provider ID survives route authoring and proxying:

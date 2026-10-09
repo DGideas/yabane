@@ -1638,11 +1638,12 @@ fn complete_exchange_observers(
 
 pub(crate) fn join_upstream_url(base_url: &str, path_and_query: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let path = if base.ends_with("/v1") && path_and_query.starts_with("/v1/") {
-        &path_and_query[3..]
-    } else {
-        path_and_query
-    };
+    // The base URL is the shared API root, so the operation path is appended
+    // below it. Yabane's own operation paths are versioned, and a Provider may
+    // version its API with a segment of its own; when the base already names a
+    // version, repeating Yabane's would address a second root that the Provider
+    // does not serve. See `upstream_operation_path`.
+    let path = upstream_operation_path(base_url, path_and_query);
     format!(
         "{base}{}",
         if path.starts_with('/') {
@@ -1651,6 +1652,61 @@ pub(crate) fn join_upstream_url(base_url: &str, path_and_query: &str) -> String 
             format!("/{path}")
         }
     )
+}
+
+/// The path an upstream request appends to its Endpoint's base URL.
+///
+/// The base URL is the Provider's shared API root, and the Provider versions
+/// that root itself: Tencent CodeBuddy publishes the OpenAI-compatible surface
+/// under `/v2`, Zhipu under `/api/paas/v4` and `/api/paas/v4/saas`, Google
+/// under `/v1beta/openai`, OpenCode Go under `/zen/go/v1`. Yabane's own
+/// operation paths carry a version segment as well, so appending it below an
+/// already-versioned root would address a root the Provider does not serve: the
+/// leading version segment is dropped when the base URL's path contains one. A
+/// root with no version segment in it, such as a bare origin or a plain path
+/// prefix, keeps the operation path as written.
+///
+/// A version is recognized in any segment, not only the last one, because a
+/// root may name its version and then a surface below it, as in `/v4/saas` or
+/// `/v1beta/openai`. Matching only a trailing segment would call those at
+/// `/v4/saas/v1/chat/completions` and `/v1beta/openai/v1/chat/completions`.
+/// Keeping the root's version is the deliberate choice here; a Provider whose
+/// real root does sit below a version segment is reached by naming that whole
+/// prefix in the base URL, which is normalized to one copy of the version.
+fn upstream_operation_path<'a>(base_url: &str, path_and_query: &'a str) -> &'a str {
+    if crate::config::base_url_path(base_url)
+        .split('/')
+        .any(is_version_segment)
+        && let Some(rest) = strip_leading_version_segment(path_and_query)
+    {
+        return rest;
+    }
+    path_and_query
+}
+
+/// A path segment that names an API version: `v` followed by digits and then
+/// letters or digits, as in `v1`, `v2`, `v4`, or `v1beta`. A segment such as
+/// `version` or `vendors` is a resource name, not a version.
+fn is_version_segment(segment: &str) -> bool {
+    let Some(version) = segment.strip_prefix('v') else {
+        return false;
+    };
+    let mut characters = version.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_digit())
+        && characters.all(|character| character.is_ascii_alphanumeric())
+}
+
+/// `path_and_query` without its leading version segment, when it has one. The
+/// result still starts with `/`, and any query is preserved.
+fn strip_leading_version_segment(path_and_query: &str) -> Option<&str> {
+    let rest = path_and_query.strip_prefix('/')?;
+    let (segment, tail) = rest.split_once('/')?;
+    if tail.is_empty() || !is_version_segment(segment) {
+        return None;
+    }
+    Some(&path_and_query[1 + segment.len()..])
 }
 
 /// Removes only headers that are meaningless or unsafe to forward on every upstream
@@ -2071,9 +2127,172 @@ mod tests {
     use super::provider_endpoint_base_url;
     use super::{
         ApiSurface, ApiType, Protocol, apply_core_upstream_headers, cooldown_decision,
-        copy_response_headers, read_body, reported_retry_after, response_is_event_stream,
-        sanitize_request_headers, strip_transformed_response_headers, upstream_transport_failure,
+        copy_response_headers, join_upstream_url, read_body, reported_retry_after,
+        response_is_event_stream, sanitize_request_headers, strip_transformed_response_headers,
+        upstream_transport_failure,
     };
+
+    /// ENDPOINT-21: a base URL is the Provider's shared API root, and the
+    /// Provider versions that root itself. Yabane's operation path must join
+    /// below whatever version the root already names instead of stacking a
+    /// second version segment on top of it.
+    #[test]
+    fn upstream_url_does_not_repeat_the_version_a_base_url_already_names() {
+        // The version is recognized wherever it sits in the root's path, so a
+        // root that names its version and then a surface below it keeps both.
+        // This is the deliberate difference from a trailing-segment-only rule:
+        // both shapes below would otherwise receive a second `/v1`.
+        for (base, operation, expected) in [
+            // The reported shape: CodeBuddy serves `/v2/chat/completions`, so a
+            // `/v1` root join addressed a route the Provider does not have.
+            (
+                "https://copilot.tencent.com/v2",
+                "/v1/chat/completions",
+                "https://copilot.tencent.com/v2/chat/completions",
+            ),
+            (
+                "https://copilot.tencent.com/v2/",
+                "/v1/chat/completions?trace=1",
+                "https://copilot.tencent.com/v2/chat/completions?trace=1",
+            ),
+            // A version below a plain prefix belongs to the Provider too.
+            (
+                "https://open.bigmodel.cn/api/paas/v4",
+                "/v1/chat/completions",
+                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+            ),
+            (
+                "https://open.bigmodel.cn/api/paas/v4/saas",
+                "/v1/chat/completions",
+                "https://open.bigmodel.cn/api/paas/v4/saas/chat/completions",
+            ),
+            // A suffixed version is still a version.
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "/v1/chat/completions",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+            // OpenCode Go's nested root keeps its own `/v1`-below-a-prefix shape.
+            (
+                "https://opencode.ai/zen/go/v1",
+                "/v1/models",
+                "https://opencode.ai/zen/go/v1/models",
+            ),
+            // A root that names no version is a plain prefix: the operation path
+            // is used exactly as written.
+            (
+                "https://example.com",
+                "/v1/chat/completions",
+                "https://example.com/v1/chat/completions",
+            ),
+            (
+                "https://example.com/openai/v1-preview",
+                "/v1/chat/completions",
+                "https://example.com/openai/v1-preview/v1/chat/completions",
+            ),
+            (
+                "https://example.com/vendors",
+                "/v1/chat/completions",
+                "https://example.com/vendors/v1/chat/completions",
+            ),
+            // A path without a leading version segment is never rewritten, so
+            // an explicit model-route or Extension path keeps its own meaning.
+            (
+                "https://copilot.tencent.com/v2",
+                "/codex/responses",
+                "https://copilot.tencent.com/v2/codex/responses",
+            ),
+            // An operation path with no leading version segment is appended as
+            // written, so a versioned operation path never reaches the Provider
+            // twice.
+            (
+                "https://copilot.tencent.com/v2",
+                "/v2/chat/completions",
+                "https://copilot.tencent.com/v2/chat/completions",
+            ),
+        ] {
+            assert_eq!(
+                join_upstream_url(base, operation),
+                expected,
+                "{base} + {operation}"
+            );
+        }
+    }
+
+    /// ENDPOINT-21: only a real version segment is treated as one, so a path
+    /// that merely resembles a version stays the resource name it is.
+    #[test]
+    fn upstream_url_version_detection_requires_a_real_version_segment() {
+        for (base, operation, expected) in [
+            // "v" must be followed by a digit, so `vendors` is a resource name.
+            (
+                "https://example.com/vendors",
+                "/v1/chat/completions",
+                "https://example.com/vendors/v1/chat/completions",
+            ),
+            (
+                "https://example.com/api/v",
+                "/v1/chat/completions",
+                "https://example.com/api/v/v1/chat/completions",
+            ),
+            // A base URL that already names Yabane's own version is normalized
+            // to exactly one copy of it rather than two.
+            (
+                "https://example.com/v1",
+                "/v1/chat/completions",
+                "https://example.com/v1/chat/completions",
+            ),
+            // A query on a version-less operation path survives unchanged.
+            (
+                "https://example.com",
+                "/v1/models?limit=1000",
+                "https://example.com/v1/models?limit=1000",
+            ),
+            // The query is kept when the version segment is dropped.
+            (
+                "https://example.com/v1",
+                "/v1/models?limit=1000",
+                "https://example.com/v1/models?limit=1000",
+            ),
+        ] {
+            assert_eq!(
+                join_upstream_url(base, operation),
+                expected,
+                "{base} + {operation}"
+            );
+        }
+    }
+
+    /// ENDPOINT-21: a version is recognized wherever it sits in the root, not
+    /// only as the last segment. A trailing-segment-only rule would call
+    /// `/api/paas/v4/saas` at `/api/paas/v4/saas/v1/chat/completions` and
+    /// `/v1beta/openai` at `/v1beta/openai/v1/chat/completions`; this test pins
+    /// the choice not to do that. A Provider whose real root does sit below a
+    /// version segment is reached by naming that whole prefix, which the join
+    /// normalizes to one copy of the version instead of refusing the root.
+    #[test]
+    fn upstream_url_keeps_a_version_that_is_not_the_last_path_segment() {
+        for (base, expected) in [
+            (
+                "https://open.bigmodel.cn/api/paas/v4/saas",
+                "https://open.bigmodel.cn/api/paas/v4/saas/chat/completions",
+            ),
+            (
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            ),
+            (
+                "https://example.com/v1/tenant-a/v1",
+                "https://example.com/v1/tenant-a/v1/chat/completions",
+            ),
+        ] {
+            assert_eq!(
+                join_upstream_url(base, "/v1/chat/completions"),
+                expected,
+                "{base}"
+            );
+        }
+    }
 
     /// PROXY-41: crossing the buffered-body ceiling is a Yabane-authored `413`,
     /// and a body at the limit still passes.

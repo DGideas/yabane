@@ -662,6 +662,27 @@ impl Provider {
     }
 }
 
+/// The path an Endpoint base URL already names, without scheme, authority,
+/// query, or trailing slash.
+///
+/// A base URL is the shared API root its Provider serves, and that root is not
+/// always spelled `/v1`: the same OpenAI-compatible surface is published as
+/// `/v2` (Tencent CodeBuddy), `/api/paas/v4` and `/api/paas/v4/saas` (Zhipu),
+/// `/v1beta/openai` (Google), and `/compatible-mode/v1` (Alibaba). Reading the
+/// path as a value, rather than matching a known spelling, is what lets
+/// configuration validation and the upstream URL join agree on which part of a
+/// base URL is the operation path and which part the Provider already owns.
+pub(crate) fn base_url_path(base_url: &str) -> &str {
+    base_url
+        .split_once("://")
+        .map(|(_, rest)| rest.split_once('/').map_or("", |(_, path)| path))
+        .unwrap_or(base_url)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+}
+
 pub async fn load_providers() -> Result<HashMap<String, Provider>, String> {
     let contents = match tokio::fs::read(PROVIDERS_FILE).await {
         Ok(contents) => contents,

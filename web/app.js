@@ -301,7 +301,7 @@ function operationPathNotice(input) {
   if (!notice) return;
   const path = new URL(input.value, 'http://invalid').pathname.replace(/\/$/, '');
   const operation = ['/chat/completions', '/responses', '/messages', '/models'].find(suffix => path.endsWith(suffix));
-  notice.textContent = operation ? `This looks like a specific ${operation} operation URL. Use the shared API root instead so discovery and inference can append their own paths.` : '';
+  notice.textContent = operation ? `This looks like a specific ${operation} operation URL. Use the shared API root instead: Yabane appends the operation path itself, and it never repeats a version segment the root already names.` : '';
 }
 $('#base-url').addEventListener('input', event => {
   const hostname = new URL(event.target.value, 'http://invalid').hostname;

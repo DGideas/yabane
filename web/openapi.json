@@ -214,7 +214,8 @@
             "description": "Endpoint type identifier, either one Core implements or one an Extension declares."
           },
           "base_url": {
-            "type": "string"
+            "type": "string",
+            "description": "The Provider's shared API root, including the version segment it serves when it has one (for example `https://api.example.com/v1` or `https://copilot.tencent.com/v2`). Yabane appends the operation path below this root and never repeats a version segment the root already names. Not an operation URL."
           },
           "socks5_proxy": {
             "type": "string",
@@ -2897,7 +2898,8 @@
                         ]
                       },
                       "base_url": {
-                        "type": "string"
+                        "type": "string",
+                        "description": "The Provider's shared API root, including the version segment it serves when it has one (for example `https://api.example.com/v1` or `https://copilot.tencent.com/v2`). Yabane appends the operation path below this root and never repeats a version segment the root already names. Not an operation URL."
                       },
                       "socks5_proxy": {
                         "type": "string",
@@ -3133,7 +3135,8 @@
                     ]
                   },
                   "base_url": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "The Provider's shared API root, including the version segment it serves when it has one (for example `https://api.example.com/v1` or `https://copilot.tencent.com/v2`). Yabane appends the operation path below this root and never repeats a version segment the root already names. Not an operation URL."
                   },
                   "socks5_proxy": {
                     "type": "string",
@@ -4306,7 +4309,8 @@
                     ]
                   },
                   "base_url": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "The Provider's shared API root, including the version segment it serves when it has one (for example `https://api.example.com/v1` or `https://copilot.tencent.com/v2`). Yabane appends the operation path below this root and never repeats a version segment the root already names. Not an operation URL."
                   },
                   "socks5_proxy": {
                     "type": "string",
