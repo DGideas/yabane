@@ -2280,6 +2280,10 @@ function renderDestinationIdentityState(editor) {
   editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.checked = input.value === (pinning ? 'pin' : 'endpoint'); });
   editor.querySelector('.route-identity-step').hidden = !pinning;
   updateDestinationEffect(editor);
+  // Choosing an Endpoint decides whether this destination can receive traffic at
+  // all, which is what the mode-level note depends on: a destination that still
+  // has no Endpoint cannot make the route a split yet.
+  renderRouteModeNote();
 }
 function updateDestinationEffect(editor) {
   const effect = editor.querySelector('.route-destination-effect');
@@ -2365,17 +2369,93 @@ function updateDestinationNotice(editor) {
   else notice.textContent = '';
 }
 function routeTargetEditors() { return $$('#route-targets .route-target-editor'); }
+/// Whether the route hands the same conversation to more than one upstream. Only a
+/// destination that can actually receive traffic counts: one still being filled in,
+/// turned off, or holding no share yet does not make the route a split. Destinations
+/// that share one Provider and Endpoint are the same upstream by construction, so
+/// they cannot move a conversation anywhere. Both modes count, because a failover
+/// route also changes the destination a conversation continues on once a cooldown
+/// moves the traffic.
+function routeHasSeveralUpstreams() {
+  const upstreams = new Set(routeTargetEditors().filter(editor => {
+    if (!editor.querySelector('[name="target_enabled"]').checked) return false;
+    if (Number(editor.querySelector('[name="target_weight"]').value) <= 0) return false;
+    return Boolean(destinationValue(editor, 'provider') && destinationValue(editor, 'endpoint'));
+  }).map(editor => `${destinationValue(editor, 'provider')}\u0000${destinationValue(editor, 'endpoint')}`));
+  return upstreams.size > 1;
+}
 /// How the route uses its destinations. The two modes are the two things an
 /// operator can want: sharing traffic between interchangeable destinations, or
 /// holding a preferred one until the Provider rate-limits every identity behind
 /// it and then handing the traffic to the next group.
 function routeMode() { return $('#route-mode-choice input:checked')?.value === 'failover' ? 'failover' : 'weighted'; }
 function setRouteMode(mode) { $$('#route-mode-choice input').forEach(input => { input.checked = input.value === mode; }); }
-/// The group a destination belongs to lives on the editor itself rather than in the
-/// select: the select is rebuilt from these values, and while it is still empty a value
-/// written into it is dropped, which would silently merge every group into Priority 1.
-function routePriorityValue(editor) { return Math.max(1, Number(editor.dataset.priority) || 1); }
-function setRoutePriority(editor, value) { editor.dataset.priority = String(Math.max(1, Number(value) || 1)); }
+/// A destination's group has two values, because the editor works in positions
+/// while the file stores a number of its own. `dataset.group` is the position the
+/// editor shows and saves in `failover` mode; `dataset.priority` is what the file
+/// had, kept untouched so editing a `weighted` route — where the number is stored
+/// but never read — cannot rewrite it. Both live on the editor rather than in the
+/// select, because the select is rebuilt from them.
+function routeGroupValue(editor) { return Math.max(1, Number(editor.dataset.group) || 1); }
+function setRouteGroup(editor, position) { editor.dataset.group = String(Math.max(1, Number(position) || 1)); }
+function routeSavedPriority(editor) { return Math.max(1, Number(editor.dataset.priority) || 1); }
+/// The group positions the draft holds, in the order they carry traffic, including
+/// a position just added for a destination to be moved into. A group exists while
+/// it holds a destination, so the positions are always the numbers 1…N rather than
+/// whatever the file happens to store.
+let routeGroupCount = 1;
+/// True while the last position is one the administrator just added and has not
+/// filled yet. Removing a group is how a position is closed, and an empty position
+/// is the one exception that survives being empty until it is filled or removed.
+let routePendingGroup = false;
+function routeGroupMembers() {
+  return Array.from({length: routeGroupCount}, (_, index) => ({position: index + 1, members: routeTargetEditors().filter(editor => routeGroupValue(editor) === index + 1)}));
+}
+/// A destination cannot stay in a position that no longer exists, and a position
+/// that lost its last destination is not left behind to clean up: moving the last
+/// destination out of a group is how that group is closed. The position added for a
+/// destination to be moved into survives until it holds one or is removed.
+function collapseRouteGroups() {
+  for (let position = routeGroupCount; position >= 1; position -= 1) {
+    if (routeGroupMembers()[position - 1]?.members.length) continue;
+    if (routePendingGroup && position === routeGroupCount) continue;
+    routeTargetEditors().forEach(editor => { if (routeGroupValue(editor) > position) setRouteGroup(editor, routeGroupValue(editor) - 1); });
+    routeGroupCount -= 1;
+  }
+}
+/// Even shares inside one group, so a destination that joins or leaves a group
+/// never leaves that group adding up to something other than 100%.
+function rebalanceRouteGroup(position) {
+  const members = routeTargetEditors().filter(editor => routeGroupValue(editor) === position);
+  distributeRouteShares(members.map(() => 1)).forEach((share, index) => { members[index].querySelector('[name="target_weight"]').value = share; });
+}
+/// The split a change landed in is the only one that has to be shared out again: a
+/// group is its own pool, so repairing the others would rewrite percentages nobody
+/// touched. A `weighted` route has one split, so every change is its own scope.
+function rebalanceRouteTraffic(position = null) {
+  const failover = routeMode() === 'failover';
+  const splits = failover
+    ? (position && position <= routeGroupCount ? [routeTargetEditors().filter(editor => routeGroupValue(editor) === position)] : routeGroupMembers().map(group => group.members))
+    : [routeTargetEditors()];
+  splits.forEach(members => {
+    const enabled = members.filter(editor => editor.querySelector('[name="target_enabled"]').checked);
+    const shares = enabled.length ? distributeRouteShares(enabled.map(() => 1)) : [];
+    members.forEach(editor => editor.querySelector('[name="target_weight"]').value = 0);
+    enabled.forEach((editor, index) => { editor.querySelector('[name="target_weight"]').value = shares[index]; });
+  });
+}
+/// A group is named by the order it carries traffic in — the first group carries
+/// it, the rest wait — while its number stays next to that name.
+function routeGroupName(position) {
+  return position === 1 ? 'Priority 1 · carries the traffic' : `Priority ${position} · standby`;
+}
+/// Groups are what `failover` reads, so the move control belongs to that mode, and it is
+/// only offered where there is another group to move a destination into — otherwise the
+/// list would be a control that cannot do anything.
+function routeGroupFieldVisible(editor) {
+  if (routeMode() !== 'failover') return false;
+  return routeGroupCount > 1 && routeGroupMembers().some(group => group.position !== routeGroupValue(editor));
+}
 /// Shown under the mode choice so the difference between the two is stated in
 /// words instead of being inferred from the editor's layout.
 function renderRouteModeEffect() {
@@ -2390,66 +2470,130 @@ function renderRouteModeEffect() {
     ? 'Shares are exact percentages inside one priority group and must total 100% there. Setting a share to 0% turns that destination off.'
     : 'Shares are exact percentages and must total 100%. Setting a share to 0% turns that destination off.';
 }
-/// Priority numbers are the console's own ordering rather than a copy of the
-/// stored value: groups read as Priority 1, 2, 3 … in the order they carry
-/// traffic, and a group can always be added below the last one.
-function refreshPrioritySelects() {
-  const editors = routeTargetEditors();
-  const highest = editors.reduce((max, editor) => Math.max(max, routePriorityValue(editor)), 1);
-  editors.forEach(editor => {
-    const select = editor.querySelector('[name="target_priority"]');
-    const current = routePriorityValue(editor);
-    select.replaceChildren(...Array.from({length: highest + 1}, (_, index) => {
-      const priority = index + 1;
-      return new Option(priority === 1 ? 'Priority 1 · First' : `Priority ${priority} · Standby`, String(priority));
-    }));
-    select.value = String(current);
-  });
+/// A route that can hand one conversation to more than one upstream is a boundary of
+/// the mode rather than a fault in it: the destinations have to accept the same
+/// conversation history, and Yabane cannot know whether they do. The note states that
+/// boundary where the decision is made — as a condition to confirm, not as a warning
+/// about a defect — and leaves the save untouched.
+function renderRouteModeNote() {
+  $('#route-mode-note').hidden = !routeHasSeveralUpstreams();
 }
-/// The destinations of each priority group, keyed by the group's position.
-function routePriorityGroups() {
-  const groups = new Map();
-  routeTargetEditors().forEach(editor => {
-    const priority = routePriorityValue(editor);
-    if (!groups.has(priority)) groups.set(priority, []);
-    groups.get(priority).push(editor);
-  });
-  return [...groups.entries()].sort((left, right) => left[0] - right[0]);
-}
+/// Every group's enabled traffic, keyed by position, in the order traffic uses them.
 function routeGroupTotals() {
   const totals = new Map();
   routeTargetEditors().forEach(editor => {
     if (!editor.querySelector('[name="target_enabled"]').checked) return;
-    const priority = routePriorityValue(editor);
-    totals.set(priority, (totals.get(priority) || 0) + Number(editor.querySelector('[name="target_weight"]').value || 0));
+    const position = routeGroupValue(editor);
+    totals.set(position, (totals.get(position) || 0) + Number(editor.querySelector('[name="target_weight"]').value || 0));
   });
   return [...totals.entries()].sort((left, right) => left[0] - right[0]);
 }
-/// Reads in the order traffic will use the groups: one heading per group, the
-/// destinations that share it below, so a standby group never looks like part of
-/// the rotation above it.
+/// Which group each destination may move to: the groups other than its own, named
+/// the way the group headings name them. A destination is moved through this list
+/// instead of being assigned a number, so two destinations can never both be moved
+/// into a group that nothing carries before, and the first group cannot disappear.
+function refreshRouteGroupSelects() {
+  const failover = routeMode() === 'failover';
+  routeTargetEditors().forEach(editor => {
+    const field = editor.querySelector('.route-group-field');
+    const select = field.querySelector('[name="target_group"]');
+    const current = routeGroupValue(editor);
+    const choices = Array.from({length: Math.max(routeGroupCount, current)}, (_, index) => index + 1).filter(position => position !== current);
+    field.hidden = !routeGroupFieldVisible(editor);
+    if (field.hidden) return;
+    select.replaceChildren(new Option('Move to group…', ''), ...choices.map(position => new Option(routeGroupName(position), String(position))));
+    select.value = '';
+  });
+  // A `weighted` route reads as one group, so a position to hold a destination back in
+  // is only offered where the groups are read.
+  $('#add-route-group').hidden = !failover;
+}
+/// A route's own groups are the same device as an Endpoint's identity groups: one
+/// section per group in the order the groups carry traffic, with the destinations that
+/// share a group inside it, so a standby group never looks like part of the rotation
+/// above it and a destination's group is the section it sits in rather than a number
+/// it was given. That is what makes moving a destination between groups a move rather
+/// than a number, so two destinations can no longer both end up in the group above the
+/// one that is left empty.
 function renderRouteGroups() {
   const container = $('#route-targets');
-  container.querySelectorAll('.route-group-head').forEach(head => head.remove());
   const editors = routeTargetEditors();
   const failover = routeMode() === 'failover';
-  editors.forEach(editor => editor.toggleAttribute('data-priority', failover));
-  if (!failover) return;
-  const ordered = [...editors].sort((left, right) => routePriorityValue(left) - routePriorityValue(right));
-  container.append(...ordered);
-  let shown = null;
-  ordered.forEach(editor => {
-    const priority = routePriorityValue(editor);
-    editor.dataset.priority = String(priority);
-    if (priority === shown) return;
-    const first = shown === null;
-    shown = priority;
+  // Reordering groups moves the list the administrator is reading, so the dialog's
+  // own scroll position is kept instead of jumping back to the top.
+  const scrolled = routeDialog.scrollTop;
+  // A destination belongs to the container rather than to the section it was last
+  // drawn in, so the frame is taken off before anything reads the destinations.
+  // Reading membership while they were still inside a detached section would find
+  // no destination at all, and every group would then read as empty.
+  container.querySelectorAll('.route-group').forEach(section => section.remove());
+  container.append(...editors);
+  if (!failover) {
+    refreshRouteGroupSelects();
+    routeDialog.scrollTop = scrolled;
+    return;
+  }
+  collapseRouteGroups();
+  const groups = routeGroupMembers();
+  groups.forEach((group, index) => {
+    const section = document.createElement('section');
+    section.className = 'route-group';
+    section.dataset.position = String(group.position);
+    section.dataset.tone = index === 0 ? 'first' : 'standby';
+    const explanation = index === 0
+      ? 'Carries the traffic while a destination in this group can serve.'
+      : 'Used only while every destination above it is cooling down.';
+    // The order of the groups is what the editor decides, so the buttons that change
+    // it sit on the group itself and travel with its destinations. An empty position
+    // can only be filled or removed, so it has no order to change.
+    const tools = group.members.length
+      ? `<output class="route-group-total" data-position="${group.position}" aria-live="polite"></output><button type="button" class="icon-button route-group-step" data-action="up" data-position="${group.position}" aria-label="Move Priority ${group.position} above the group before it"${index === 0 ? ' disabled' : ''}>${icon('chevron-up')}</button><button type="button" class="icon-button route-group-step" data-action="down" data-position="${group.position}" aria-label="Move Priority ${group.position} below the group after it"${index === groups.length - 1 ? ' disabled' : ''}>${icon('chevron-down')}</button>`
+      : `<button type="button" class="icon-button route-group-remove" data-action="remove" data-position="${group.position}" aria-label="Remove Priority ${group.position}">${icon('close')}</button>`;
     const head = document.createElement('div');
     head.className = 'route-group-head';
-    head.dataset.tone = first ? 'first' : 'standby';
-    head.innerHTML = `<strong>Priority ${priority}</strong><small>${first ? 'Carries the traffic while a destination in this group can serve.' : 'Used only while every destination above it is cooling down.'}</small><output class="route-group-total" data-priority="${priority}" aria-live="polite"></output>`;
-    container.insertBefore(head, editor);
+    head.innerHTML = `<div class="route-group-title"><span class="route-group-name"><strong>Priority ${group.position}</strong><span class="route-group-role">${index === 0 ? 'First' : 'Standby'}</span></span><small>${explanation}</small></div><div class="route-group-tools">${tools}</div>`;
+    section.append(head);
+    // A group is a position a destination is moved to, so an empty one is filled or
+    // removed and says which of the two it is waiting for.
+    if (!group.members.length) {
+      const empty = document.createElement('p');
+      empty.className = 'route-group-empty';
+      empty.textContent = 'No destinations in this group yet. Move one here with a destination’s Group list, or remove this group.';
+      section.append(empty);
+    }
+    section.append(...group.members);
+    container.append(section);
   });
+  refreshRouteGroupSelects();
+  routeDialog.scrollTop = scrolled;
+}
+/// A group is a position, so moving it swaps every destination in the two groups at
+/// once, and a move between groups shares both of them out again instead of leaving a
+/// total to be repaired by hand.
+function moveRouteGroup(position, action) {
+  if (action === 'remove') {
+    routeTargetEditors().forEach(editor => { if (routeGroupValue(editor) > position) setRouteGroup(editor, routeGroupValue(editor) - 1); });
+    routeGroupCount -= 1;
+    routePendingGroup = false;
+  } else {
+    const target = position + (action === 'up' ? -1 : 1);
+    routeTargetEditors().forEach(editor => {
+      if (routeGroupValue(editor) === position) setRouteGroup(editor, target);
+      else if (routeGroupValue(editor) === target) setRouteGroup(editor, position);
+    });
+  }
+  renderRouteGroups();
+  validateRouteSplit();
+}
+/// Moving a destination between groups leaves the split it joined for another one,
+/// so both groups are shared out again before the order is read back.
+function moveRouteTarget(editor, position) {
+  const previous = routeGroupValue(editor);
+  if (!position || position === previous) return;
+  setRouteGroup(editor, position);
+  rebalanceRouteGroup(previous);
+  rebalanceRouteGroup(position);
+  updateRouteTargetMode(false);
 }
 function distributeRouteShares(weights) {
   const count = weights.length;
@@ -2488,14 +2632,20 @@ function validateRouteSplit() {
   let validTotal;
   if (failover) {
     // A standby group is not a slice of the group above it: each group splits
-    // its own 100%, exactly as an Endpoint's priority groups do.
+    // its own 100%, exactly as an Endpoint's priority groups do. A group whose
+    // destinations are all turned off carries nothing and is simply left out of the
+    // route, but a position created for a destination to be moved into is a plan
+    // still waiting to be finished, so it holds the save until it is filled or
+    // removed, the same way an empty group does for an Endpoint's identities.
     const totals = routeGroupTotals();
-    validTotal = totals.length > 0 && totals.every(([, total]) => total === 100);
-    const printed = totals.length ? totals.map(([priority, total]) => `Priority ${priority} ${total}%`).join(' · ') : 'no destination is on';
-    summary.innerHTML = `Each priority group splits its own 100% <b id="route-split-total">${escapeHtml(printed)}</b>`;
+    const waiting = routeGroupMembers().some(group => !group.members.length);
+    validTotal = totals.length > 0 && totals.every(([, total]) => total === 100) && !waiting;
+    const printed = totals.length ? totals.map(([position, total]) => `Priority ${position} ${total}%`).join(' · ') : 'no destination is on';
+    summary.innerHTML = `<b id="route-split-total">${escapeHtml(printed)}</b>`;
     const totalLabel = $('#route-split-total');
+    const label = waiting ? 'Every priority group must hold a destination or be removed' : validTotal ? 'Every priority group totals 100%' : `A priority group does not total 100%: ${printed}`;
     totalLabel.classList.toggle('invalid', !validTotal);
-    totalLabel.setAttribute('aria-label', validTotal ? 'Every priority group totals 100%' : `A priority group does not total 100%: ${printed}`);
+    totalLabel.setAttribute('aria-label', label);
   } else {
     const total = editors.reduce((sum, editor) => sum + Number(editor.querySelector('[name="target_weight"]').value || 0), 0);
     validTotal = total === 100;
@@ -2505,9 +2655,14 @@ function validateRouteSplit() {
     totalLabel.setAttribute('aria-label', multiple && !validTotal ? `Invalid traffic total: ${total}%` : `Traffic total: ${total}%`);
   }
   $$('#route-targets .route-group-total').forEach(output => {
-    const total = routeGroupTotals().find(([priority]) => priority === Number(output.dataset.priority))?.[1] || 0;
-    output.textContent = `${total}% of this group`;
-    output.classList.toggle('invalid', total !== 100);
+    const position = Number(output.dataset.position);
+    const total = routeGroupTotals().find(([group]) => group === position)?.[1] || 0;
+    // A group whose destinations are all turned off carries nothing, so it is not a
+    // distribution to repair: marking it invalid would claim a fault where the route
+    // simply sends no traffic through that group.
+    const carries = routeTargetEditors().some(editor => routeGroupValue(editor) === position && editor.querySelector('[name="target_enabled"]').checked);
+    output.textContent = `${total}%`;
+    output.classList.toggle('invalid', carries && total !== 100);
   });
   // A pinned destination is incomplete until it names the identity it must use;
   // without one, saving would silently fall back to the Endpoint's own choice.
@@ -2517,6 +2672,7 @@ function validateRouteSplit() {
     return identityMode(editor) !== 'pin' || !endpoint?.requires_credential || Boolean(destinationValue(editor, 'identity'));
   });
   $('#save-route').disabled = !hasDestinations || !validTotal;
+  renderRouteModeNote();
 }
 function updateRouteTargetMode(rebalance = false) {
   const editors = routeTargetEditors();
@@ -2526,22 +2682,17 @@ function updateRouteTargetMode(rebalance = false) {
   $('#route-targets').classList.toggle('failover', failover);
   $('#route-split-head').hidden = !multiple && !failover;
   $('#add-route-target-label').textContent = multiple ? 'Add another destination' : 'Add a destination';
-  editors.forEach(editor => { editor.querySelector('.route-priority-field').hidden = !failover; });
-  refreshPrioritySelects();
+  // The groups a `weighted` route carries are stored but never read, so the draft
+  // keeps them: switching to the other mode and back shows the same plan instead of
+  // collapsing every destination into the first group.
+  if (!failover) { routePendingGroup = false; }
   if (!multiple) {
     const input = editors[0].querySelector('[name="target_weight"]');
     input.value = 100;
   } else if (rebalance) {
     // Adding or moving a destination redistributes the split it joined, so a
-    // group never has to be repaired by hand afterwards. A weighted route has
-    // one split; a failover route has one per priority group.
-    const splits = failover ? routePriorityGroups().map(([, members]) => members) : [editors];
-    splits.forEach(members => {
-      const enabled = members.filter(editor => editor.querySelector('[name="target_enabled"]').checked);
-      const shares = enabled.length ? distributeRouteShares(enabled.map(() => 1)) : [];
-      members.forEach(editor => editor.querySelector('[name="target_weight"]').value = 0);
-      enabled.forEach((editor, index) => { editor.querySelector('[name="target_weight"]').value = shares[index]; });
-    });
+    // group never has to be repaired by hand afterwards.
+    rebalanceRouteTraffic(typeof rebalance === 'number' ? rebalance : null);
   }
   editors.forEach(editor => {
     const button = editor.querySelector('.remove-route-target');
@@ -2549,6 +2700,7 @@ function updateRouteTargetMode(rebalance = false) {
   });
   renderRouteGroups();
   renderRouteModeEffect();
+  renderRouteModeNote();
   validateRouteSplit();
 }
 function initializeRouteTarget(editor, target = null) {
@@ -2566,7 +2718,12 @@ function initializeRouteTarget(editor, target = null) {
   setIdentityMode(editor, target?.credential_id ? 'pin' : 'endpoint');
   const input = editor.querySelector('.upstream-model-input');
   if (target?.upstream_model) input.value = target.upstream_model;
-  setRoutePriority(editor, target?.priority ?? 1);
+  // The file stores a group number of its own; the editor numbers the groups that
+  // exist from the top, so what is remembered here is the position this destination
+  // holds while what the file had stays on `dataset.priority` for a save that does
+  // not touch the mode.
+  editor.dataset.priority = String(Math.max(1, Number(target?.priority) || 1));
+  setRouteGroup(editor, Math.max(1, Number(target?.priority) || 1));
   const enabled = target ? target.enabled !== false && target.weight > 0 : true;
   const weight = editor.querySelector('[name="target_weight"]');
   weight.value = target ? (enabled ? target.weight : 0) : weight.value;
@@ -2599,17 +2756,41 @@ function addRouteTargetEditor(target = null) {
   $('#route-targets').append(editor); initializeRouteTarget(editor, target);
   return editor;
 }
+/// A destination added to a `failover` route is another upstream to fall back to, so
+/// it takes a standby position of its own instead of silently splitting the group
+/// above it — unless the administrator already added a position to move one into,
+/// which is the position it fills. The group it joined is shared out again, and only
+/// that one.
+function addRouteDestination() {
+  const editor = addRouteTargetEditor();
+  if (routeMode() !== 'failover') { updateRouteTargetMode(true); return; }
+  const last = routeGroupMembers().at(-1);
+  let position;
+  if (last && !last.members.length) position = last.position;
+  else { routeGroupCount += 1; position = routeGroupCount; }
+  setRouteGroup(editor, position);
+  updateRouteTargetMode(position);
+}
 function openRouteDialog(route = null) {
   const form = $('#route-form'); form.reset(); $('#route-error').textContent = ''; editingRoutePattern = route?.pattern || null;
   setRouteMode(route?.mode === 'failover' ? 'failover' : 'weighted');
   routeDialog.querySelector('h2').textContent = route ? 'Edit model route' : 'Add model route';
   routeDialog.querySelector('.dialog-head p').textContent = route ? 'Update the public alias and its destination.' : 'Create a short alias for a Provider model.';
   $('#save-route').textContent = route ? 'Save changes' : 'Save route';
+  // The draft starts as one group holding every destination, which is what a route
+  // without priorities already is; a stored `failover` route then takes the groups
+  // it had, numbered from the top in the order they carry traffic.
+  routeGroupCount = 1;
+  routePendingGroup = false;
   const editors = $$('#route-targets .route-target-editor'); editors.slice(1).forEach(editor => editor.remove());
   if (route) {
     form.elements.pattern.value = route.pattern;
     initializeRouteTarget(editors[0], route.targets[0]);
     route.targets.slice(1).forEach(addRouteTargetEditor);
+    const stored = [...new Set(route.targets.map(target => Math.max(1, Number(target.priority) || 1)))];
+    routeGroupCount = Math.max(1, stored.length);
+    const positions = stored.sort((left, right) => left - right);
+    routeTargetEditors().forEach(editor => setRouteGroup(editor, positions.indexOf(routeSavedPriority(editor)) + 1));
   } else initializeRouteTarget(editors[0]);
   updateRouteTargetMode(false);
   const hasDestinations = Boolean(destinationValue($('#route-targets .route-target-editor'), 'endpoint'));
@@ -2621,37 +2802,55 @@ $('#models-view').addEventListener('click', event => {
   if (event.target.closest('#open-route, #empty-add-route')) openRouteDialog();
 });
 $('#route-search').addEventListener('input', renderRoutes);
-$('#add-route-target').addEventListener('click', () => { addRouteTargetEditor(); updateRouteTargetMode(true); });
+$('#add-route-target').addEventListener('click', () => { addRouteDestination(); });
+$('#add-route-group').addEventListener('click', () => {
+  routeGroupCount += 1;
+  routePendingGroup = true;
+  renderRouteGroups();
+  validateRouteSplit();
+  $('#route-targets').lastElementChild?.scrollIntoView({block: 'nearest'});
+});
+$('#route-targets').addEventListener('click', event => {
+  const groupButton = event.target.closest('.route-group-step, .route-group-remove');
+  if (groupButton) { moveRouteGroup(Number(groupButton.dataset.position), groupButton.dataset.action); return; }
+  const remove = event.target.closest('.remove-route-target');
+  if (!remove || remove.disabled) return;
+  const editor = remove.closest('.route-target-editor');
+  const position = routeGroupValue(editor);
+  editor.remove();
+  updateRouteTargetMode(routeMode() === 'failover' ? position : true);
+});
 $('#route-targets').addEventListener('input', event => {
   if (event.target.matches('[name="target_weight"]')) {
-    const wasEnabled = event.target.closest('.route-target-editor').querySelector('[name="target_enabled"]').checked;
+    const editor = event.target.closest('.route-target-editor');
+    const wasEnabled = editor.querySelector('[name="target_enabled"]').checked;
     validateRouteSplit();
-    if (wasEnabled && event.target.value !== '' && Number(event.target.value) === 0) updateRouteTargetMode(true);
+    if (wasEnabled && event.target.value !== '' && Number(event.target.value) === 0) updateRouteTargetMode(routeMode() === 'failover' ? routeGroupValue(editor) : true);
   }
   if (event.target.matches('[name="target_enabled"]')) {
     const editor = event.target.closest('.route-target-editor');
     editor.querySelector('[name="target_weight"]').value = event.target.checked ? 1 : 0;
     setRouteTargetEnabled(editor, event.target.checked);
-    updateRouteTargetMode(true);
+    updateRouteTargetMode(routeMode() === 'failover' ? routeGroupValue(editor) : true);
   }
 });
-$('#route-targets').addEventListener('click', event => {
-  const remove = event.target.closest('.remove-route-target');
-  if (!remove || remove.disabled) return;
-  remove.closest('.route-target-editor').remove(); updateRouteTargetMode(true);
-});
 $$('.close-route').forEach(button => button.addEventListener('click', () => routeDialog.close()));
-$('#route-mode-choice').addEventListener('change', () => { updateRouteTargetMode(false); });
+$('#route-mode-choice').addEventListener('change', () => {
+  // A destination is in a group in both modes; what changes is whether the group is
+  // read. Switching to `failover` therefore shows the groups the draft already has
+  // instead of collapsing every destination into the first one, and a change of mode
+  // never rewrites the other mode's split.
+  if (routeMode() === 'failover') routeGroupCount = Math.max(routeGroupCount, ...routeTargetEditors().map(routeGroupValue));
+  updateRouteTargetMode(false);
+});
 $('#route-targets').addEventListener('change', event => {
-  if (!event.target.matches('[name="target_priority"]')) return;
-  // A destination that moves between groups leaves the split it joined and
-  // joins another one, so both are shared out again instead of being left
-  // adding up to something other than 100%.
-  setRoutePriority(event.target.closest('.route-target-editor'), event.target.value);
-  updateRouteTargetMode(true);
+  if (!event.target.matches('[name="target_group"]')) return;
+  const position = Number(event.target.value);
+  if (!position) return;
+  moveRouteTarget(event.target.closest('.route-target-editor'), position);
 });
 $('#route-form').addEventListener('submit', async event => {
-  event.preventDefault(); const data = new FormData(event.target); const targets = [...event.target.querySelectorAll('.route-target-editor')].map(editor => { const {provider_id, endpoint_id, credential_id} = destinationTarget(editor); const weight = Number(editor.querySelector('[name="target_weight"]').value); return {provider_id, endpoint_id, credential_id, upstream_model: editor.querySelector('[name="upstream_model"]').value, weight, priority: routePriorityValue(editor), enabled: weight > 0}; });
+  event.preventDefault(); const data = new FormData(event.target); const failover = routeMode() === 'failover'; const targets = [...event.target.querySelectorAll('.route-target-editor')].map(editor => { const {provider_id, endpoint_id, credential_id} = destinationTarget(editor); const weight = Number(editor.querySelector('[name="target_weight"]').value); return {provider_id, endpoint_id, credential_id, upstream_model: editor.querySelector('[name="upstream_model"]').value, weight, priority: failover ? routeGroupValue(editor) : routeSavedPriority(editor), enabled: weight > 0}; });
   const response = await fetch(editingRoutePattern ? `/admin/routes/${encodeURIComponent(editingRoutePattern)}` : '/admin/routes', {method: editingRoutePattern ? 'PATCH' : 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({pattern: data.get('pattern'), mode: routeMode(), targets})});
   if (!response.ok) return showApiError(response, $('#route-error'));
   routeDialog.close(); await loadRoutes();
@@ -3366,16 +3565,16 @@ function renderApiKeyStats(target, items, totalRequests) {
   }).join('') : '<div class="activity-empty">No API key activity in this period.</div>';
 }
 function modelSuccessTone(successRate) { return successRate >= 99 ? 'model-healthy' : successRate >= 95 ? 'model-warning' : 'model-critical'; }
-function renderModelDimensionCopy() {
-  const outgoing = activityModelDimension === 'outgoing';
+function renderModelDimensionCopy(dimension = activityModelDimension) {
+  const outgoing = dimension === 'outgoing';
   $('#model-dimension-column').textContent = outgoing ? 'Outgoing model' : 'Incoming model';
   $('#model-analysis-note').textContent = outgoing
     ? 'Usage efficiency and estimated or reported value grouped by the model ID Yabane sent to the Provider. Requests without a recorded model ID are grouped as Not recorded.'
     : 'Usage efficiency and estimated or reported value grouped by the model name clients requested.';
 }
-function renderModelStats(target, items, totalRequests) {
+function renderModelStats(target, items, totalRequests, dimension = activityModelDimension) {
   $('#model-count').textContent = `${items.length.toLocaleString()} model${items.length === 1 ? '' : 's'}`;
-  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = pricedRequestCount(item); return `<tr><td data-label="${activityModelDimension === 'outgoing' ? 'Outgoing model' : 'Incoming model'}">${item.name ? `<code>${escapeHtml(item.name)}</code>` : '<span class="activity-model-unavailable">Not recorded</span>'}<small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Usage value"><strong>${formatTrackedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg · ` : ''}${costCoverageLabel(item)}</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
+  target.innerHTML = items.length ? items.map(item => { const cacheRate = item.input_tokens ? item.cached_tokens * 100 / item.input_tokens : 0; const successRate = item.requests ? (item.requests - item.errors) * 100 / item.requests : 0; const averageLatency = item.requests ? item.latency_ms / item.requests : 0; const coverage = pricedRequestCount(item); return `<tr><td data-label="${dimension === 'outgoing' ? 'Outgoing model' : 'Incoming model'}">${item.name ? `<code>${escapeHtml(item.name)}</code>` : '<span class="activity-model-unavailable">Not recorded</span>'}<small>${(item.requests * 100 / Math.max(totalRequests, 1)).toFixed(1)}% of traffic</small></td><td data-label="Requests"><strong>${item.requests.toLocaleString()}</strong></td><td data-label="Input"><strong>${compactNumber(item.input_tokens)}</strong></td><td data-label="Output"><strong>${compactNumber(item.output_tokens)}</strong></td><td data-label="Input cache hit"><span class="cache-rate"><span><i style="width:${Math.min(cacheRate, 100)}%"></i></span><strong>${cacheRate.toFixed(1)}%</strong></span><small>${compactNumber(item.cached_tokens)} tokens</small></td><td data-label="Success"><strong class="${modelSuccessTone(successRate)}">${successRate.toFixed(1)}%</strong><small>${item.errors.toLocaleString()} errors</small></td><td data-label="Avg latency"><strong>${formatDuration(Math.round(averageLatency))}</strong></td><td data-label="Usage value"><strong>${formatTrackedCost(item.cost, coverage)}</strong><small>${coverage ? `${formatCost(item.cost / coverage)} avg · ` : ''}${costCoverageLabel(item)}</small></td></tr>`; }).join('') : '<tr><td colspan="8"><div class="activity-empty">No activity in this period.</div></td></tr>';
 }
 function statusBadge(status) { const success = status >= 200 && status < 400; return `<span class="status-badge ${success ? 'success' : 'failure'}"><i></i>${status}</span>`; }
 function failureLabel(log) { return log.failure?.message || (log.status >= 400 ? `HTTP ${log.status}` : ''); }
@@ -3544,16 +3743,24 @@ async function loadActivity(requestedLogLimit) {
   }
   activityLoadPromise = (async () => {
     const range = selectedActivityRange(); const {seconds, since, until, bucketCount, pageUntil} = range; activityPageSince = since; activityPageUntil = pageUntil;
-    const statsParams = addActivityFilterParams(new URLSearchParams({since, until, buckets: bucketCount, model_dimension: activityModelDimension}));
+    // The column label, its explanation, and the rows are one answer: they are rendered from the
+    // dimension this request asked for, never from whichever grouping is selected by the time the
+    // response is parsed. A refresh started before a grouping switch must not label its rows with
+    // the grouping the operator just chose.
+    const dimension = activityModelDimension;
+    const statsParams = addActivityFilterParams(new URLSearchParams({since, until, buckets: bucketCount, model_dimension: dimension}));
     const logsParams = addActivityFilterParams(new URLSearchParams({since, until: pageUntil, limit: logLimit}));
     const [stats, logs] = await Promise.all([fetch(`/admin/activity/stats?${statsParams}`).then(response => response.json()), fetch(`/admin/activity/logs?${logsParams}`).then(response => response.json())]);
+    // A response whose grouping is no longer selected must not paint: its label, explanation, and
+    // rows would otherwise describe a different grouping than the one the operator chose.
+    if (dimension !== activityModelDimension) return;
     activityOverviewLogs = logs; activityLogsLimit = logLimit;
     const totals = {input: stats.input_tokens, output: stats.output_tokens, cached: stats.cached_tokens, cost: stats.cost, priced: pricedRequestCount(stats), reported_requests: stats.reported_requests || 0, estimated_requests: stats.estimated_requests || 0, latency: stats.latency_ms, success: stats.successful, streaming: stats.streaming};
     const buckets = stats.buckets; const requests = stats.requests; const totalTokens = totals.input + totals.output;
     $('#stat-requests').textContent = compactNumber(requests); $('#stat-streaming').textContent = compactNumber(totals.streaming); $('#stat-input').textContent = compactNumber(totals.input); $('#stat-output').textContent = compactNumber(totals.output); $('#stat-cached').textContent = compactNumber(totals.cached); $('#stat-total-tokens').textContent = compactNumber(totalTokens);
     $('#stat-success-rate').textContent = `${requests ? (totals.success * 100 / requests).toFixed(1) : '0.0'}%`; $('#stat-errors').textContent = `${(requests - totals.success).toLocaleString()} error${requests - totals.success === 1 ? '' : 's'}`; $('#stat-cache-rate').textContent = `${totals.input ? (totals.cached * 100 / totals.input).toFixed(1) : '0.0'}%`; $('#stat-cost').textContent = formatTrackedCost(totals.cost, totals.priced); $('#stat-cost-coverage').textContent = costCoverageLabel(totals, requests); $('#stat-latency').textContent = formatDuration(requests ? Math.round(totals.latency / requests) : 0);
     $('#requests-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests), '#0b57d0'); $('#tokens-spark').innerHTML = sparkline(buckets.map(bucket => bucket.tokens), '#7c4dff'); $('#success-spark').innerHTML = sparkline(buckets.map(bucket => bucket.requests ? bucket.successful / bucket.requests : 0), '#00a67e'); $('#latency-spark').innerHTML = sparkline(buckets.map(bucket => bucket.samples ? bucket.latency / bucket.samples : 0), '#168c9a'); $('#cache-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cached), '#00897b'); $('#cost-spark').innerHTML = sparkline(buckets.map(bucket => bucket.cost), '#ff8f00');
-    renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelDimensionCopy(); renderModelStats($('#model-stats'), stats.by_model, requests);
+    renderActivityChart(buckets, seconds); renderProviderStats($('#provider-stats'), stats.by_provider, requests); renderApiKeyStats($('#api-key-stats'), stats.by_api_key || [], requests); renderModelDimensionCopy(dimension); renderModelStats($('#model-stats'), stats.by_model, requests, dimension);
     $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
     activityFilterOptions = stats.filter_options || {providers: [], models: [], api_keys: []};
     renderActivityFilterOptions();
@@ -3677,7 +3884,6 @@ $('#model-dimension-picker').addEventListener('click', event => {
   if (!button || button.dataset.modelDimension === activityModelDimension) return;
   activityModelDimension = button.dataset.modelDimension;
   $$('#model-dimension-picker button').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
-  renderModelDimensionCopy();
   reloadActivityOverview();
 });
 $('#refresh-activity').addEventListener('click', resetAndLoadActivity);

@@ -97,6 +97,10 @@ for (const project of projects) {
     // can end a cooldown the console already fetched instead of only changing it
     // across a reload.
     const providerRuntimeFixture = {chatgptAccountCooldown: 90};
+    // Group numbers that drifted apart in the file, delivered by a Provider read the test
+    // awaits instead of edited in memory, so the reload that follows a save cannot replace
+    // them behind the dialog that is being asserted.
+    let tieredPriorityDrift = null;
     await page.route('**/admin/providers', async route => {
       if (route.request().method() !== 'GET') return route.continue();
       const response = await route.fetch();
@@ -151,6 +155,11 @@ for (const project of projects) {
         discovered_models: ['tiered-model'], model_endpoints: {'tiered-model': ['pool', 'open']}, model_endpoint_preferences: [],
         models_discovered_at: 1, model_discovery_error: null,
       });
+      // A read can also carry group numbers that drifted apart, which is what the
+      // distribution dialog has to normalise; the drift is applied to the assembled
+      // list so it follows the same path every other read takes.
+      const tieredFixture = tieredPriorityDrift && body.find(provider => provider.id === 'ui-tiered');
+      if (tieredFixture) tieredFixture.endpoints[0].credentials.forEach((credential, index) => { credential.priority = tieredPriorityDrift[index]; });
       await route.fulfill({response, json: body});
     });
     await page.route('**/admin/activity/logs*', async route => {
@@ -1034,13 +1043,11 @@ for (const project of projects) {
       // A group number is a position in the console, not a fact about the file: a
       // distribution whose stored numbers drifted apart (or lost their lowest one)
       // must still show Priority 1 first, must still be able to create a group below
-      // it, and must write those positions back when it is saved.
-      await page.evaluate(() => {
-        const endpoint = providers.find(provider => provider.id === 'ui-tiered').endpoints[0];
-        endpoint.credentials[0].priority = 4;
-        endpoint.credentials[1].priority = 9;
-        renderProviderPage();
-      });
+      // it, and must write those positions back when it is saved. The drifted numbers
+      // arrive with a Provider read the test awaits, so the reload that saving performs
+      // cannot overwrite them the way an in-memory edit could.
+      tieredPriorityDrift = [4, 9];
+      await page.evaluate(() => loadProviders());
       const driftedPool = await page.locator('.endpoint-card').first().locator('.endpoint-pool').textContent();
       if (!driftedPool.includes('Traffic always uses Priority 1 first (Primary account)')) throw new Error(`${project.name}: a stored group number changes which group the pool calls first (${driftedPool})`);
       await page.locator('.endpoint-card').first().getByRole('button', {name: 'Distribute traffic'}).click();
@@ -1347,19 +1354,70 @@ for (const project of projects) {
       await editableFailoverRow.locator('.edit-route').click();
       await assertDialog(page, '#route-dialog', project.name);
       if (!(await page.locator('#route-mode-choice input[value="failover"]').isChecked())) throw new Error(`${project.name}: editing a failover rule does not open it in failover mode`);
-      const priorityFields = page.locator('#route-targets .route-priority-field');
-      if (await priorityFields.count() !== await page.locator('#route-targets .route-target-editor').count() || await priorityFields.first().isHidden()) throw new Error(`${project.name}: a failover rule does not offer a priority for every destination`);
-      const priorityValues = await page.locator('#route-targets [name="target_priority"]').evaluateAll(selects => selects.map(select => select.value));
+      const groupFields = page.locator('#route-targets .route-group-field');
+      if (await groupFields.count() !== await page.locator('#route-targets .route-target-editor').count() || await groupFields.first().isHidden()) throw new Error(`${project.name}: a failover rule does not offer a group for every destination`);
+      const priorityValues = await page.locator('#route-targets .route-target-editor').evaluateAll(editors => editors.map(editor => editor.dataset.group));
       if (priorityValues.join(',') !== '1,2') throw new Error(`${project.name}: reopening a failover rule loses its priority groups (${priorityValues.join(',')})`);
+
       const groupHeads = await page.locator('#route-targets .route-group-head strong').allTextContents();
       if (groupHeads.join(',') !== 'Priority 1,Priority 2') throw new Error(`${project.name}: the editor does not present the groups in the order they carry traffic (${groupHeads.join(',')})`);
       const editorOverflow = await page.locator('#route-targets').evaluate(element => element.scrollWidth > element.clientWidth + 1);
       if (editorOverflow) throw new Error(`${project.name}: the failover destination row overflows the route dialog`);
       const labelsFit = await page.locator('#route-targets .route-target-row .field-label').evaluateAll(labels => labels.every(label => label.scrollWidth <= label.clientWidth + 1));
       if (!labelsFit) throw new Error(`${project.name}: route field labels overlap adjacent controls`);
+      // Provider and Endpoint are read as one destination, so their pickers split the
+      // width of the card instead of sharing one narrow column: a stored Provider name
+      // that only fits when truncated makes the choice unreadable.
+      const destinationSpan = await page.locator('#route-targets .route-target-editor').first().evaluate(node => {
+        const style = getComputedStyle(node);
+        const box = node.getBoundingClientRect();
+        const available = box.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) - parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth);
+        return {field: node.querySelector('.route-destination-field').getBoundingClientRect().width, available};
+      });
+      if (destinationSpan.field < destinationSpan.available - 2) throw new Error(`${project.name}: the destination block takes ${Math.round(destinationSpan.field)}px of its card's ${Math.round(destinationSpan.available)}px, leaving the Provider and Endpoint pickers in a narrow column`);
+      const truncatedPickers = await page.locator('#route-targets .route-target-editor').first().locator('.route-destination-field .picker-value').evaluateAll(values => values.filter(value => value.scrollWidth > value.clientWidth + 1).map(value => value.textContent.trim()));
+      if (truncatedPickers.length) throw new Error(`${project.name}: a chosen Provider or Endpoint is cut off in the destination block (${JSON.stringify(truncatedPickers)})`);
       const separatedModel = await page.locator('#route-targets .route-target-row').first().evaluate(row => row.querySelector('.route-model-field').getBoundingClientRect().bottom <= row.querySelector('.route-weight-field').getBoundingClientRect().top);
       if (!separatedModel) throw new Error(`${project.name}: model and traffic controls share the same crowded row`);
-      if ((await page.locator('.route-group-total').allTextContents()).some(text => text !== '100% of this group')) throw new Error(`${project.name}: group totals are missing from their group headings`);
+      if ((await page.locator('.route-group-total').allTextContents()).some(text => text !== '100%')) throw new Error(`${project.name}: group totals are missing from their group headings`);
+      // A destination is moved between groups through its own group list, and the
+      // group it leaves is closed instead of being left behind holding the position
+      // above the group that received it — the reported defect was that moving the
+      // first destination down left both destinations in one group with none left
+      // carrying the traffic first.
+      const groupsInOrder = () => page.locator('#route-targets .route-group').evaluateAll(sections => sections.map(section => [...section.querySelectorAll('.route-target-editor')].map(editor => ({model: editor.querySelector('[name="upstream_model"]').value, group: editor.dataset.group, weight: editor.querySelector('[name="target_weight"]').value}))));
+      const opened = await groupsInOrder();
+      if (opened.length !== 2 || opened.some(group => group.length !== 1)) throw new Error(`${project.name}: a failover rule does not open with one destination per group (${JSON.stringify(opened)})`);
+      await page.locator('#route-targets .route-group').first().locator('[name="target_group"]').selectOption('2');
+      const moved = await groupsInOrder();
+      if (moved.length !== 1) throw new Error(`${project.name}: moving the only destination of a group leaves the group behind (${moved.length} groups)`);
+      if (moved[0].length !== 2) throw new Error(`${project.name}: the moved destination does not join the group it was moved to (${JSON.stringify(moved)})`);
+      if (moved[0].map(entry => entry.model).sort().join() !== opened.flat().map(entry => entry.model).sort().join()) throw new Error(`${project.name}: moving a destination between groups loses one of them (${JSON.stringify(moved)})`);
+      if (moved[0].some(entry => entry.weight !== '50')) throw new Error(`${project.name}: a group that gained a destination does not share its own 100% (${JSON.stringify(moved)})`);
+      if ((await page.locator('#route-targets .route-group-total').allTextContents()).join() !== '100%') throw new Error(`${project.name}: a group that received a destination does not state its own total`);
+      // One group is not a choice, so the list that moves a destination between
+      // groups is not offered while there is nowhere to move it to.
+      if (await page.locator('#route-targets .route-group-field').first().isVisible()) throw new Error(`${project.name}: a single group still offers a list of groups to move a destination to`);
+      if (await page.locator('#save-route').isDisabled()) throw new Error(`${project.name}: a repaired failover split cannot be saved`);
+      // A standby group is a position to move a destination into, and the arrows
+      // reorder the groups themselves so the destinations travel with their group.
+      await page.locator('#add-route-group').click();
+      const standby = await page.locator('#route-targets .route-group').count();
+      if (standby !== 2 || !(await page.locator('#route-targets .route-group').last().locator('.route-group-empty').count())) throw new Error(`${project.name}: adding a standby group does not add a position to move a destination into`);
+      if (!(await page.locator('#save-route').isDisabled())) throw new Error(`${project.name}: a group waiting for its first destination can be saved`);
+      await page.locator('#route-targets .route-group').first().locator('[name="target_group"]').first().selectOption('2');
+      const arranged = await groupsInOrder();
+      if (arranged.length !== 2 || arranged.some(group => group.length !== 1)) throw new Error(`${project.name}: moving a destination into the new group does not fill it (${JSON.stringify(arranged)})`);
+      await page.locator('.route-group-step[data-action="down"]').first().click();
+      const swapped = await groupsInOrder();
+      if (swapped.map(group => group[0].model).join() !== arranged.map(group => group[0].model).reverse().join()) throw new Error(`${project.name}: the group arrows do not swap the two groups (${JSON.stringify(swapped)})`);
+      // The draft keeps its groups while the other mode is shown, so switching modes
+      // and back does not collapse the plan the administrator just arranged.
+      await page.locator('#route-mode-choice input[value="weighted"]').check();
+      if (await page.locator('#route-targets .route-group-field').first().isVisible()) throw new Error(`${project.name}: a weighted rule offers a group the mode never reads`);
+      await page.locator('#route-mode-choice input[value="failover"]').check();
+      const kept = await groupsInOrder();
+      if (JSON.stringify(kept) !== JSON.stringify(swapped)) throw new Error(`${project.name}: switching modes collapses the planned groups (${JSON.stringify(kept)})`);
       const policyDetails = page.locator('#route-targets .route-policy-details').first();
       if (await policyDetails.getAttribute('open') !== null) throw new Error(`${project.name}: repeated policy details start expanded`);
       await policyDetails.locator('summary').click();
@@ -1529,6 +1587,43 @@ for (const project of projects) {
     await page.locator('#route-targets [name="target_enabled"]').nth(1).uncheck();
     if (!(await page.locator('#save-route').isDisabled()) || await page.locator('#route-split-total').textContent() !== '0%') throw new Error(`${project.name}: route permits every target to be turned off`);
     await page.locator('#route-dialog .close-route').first().click();
+    await page.locator('#route-dialog').waitFor({state: 'hidden'});
+    // A route that can hand one conversation to more than one Endpoint says so next
+    // to the mode, in both modes, because a failover destination receives the
+    // conversation as soon as a cooldown moves the traffic. The statement follows
+    // the traffic that actually exists, so a destination that is empty, off, or
+    // holds no share yet does not make the route a split.
+    await page.evaluate(() => document.querySelector('#open-route').click());
+    await assertDialog(page, '#route-dialog', project.name);
+    const modeNote = page.locator('#route-mode-note');
+    const destinationEditor = index => page.locator('#route-targets .route-target-editor').nth(index);
+    const chooseDestination = async (index, provider, endpoint) => {
+      const field = destinationEditor(index);
+      await field.locator('.route-provider .picker-trigger').click();
+      await field.locator('.route-provider .picker-option', {hasText: provider}).click();
+      await field.locator('.route-endpoint .picker-trigger').click();
+      await field.locator('.route-endpoint .picker-option', {hasText: endpoint}).click();
+    };
+    await chooseDestination(0, 'UI plain fixture', 'main');
+    if (await modeNote.isVisible()) throw new Error(`${project.name}: one destination is already described as a conversation split`);
+    // Two destinations on one Provider and Endpoint are the same upstream by
+    // construction, so no conversation can move and there is nothing to confirm.
+    await page.locator('#add-route-target').click();
+    await chooseDestination(1, 'UI plain fixture', 'main');
+    if (await modeNote.isVisible()) throw new Error(`${project.name}: destinations sharing one Provider and Endpoint are described as a conversation split`);
+    await chooseDestination(1, 'UI keyless fixture', 'local');
+    if (!(await modeNote.isVisible())) throw new Error(`${project.name}: two destinations that can both receive traffic do not state that a conversation can move between them`);
+    const noteText = (await modeNote.textContent()).replace(/\s+/g, ' ').trim();
+    if (!noteText.includes('different Provider or Endpoint') || !noteText.includes('reasoning') || !noteText.includes('interchangeable')) throw new Error(`${project.name}: the conversation-continuity note does not name what the operator has to confirm (${noteText})`);
+    if (await page.locator('#save-route').isDisabled()) throw new Error(`${project.name}: the conversation-continuity note blocks saving a valid split`);
+    await destinationEditor(1).locator('[name="target_enabled"]').uncheck();
+    if (await modeNote.isVisible()) throw new Error(`${project.name}: turning a destination off still describes the route as a conversation split`);
+    await destinationEditor(1).locator('[name="target_enabled"]').check();
+    await page.locator('#route-mode-choice input[value="failover"]').check();
+    if (!(await modeNote.isVisible())) throw new Error(`${project.name}: a failover route that switches destinations does not state that a conversation can move between them`);
+    await page.locator('#route-mode-choice input[value="weighted"]').check();
+    await page.locator('#route-dialog .close-route').first().click();
+    await page.locator('#route-dialog').waitFor({state: 'hidden'});
     // A destination that pins an identity keeps it when the route is reopened: the
     // decision is read against the chosen Endpoint, so it can never be reset by the
     // empty destination that exists before the pickers are rendered.
@@ -1809,10 +1904,34 @@ for (const project of projects) {
     const modelDimensionPicker = page.locator('#model-dimension-picker');
     if (!(await modelDimensionPicker.isVisible()) || await page.locator('#model-dimension-column').textContent() !== 'Incoming model' || !(await page.locator('#model-analysis-note').textContent()).includes('clients requested')) throw new Error(`${project.name}: Model analysis does not offer grouping by the incoming or outgoing model name`);
     if (await modelDimensionPicker.locator('[data-model-dimension="incoming"]').getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Model analysis does not start grouped by the model name clients requested`);
+    // A refresh that was already in flight when the grouping changed must not paint its
+    // rows under the newly selected label: the column name, its explanation, and the rows
+    // are one answer, so a pending switch keeps describing the grouping it is replacing.
+    let holdingOutgoingStats = false;
+    const statsRoute = '**/admin/activity/stats*';
+    await page.route(statsRoute, async route => {
+      if (holdingOutgoingStats && new URL(route.request().url()).searchParams.get('model_dimension') === 'outgoing') await new Promise(resolve => setTimeout(resolve, 750));
+      await route.continue();
+    });
+    const groupingState = () => page.evaluate(() => {
+      const column = document.querySelector('#model-dimension-column')?.textContent;
+      const rows = [...document.querySelectorAll('#model-stats tr')].map(row => row.querySelector('td[data-label]')?.dataset.label).filter(Boolean);
+      return {column, rows: [...new Set(rows)]};
+    });
+    holdingOutgoingStats = true;
     const outgoingStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?') && response.url().includes('model_dimension=outgoing'));
     await modelDimensionPicker.locator('[data-model-dimension="outgoing"]').click();
+    await page.waitForTimeout(200);
+    const pendingGrouping = await groupingState();
+    const expectedPendingLabel = pendingGrouping.column === 'Outgoing model' ? 'Outgoing model' : 'Incoming model';
+    // The held response is released before anything is asserted, so a failure here still
+    // leaves no request waiting behind it.
+    holdingOutgoingStats = false;
     await outgoingStats;
-    await page.waitForFunction(() => document.querySelector('#model-dimension-column')?.textContent === 'Outgoing model');
+    if (!pendingGrouping.rows.length) throw new Error(`${project.name}: Model analysis shows no rows while a grouping switch is loading, so the label cannot be checked against them`);
+    if (pendingGrouping.rows.some(label => label !== expectedPendingLabel)) throw new Error(`${project.name}: Model analysis labels rows with a grouping other than the one its column states while a switch is still loading (${JSON.stringify(pendingGrouping)})`);
+    await page.waitForFunction(() => document.querySelector('#model-dimension-column')?.textContent === 'Outgoing model' && ![...document.querySelectorAll('#model-stats tr')].some(row => row.querySelector('td[data-label]')?.dataset.label === 'Incoming model'));
+    await page.unroute(statsRoute);
     if (await modelDimensionPicker.locator('[data-model-dimension="incoming"]').getAttribute('aria-pressed') !== 'false' || !(await page.locator('#model-analysis-note').textContent()).includes('sent to the Provider')) throw new Error(`${project.name}: Model analysis does not explain grouping by the model sent to the Provider`);
     const outgoingRows = await page.locator('#model-stats tr').allTextContents();
     if (outgoingRows.some(row => row.includes('priced-alias')) || outgoingRows.filter(row => row.includes('alias-sent')).length < 1) throw new Error(`${project.name}: grouping by the sent model keeps the caller-only name or loses the sent model (${JSON.stringify(outgoingRows)})`);
