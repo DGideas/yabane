@@ -237,6 +237,18 @@ class Handler(BaseHTTPRequestHandler):
         if endpoint == 'versioned' and self.path != '/v2/chat/completions':
             # A Provider that versions its API itself has no `/v2/v1/...` route.
             self.send_response(404); self.end_headers(); return
+        if endpoint == 'ck-e2e-12345678':
+            # PROXY-64 / ENDPOINT-45: a CodeBuddy (CN) Endpoint is streaming-only and
+            # owns the client identity it sends, so record the exact request and
+            # answer as SSE.
+            with open('codebuddy-requests.jsonl', 'a') as handle:
+                handle.write(json.dumps({'path': self.path, 'headers': dict(self.headers), 'body': request}, sort_keys=True) + '\n')
+            frames = [
+                {'id': self.headers.get('x-request-id', ''), 'object': 'chat.completion.chunk', 'created': 1, 'model': request.get('model'), 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'from-codebuddy'}, 'finish_reason': None}]},
+                {'id': self.headers.get('x-request-id', ''), 'object': 'chat.completion.chunk', 'created': 1, 'model': request.get('model'), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}},
+            ]
+            body = ''.join(f'data: {json.dumps(frame)}\n\n' for frame in frames).encode() + b'data: [DONE]\n\n'
+            self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.write(body); return
         body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
@@ -253,10 +265,16 @@ extensions=$(admin -f "$base/admin/extensions")
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "request-defaults") | [.implementation, (.api_version | tostring), (.hooks | join(","))] | join(":")') == native_rust:1:upstream_request,upstream_headers ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "traffic-capture") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:upstream_exchange:true ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "codebuddy") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
 # Identity kinds belong to the Endpoint type that declares them, so the console
 # and the API describe a credential with the declaration's own words.
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai_codex") | [.label, .native, (.sign_in.device_code | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'OpenAI subscription|false|true|openai_subscription:subscription' ]]
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "anthropic") | [.label, (.native | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'Anthropic|true|secret:secret' ]]
+# A CodeBuddy (CN) Endpoint type fixes no base URL, so the administrator supplies
+# the deployment root and keeps it editable, and owns exactly one pasted secret
+# (ENDPOINT-45).
+[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "codebuddy_cn") | [(.label), (.native | tostring), (.fixed_base_url // "editable"), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'CodeBuddy (CN)|false|editable|codebuddy_api_key:secret' ]]
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "codebuddy") | [.endpoint_types[].id] | join(",")') == codebuddy_cn ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].endpoint_type_label, .endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'OpenAI subscription|https://chatgpt.com/backend-api|true|OAuth account' ]]
 # A policy stored in the earlier honored-Retry-After shape reads back as the delay
 # source it always meant, and reads back as the disabled fixed source here.
@@ -443,6 +461,48 @@ admin -f -X POST "$base/admin/providers/versioned-root/models/refresh" >/dev/nul
 versioned_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"versioned-root/versioned-model","messages":[]}')
 [[ $(printf '%s' "$versioned_call" | jq -r .endpoint) == versioned ]]
 admin -f -X DELETE "$base/admin/providers/versioned-root" >/dev/null
+
+# ENDPOINT-45 / DISCOVERY-06: a CodeBuddy (CN) Endpoint type owns its catalog
+# instead of discovering one, and keeps the administrator's own base URL, so a `/v2`
+# deployment root is reached at `/v2/chat/completions`. Its requests carry the
+# identity of the client it proxies as, never the caller's own, and a caller-declared
+# conversation boundary survives (PROXY-64).
+codebuddy_models=$(jq -r '[.[] | select(.id == "codebuddy") | .endpoint_types[].id] | join(",")' <<<"$extensions")
+[[ $codebuddy_models == codebuddy_cn ]]
+[[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"codebuddy\",\"name\":\"CodeBuddy\",\"endpoint\":{\"id\":\"cn\",\"api_type\":\"codebuddy_cn\",\"base_url\":\"http://127.0.0.1:$upstream_port/v2\",\"requires_credential\":true,\"credential_secret\":\"ck-e2e-12345678\"}}") == 204 ]]
+admin -f -X POST "$base/admin/providers/codebuddy/models/refresh" >/dev/null
+# The catalog is explicit, so it is published without asking the deployment for a
+# `/models` operation that does not exist, and the refresh is not an error.
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "codebuddy") | [(.model_discovery_error == null), (.discovered_models | length > 0)] | join(":")') == 'true:true' ]]
+: >codebuddy-requests.jsonl
+codebuddy_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' \
+  -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' \
+  -d '{"model":"codebuddy/glm-5.3","messages":[{"role":"user","content":"hi"}]}')
+# The deployment answers SSE, and Yabane returns one aggregated response to a caller
+# that asked for one.
+[[ $(printf '%s' "$codebuddy_call" | jq -r '[.object, .choices[0].message.content, .choices[0].finish_reason, .usage.total_tokens] | join("|")') == 'chat.completion|from-codebuddy|stop|7' ]]
+codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | tail -1)
+[[ $(printf '%s' "$codebuddy_request" | jq -r .path) == /v2/chat/completions ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers.authorization') == 'Bearer ck-e2e-12345678' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-user-id"]') == anonymous_12345678 ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"]') == 'CLI|2.156.0|craft|main' ]]
+# A caller cannot name an identity or a client version on this Endpoint...
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-version"] != "9.9.9"') == true ]]
+# ...while the conversation and tracing it declared are kept, and the per-exchange
+# message identifier is a fresh UUIDv7 in the shape the deployment validates.
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-conversation-id"]') == 0e37df36f0e23361ad6e1b6f1a9f11b9 ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-request-id"]') == caller-trace ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-conversation-message-id"] | test("^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$")') == true ]]
+# The deployment refuses a chat completion that does not ask for a stream, so the
+# request is prepared as one whatever the caller sent.
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.body.stream') == true ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.body.model') == glm-5.3 ]]
+# An exchange that declares no conversation is a conversation of its own.
+curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"codebuddy/kimi-k3-1","messages":[]}' >/dev/null
+[[ $(jq -r 'select(.path != null) | .headers["x-conversation-id"]' <codebuddy-requests.jsonl | tail -1) == $(jq -r 'select(.path != null) | .headers["x-conversation-message-id"]' <codebuddy-requests.jsonl | tail -1) ]]
+codebuddy_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
+[[ $(printf '%s' "$codebuddy_logs" | jq '[.[] | select(.provider == "codebuddy" and .upstream_streaming == true and .status == 200)] | length') == 2 ]]
+admin -f -X DELETE "$base/admin/providers/codebuddy" >/dev/null
 
 # A Provider model ID removes only Yabane's first `provider/` segment, so a native
 # namespace that begins with the Provider ID survives route authoring and proxying:

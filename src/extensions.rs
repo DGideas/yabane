@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
     feature = "extension-openai-subscription",
+    feature = "extension-codebuddy",
     test
 ))]
 use yabane_extension_api::{EXTENSION_API_VERSION, Extension};
@@ -220,6 +221,8 @@ impl ExtensionRegistry {
             extension_info(yabane_extension_traffic_capture::metadata())?,
             #[cfg(feature = "extension-openai-subscription")]
             extension_info(yabane_extension_openai_subscription::metadata())?,
+            #[cfg(feature = "extension-codebuddy")]
+            extension_info(yabane_extension_codebuddy::metadata())?,
         ];
         let settings = load_settings(EXTENSIONS_FILE).await?;
         #[allow(unused_mut)]
@@ -232,6 +235,12 @@ impl ExtensionRegistry {
             registry
                 .subscription_providers
                 .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        #[cfg(feature = "extension-codebuddy")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_codebuddy::ENDPOINT);
         }
         Ok(registry)
     }
@@ -247,6 +256,8 @@ impl ExtensionRegistry {
             extension_info(yabane_extension_traffic_capture::metadata()).unwrap(),
             #[cfg(feature = "extension-openai-subscription")]
             extension_info(yabane_extension_openai_subscription::metadata()).unwrap(),
+            #[cfg(feature = "extension-codebuddy")]
+            extension_info(yabane_extension_codebuddy::metadata()).unwrap(),
         ];
         #[allow(unused_mut)]
         let mut registry = Self::new(
@@ -264,6 +275,12 @@ impl ExtensionRegistry {
             registry
                 .subscription_providers
                 .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        #[cfg(feature = "extension-codebuddy")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_codebuddy::ENDPOINT);
         }
         registry
     }
@@ -630,6 +647,7 @@ async fn load_settings(path: impl AsRef<Path>) -> Result<ExtensionSettings, Stri
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
     feature = "extension-openai-subscription",
+    feature = "extension-codebuddy",
     test
 ))]
 fn extension_info(extension: Extension) -> Result<ExtensionInfo, String> {

@@ -393,13 +393,7 @@
                 },
                 "api_type": {
                   "type": "string",
-                  "enum": [
-                    "openai_compatible",
-                    "openai_chat_completions",
-                    "openai_responses",
-                    "openai_codex",
-                    "anthropic"
-                  ]
+                  "description": "Endpoint type identifier, either one Core implements or one an Extension declares. `GET /admin/endpoint-types` lists the identifiers this process currently offers."
                 },
                 "endpoint_id": {
                   "type": "string"
@@ -2890,12 +2884,7 @@
                       },
                       "api_type": {
                         "type": "string",
-                        "enum": [
-                          "openai_compatible",
-                          "openai_chat_completions",
-                          "openai_responses",
-                          "anthropic"
-                        ]
+                        "description": "Endpoint type identifier: either one Core implements or one an Extension declares. `GET /admin/endpoint-types` lists the identifiers this process currently offers together with the words, identity kinds, and sign-in flows each declaration owns. An Endpoint type whose declaration owns its base URL or sign-in flow is connected through that flow instead of this operation."
                       },
                       "base_url": {
                         "type": "string",
@@ -3127,12 +3116,7 @@
                   },
                   "api_type": {
                     "type": "string",
-                    "enum": [
-                      "openai_compatible",
-                      "openai_chat_completions",
-                      "openai_responses",
-                      "anthropic"
-                    ]
+                    "description": "Endpoint type identifier: either one Core implements or one an Extension declares. `GET /admin/endpoint-types` lists the identifiers this process currently offers together with the words, identity kinds, and sign-in flows each declaration owns. An Endpoint type whose declaration owns its base URL or sign-in flow is connected through that flow instead of this operation."
                   },
                   "base_url": {
                     "type": "string",
@@ -4300,13 +4284,7 @@
                   },
                   "api_type": {
                     "type": "string",
-                    "enum": [
-                      "openai_compatible",
-                      "openai_chat_completions",
-                      "openai_responses",
-                      "openai_codex",
-                      "anthropic"
-                    ]
+                    "description": "Endpoint type identifier, either one Core implements or one an Extension declares. Core's own types are `openai_compatible`, `openai_chat_completions`, `openai_responses`, and `anthropic`; an Extension-declared type such as `openai_codex` or `codebuddy_cn` is available whenever its Extension is enabled."
                   },
                   "base_url": {
                     "type": "string",
@@ -4500,13 +4478,7 @@
                         },
                         "api_type": {
                           "type": "string",
-                          "enum": [
-                            "openai_compatible",
-                            "openai_chat_completions",
-                            "openai_responses",
-                            "openai_codex",
-                            "anthropic"
-                          ]
+                          "description": "Endpoint type identifier, either one Core implements or one an Extension declares. `GET /admin/endpoint-types` lists the identifiers this process currently offers."
                         },
                         "endpoint_id": {
                           "type": "string"

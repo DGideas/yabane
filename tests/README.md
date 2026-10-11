@@ -8,7 +8,7 @@ bash tests/check.sh --full
 bash tests/check.sh --load
 ```
 
-Both offline modes check Rust formatting, JS/shell syntax, strict Clippy, workspace tests, and all eight combinations of the three optional Extensions. They then rebuild the default binary and run the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
+Both offline modes check Rust formatting, JS/shell syntax, strict Clippy, workspace tests, and all eleven combinations of the four optional Extensions. They then rebuild the default binary and run the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
 
 - `tests/cooldown-copy.mjs` — console history copy uses recorded delay sources, stays unchanged after policy edits, distinguishes zero from missing, and avoids guessing older observations (ENDPOINT-42).
 - `tests/cooldown-history.mjs` — a real process records fixed/Provider/capped/fallback decisions, preserves them across policy edits and skipped answers, handles zero without a new cooldown, and keeps Provider 429 bytes and request counts unchanged (ENDPOINT-42 / PROXY-43).

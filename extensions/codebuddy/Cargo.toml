@@ -1,0 +1,12 @@
+[package]
+name = "yabane-extension-codebuddy"
+version = "0.1.0"
+edition = "2024"
+description = "Tencent CodeBuddy CN Endpoint type for Yabane"
+license = "MIT"
+
+[dependencies]
+http = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v7"] }
+yabane-extension-api = { path = "../../crates/yabane-extension-api" }

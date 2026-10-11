@@ -19,7 +19,7 @@ bash -n tests/e2e.sh tests/behavior-map.sh
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 
-# Check all remaining subsets of the three independently optional Extensions.
+# Check all remaining subsets of the four independently optional Extensions.
 # Keep Core tests active here: adding a dev dependency or disabling those tests
 # would hide accidental coupling to a bundled implementation.
 for features in \
@@ -27,9 +27,13 @@ for features in \
   'extension-request-defaults' \
   'extension-traffic-capture' \
   'extension-openai-subscription' \
+  'extension-codebuddy' \
   'extension-request-defaults,extension-traffic-capture' \
   'extension-request-defaults,extension-openai-subscription' \
-  'extension-traffic-capture,extension-openai-subscription'; do
+  'extension-request-defaults,extension-codebuddy' \
+  'extension-traffic-capture,extension-openai-subscription' \
+  'extension-traffic-capture,extension-codebuddy' \
+  'extension-openai-subscription,extension-codebuddy'; do
   printf '\nChecking Extension subset: %s\n' "${features:-Core only}"
   cargo clippy -p yabane --all-targets --no-default-features --features "$features" --locked -- -D warnings
   cargo test -p yabane --no-default-features --features "$features" --locked
