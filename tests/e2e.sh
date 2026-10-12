@@ -356,7 +356,12 @@ admin -f -X DELETE "$base/admin/auth/keys/$id" >/dev/null
 [[ $(status "$base/v1/models" -H "Authorization: Bearer $secret") == 401 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"expired","expires_at":1,"provider_ids":[]}') == 400 ]]
 [[ $(admin_status -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d '{"note":"bad scope","expires_at":null,"provider_ids":["missing"]}') == 400 ]]
-short_expiry=$(($(date +%s) + 1))
+# `date +%s` truncates to a whole second, so a key that expires one second from
+# now is already in the past when the round trip takes longer than the fraction
+# of the current second that is left. Leave a margin so the key is comfortably
+# in the future when the server validates it, and still expires before the sleep
+# below is over.
+short_expiry=$(($(date +%s) + 2))
 expiring=$(admin -f -X POST "$base/admin/auth/keys" -H 'content-type: application/json' -d "{\"note\":\"Short lived\",\"expires_at\":$short_expiry,\"provider_ids\":[]}")
 expiring_secret=$(printf '%s' "$expiring" | jq -r .secret)
 expiring_id=$(printf '%s' "$expiring" | jq -r .api_key.id)
