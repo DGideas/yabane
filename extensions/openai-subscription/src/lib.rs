@@ -38,13 +38,13 @@ const CREDENTIAL_KINDS: &[ProviderCredentialKind] = &[ProviderCredentialKind {
 // and update it from pi-ai's OpenAI Codex provider catalog.
 const MODELS: &[&str] = &[
     "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
     "gpt-5.5",
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
 ];
 
 pub fn metadata() -> Extension {
@@ -618,6 +618,28 @@ mod tests {
 
     fn jwt(claims: &str) -> String {
         format!("header.{}.signature", URL_SAFE_NO_PAD.encode(claims))
+    }
+
+    /// DISCOVERY-06: this Endpoint type serves one catalog, and it mirrors pi-ai's
+    /// `openai-codex` catalog because the Codex backend has no `/models` operation
+    /// to keep it honest. GPT-5.4 and GPT-5.4 mini were removed because the backend
+    /// stopped serving them, so an entry pi-ai drops must disappear here too;
+    /// GPT-6 Sol and GPT-6 Luna must appear as soon as pi-ai adds them.
+    #[test]
+    fn the_catalog_mirrors_pi_ai_openai_codex_models() {
+        assert_eq!(
+            ENDPOINT.models(),
+            [
+                "gpt-5.3-codex-spark",
+                "gpt-5.5",
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+            ]
+        );
     }
 
     #[test]

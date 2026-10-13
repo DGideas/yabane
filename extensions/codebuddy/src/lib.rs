@@ -12,10 +12,10 @@
 //!   answered with error `11101`, so the prepared body always asks for a stream.
 //! * The service publishes no model catalog to an API-key client: `/v3/config`
 //!   reports `models: null` and there is no `/models` operation. The catalog is
-//!   therefore an explicit list maintained here, discovered over the wire rather
-//!   than guessed from model names. Its model IDs are the ones this deployment
-//!   actually serves to a key, which is why the CN catalog contains no overseas
-//!   model: those answer `11102 ... only available for authorized users`.
+//!   therefore an explicit list maintained here rather than discovered over the
+//!   wire or inferred from model names. Its model IDs are the ones this
+//!   deployment actually serves to a key, which is why the CN catalog contains no
+//!   overseas model: those answer `11102 ... only available for authorized users`.
 
 use http::{HeaderMap, HeaderName, HeaderValue, header};
 use yabane_extension_api::{
@@ -43,11 +43,10 @@ const DEFAULT_BASE_URL_HINT: &str = "https://copilot.tencent.com/v2";
 
 /// Models this deployment serves to a CodeBuddy API key.
 ///
-/// The catalog is dynamic: the service publishes it from `/v3/config` under
-/// `data.models`, and the bundled product configuration is only an offline
-/// fallback that goes stale. There is no `/models` operation, so this list is
-/// kept here explicitly and refreshed from that response rather than inferred
-/// from model names or copied from the bundled file.
+/// There is no `/models` operation, and `/v3/config` answers an API-key client
+/// with `models: null`, so this catalog is an explicit list maintained here
+/// rather than discovered over the wire or read from the bundled product
+/// configuration file, which is only an offline fallback that goes stale.
 ///
 /// The entries below are the conversational models (`craft`, `ask`, and `plan`
 /// all advertise the same set) confirmed against the live CN service. Auxiliary
@@ -384,9 +383,9 @@ mod tests {
         assert!(declaration.sign_in.is_none());
     }
 
-    /// ENDPOINT-45 / DISCOVERY-06: the service publishes no `/models` operation, so
-    /// the catalog is explicit. It must contain no overseas model and no auxiliary
-    /// model that cannot serve a chat-completions request.
+    /// ENDPOINT-45: this Endpoint type serves one catalog and it contains only the
+    /// conversational models this credential kind can call, so it offers no overseas
+    /// model and no auxiliary model that cannot serve a chat-completions request.
     #[test]
     fn the_catalog_holds_only_models_this_credential_kind_may_call() {
         let models = CodeBuddyEndpoint.models();

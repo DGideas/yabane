@@ -280,6 +280,13 @@ extensions=$(admin -f "$base/admin/extensions")
 # source it always meant, and reads back as the disabled fixed source here.
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 0,fixed ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.endpoint_types[].id] | join(",")') == openai_codex ]]
+# DISCOVERY-06: the Codex backend serves no `/models` operation, so an explicit
+# refresh publishes the Endpoint type's own catalog instead of calling one. The
+# catalog mirrors pi-ai's `openai-codex` provider catalog: a model pi-ai removed
+# because the backend stopped serving it must not be offered here, and a model
+# pi-ai added must be. GPT-5.4 and GPT-5.4 mini were removed; GPT-6 Sol and
+# GPT-6 Luna were added.
+[[ $(admin -f -X POST "$base/admin/providers/subscription-fixture/models/refresh" | jq -r '.models | join(",")') == 'gpt-5.3-codex-spark,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra,gpt-6-luna,gpt-6-sol' ]]
 # An Endpoint type that owns its own identity refuses pasted secrets, and one
 # that owns its own sign-in cannot be created through the plain Endpoint API.
 [[ $(admin_status -X POST "$base/admin/providers/subscription-fixture/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"chatgpt","name":"Pasted key","secret":"sk-not-subscription","weight":100}') == 400 ]]
