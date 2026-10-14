@@ -2576,14 +2576,66 @@ mod tests {
 
     #[cfg(feature = "extension-openai-subscription")]
     #[test]
-    fn codex_adapter_matches_pi_ai_system_prompt_and_output_limit_shape() {
-        let mut body = br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Pi system prompt"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec();
+    fn codex_adapter_preserves_leading_developer_guidance_and_removes_output_limit() {
+        let mut body = br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Client guidance"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec();
+        let original: serde_json::Value = serde_json::from_slice(&body).unwrap();
         yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["instructions"], "Pi system prompt");
-        assert_eq!(value["input"].as_array().unwrap().len(), 1);
-        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["instructions"], "You are a helpful assistant.");
+        assert_eq!(value["input"], original["input"]);
         assert!(value.get("max_output_tokens").is_none());
+    }
+
+    #[cfg(feature = "extension-openai-subscription")]
+    #[test]
+    fn codex_request_preparation_preserves_pi_mid_conversation_updates() {
+        // PROXY-17: pi keeps initial instructions outside input and sends later
+        // updates inline. Exercise the Endpoint hook, not just its body helper.
+        let request = serde_json::json!({
+            "model": "gpt-6.1-sol",
+            "instructions": "Base prompt",
+            "tools": [{"type": "function", "name": "base_tool"}],
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "function", "name": "late_tool", "parameters": {"type": "object"}}
+                ]},
+                {"role": "developer", "content": "Updated guidance"},
+                {"type": "function_call", "call_id": "call_1", "name": "late_tool", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+            ],
+            "reasoning": {"effort": "low"},
+            "prompt_cache_key": "session"
+        });
+        let mut body = serde_json::to_vec(&request).unwrap();
+        let mut headers = HeaderMap::new();
+        let mut target_path = "/v1/responses".to_owned();
+        yabane_extension_api::ProviderEndpoint::prepare_request(
+            &yabane_extension_openai_subscription::ENDPOINT,
+            yabane_extension_api::ProviderEndpointRequest {
+                headers: &mut headers,
+                body: &mut body,
+                target_path: &mut target_path,
+                credential: Some(yabane_extension_api::ProviderEndpointCredential {
+                    kind: "openai_subscription",
+                    material: yabane_extension_api::ProviderEndpointMaterial::Subscription {
+                        access_token: "access-token",
+                        account_id: "account-123",
+                    },
+                }),
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["instructions"], request["instructions"]);
+        assert_eq!(value["input"], request["input"]);
+        assert_eq!(value["tools"], request["tools"]);
+        assert_eq!(value["reasoning"], request["reasoning"]);
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(target_path, "/codex/responses");
+        assert_eq!(headers["session-id"], "session");
+        assert_eq!(headers["x-client-request-id"], "session");
     }
 
     #[cfg(feature = "extension-openai-subscription")]

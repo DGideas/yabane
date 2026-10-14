@@ -285,8 +285,8 @@ extensions=$(admin -f "$base/admin/extensions")
 # catalog mirrors pi-ai's `openai-codex` provider catalog: a model pi-ai removed
 # because the backend stopped serving it must not be offered here, and a model
 # pi-ai added must be. GPT-5.4 and GPT-5.4 mini were removed; GPT-6 Sol and
-# GPT-6 Luna were added.
-[[ $(admin -f -X POST "$base/admin/providers/subscription-fixture/models/refresh" | jq -r '.models | join(",")') == 'gpt-5.3-codex-spark,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra,gpt-6-luna,gpt-6-sol' ]]
+# GPT-6 Luna were added, and GPT-6.1 Sol joined them as pi-ai's Codex default.
+[[ $(admin -f -X POST "$base/admin/providers/subscription-fixture/models/refresh" | jq -r '.models | join(",")') == 'gpt-5.3-codex-spark,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra,gpt-6-luna,gpt-6-sol,gpt-6.1-sol' ]]
 # An Endpoint type that owns its own identity refuses pasted secrets, and one
 # that owns its own sign-in cannot be created through the plain Endpoint API.
 [[ $(admin_status -X POST "$base/admin/providers/subscription-fixture/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"chatgpt","name":"Pasted key","secret":"sk-not-subscription","weight":100}') == 400 ]]

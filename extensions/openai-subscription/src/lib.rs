@@ -45,6 +45,7 @@ const MODELS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
 ];
 
 pub fn metadata() -> Extension {
@@ -475,9 +476,10 @@ pub fn adapt_body(body: &mut Vec<u8>) {
     if let Some(object) = value.as_object_mut() {
         object.insert("store".to_owned(), serde_json::Value::Bool(false));
         object.insert("stream".to_owned(), serde_json::Value::Bool(true));
-        // The Codex backend rejects the `system` role anywhere in `input`, so
-        // every instruction message is folded into `instructions` the way
-        // pi-ai replays its transcript, whatever content shape it arrives in.
+        // Codex rejects ordinary `system` input messages. Fold only those into
+        // `instructions`; pi sends mid-conversation updates as `developer`
+        // messages and tool declarations as `additional_tools` items, which
+        // must keep their content and position even when instructions exist.
         let mut system_instructions = Vec::new();
         if let Some(input) = object
             .get_mut("input")
@@ -487,10 +489,11 @@ pub fn adapt_body(body: &mut Vec<u8>) {
                 let Some(message) = item.as_object() else {
                     return true;
                 };
-                if !matches!(
-                    message.get("role").and_then(serde_json::Value::as_str),
-                    Some("developer" | "system")
-                ) {
+                if message.get("role").and_then(serde_json::Value::as_str) != Some("system")
+                    || message
+                        .get("type")
+                        .is_some_and(|kind| kind.as_str() != Some("message"))
+                {
                     return true;
                 }
                 if let Some(text) = message
@@ -620,28 +623,6 @@ mod tests {
         format!("header.{}.signature", URL_SAFE_NO_PAD.encode(claims))
     }
 
-    /// DISCOVERY-06: this Endpoint type serves one catalog, and it mirrors pi-ai's
-    /// `openai-codex` catalog because the Codex backend has no `/models` operation
-    /// to keep it honest. GPT-5.4 and GPT-5.4 mini were removed because the backend
-    /// stopped serving them, so an entry pi-ai drops must disappear here too;
-    /// GPT-6 Sol and GPT-6 Luna must appear as soon as pi-ai adds them.
-    #[test]
-    fn the_catalog_mirrors_pi_ai_openai_codex_models() {
-        assert_eq!(
-            ENDPOINT.models(),
-            [
-                "gpt-5.3-codex-spark",
-                "gpt-5.5",
-                "gpt-5.6-luna",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-6-astra",
-                "gpt-6-luna",
-                "gpt-6-sol",
-            ]
-        );
-    }
-
     #[test]
     fn extracts_only_a_non_empty_chatgpt_account_id() {
         let token = jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-123"}}"#);
@@ -743,19 +724,71 @@ mod tests {
     }
 
     #[test]
-    fn folds_every_system_or_developer_input_message_into_instructions() {
-        let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"developer","content":"Late note."}]}"#.to_vec();
+    fn folds_only_system_input_messages_into_instructions() {
+        let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"developer","content":"Keep this update in place."},{"role":"system","content":"Late note."}]}"#.to_vec();
 
         adapt_body(&mut body);
 
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["instructions"], "Be terse.\n\nLate note.");
-        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
         assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(
+            value["input"][1],
+            serde_json::json!({"role": "developer", "content": "Keep this update in place."})
+        );
+    }
+
+    /// PROXY-17: preserve transcript updates, not merely the final set of tools
+    /// or instruction text. No model catalog lookup controls this behavior.
+    #[test]
+    fn preserves_developer_messages_and_structured_items_in_order() {
+        let input = serde_json::json!([
+            {"role": "developer", "content": "Initial guidance"},
+            {"role": "user", "content": "hello"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "Checking."}
+            ]},
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "function", "name": "late_tool", "parameters": {"type": "object"}}
+            ]},
+            {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "Use the newly available tool."}
+            ]},
+            {"type": "tool_search_call", "call_id": "search_1", "execution": "client",
+                "status": "completed", "arguments": {"query": "late_tool", "limit": 1}},
+            {"type": "tool_search_output", "call_id": "search_1", "execution": "client",
+                "status": "completed", "tools": [{"type": "function", "name": "late_tool"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "late_tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "done"},
+            {"type": "future_item", "role": "system", "content": "Not an ordinary message"}
+        ]);
+        for instructions in [None, Some(""), Some("Caller prompt")] {
+            let mut request = serde_json::json!({"model": "custom-model", "input": input});
+            if let Some(instructions) = instructions {
+                request["instructions"] = serde_json::json!(instructions);
+            }
+            let mut body = serde_json::to_vec(&request).unwrap();
+
+            adapt_body(&mut body);
+
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["input"], input);
+            assert_eq!(
+                value["instructions"],
+                instructions.unwrap_or("You are a helpful assistant.")
+            );
+            let prepared = body.clone();
+            adapt_body(&mut body);
+            assert_eq!(
+                body, prepared,
+                "a second preparation must not move or duplicate updates"
+            );
+        }
     }
 
     #[test]
-    fn caller_instructions_win_over_input_instruction_messages() {
+    fn caller_instructions_win_over_input_system_messages() {
         let mut body = br#"{"model":"gpt-6-astra","instructions":"Caller prompt","input":[{"role":"system","content":"Input prompt"},{"role":"user","content":"hello"}]}"#.to_vec();
 
         adapt_body(&mut body);
