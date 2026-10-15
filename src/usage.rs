@@ -19,6 +19,7 @@ pub struct UsageTracker {
     payload: Payload,
     usage: TokenUsage,
     protocol_failed: bool,
+    stream_ended: bool,
 }
 
 enum Payload {
@@ -33,6 +34,8 @@ struct EventStreamDecoder {
     discard_event: bool,
     /// True while skipping the remainder of a line that exceeded the cap.
     discarding_line: bool,
+    /// CR is a line ending itself; ignore a following LF, even across chunks.
+    skip_lf: bool,
 }
 
 impl UsageTracker {
@@ -49,6 +52,7 @@ impl UsageTracker {
             },
             usage: TokenUsage::default(),
             protocol_failed: false,
+            stream_ended: false,
         }
     }
 
@@ -65,10 +69,15 @@ impl UsageTracker {
             Payload::EventStream(decoder) => {
                 for event in decoder.push(chunk) {
                     self.protocol_failed |= event_reports_failure(self.protocol, &event);
+                    self.stream_ended |= event_ends_stream(self.protocol, &event);
                     merge_event_usage(self.protocol, &event, &mut self.usage);
                 }
             }
         }
+    }
+
+    pub fn stream_ended(&self) -> bool {
+        self.stream_ended
     }
 
     /// Finishes observation and returns what was seen. Taking `&mut self` lets the
@@ -102,56 +111,44 @@ impl UsageTracker {
 
 impl EventStreamDecoder {
     fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
-        self.pending.extend_from_slice(chunk);
-        self.consume_lines(false)
-    }
-
-    fn finish(&mut self) -> Vec<Vec<u8>> {
-        self.consume_lines(true)
-    }
-
-    fn consume_lines(&mut self, finish: bool) -> Vec<Vec<u8>> {
         let mut events = Vec::new();
-        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
-            if self.discarding_line {
-                // The over-long line just ended; drop it and keep reading normally.
-                // Its event is still discarded: the data already collected for it
-                // was cleared when the line was dropped.
-                self.pending.drain(..=newline);
-                self.discarding_line = false;
-                self.discard_event = false;
-                continue;
-            }
-            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.observe_line(&line, &mut events);
-        }
-        if finish {
-            if !self.pending.is_empty() {
-                let mut line = std::mem::take(&mut self.pending);
-                if line.last() == Some(&b'\r') {
-                    line.pop();
+        for &byte in chunk {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
                 }
-                self.observe_line(&line, &mut events);
             }
-            self.dispatch(&mut events);
+            if matches!(byte, b'\r' | b'\n') {
+                self.skip_lf = byte == b'\r';
+                if self.discarding_line {
+                    self.discarding_line = false;
+                    continue;
+                }
+                let line = std::mem::take(&mut self.pending);
+                self.observe_line(&line, &mut events);
+            } else if !self.discarding_line {
+                if self.pending.len() == MAX_PENDING_USAGE_BYTES {
+                    self.pending.clear();
+                    self.discarding_line = true;
+                    self.data.clear();
+                    self.discard_event = true;
+                } else {
+                    self.pending.push(byte);
+                }
+            }
         }
-        self.trim_pending();
         events
     }
 
-    /// A line longer than the cap cannot belong to a usage event, so drop it and
-    /// the event it belongs to rather than buffering traffic that cannot be read.
-    fn trim_pending(&mut self) {
-        if self.pending.len() > MAX_PENDING_USAGE_BYTES {
-            self.pending.clear();
-            self.discarding_line = true;
-            self.data.clear();
-            self.discard_event = true;
+    fn finish(&mut self) -> Vec<Vec<u8>> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.observe_line(&line, &mut events);
         }
+        self.dispatch(&mut events);
+        events
     }
 
     fn observe_line(&mut self, line: &[u8], events: &mut Vec<Vec<u8>>) {
@@ -182,12 +179,34 @@ impl EventStreamDecoder {
     }
 
     fn dispatch(&mut self, events: &mut Vec<Vec<u8>>) {
-        if !self.discard_event && !self.data.is_empty() && self.data != b"[DONE]" {
+        if !self.discard_event && !self.data.is_empty() {
             events.push(std::mem::take(&mut self.data));
         } else {
             self.data.clear();
         }
         self.discard_event = false;
+    }
+}
+
+/// Only complete SSE frames observed during forwarding prove protocol completion.
+/// Flushing a partial frame from a Drop handler must never invent that proof.
+fn event_ends_stream(protocol: Protocol, bytes: &[u8]) -> bool {
+    if protocol == Protocol::OpenAiChat && bytes == b"[DONE]" {
+        return true;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    match protocol {
+        Protocol::OpenAiChat => value.get("error").is_some_and(|error| !error.is_null()),
+        Protocol::OpenAiResponses => matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+        ),
+        Protocol::AnthropicMessages => matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("message_stop" | "error")
+        ),
     }
 }
 
@@ -362,12 +381,96 @@ mod tests {
         } else {
             panic!("expected an event-stream decoder");
         }
-        tracker.observe(b"\n");
+        tracker.observe(b"\n\n");
         tracker.observe(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n");
         let (usage, failed) = tracker.finish();
         assert_eq!(usage.input, 7);
         assert_eq!(usage.output, 3);
         assert!(!failed);
+    }
+
+    // PROXY-45 / PROXY-50: recognition is bounded, incremental, protocol-specific,
+    // and independent of both generation finish and HTTP EOF.
+    #[test]
+    fn terminal_frames_survive_every_chunk_split_and_sse_line_ending() {
+        for (protocol, data) in [
+            (Protocol::OpenAiChat, "[DONE]"),
+            (
+                Protocol::OpenAiResponses,
+                r#"{"type":"response.completed"}"#,
+            ),
+            (
+                Protocol::OpenAiResponses,
+                r#"{"type":"response.incomplete"}"#,
+            ),
+            (Protocol::AnthropicMessages, r#"{"type":"message_stop"}"#),
+        ] {
+            for ending in ["\n\n", "\r\n\r\n", "\r\r", "\r\n\n", "\n\r\n"] {
+                let frame = format!("data: {data}{ending}");
+                for split in 0..=frame.len() {
+                    let mut tracker = UsageTracker::new(protocol, true);
+                    tracker.observe(&frame.as_bytes()[..split]);
+                    tracker.observe(&frame.as_bytes()[split..]);
+                    assert!(
+                        tracker.stream_ended(),
+                        "{protocol:?}: {ending:?} split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_frames_finish_reasons_and_foreign_markers_do_not_prove_completion() {
+        for (protocol, data) in [
+            (Protocol::OpenAiChat, "data: [DONE]\n"),
+            (
+                Protocol::OpenAiChat,
+                "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            (
+                Protocol::OpenAiChat,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"[DONE]\"}}]}\n\n",
+            ),
+            (Protocol::OpenAiResponses, "data: [DONE]\n\n"),
+            (
+                Protocol::AnthropicMessages,
+                "data: {\"type\":\"response.completed\"}\n\n",
+            ),
+        ] {
+            let mut tracker = UsageTracker::new(protocol, true);
+            tracker.observe(data.as_bytes());
+            assert!(!tracker.stream_ended(), "{data}");
+            tracker.finish();
+            assert!(
+                !tracker.stream_ended(),
+                "finish must not complete a partial frame: {data}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_marker_never_hides_an_observed_protocol_failure() {
+        for data in [
+            "data: {\"error\":{\"message\":\"fixture\"}}\n\ndata: [DONE]\n\n",
+            "data: [DONE]\n\ndata: {\"error\":{\"message\":\"fixture\"}}\n\n",
+        ] {
+            let mut tracker = UsageTracker::new(Protocol::OpenAiChat, true);
+            tracker.observe(data.as_bytes());
+            assert!(tracker.stream_ended());
+            assert!(tracker.finish().1);
+        }
+    }
+
+    #[test]
+    fn overlong_event_cannot_turn_its_tail_into_a_terminal_marker() {
+        let mut tracker = UsageTracker::new(Protocol::OpenAiChat, true);
+        tracker.observe(b"data: ");
+        tracker.observe(&vec![b'x'; super::MAX_PENDING_USAGE_BYTES + 1]);
+        tracker.observe(b"\ndata: [DONE]\n\n");
+        assert!(!tracker.stream_ended());
+        tracker.observe(b"data: [DONE]\n\n");
+        assert!(tracker.stream_ended());
     }
 
     #[test]

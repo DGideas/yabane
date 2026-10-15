@@ -143,7 +143,7 @@ try {
     await pause(50);
   }
   assert.ok(record, `the disconnected request must be recorded (${serverLog})`);
-  assert.equal(record.status, 502, 'an unfinished exchange is not recorded as a success');
+  assert.equal(record.status, 499, 'an unfinished exchange is cancelled, not a Provider failure or success');
   assert.equal(record.failure?.stage, 'client');
   assert.equal(record.failure?.category, 'disconnected');
   assert.ok(record.failure.message.includes('disconnected'), record.failure.message);

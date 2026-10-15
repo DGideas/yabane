@@ -565,62 +565,129 @@ fn shutdown_failure() -> RequestFailure {
     )
 }
 
-/// Owns everything that has to be finalized exactly once when a Provider response
-/// body ends: normally, on a read or conversion failure, or because the caller
-/// disconnected mid-stream and the body was dropped before the exchange finished.
-/// The proxy builds it before the response body is created, so a caller that goes
-/// away still leaves one Activity record and one observer completion behind.
+/// Owns one terminal Activity record and one observer completion. Protocol
+/// termination and record persistence are separate: cancelling a body after its
+/// terminal output must neither invent a disconnect nor cancel its record task.
 struct StreamCompletion {
     observers: Vec<Box<dyn yabane_extension_api::UpstreamExchangeObserver>>,
     activity: Option<ProxyActivity>,
     usage: UsageTracker,
+    status: StatusCode,
     streaming: bool,
     first_byte_ms: Option<u64>,
-    completed: bool,
+    caller_stream_ended: bool,
+    failure: Option<RequestFailure>,
+}
+
+/// Owned by the detached record task, not by the cancellable response body.
+struct StreamRecordGuard;
+
+impl StreamRecordGuard {
+    fn spawn(
+        self,
+        record: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        Some(handle.spawn(async move {
+            let _record_guard = self;
+            record.await;
+        }))
+    }
+}
+
+impl Drop for StreamRecordGuard {
+    fn drop(&mut self) {
+        ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl StreamCompletion {
+    fn conversion_failed(&mut self) {
+        self.failure = Some(RequestFailure::new(
+            "upstream_stream",
+            "interrupted",
+            "Provider stream ended or could not be converted",
+        ));
+    }
+
+    fn finalize(
+        &mut self,
+        outcome: yabane_extension_api::ExchangeOutcome,
+        interruption: Option<RequestFailure>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        // Taking ownership is the single-finalization gate, on every exit path.
+        let activity = self.activity.take()?;
+        let record_guard = StreamRecordGuard;
+        complete_exchange_observers(&mut self.observers, outcome);
+        let (usage, protocol_failed) = self.usage.finish();
+        let http_error = self.status.is_client_error() || self.status.is_server_error();
+        let failure = self
+            .failure
+            .take()
+            .or_else(|| http_error.then(|| upstream_http_failure(self.status)))
+            .or_else(|| {
+                protocol_failed.then(|| {
+                    RequestFailure::new(
+                        if self.streaming {
+                            "upstream_stream"
+                        } else {
+                            "upstream_response"
+                        },
+                        "protocol_failure",
+                        if self.streaming {
+                            "Provider stream reported a failure"
+                        } else {
+                            "Provider response reported a failure"
+                        },
+                    )
+                })
+            })
+            .or(interruption);
+        let status = if http_error || failure.is_none() {
+            self.status
+        } else if failure
+            .as_ref()
+            .is_some_and(|failure| failure.stage == "client" && failure.category == "disconnected")
+        {
+            StatusCode::from_u16(499).expect("valid client cancellation status")
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        let streaming = self.streaming;
+        let first_byte_ms = self.first_byte_ms;
+        let latency_ms = activity.started.elapsed().as_millis() as u64;
+        record_guard.spawn(async move {
+            activity
+                .record_failure_at(status, usage, streaming, first_byte_ms, latency_ms, failure)
+                .await;
+        })
+    }
 }
 
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
-        if self.completed {
+        if self.activity.is_none() {
             return;
         }
-        complete_exchange_observers(
-            &mut self.observers,
-            yabane_extension_api::ExchangeOutcome::Interrupted,
-        );
-        let Some(activity) = self.activity.take() else {
-            return;
-        };
-        let (usage, _) = self.usage.finish();
-        let streaming = self.streaming;
-        let first_byte_ms = self.first_byte_ms;
-        let failure = if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
-            shutdown_failure()
+        let interruption = if self.caller_stream_ended {
+            None
+        } else if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(shutdown_failure())
         } else {
-            RequestFailure::new(
+            Some(RequestFailure::new(
                 "client",
                 "disconnected",
-                "Client disconnected before the Provider response finished",
-            )
+                "Client disconnected before the response protocol finished",
+            ))
         };
-        // Dropping the body happens on a runtime thread, but the Activity store
-        // still has to be written, so the record is spawned rather than skipped.
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return;
+        let outcome = if self.caller_stream_ended && self.failure.is_none() {
+            yabane_extension_api::ExchangeOutcome::Complete
+        } else {
+            yabane_extension_api::ExchangeOutcome::Interrupted
         };
-        handle.spawn(async move {
-            activity
-                .record_failure(
-                    StatusCode::BAD_GATEWAY,
-                    usage,
-                    streaming,
-                    first_byte_ms,
-                    failure,
-                )
-                .await;
-            ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
+        // Dropping the JoinHandle detaches the record task; shutdown still waits
+        // for its guard. A terminal/error result takes precedence over cancellation.
+        self.finalize(outcome, interruption);
     }
 }
 
@@ -1366,9 +1433,11 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         observers: exchange_observers,
         activity: Some(activity),
         usage: UsageTracker::new(upstream_protocol, event_stream),
+        status,
         streaming: requested_streaming || event_stream,
         first_byte_ms: None,
-        completed: false,
+        caller_stream_ended: false,
+        failure: None,
     };
     let stream = async_stream::stream! {
         let mut state = stream_state;
@@ -1386,15 +1455,21 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
         } {
             match chunk {
                 Ok(chunk) => {
-                    state
-                        .first_byte_ms
-                        .get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                    state.first_byte_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                     observe_response_chunk(&mut state.observers, &chunk);
                     state.usage.observe(&chunk);
                     if let Some(converter) = &mut converter {
                         match converter.push(&chunk) {
                             Ok(converted) => {
                                 let failed = converter.has_failed();
+                                if failed {
+                                    state.conversion_failed();
+                                }
+                                // The converter's own terminal output, not the source
+                                // marker, proves a terminal response in the caller's
+                                // protocol. This also covers a Responses terminal larger
+                                // than the bounded usage observer's 1 MiB event limit.
+                                state.caller_stream_ended = converter.has_ended();
                                 if !converted.is_empty() {
                                     yield Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(converted));
                                 }
@@ -1405,145 +1480,63 @@ async fn forward(state: AppState, request: ForwardRequest) -> Response {
                             }
                             Err(err) => {
                                 conversion_failed = true;
+                                state.conversion_failed();
                                 yield Err(std::io::Error::other(err));
                                 break;
                             }
                         }
                     } else {
+                        // No buffering or rewriting on the native protocol path.
+                        state.caller_stream_ended = state.usage.stream_ended();
                         yield Ok::<bytes::Bytes, std::io::Error>(chunk);
                     }
                 }
                 Err(err) => {
-                    let kind = if err.is_timeout() {
-                        std::io::ErrorKind::TimedOut
-                    } else {
-                        std::io::ErrorKind::Other
-                    };
+                    let kind = if err.is_timeout() { std::io::ErrorKind::TimedOut } else { std::io::ErrorKind::Other };
                     let failure = upstream_read_failure(&err, true);
                     let message = failure.message.clone();
-                    complete_exchange_observers(
-                        &mut state.observers,
-                        yabane_extension_api::ExchangeOutcome::Interrupted,
-                    );
-                    let (usage, _) = state.usage.finish();
-                    let first_byte_ms = state.first_byte_ms;
-                    let streaming = state.streaming;
-                    let activity = state.activity.take().expect("one terminal Activity record");
-                    // The record is already being written, so a cancelled generator
-                    // must not write a second one for the same request.
-                    state.completed = true;
-                    activity
-                        .record_failure(
-                            StatusCode::BAD_GATEWAY,
-                            usage,
-                            streaming,
-                            first_byte_ms,
-                            failure,
-                        )
-                        .await;
-                    ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    state.failure = Some(failure);
+                    if let Some(record) = state.finalize(yabane_extension_api::ExchangeOutcome::Interrupted, None) {
+                        let _ = record.await;
+                    }
                     yield Err(std::io::Error::new(kind, message));
                     return;
                 }
             }
         }
-        if !conversion_failed
-            && !interrupted_by_shutdown
-            && let Some(converter) = &mut converter
-        {
+        if !conversion_failed && !interrupted_by_shutdown && let Some(converter) = &mut converter {
             match converter.finish() {
                 Ok(converted) => {
                     conversion_failed = converter.has_failed();
+                    if conversion_failed {
+                        state.conversion_failed();
+                    }
+                    state.caller_stream_ended = converter.has_ended();
                     if !converted.is_empty() {
                         yield Ok(bytes::Bytes::from(converted));
                     }
                 }
                 Err(err) => {
                     conversion_failed = true;
+                    state.conversion_failed();
                     yield Err(std::io::Error::other(err));
                 }
             }
         }
+        // A response whose protocol already ended stays complete even when the
+        // process stops before the Provider body reached EOF; only an unfinished
+        // protocol is explained by the shutdown itself.
+        let interrupted_by_shutdown =
+            interrupted_by_shutdown && !(state.caller_stream_ended && state.failure.is_none());
         let exchange_outcome = if conversion_failed || interrupted_by_shutdown {
             yabane_extension_api::ExchangeOutcome::Interrupted
         } else {
             yabane_extension_api::ExchangeOutcome::Complete
         };
-        complete_exchange_observers(&mut state.observers, exchange_outcome);
-        let (usage, protocol_failed) = state.usage.finish();
-        let first_byte_ms = state.first_byte_ms;
-        let streaming = state.streaming;
-        let activity = state.activity.take().expect("one terminal Activity record");
-        // Recorded below: the drop guard must not repeat it if this generator is
-        // cancelled after the response finished.
-        state.completed = true;
-        let http_error = status.is_client_error() || status.is_server_error();
-        // A Protocol failure only becomes a gateway status when the Provider
-        // claimed success; an answer that already carries an HTTP error keeps
-        // the status the caller received, so a rate-limit body that names its
-        // error is not recorded as a Yabane failure.
-        let recorded_status = if conversion_failed
-            || interrupted_by_shutdown
-            || (protocol_failed && !http_error)
-        {
-            StatusCode::BAD_GATEWAY
-        } else {
-            status
-        };
-        if interrupted_by_shutdown {
-            activity
-                .record_failure(
-                    recorded_status,
-                    usage,
-                    streaming,
-                    first_byte_ms,
-                    shutdown_failure(),
-                )
-                .await;
-        } else if conversion_failed {
-            activity.record_failure(
-                recorded_status,
-                usage,
-                streaming,
-                first_byte_ms,
-                RequestFailure::new(
-                    "upstream_stream",
-                    "interrupted",
-                    "Provider stream ended or could not be converted",
-                ),
-            ).await;
-        } else if http_error {
-            activity.record_failure(
-                status,
-                usage,
-                streaming,
-                first_byte_ms,
-                upstream_http_failure(status),
-            ).await;
-        } else if protocol_failed {
-            activity.record_failure(
-                recorded_status,
-                usage,
-                streaming,
-                first_byte_ms,
-                RequestFailure::new(
-                    if streaming {
-                        "upstream_stream"
-                    } else {
-                        "upstream_response"
-                    },
-                    "protocol_failure",
-                    if streaming {
-                        "Provider stream reported a failure"
-                    } else {
-                        "Provider response reported a failure"
-                    },
-                ),
-            ).await;
-        } else {
-            activity.record(status, usage, streaming, first_byte_ms).await;
+        let interruption = interrupted_by_shutdown.then(shutdown_failure);
+        if let Some(record) = state.finalize(exchange_outcome, interruption) {
+            let _ = record.await;
         }
-        ACTIVE_STREAM_RECORDS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -2131,6 +2124,37 @@ mod tests {
         response_is_event_stream, sanitize_request_headers, strip_transformed_response_headers,
         upstream_transport_failure,
     };
+
+    // PROXY-45: dropping the body's awaiter cannot cancel record persistence or
+    // decrement the active-record count before the owned record task finishes.
+    #[tokio::test]
+    async fn stream_record_task_outlives_its_cancelled_awaiter() {
+        use std::sync::atomic::Ordering;
+        let baseline = super::active_stream_records();
+        super::ACTIVE_STREAM_RECORDS.fetch_add(1, Ordering::SeqCst);
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (finished, finish) = tokio::sync::oneshot::channel();
+        let task = super::StreamRecordGuard
+            .spawn(async move {
+                started.send(()).unwrap();
+                wait.await.unwrap();
+                finished.send(()).unwrap();
+            })
+            .unwrap();
+        start.await.unwrap();
+        drop(task);
+        assert_eq!(super::active_stream_records(), baseline + 1);
+        release.send(()).unwrap();
+        finish.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while super::active_stream_records() != baseline {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     /// ENDPOINT-21: a base URL is the Provider's shared API root, and the
     /// Provider versions that root itself. Yabane's operation path must join

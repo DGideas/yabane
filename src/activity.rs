@@ -154,6 +154,19 @@ pub struct RequestLog {
     pub upstream_streaming: bool,
 }
 
+impl RequestLog {
+    fn is_cancelled(&self) -> bool {
+        self.status == 499
+            && self.failure.as_ref().is_some_and(|failure| {
+                failure.stage == "client" && failure.category == "disconnected"
+            })
+    }
+
+    fn is_error(&self) -> bool {
+        self.status >= 400 && !self.is_cancelled()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CostSource {
@@ -325,6 +338,8 @@ pub struct Stats {
     pub cached_tokens: u64,
     pub cost: f64,
     pub successful: usize,
+    pub errors: usize,
+    pub cancelled: usize,
     pub streaming: usize,
     pub latency_ms: u64,
     pub by_provider: Vec<DimensionStats>,
@@ -388,6 +403,7 @@ pub struct DimensionStats {
     #[serde(skip)]
     cost_units: i128,
     pub errors: usize,
+    pub cancelled: usize,
     pub latency_ms: u64,
 }
 
@@ -407,6 +423,7 @@ pub struct ApiKeyStats {
     #[serde(skip)]
     cost_units: i128,
     pub errors: usize,
+    pub cancelled: usize,
     pub latency_ms: u64,
 }
 
@@ -438,6 +455,7 @@ pub struct ActivityBucket {
     pub generation_samples: usize,
     pub successful: usize,
     pub errors: usize,
+    pub cancelled: usize,
 }
 
 impl ActivityStore {
@@ -503,7 +521,8 @@ impl ActivityStore {
                 && query.filters.matches(log)
                 && query.status.is_none_or(|status| match status {
                     "success" => log.status < 400,
-                    "error" => log.status >= 400,
+                    "error" => log.is_error(),
+                    "cancelled" => log.is_cancelled(),
                     _ => true,
                 })
                 && text.as_ref().is_none_or(|text| {
@@ -941,6 +960,7 @@ impl ActivityStore {
                     cost: 0.0,
                     cost_units: 0,
                     errors: 0,
+                    cancelled: 0,
                     latency_ms: 0,
                 });
                 stats.requests += 1;
@@ -952,7 +972,8 @@ impl ActivityStore {
                 stats.output_tokens += log.output_tokens;
                 stats.cached_tokens += log.cached_tokens;
                 stats.cost_units = stats.cost_units.saturating_add(cost_to_units(log.cost));
-                stats.errors += usize::from(log.status >= 400);
+                stats.errors += usize::from(log.is_error());
+                stats.cancelled += usize::from(log.is_cancelled());
                 stats.latency_ms += log.latency_ms;
             }
             let mut values: Vec<_> = values.into_values().collect();
@@ -990,6 +1011,7 @@ impl ActivityStore {
                 cost: 0.0,
                 cost_units: 0,
                 errors: 0,
+                cancelled: 0,
                 latency_ms: 0,
             });
             stats.requests += 1;
@@ -1001,7 +1023,8 @@ impl ActivityStore {
             stats.output_tokens += log.output_tokens;
             stats.cached_tokens += log.cached_tokens;
             stats.cost_units = stats.cost_units.saturating_add(cost_to_units(log.cost));
-            stats.errors += usize::from(log.status >= 400);
+            stats.errors += usize::from(log.is_error());
+            stats.cancelled += usize::from(log.is_cancelled());
             stats.latency_ms += log.latency_ms;
         }
         let mut by_api_key: Vec<_> = api_keys.into_values().collect();
@@ -1041,6 +1064,7 @@ impl ActivityStore {
                 generation_samples: 0,
                 successful: 0,
                 errors: 0,
+                cancelled: 0,
             })
             .collect();
         let mut provider_buckets = std::collections::BTreeMap::<String, Vec<usize>>::new();
@@ -1078,7 +1102,8 @@ impl ActivityStore {
                     }
                 }
                 bucket.successful += usize::from(log.status < 400);
-                bucket.errors += usize::from(log.status >= 400);
+                bucket.errors += usize::from(log.is_error());
+                bucket.cancelled += usize::from(log.is_cancelled());
             }
             provider_buckets
                 .entry(log.provider.clone())
@@ -1146,6 +1171,8 @@ impl ActivityStore {
             cached_tokens: logs.iter().map(|log| log.cached_tokens).sum(),
             cost: units_to_cost(cost_units),
             successful: logs.iter().filter(|log| log.status < 400).count(),
+            errors: logs.iter().filter(|log| log.is_error()).count(),
+            cancelled: logs.iter().filter(|log| log.is_cancelled()).count(),
             streaming: logs.iter().filter(|log| log.streaming).count(),
             latency_ms: logs.iter().map(|log| log.latency_ms).sum(),
             by_provider: dimensions(|log| &log.provider),
@@ -2743,6 +2770,95 @@ mod tests {
                 .iter()
                 .any(|key| key.id == UNATTRIBUTED_API_KEY_FILTER)
         );
+    }
+
+    // ACTIVITY-54: cancellation consumes traffic/usage, but is neither a
+    // successful response nor a Provider error. Historical 502s are not rewritten.
+    #[tokio::test]
+    async fn cancellations_are_separate_in_every_statistics_dimension_and_filter() {
+        let now = crate::auth::now();
+        let mut cancelled = request(now, "cancelled", "alpha", 499);
+        cancelled.failure = Some(RequestFailure::new(
+            "client",
+            "disconnected",
+            "Client disconnected",
+        ));
+        cancelled.input_tokens = 7;
+        cancelled.output_tokens = 3;
+        cancelled.cost = Some(0.25);
+        let mut legacy = request(now, "legacy", "alpha", 502);
+        legacy.failure = cancelled.failure.clone();
+        let mut provider_499 = request(now, "provider-499", "alpha", 499);
+        provider_499.failure = Some(RequestFailure::new(
+            "upstream_response",
+            "http_error",
+            "Provider returned HTTP 499",
+        ));
+        let mut logs = vec![
+            request(now, "ok", "alpha", 200),
+            request(now, "error", "alpha", 502),
+            cancelled,
+            legacy,
+            provider_499,
+        ];
+        for log in &mut logs {
+            log.model = "alias".to_owned();
+        }
+        let store = store(logs);
+        let stats = store
+            .stats(
+                now - 1,
+                ActivityFilters::default(),
+                1,
+                now,
+                ModelDimension::Incoming,
+            )
+            .await;
+        assert_eq!(
+            (
+                stats.requests,
+                stats.successful,
+                stats.errors,
+                stats.cancelled
+            ),
+            (5, 1, 3, 1)
+        );
+        assert_eq!(
+            (stats.input_tokens, stats.output_tokens, stats.cost),
+            (7, 3, 0.25)
+        );
+        for dimension in stats.by_provider.iter().chain(&stats.by_model) {
+            assert_eq!(
+                (dimension.requests, dimension.errors, dimension.cancelled),
+                (5, 3, 1)
+            );
+        }
+        assert_eq!(
+            (stats.by_api_key[0].errors, stats.by_api_key[0].cancelled),
+            (3, 1)
+        );
+        assert_eq!(
+            (
+                stats.buckets[0].successful,
+                stats.buckets[0].errors,
+                stats.buckets[0].cancelled
+            ),
+            (1, 3, 1)
+        );
+        for (status, count) in [("success", 1), ("error", 3), ("cancelled", 1)] {
+            let (logs, total) = store
+                .query_logs(ActivityLogQuery {
+                    since: now - 1,
+                    until: now,
+                    filters: ActivityFilters::default(),
+                    text: None,
+                    status: Some(status),
+                    offset: 0,
+                    limit: 100,
+                })
+                .await;
+            assert_eq!((logs.len(), total), (count, count));
+        }
     }
 
     #[tokio::test]

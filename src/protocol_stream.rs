@@ -156,6 +156,11 @@ impl StreamConverter {
         Ok(output)
     }
 
+    /// True only after rendering the target protocol's terminal output.
+    pub fn has_ended(&self) -> bool {
+        self.state.done
+    }
+
     pub fn has_failed(&self) -> bool {
         self.state.truncated || self.state.failure.is_some()
     }

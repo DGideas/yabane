@@ -765,6 +765,8 @@
           "cached_tokens",
           "cost",
           "successful",
+          "errors",
+          "cancelled",
           "streaming",
           "latency_ms",
           "by_provider",
@@ -802,6 +804,14 @@
           },
           "successful": {
             "type": "integer"
+          },
+          "errors": {
+            "type": "integer",
+            "description": "Failed requests, excluding client cancellations."
+          },
+          "cancelled": {
+            "type": "integer",
+            "description": "Client cancellations recorded as gateway-attributed 499. Included in traffic, usage and cost totals, but excluded from success/error-rate denominators."
           },
           "streaming": {
             "type": "integer"
@@ -952,6 +962,9 @@
           "errors": {
             "type": "integer"
           },
+          "cancelled": {
+            "type": "integer"
+          },
           "latency_ms": {
             "type": "integer"
           }
@@ -996,6 +1009,9 @@
             "type": "number"
           },
           "errors": {
+            "type": "integer"
+          },
+          "cancelled": {
             "type": "integer"
           },
           "latency_ms": {
@@ -1071,6 +1087,9 @@
             "type": "integer"
           },
           "errors": {
+            "type": "integer"
+          },
+          "cancelled": {
             "type": "integer"
           }
         }
@@ -3696,7 +3715,8 @@
               "type": "string",
               "enum": [
                 "success",
-                "error"
+                "error",
+                "cancelled"
               ]
             }
           }
