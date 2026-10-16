@@ -259,7 +259,7 @@ pub trait SubscriptionProvider: ProviderEndpoint {
     fn exchange_browser_authorization<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        code: &'a str,
+        callback: &'a BrowserAuthorizationCallback,
         code_verifier: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
@@ -294,9 +294,49 @@ pub trait SubscriptionProvider: ProviderEndpoint {
 #[derive(Clone, Debug)]
 pub struct BrowserAuthorization {
     pub authorization_url: String,
+    /// The callback address this sign-in registers. Core validates the pasted
+    /// callback against exactly this address, so one Endpoint type’s registered
+    /// callback never accepts another’s.
+    pub redirect_uri: String,
     pub state: String,
     pub code_verifier: String,
     pub expires_in_seconds: u64,
+}
+
+/// The callback the administrator pasted once the Provider redirected the
+/// browser. Core owns the flow: it validates the pasted URL against the address
+/// this sign-in registered, verifies the state parameter, and only then hands
+/// over the authorization code together with the other query parameters the
+/// Provider added. Parameter names carry no meaning to Core, so an Endpoint
+/// implementation reads the ones its Provider returns — an issued client
+/// identifier, for example — without Core interpreting them.
+#[derive(Clone, Debug)]
+pub struct BrowserAuthorizationCallback {
+    /// The registered callback address this callback was validated against.
+    pub redirect_uri: String,
+    pub code: String,
+    /// Every other query parameter, in the order the Provider wrote them.
+    /// Repeated parameters are preserved instead of being collapsed.
+    pub extra_params: Vec<(String, String)>,
+}
+
+impl BrowserAuthorizationCallback {
+    /// The value of a callback query parameter that appears exactly once with a
+    /// non-empty value. A missing, empty, or repeated parameter yields None, so
+    /// an implementation can require the value it needs without a caller
+    /// smuggling it in twice.
+    pub fn parameter(&self, name: &str) -> Option<&str> {
+        let mut values = self
+            .extra_params
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str());
+        let value = values.next()?;
+        if values.next().is_some() || value.is_empty() {
+            return None;
+        }
+        Some(value)
+    }
 }
 
 #[derive(Clone, Debug)]

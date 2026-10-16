@@ -73,7 +73,15 @@ for (const project of projects) {
     });
     await page.route('**/admin/endpoint-types/openai_codex/sign-in/oauth', async route => {
       if (route.request().method() !== 'POST') return route.continue();
-      await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'browser-flow', authorization_url: 'https://auth.openai.com/oauth/authorize?state=browser-state', expires_at: 4102444800})});
+      await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'browser-flow', authorization_url: 'https://auth.openai.com/oauth/authorize?state=browser-state', redirect_uri: 'http://localhost:1455/auth/callback', expires_at: 4102444800})});
+    });
+    // A type that declares browser sign-in alone is never asked for a device
+    // code, and it publishes its own callback address.
+    const acmeOAuthBodies = [];
+    await page.route('**/admin/endpoint-types/acme_plan/sign-in/oauth', async route => {
+      if (route.request().method() !== 'POST') return route.continue();
+      acmeOAuthBodies.push(route.request().postDataJSON());
+      await route.fulfill({status: 201, contentType: 'application/json', body: JSON.stringify({id: 'acme-flow', authorization_url: 'https://api.acme.test/plan/authorize?state=acme-state', redirect_uri: 'http://127.0.0.1:9911/acme/callback', expires_at: 4102444800})});
     });
     await page.route('**/admin/endpoint-types/openai_codex/sign-in/oauth/browser-flow/complete', async route => {
       const body = route.request().postDataJSON();
@@ -680,9 +688,40 @@ for (const project of projects) {
     await page.evaluate(() => document.querySelector('#open-provider').click());
     await page.locator('#display-name').fill('OpenAI subscription');
     await page.locator('#next-step').click();
-    const providerFieldOrder = await page.locator('#provider-form [data-step="2"] > label.field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('input, select')?.name));
+    // The API type group is a fieldset while the other fields are labels, so the
+    // order is read from the field wrappers themselves rather than one tag.
+    const providerFieldOrder = await page.locator('#provider-form [data-step="2"] > .field').evaluateAll(fields => fields.slice(0, 3).map(field => field.querySelector('input, select')?.name));
     if (providerFieldOrder.join('|') !== 'endpoint_id|api_type|base_url') throw new Error(`${project.name}: initial Endpoint setup does not ask for API type before Base URL`);
+    // ENDPOINT-49: the choice cards are separate controls, so the space around and
+    // between them belongs to no choice. A wrapper that activates the first card
+    // or an invisible control that extends past its card would let a click there
+    // silently replace the Endpoint type the administrator already picked.
+    const choiceWrapper = await page.locator('#api-type-choices').evaluate(grid => ({tag: grid.parentElement.tagName, insideLabel: Boolean(grid.closest('label'))}));
+    if (choiceWrapper.insideLabel || choiceWrapper.tag !== 'FIELDSET') throw new Error(`${project.name}: API type choices sit inside a control that activates the first choice (${JSON.stringify(choiceWrapper)})`);
+    const choiceOverflow = await page.locator('#api-type-choices label.choice').evaluateAll(cards => cards.filter(card => {
+      const box = card.getBoundingClientRect();
+      const control = card.querySelector('input').getBoundingClientRect();
+      return control.right > box.right + 0.5 || control.left < box.left - 0.5 || control.bottom > box.bottom + 0.5 || control.top < box.top - 0.5;
+    }).map(card => card.querySelector('input').value));
+    if (choiceOverflow.length) throw new Error(`${project.name}: a hidden API type choice extends past the card that represents it (${choiceOverflow.join(', ')})`);
     await page.locator('#api-type-choices input[value="openai_codex"]').check();
+    await page.waitForTimeout(150);
+    const emptyChoicePoint = await page.locator('#api-type-choices').evaluate(grid => {
+      const bounds = grid.getBoundingClientRect();
+      const cards = [...grid.querySelectorAll('label.choice')].map(card => card.getBoundingClientRect());
+      for (let y = bounds.top + 1; y < bounds.bottom; y += 3) {
+        for (let x = bounds.left + 1; x < bounds.right; x += 3) {
+          if (cards.some(card => x >= card.left - 0.5 && x <= card.right + 0.5 && y >= card.top - 0.5 && y <= card.bottom + 0.5)) continue;
+          const hit = document.elementFromPoint(x, y);
+          if (hit === grid || hit === grid.parentElement) return [x, y];
+        }
+      }
+      return null;
+    });
+    if (!emptyChoicePoint) throw new Error(`${project.name}: API type choices leave no space between the cards to test`);
+    await page.mouse.click(emptyChoicePoint[0], emptyChoicePoint[1]);
+    await page.waitForTimeout(150);
+    if (await page.locator('#api-type-choices input[name="api_type"]:checked').getAttribute('value') !== 'openai_codex') throw new Error(`${project.name}: clicking the space between API type cards replaced the selected Endpoint type`);
     // Every Endpoint type the API publishes is offered by the console without a
     // console change, together with its own words and its fixed connection.
     const acmeChoice = page.locator('#api-type-choices label.choice').filter({has: page.locator('input[value="acme_plan"]')});
@@ -692,6 +731,29 @@ for (const project of projects) {
     if (await page.locator('#api-key').isVisible()) throw new Error(`${project.name}: an Endpoint type that signs in accounts exposes API key input`);
     if (await page.locator('#initial-endpoint-id').inputValue() !== 'acme') throw new Error(`${project.name}: an Extension-declared Endpoint type does not suggest its own Endpoint ID`);
     if (await page.locator('#create-provider').textContent() !== 'Connect account') throw new Error(`${project.name}: an Endpoint type that signs in accounts does not offer to connect one`);
+    // A type that offers browser sign-in alone opens that flow directly: no
+    // device-code start is attempted, and the instructions name the callback
+    // address this flow registered instead of another type's.
+    acmeOAuthBodies.length = 0;
+    await page.locator('#create-provider').click();
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'visible'});
+    await page.locator('#sign-in-browser').waitFor({state: 'visible'});
+    if (await page.locator('#sign-in-device').isVisible()) throw new Error(`${project.name}: an Endpoint type without a device code still shows device-code instructions`);
+    // No device-code start was attempted: the server would refuse one for this
+    // type, so a failed attempt would be reported here.
+    if (await page.locator('#sign-in-error').textContent() !== '') throw new Error(`${project.name}: an Endpoint type without a device code still attempted a device-code start`);
+    if (await page.locator('#sign-in-browser-link').getAttribute('href') !== 'https://api.acme.test/plan/authorize?state=acme-state') throw new Error(`${project.name}: an Endpoint type without a device code does not expose its own authorization URL`);
+    if (acmeOAuthBodies.length !== 1) throw new Error(`${project.name}: an Endpoint type without a device code did not start its browser flow exactly once (${acmeOAuthBodies.length})`);
+    if (JSON.stringify(acmeOAuthBodies[0]) !== JSON.stringify({endpoint_type: 'acme_plan', provider_id: 'openai-subscription', provider_name: 'OpenAI subscription', endpoint_id: 'acme', socks5_proxy: null})) throw new Error(`${project.name}: browser-only sign-in addresses the wrong target (${JSON.stringify(acmeOAuthBodies[0])})`);
+    if (await page.locator('#oauth-expected-origin').textContent() !== 'http://127.0.0.1:9911/acme/callback') throw new Error(`${project.name}: browser-only sign-in describes a callback address it did not register`);
+    if (!(await page.locator('#sign-in-callback').getAttribute('placeholder')).startsWith('http://127.0.0.1:9911/acme/callback?code=')) throw new Error(`${project.name}: browser-only sign-in does not show its own callback address in the paste field`);
+    await page.locator('#endpoint-sign-in-dialog .close-sign-in').first().click();
+    await page.locator('#endpoint-sign-in-dialog').waitFor({state: 'hidden'});
+    // Connecting an account closes the Provider dialog, so start that dialog
+    // again for the device-code type below.
+    await page.evaluate(() => document.querySelector('#open-provider').click());
+    await page.locator('#display-name').fill('OpenAI subscription');
+    await page.locator('#next-step').click();
     await page.locator('#api-type-choices input[value="openai_codex"]').check();
     if (await page.locator('#initial-endpoint-id').inputValue() !== 'chatgpt') throw new Error(`${project.name}: first endpoint does not expose the API-type default ID`);
     if (await page.locator('#base-url').isVisible()) throw new Error(`${project.name}: subscription setup exposes Base URL`);
@@ -709,7 +771,55 @@ for (const project of projects) {
     const oauthWarning = page.locator('#sign-in-browser .oauth-expected-warning');
     if (!(await oauthWarning.isVisible()) || !(await oauthWarning.getByText('A localhost error page is expected', {exact: true}).isVisible())) throw new Error(`${project.name}: browser OAuth does not prominently prepare users for the localhost error page`);
     const warningText = await oauthWarning.textContent();
-    if (!warningText.includes('This does not mean OAuth failed') || !warningText.includes('localhost:1455')) throw new Error(`${project.name}: browser OAuth warning does not explain that the localhost failure is intentional`);
+    if (!warningText.includes('This does not mean OAuth failed')) throw new Error(`${project.name}: browser OAuth warning does not explain that the localhost failure is intentional`);
+    // The address in the instructions is the one this sign-in registered, so the
+    // console never describes another Endpoint type's callback.
+    if (await page.locator('#oauth-expected-origin').textContent() !== 'http://localhost:1455/auth/callback') throw new Error(`${project.name}: browser OAuth warning does not name the registered callback address`);
+    if (!(await page.locator('#sign-in-callback').getAttribute('placeholder')).startsWith('http://localhost:1455/auth/callback?code=')) throw new Error(`${project.name}: browser OAuth input does not show the registered callback address`);
+    // ENDPOINT-11: the warning and the three steps are one column of prose, so
+    // each block spans the full width of the column it sits in rather than being
+    // shrink-wrapped and centred, and the paste instructions line up with the
+    // input they describe. A rule keyed to a form id that no element carries
+    // leaves the shared `.subscription-signin` centring in force, which collapses
+    // every row to its own text width and centres it instead.
+    const proseAlignment = await page.locator('#sign-in-browser').evaluate(form => {
+      const rows = [];
+      const expectSpan = (label, node, column) => {
+        const box = node.getBoundingClientRect();
+        const bounds = column.getBoundingClientRect();
+        const options = getComputedStyle(node);
+        rows.push({label, offset: Math.round(box.left - bounds.left), width: Math.round(box.width), column: Math.round(bounds.width), textAlign: options.textAlign});
+      };
+      const warning = form.querySelector('.oauth-expected-warning');
+      expectSpan('warning', warning.querySelector(':scope > div > strong'), warning.querySelector(':scope > div'));
+      expectSpan('warning text', warning.querySelector(':scope > div > p'), warning.querySelector(':scope > div'));
+      [...form.querySelectorAll('.oauth-steps li')].forEach((li, index) => {
+        const column = li.querySelector(':scope > div');
+        expectSpan(`step ${index + 1} title`, column.querySelector('strong'), column);
+        expectSpan(`step ${index + 1} help`, column.querySelector('small'), column);
+      });
+      const callbackField = form.querySelector('.oauth-callback-field');
+      expectSpan('callback help', callbackField.querySelector('.field-help'), callbackField);
+      // The registered address is the longest unbroken string in the dialog, so
+      // the column must not be widened by it.
+      const dialog = form.closest('dialog');
+      const submitted = form.querySelector('[type="submit"]').getBoundingClientRect();
+      const formBox = form.getBoundingClientRect();
+      const options = getComputedStyle(form);
+      const contentLeft = formBox.left + parseFloat(options.paddingLeft);
+      const contentRight = formBox.right - parseFloat(options.paddingRight);
+      return {rows, justifyItems: options.justifyItems, submitLeft: submitted.left, submitRight: submitted.right, contentLeft, contentRight, formOverflow: form.scrollWidth - form.clientWidth, dialogOverflow: dialog.scrollWidth - dialog.clientWidth};
+    });
+    if (proseAlignment.justifyItems !== 'stretch') throw new Error(`${project.name}: browser sign-in prose inherits the centred device-code layout (justify-items: ${proseAlignment.justifyItems})`);
+    // A block may cap its own reading width, but it must still start where its
+    // column starts instead of being centred inside it.
+    const unaligned = proseAlignment.rows.filter(row => row.textAlign !== 'left' || Math.abs(row.offset) > 1);
+    if (unaligned.length) throw new Error(`${project.name}: browser sign-in prose is not left-aligned in its column (${unaligned.map(row => `${row.label}: offset ${row.offset}px, ${row.textAlign}`).join('; ')})`);
+    // The primary action spans the padded content column, matching the input above it.
+    if (Math.abs(proseAlignment.submitLeft - proseAlignment.contentLeft) > 1 || Math.abs(proseAlignment.submitRight - proseAlignment.contentRight) > 1) throw new Error(`${project.name}: browser sign-in submit button does not span the form it belongs to`);
+    // The address registered for this flow is long and unbroken, so a missing
+    // wrap would widen the column and clip the prose inside the dialog.
+    if (proseAlignment.formOverflow > 0 || proseAlignment.dialogOverflow > 0) throw new Error(`${project.name}: browser sign-in content overflows its dialog (form ${proseAlignment.formOverflow}px, dialog ${proseAlignment.dialogOverflow}px)`);
     const oauthSteps = await page.locator('#sign-in-browser .oauth-steps li strong').allTextContents();
     if (oauthSteps.join('|') !== 'Sign in with the Provider|Expect the localhost error|Return and paste once') throw new Error(`${project.name}: browser sign-in steps do not describe the expected failure before launch`);
     if (await page.locator('#sign-in-browser-link').textContent() !== 'I understand — open sign-in page') throw new Error(`${project.name}: browser sign-in launch does not require an explicit acknowledgement`);

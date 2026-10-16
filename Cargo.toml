@@ -5,6 +5,7 @@ members = [
     "extensions/request-defaults",
     "extensions/traffic-capture",
     "extensions/openai-subscription",
+    "extensions/openai",
     "extensions/codebuddy",
 ]
 resolver = "2"
@@ -18,10 +19,11 @@ description = "A clear, reliable gateway to every LLM."
 license = "MIT"
 
 [features]
-default = ["extension-request-defaults", "extension-traffic-capture", "extension-openai-subscription", "extension-codebuddy"]
+default = ["extension-request-defaults", "extension-traffic-capture", "extension-openai-subscription", "extension-openai", "extension-codebuddy"]
 extension-request-defaults = ["dep:yabane-extension-request-defaults"]
 extension-traffic-capture = ["dep:yabane-extension-traffic-capture"]
 extension-openai-subscription = ["dep:yabane-extension-openai-subscription"]
+extension-openai = ["dep:yabane-extension-openai"]
 extension-codebuddy = ["dep:yabane-extension-codebuddy"]
 
 [dependencies]
@@ -45,6 +47,7 @@ yabane-extension-api = { path = "crates/yabane-extension-api" }
 yabane-extension-request-defaults = { path = "extensions/request-defaults", optional = true }
 yabane-extension-traffic-capture = { path = "extensions/traffic-capture", optional = true }
 yabane-extension-openai-subscription = { path = "extensions/openai-subscription", optional = true }
+yabane-extension-openai = { path = "extensions/openai", optional = true }
 yabane-extension-codebuddy = { path = "extensions/codebuddy", optional = true }
 
 [profile.release]

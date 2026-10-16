@@ -240,6 +240,7 @@ let hooks = RequestHooks {
 规则：
 
 - Core 只保存身份的通用形状和 `kind` 标识。身份的名称、材料解析、刷新、登录流程和文案都归声明它的 Extension，Core 不得按标识猜语义，也不得在代码或文案里写死某个 Extension 的类型名或身份名。
+- 浏览器登录的回调地址由 Extension 在 `BrowserAuthorization::redirect_uri` 声明，而不是由 Core 固定。Core 只按这个地址校验管理员粘贴的回调（scheme、host、port、path、无 userinfo/fragment）并校验唯一非空 `code` 和 `state`，然后把 `BrowserAuthorizationCallback` 交给实现：`code`、本次注册的 `redirect_uri`，以及其余 query 参数原序、允许重复的 `extra_params`。参数名对 Core 没有含义，实现自己读取自己 Provider 返回的值（例如 `client_id`）；Core 不得解释、合并或补齐这些参数。读取用 `BrowserAuthorizationCallback::parameter`，它只返回唯一且非空的值，参数缺失、为空或重复时返回 `None`，实现据此拒绝要求明确的参数。
 - 身份材料按 `flow` 传递：`Secret` 交给 Extension 的是原始密钥，`Subscription` 交给 Extension 的是登录后的 access/refresh token 与过期时间。
 - 登录流程的地址是 `/admin/endpoint-types/{endpoint_type}/sign-in/*`。未声明登录流程的类型必须被明确拒绝，不能猜测或回退到别的 Extension。
 - 未启用的 Extension 不发布任何 Endpoint 类型：它的 Endpoint 配置保持原样、不再校验，使用时报错并点出 Endpoint 类型名，而不是静默换一个含义或回退到其他 Provider。
@@ -315,10 +316,10 @@ cargo check --no-default-features
 以下需求不是当前 Hook 的既有能力，不能硬塞进 `UpstreamRequestHook` 或 `UpstreamHeadersHook`：
 
 - 修改协议转换前的 caller payload。
-- 修改 response（v2 exchange observer 只能只读观察 response）。
+- 修改 response（exchange observer 只能只读观察 response）。
 - 在 Hook 或 observer 回调内执行异步网络或阻塞存储调用；observer 应使用有界队列转交后台任务。
 - 每实例 timeout 或可选 fail-open。
 - 动态安装、卸载、热加载或沙箱。
 - 通用运行时实例配置和排序。
 
-遇到这些需求时，先在 Core 中定义明确的新生命周期、数据权限、顺序、错误和性能契约；必要时提升 `EXTENSION_API_VERSION`，再实现具体 Extension。不要添加语义含糊的万能 `before_request`。
+遇到这些需求时，先在 Core 中定义明确的新生命周期、数据权限、顺序、错误和性能契约，再实现具体 Extension。本仓库的 Extension 与二进制一起编译，`EXTENSION_API_VERSION` 只是展示和加载校验用的标识，接口调整时不要递增它。不要添加语义含糊的万能 `before_request`。

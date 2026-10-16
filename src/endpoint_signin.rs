@@ -42,6 +42,10 @@ struct DeviceFlow {
     expires_at: u64,
     status: FlowStatus,
     browser_state: Option<String>,
+    /// The callback address this sign-in registered, as declared by the
+    /// Endpoint type that owns it. The pasted callback is validated against
+    /// exactly this address.
+    browser_redirect_uri: Option<String>,
     code_verifier: Option<String>,
 }
 
@@ -93,6 +97,9 @@ pub struct DeviceFlowView {
 pub struct BrowserFlowView {
     pub id: String,
     pub authorization_url: String,
+    /// The callback address this sign-in listens for, so the console can
+    /// describe the address actually registered instead of assuming one.
+    pub redirect_uri: String,
     pub expires_at: u64,
 }
 
@@ -112,6 +119,16 @@ pub async fn start(
         ));
     }
     let implementation = sign_in_provider(state, endpoint_type)?;
+    if !implementation
+        .endpoint_type()
+        .sign_in
+        .is_some_and(|sign_in| sign_in.device_code)
+    {
+        return Err(StartError::Invalid(format!(
+            "{} does not offer device-code sign-in",
+            implementation.endpoint_type().display_name
+        )));
+    }
     let endpoint_id = input.endpoint_id.unwrap_or_else(|| {
         implementation
             .endpoint_type()
@@ -165,6 +182,7 @@ pub async fn start(
         expires_at: now.saturating_add(device.expires_in_seconds),
         status: FlowStatus::Pending,
         browser_state: None,
+        browser_redirect_uri: None,
         code_verifier: None,
     };
     let view = flow_view(&id, &flow);
@@ -246,11 +264,16 @@ pub async fn start_browser(
         expires_at: now.saturating_add(browser.expires_in_seconds),
         status: FlowStatus::Pending,
         browser_state: Some(browser.state),
+        browser_redirect_uri: Some(browser.redirect_uri),
         code_verifier: Some(browser.code_verifier),
     };
     let view = BrowserFlowView {
         id: id.clone(),
         authorization_url: browser.authorization_url,
+        redirect_uri: flow
+            .browser_redirect_uri
+            .clone()
+            .expect("a browser flow always registers a callback address"),
         expires_at: flow.expires_at,
     };
     let mut flows = state.sign_in.flows.lock().await;
@@ -283,10 +306,15 @@ pub async fn complete_browser(
     let _guard = flow.poll_lock.clone().try_lock_owned().map_err(|_| {
         CompleteError::Invalid("This browser sign-in is already being completed".to_owned())
     })?;
-    let (code, callback_state) =
-        parse_browser_callback(&input.redirect_url).map_err(CompleteError::Invalid)?;
+    // The Endpoint type declares the callback address it registers, so the
+    // pasted URL is validated against that address rather than one Core assumes.
+    let expected_redirect_uri = flow.browser_redirect_uri.as_deref().ok_or_else(|| {
+        CompleteError::Invalid("This sign-in did not register a callback address".to_owned())
+    })?;
+    let callback = parse_browser_callback(&input.redirect_url, expected_redirect_uri)
+        .map_err(CompleteError::Invalid)?;
     let expected_state = flow.browser_state.as_deref().unwrap_or_default();
-    if !crate::auth::constant_time_eq(&callback_state, expected_state) {
+    if !crate::auth::constant_time_eq(&callback.state, expected_state) {
         return Err(CompleteError::Invalid(
             "The callback state does not match this sign-in".to_owned(),
         ));
@@ -304,10 +332,15 @@ pub async fn complete_browser(
                 "Endpoint type '{endpoint_type}' is not available because its Extension is not enabled"
             ))
         })?;
+    let callback = yabane_extension_api::BrowserAuthorizationCallback {
+        redirect_uri: expected_redirect_uri.to_owned(),
+        code: callback.code,
+        extra_params: callback.extra_params,
+    };
     let credential = implementation
         .exchange_browser_authorization(
             &flow.client,
-            &code,
+            &callback,
             flow.code_verifier.as_deref().unwrap_or_default(),
         )
         .await
@@ -806,33 +839,58 @@ fn sign_in_provider(
     Ok(implementation)
 }
 
-fn parse_browser_callback(value: &str) -> Result<(String, String), String> {
+/// A callback that passed validation: the authorization code, the state Core
+/// compares in constant time, and every other query parameter the Provider
+/// added, in the order it wrote them.
+struct BrowserCallback {
+    code: String,
+    state: String,
+    extra_params: Vec<(String, String)>,
+}
+
+/// Validates the pasted callback against the address the sign-in registered and
+/// splits it into the authorization code, the state Core verifies, and every
+/// other query parameter the Provider added. Core does not know what those
+/// parameters mean, so they are handed to the Endpoint implementation in the
+/// order the Provider wrote them, with repeats preserved.
+fn parse_browser_callback(
+    value: &str,
+    expected_redirect_uri: &str,
+) -> Result<BrowserCallback, String> {
+    let expected = reqwest::Url::parse(expected_redirect_uri)
+        .map_err(|_| "This sign-in registered an unusable callback address".to_owned())?;
     let redirect = reqwest::Url::parse(value.trim())
-        .map_err(|_| "Paste the complete localhost callback URL".to_owned())?;
-    if redirect.scheme() != "http"
-        || redirect.host_str() != Some("localhost")
-        || redirect.port() != Some(1455)
-        || redirect.path() != "/auth/callback"
+        .map_err(|_| "Paste the complete callback URL the Provider opened".to_owned())?;
+    if redirect.scheme() != expected.scheme()
+        || redirect.host_str() != expected.host_str()
+        || redirect.port_or_known_default() != expected.port_or_known_default()
+        || redirect.path() != expected.path()
         || !redirect.username().is_empty()
         || redirect.password().is_some()
         || redirect.fragment().is_some()
     {
-        return Err("Callback URL must start with http://localhost:1455/auth/callback".to_owned());
+        return Err(format!(
+            "Callback URL must start with {expected_redirect_uri}"
+        ));
     }
-    let codes: Vec<_> = redirect
-        .query_pairs()
-        .filter(|(name, _)| name == "code")
-        .map(|(_, value)| value.into_owned())
-        .collect();
-    let states: Vec<_> = redirect
-        .query_pairs()
-        .filter(|(name, _)| name == "state")
-        .map(|(_, value)| value.into_owned())
-        .collect();
+    let mut codes = Vec::new();
+    let mut states = Vec::new();
+    let mut extra_params = Vec::new();
+    for (name, value) in redirect.query_pairs() {
+        match name.as_ref() {
+            "code" => codes.push(value.into_owned()),
+            "state" => states.push(value.into_owned()),
+            _ => extra_params.push((name.into_owned(), value.into_owned())),
+        }
+    }
     if codes.len() != 1 || states.len() != 1 || codes[0].is_empty() || states[0].is_empty() {
         return Err("Callback URL must contain exactly one non-empty code and state".to_owned());
     }
-    Ok((codes[0].clone(), states[0].clone()))
+    Ok(BrowserCallback {
+        code: std::mem::take(&mut codes[0]),
+        state: std::mem::take(&mut states[0]),
+        extra_params,
+    })
 }
 
 fn normalized_socks5_proxy(value: Option<&str>) -> Result<Option<String>, String> {
@@ -1145,13 +1203,15 @@ mod tests {
 
     #[test]
     fn browser_callback_accepts_only_the_registered_complete_url() {
-        assert_eq!(
-            super::parse_browser_callback(
-                "http://localhost:1455/auth/callback?code=code%20123&state=state-456"
-            )
-            .unwrap(),
-            ("code 123".to_owned(), "state-456".to_owned()),
-        );
+        let registered = "http://localhost:1455/auth/callback";
+        let callback = super::parse_browser_callback(
+            "http://localhost:1455/auth/callback?code=code%20123&state=state-456",
+            registered,
+        )
+        .unwrap();
+        assert_eq!(callback.code, "code 123");
+        assert_eq!(callback.state, "state-456");
+        assert!(callback.extra_params.is_empty());
         for invalid in [
             "http://127.0.0.1:1455/auth/callback?code=x&state=y",
             "http://localhost:1456/auth/callback?code=x&state=y",
@@ -1161,8 +1221,66 @@ mod tests {
             "http://localhost:1455/auth/callback?code=&state=y",
             "http://localhost:1455/auth/callback?code=x&state=",
         ] {
-            assert!(super::parse_browser_callback(invalid).is_err(), "{invalid}");
+            assert!(
+                super::parse_browser_callback(invalid, registered).is_err(),
+                "{invalid}"
+            );
         }
+    }
+
+    /// The callback address belongs to the sign-in that registered it, so one
+    /// Endpoint type never accepts another one’s address, and query parameters
+    /// the Provider adds reach the Endpoint implementation untouched.
+    #[test]
+    fn a_sign_in_accepts_only_the_callback_address_it_registered() {
+        let hosted_loopback = "http://127.0.0.1:1455/auth/callback";
+        let callback = super::parse_browser_callback(
+            "http://127.0.0.1:1455/auth/callback?code=abc&state=s&client_id=issued-1&scope=a+b",
+            hosted_loopback,
+        )
+        .expect("the registered loopback address is accepted");
+        assert_eq!(callback.code, "abc");
+        assert_eq!(callback.state, "s");
+        assert_eq!(
+            callback.extra_params,
+            [
+                ("client_id".to_owned(), "issued-1".to_owned()),
+                ("scope".to_owned(), "a b".to_owned()),
+            ],
+        );
+        assert!(
+            super::parse_browser_callback(
+                "http://localhost:1455/auth/callback?code=x&state=y",
+                hosted_loopback,
+            )
+            .is_err(),
+            "the other spelling of the same port is a different registered address",
+        );
+    }
+
+    /// A parameter the Endpoint implementation requires must be unambiguous, so
+    /// a missing, empty, or repeated value is refused instead of guessed at.
+    #[test]
+    fn callback_parameters_are_read_only_when_they_are_unambiguous() {
+        let callback =
+            |extra: &[(&str, &str)]| yabane_extension_api::BrowserAuthorizationCallback {
+                redirect_uri: "http://127.0.0.1:1455/auth/callback".to_owned(),
+                code: "code".to_owned(),
+                extra_params: extra
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            };
+        assert_eq!(
+            callback(&[("client_id", "issued")]).parameter("client_id"),
+            Some("issued")
+        );
+        assert_eq!(callback(&[("other", "x")]).parameter("client_id"), None);
+        assert_eq!(callback(&[("client_id", "")]).parameter("client_id"), None);
+        assert_eq!(
+            callback(&[("client_id", "a"), ("client_id", "b")]).parameter("client_id"),
+            None,
+        );
     }
 
     #[test]
@@ -1201,6 +1319,7 @@ mod tests {
             expires_at: u64::MAX,
             status: super::FlowStatus::Pending,
             browser_state: None,
+            browser_redirect_uri: None,
             code_verifier: None,
         };
 

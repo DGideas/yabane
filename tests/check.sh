@@ -27,13 +27,18 @@ for features in \
   'extension-request-defaults' \
   'extension-traffic-capture' \
   'extension-openai-subscription' \
+  'extension-openai' \
   'extension-codebuddy' \
   'extension-request-defaults,extension-traffic-capture' \
   'extension-request-defaults,extension-openai-subscription' \
+  'extension-request-defaults,extension-openai' \
   'extension-request-defaults,extension-codebuddy' \
   'extension-traffic-capture,extension-openai-subscription' \
+  'extension-traffic-capture,extension-openai' \
   'extension-traffic-capture,extension-codebuddy' \
-  'extension-openai-subscription,extension-codebuddy'; do
+  'extension-openai-subscription,extension-openai' \
+  'extension-openai-subscription,extension-codebuddy' \
+  'extension-openai,extension-codebuddy'; do
   printf '\nChecking Extension subset: %s\n' "${features:-Core only}"
   cargo clippy -p yabane --all-targets --no-default-features --features "$features" --locked -- -D warnings
   cargo test -p yabane --no-default-features --features "$features" --locked

@@ -1557,7 +1557,7 @@
       },
       "EndpointSignInState": {
         "type": "object",
-        "description": "Progress of one Endpoint-type sign-in. Device-code fields are present for the device-code flow; the browser flow exposes its authorization URL instead. Tokens, authorization codes, and PKCE verifiers are never returned.",
+        "description": "Progress of one Endpoint-type sign-in. Device-code fields are present for the device-code flow; the browser flow exposes its authorization URL and the callback address it registered instead. Tokens, authorization codes, and PKCE verifiers are never returned.",
         "required": [
           "id",
           "status",
@@ -1588,6 +1588,11 @@
             "type": "string",
             "format": "uri",
             "nullable": true
+          },
+          "redirect_uri": {
+            "type": "string",
+            "format": "uri",
+            "description": "Present in the browser flow: the callback address this sign-in registered, so the console can describe the address that will actually open."
           },
           "interval_seconds": {
             "type": "integer",
@@ -5193,7 +5198,7 @@
           "Providers"
         ],
         "summary": "Start browser sign-in for an Endpoint type",
-        "description": "Starts an Authorization Code with PKCE sign-in for an Endpoint type that declares browser sign-in, for organizations that disable device authorization. The registered callback is http://localhost:1455/auth/callback; Yabane does not listen there and the administrator pastes the resulting complete callback URL into the completion operation.",
+        "description": "Starts an Authorization Code with PKCE sign-in for an Endpoint type that declares browser sign-in, for organizations that disable device authorization. The callback address comes from the Endpoint type's own declaration and is returned with the flow, so each Endpoint type registers only the address it owns; Yabane does not listen there and the administrator pastes the resulting complete callback URL into the completion operation.",
         "security": [
           {
             "managementKey": []
@@ -5274,7 +5279,7 @@
           "Providers"
         ],
         "summary": "Complete Endpoint-type browser sign-in",
-        "description": "Validates the complete pasted localhost callback URL and its state, exchanges its one-time authorization code with the server-held PKCE verifier, and atomically creates the connected Endpoint. Callback URLs, authorization codes, verifiers, and tokens are not returned or persisted as flow history.",
+        "description": "Validates the complete pasted callback URL against the address this sign-in registered and its state, then exchanges its one-time authorization code with the server-held PKCE verifier and atomically creates the connected Endpoint. Query parameters the Provider adds to the callback, such as an issued client identifier, are passed to the Endpoint type's implementation, which owns their meaning. Callback URLs, authorization codes, verifiers, and tokens are not returned or persisted as flow history.",
         "security": [
           {
             "managementKey": []
@@ -5314,7 +5319,7 @@
                   "redirect_url": {
                     "type": "string",
                     "format": "uri",
-                    "description": "Complete localhost callback URL returned by the sign-in page."
+                    "description": "Complete callback URL returned by the sign-in page, using the address this sign-in registered."
                   }
                 }
               }

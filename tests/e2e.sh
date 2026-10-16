@@ -275,6 +275,33 @@ extensions=$(admin -f "$base/admin/extensions")
 # (ENDPOINT-45).
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "codebuddy_cn") | [(.label), (.native | tostring), (.fixed_base_url // "editable"), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'CodeBuddy (CN)|false|editable|codebuddy_api_key:secret' ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "codebuddy") | [.endpoint_types[].id] | join(",")') == codebuddy_cn ]]
+# An OpenAI Endpoint type that signs in with ChatGPT fixes its own connection,
+# owns one signed-in account kind, and offers browser sign-in alone (ENDPOINT-46).
+[[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring), (.endpoint_types | map(.id) | join(","))] | join(":")') == native_rust:1:provider_endpoint:true:openai ]]
+[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai") | [(.label), (.native | tostring), (.fixed_base_url // "editable"), (.sign_in.device_code | tostring), (.sign_in.browser | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'OpenAI|false|https://api.openai.com/v1|false|true|openai_account:subscription' ]]
+# A type that offers browser sign-in alone must not be asked for a device code,
+# and its browser flow registers the loopback address that this flow needs.
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"openai-no-device","provider_name":"No device"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "OpenAI does not offer device-code sign-in" ]]
+openai_oauth=$(admin -f -X POST "$base/admin/endpoint-types/openai/sign-in/oauth" -H 'content-type: application/json' -d '{"provider_id":"openai-platform","provider_name":"OpenAI Platform","endpoint_id":"openai"}')
+openai_oauth_url=$(printf '%s' "$openai_oauth" | jq -r .authorization_url)
+[[ $(printf '%s' "$openai_oauth" | jq -r .redirect_uri) == 'http://127.0.0.1:1455/auth/callback' ]]
+[[ $openai_oauth_url == https://auth.openai.com/api/accounts/authorize\?* ]]
+# Registration starts from the dynamic entrypoint and identifies this host, and
+# neither the entrypoint nor the Codex client is what it saves (ENDPOINT-47).
+[[ $openai_oauth_url == *client_id=dynamic_agent_client* ]]
+[[ $openai_oauth_url == *agent_name_hint=Yabane* ]]
+[[ $openai_oauth_url == *ext_agent_host_id=urn%3Auuid%3A* ]]
+[[ $openai_oauth_url == *resource=https%3A%2F%2Fapi.openai.com%2Fv1* ]]
+[[ $openai_oauth_url == *redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback* ]]
+[[ $openai_oauth_url == *code_challenge_method=S256* ]]
+[[ $openai_oauth_url == *scope=*chatgpt.tokens.use.direct* ]]
+[[ $openai_oauth_url != *app_EMoamEEZ73f0CkXaXp7hrann* ]]
+# A callback without the issued client identifier cannot be exchanged, so it is
+# refused instead of falling back to the registration entrypoint.
+openai_oauth_id=$(printf '%s' "$openai_oauth" | jq -r .id)
+[[ $(admin_status -X POST "$base/admin/endpoint-types/openai/sign-in/oauth/$openai_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=state&client_id=issued"}') == 400 ]]
+[[ $(jq -r '.error.message' response.json) == "Callback URL must start with http://127.0.0.1:1455/auth/callback" ]]
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].endpoint_type_label, .endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'OpenAI subscription|https://chatgpt.com/backend-api|true|OAuth account' ]]
 # A policy stored in the earlier honored-Retry-After shape reads back as the delay
 # source it always meant, and reads back as the disabled fixed source here.
@@ -388,6 +415,11 @@ browser_oauth_url=$(printf '%s' "$browser_oauth" | jq -r .authorization_url)
 [[ $browser_oauth_url == *client_id=app_EMoamEEZ73f0CkXaXp7hrann* ]]
 [[ $browser_oauth_url == *redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback* ]]
 [[ $browser_oauth_url == *code_challenge_method=S256* ]]
+# The callback address belongs to the Endpoint type that declared it, so the
+# flow publishes the address it registered instead of one Core assumes.
+[[ $(printf '%s' "$browser_oauth" | jq -r .redirect_uri) == 'http://localhost:1455/auth/callback' ]]
+# Another spelling of the same port is a different registered address, and a
+# callback the flow does not own is rejected before any token exchange.
 [[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://127.0.0.1:1455/auth/callback?code=code&state=state"}') == 400 ]]
 [[ $(jq -r '.error.message' response.json) == "Callback URL must start with http://localhost:1455/auth/callback" ]]
 [[ $(admin_status -X POST "$base/admin/endpoint-types/openai_codex/sign-in/oauth/$browser_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=wrong"}') == 400 ]]

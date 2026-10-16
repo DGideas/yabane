@@ -6,10 +6,10 @@ use rand::RngCore as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use yabane_extension_api::{
-    BrowserAuthorization, DeviceAuthorization, EXTENSION_API_VERSION, Extension, HookStage,
-    Protocol, ProviderCredentialKind, ProviderEndpoint, ProviderEndpointMaterial,
-    ProviderEndpointRequest, ProviderEndpointType, ProviderSignIn, SubscriptionCredential,
-    SubscriptionProvider,
+    BrowserAuthorization, BrowserAuthorizationCallback, DeviceAuthorization, EXTENSION_API_VERSION,
+    Extension, HookStage, Protocol, ProviderCredentialKind, ProviderEndpoint,
+    ProviderEndpointMaterial, ProviderEndpointRequest, ProviderEndpointType, ProviderSignIn,
+    SubscriptionCredential, SubscriptionProvider,
 };
 
 pub const ID: &str = "openai-subscription";
@@ -248,6 +248,7 @@ impl SubscriptionProvider for OpenAiSubscriptionEndpoint {
         .map_err(|_| "Could not construct OpenAI authorization URL".to_owned())?;
         Ok(BrowserAuthorization {
             authorization_url: format!("{AUTH_BASE_URL}/oauth/authorize?{query}"),
+            redirect_uri: BROWSER_REDIRECT_URI.to_owned(),
             state,
             code_verifier,
             expires_in_seconds: BROWSER_TIMEOUT_SECONDS,
@@ -257,7 +258,7 @@ impl SubscriptionProvider for OpenAiSubscriptionEndpoint {
     fn exchange_browser_authorization<'a>(
         &'a self,
         client: &'a reqwest::Client,
-        code: &'a str,
+        callback: &'a BrowserAuthorizationCallback,
         code_verifier: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<SubscriptionCredential, String>> + Send + 'a>,
@@ -268,9 +269,11 @@ impl SubscriptionProvider for OpenAiSubscriptionEndpoint {
                 .form(&[
                     ("grant_type", "authorization_code"),
                     ("client_id", CLIENT_ID),
-                    ("code", code),
+                    ("code", callback.code.as_str()),
                     ("code_verifier", code_verifier),
-                    ("redirect_uri", BROWSER_REDIRECT_URI),
+                    // The exchange repeats the address this sign-in registered,
+                    // which is the value Core validated the callback against.
+                    ("redirect_uri", callback.redirect_uri.as_str()),
                 ])
                 .timeout(OAUTH_REQUEST_TIMEOUT)
                 .send()
@@ -648,6 +651,8 @@ mod tests {
         );
         assert_eq!(query.get("client_id").unwrap(), CLIENT_ID);
         assert_eq!(query.get("redirect_uri").unwrap(), BROWSER_REDIRECT_URI);
+        // The address the flow publishes for validation is the one it registers.
+        assert_eq!(flow.redirect_uri, BROWSER_REDIRECT_URI);
         assert_eq!(query.get("scope").unwrap(), BROWSER_SCOPE);
         assert_eq!(query.get("state").unwrap(), &flow.state);
         assert_eq!(query.get("code_challenge_method").unwrap(), "S256");

@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
     feature = "extension-openai-subscription",
+    feature = "extension-openai",
     feature = "extension-codebuddy",
     test
 ))]
@@ -221,6 +222,8 @@ impl ExtensionRegistry {
             extension_info(yabane_extension_traffic_capture::metadata())?,
             #[cfg(feature = "extension-openai-subscription")]
             extension_info(yabane_extension_openai_subscription::metadata())?,
+            #[cfg(feature = "extension-openai")]
+            extension_info(yabane_extension_openai::metadata())?,
             #[cfg(feature = "extension-codebuddy")]
             extension_info(yabane_extension_codebuddy::metadata())?,
         ];
@@ -235,6 +238,15 @@ impl ExtensionRegistry {
             registry
                 .subscription_providers
                 .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        #[cfg(feature = "extension-openai")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_openai::ENDPOINT);
+            registry
+                .subscription_providers
+                .push(&yabane_extension_openai::ENDPOINT);
         }
         #[cfg(feature = "extension-codebuddy")]
         {
@@ -256,6 +268,8 @@ impl ExtensionRegistry {
             extension_info(yabane_extension_traffic_capture::metadata()).unwrap(),
             #[cfg(feature = "extension-openai-subscription")]
             extension_info(yabane_extension_openai_subscription::metadata()).unwrap(),
+            #[cfg(feature = "extension-openai")]
+            extension_info(yabane_extension_openai::metadata()).unwrap(),
             #[cfg(feature = "extension-codebuddy")]
             extension_info(yabane_extension_codebuddy::metadata()).unwrap(),
         ];
@@ -275,6 +289,15 @@ impl ExtensionRegistry {
             registry
                 .subscription_providers
                 .push(&yabane_extension_openai_subscription::ENDPOINT);
+        }
+        #[cfg(feature = "extension-openai")]
+        {
+            registry
+                .provider_endpoints
+                .push(&yabane_extension_openai::ENDPOINT);
+            registry
+                .subscription_providers
+                .push(&yabane_extension_openai::ENDPOINT);
         }
         #[cfg(feature = "extension-codebuddy")]
         {
@@ -349,7 +372,8 @@ impl ExtensionRegistry {
         not(any(
             feature = "extension-request-defaults",
             feature = "extension-traffic-capture",
-            feature = "extension-openai-subscription"
+            feature = "extension-openai-subscription",
+            feature = "extension-openai"
         )),
         allow(dead_code)
     )]
@@ -647,6 +671,7 @@ async fn load_settings(path: impl AsRef<Path>) -> Result<ExtensionSettings, Stri
     feature = "extension-request-defaults",
     feature = "extension-traffic-capture",
     feature = "extension-openai-subscription",
+    feature = "extension-openai",
     feature = "extension-codebuddy",
     test
 ))]

@@ -47,6 +47,20 @@ const incompleteResponse = {
   output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'partial' }] }],
   usage: { input_tokens: 10, output_tokens: 5, input_tokens_details: { cached_tokens: 3 } },
 };
+// ACTIVITY-16: DeepSeek-derived responses carry a permanent zero in a top-level
+// cached_tokens next to the hit count they actually report.
+const deepseekUsage = {
+  prompt_tokens: 10, completion_tokens: 5, total_tokens: 15,
+  prompt_tokens_details: { cached_tokens: 4 },
+  prompt_cache_hit_tokens: 4, prompt_cache_miss_tokens: 6,
+  cached_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+};
+const deepseekReply = {
+  id: 'c9', object: 'chat.completion', model: 'fixture',
+  choices: [{ index: 0, message: { role: 'assistant', content: 'partial' }, finish_reason: 'length' }],
+  usage: deepseekUsage,
+};
+const deepseekStream = frame(chunk({ content: 'partial' }, 'length')) + frame({ id: 'c9', model: 'fixture', choices: [], usage: deepseekUsage }) + 'data: [DONE]\n\n';
 const incompleteStream = frame({ type: 'response.created', response: { id: 'r1', model: 'fixture' } })
   + frame({ type: 'response.output_text.delta', output_index: 0, delta: 'partial' })
   + frame({ type: 'response.incomplete', response: incompleteResponse });
@@ -86,7 +100,7 @@ try {
     for await (const chunk of req) raw += chunk;
     if (req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ data: ['json', 'sse', 'tools', 'empty-tools', 'replay', 'truncated', 'terminal', 'bare-done', 'divergent', 'json-arguments', 'refusal'].map(id => ({ id })) }));
+      res.end(JSON.stringify({ data: ['json', 'sse', 'tools', 'empty-tools', 'replay', 'truncated', 'terminal', 'bare-done', 'divergent', 'json-arguments', 'refusal', 'deepseek'].map(id => ({ id })) }));
       return;
     }
     const body = JSON.parse(raw);
@@ -127,6 +141,9 @@ try {
         id: 'm1', type: 'message', role: 'assistant', model: 'fixture', content: [{ type: 'text', text: 'ok' }],
         stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 1 },
       } : isResponses ? incompleteResponse : jsonReply));
+    } else if (body.model === 'deepseek') {
+      res.setHeader('content-type', body.stream ? 'text/event-stream' : 'application/json');
+      res.end(body.stream ? deepseekStream : JSON.stringify(deepseekReply));
     } else if (body.model === 'refusal') {
       res.end(refusalStream);
     } else if (body.model === 'terminal') {
@@ -189,6 +206,7 @@ try {
   };
   const successfulIds = [];
   const incompleteIds = [];
+  const deepseekIds = [];
   for (const model of ['json', 'sse']) {
     for (const stream of model === 'json' ? [false] : [false, true]) {
       const { response, raw } = await post('/v1/responses', { model: `chat/${model}`, input: 'fixture', stream });
@@ -212,6 +230,15 @@ try {
       assert.equal(final.usage.total_tokens, 15);
     }
   }
+  // ACTIVITY-16: the deepseek placeholder must not read as a cache miss.
+  for (const stream of [false, true]) {
+    const { response, raw } = await post('/v1/chat/completions', {
+      model: 'chat/deepseek', messages: [{ role: 'user', content: 'fixture' }], stream,
+    });
+    assert.equal(response.status, 200, raw);
+    deepseekIds.push(response.headers.get('x-yabane-request-id'));
+  }
+
   const tools = await post('/v1/responses', { model: 'chat/tools', input: 'fixture', stream: true });
   assert.equal(tools.response.status, 200, tools.raw);
   const toolEvents = events(tools.raw);
@@ -394,7 +421,7 @@ try {
   let records = [];
   for (let i = 0; i < 50; i++) {
     records = await (await request(`${base}/admin/activity/logs?limit=100`, { headers: { cookie } })).json();
-    if ([...successfulIds, ...incompleteIds].every(id => records.some(record => record.request_id === id))) break;
+    if ([...successfulIds, ...incompleteIds, ...deepseekIds].every(id => records.some(record => record.request_id === id))) break;
     await pause(20);
   }
   for (const id of successfulIds) {
@@ -413,6 +440,16 @@ try {
     assert.equal(record.input_tokens, 10);
     assert.equal(record.output_tokens, 5);
     assert.equal(record.cached_tokens, 3);
+  }
+  // ACTIVITY-16: the reported hit count wins over the permanent zero placeholder
+  // on both the buffered and the streamed path.
+  for (const id of deepseekIds) {
+    const record = records.find(record => record.request_id === id);
+    assert.ok(record, `missing Activity ${id}`);
+    assert.equal(record.input_tokens, 10);
+    assert.equal(record.output_tokens, 5);
+    assert.equal(record.cached_tokens, 4);
+    assert.equal(record.finish_reason, 'length');
   }
   console.log('Stream semantics passed: limits, final usage, tool lifecycle and replay, empty deltas, mixed frames, native passthrough');
 } finally {

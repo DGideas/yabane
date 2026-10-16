@@ -377,8 +377,10 @@ function showDeviceSignIn(target, flow = null) {
     $('#sign-in-code').textContent = flow.user_code;
     $('#sign-in-link').href = flow.verification_uri;
     $('#sign-in-status').textContent = 'Waiting for sign-in to complete…';
-  } else {
-    $('#sign-in-status').textContent = 'Device-code sign-in could not start. You can use browser sign-in instead.';
+  } else if (flows.browser) {
+    $('#sign-in-status').textContent = flows.device_code
+      ? 'Device-code sign-in could not start. You can use browser sign-in instead.'
+      : 'This Endpoint type signs in through the browser.';
   }
   signInDialog.showModal();
 }
@@ -388,6 +390,15 @@ async function beginEndpointSignIn(target, errorElement, parentDialog = null) {
   signInPollController = null;
   signInStartController?.abort();
   signInTarget = target;
+  // An Endpoint type that declares browser sign-in alone has no device code to
+  // start, so its dialog opens on the flow it actually offers.
+  const flows = signInFlows();
+  if (!flows.device_code && flows.browser) {
+    parentDialog?.close();
+    showDeviceSignIn(target);
+    await startBrowserSignIn();
+    return;
+  }
   const controller = new AbortController();
   signInStartController = controller;
   parentDialog?.addEventListener('close', () => controller.abort(), {once: true});
@@ -457,9 +468,13 @@ function stopSignInPolling() {
   signInPollController?.abort();
   signInPollController = null;
 }
-$('#sign-in-use-oauth').addEventListener('click', async () => {
+/// Starts this Endpoint type's browser flow and shows its copy-and-paste
+/// steps. Both an explicit request for browser sign-in and an Endpoint type
+/// that offers nothing else reach the flow through here.
+async function startBrowserSignIn() {
   stopSignInPolling();
   $('#sign-in-error').textContent = '';
+  $('#sign-in-browser-error').textContent = '';
   $('#sign-in-use-oauth').disabled = true;
   let response;
   try {
@@ -476,9 +491,22 @@ $('#sign-in-use-oauth').addEventListener('click', async () => {
   $('#sign-in-browser-link').href = flow.authorization_url;
   $('#sign-in-callback').value = '';
   $('#sign-in-browser-error').textContent = '';
+  // The callback address belongs to the sign-in that registered it, so the
+  // instructions describe the address this flow will actually open.
+  showCallbackAddress(flow.redirect_uri);
   $('#sign-in-device').hidden = true;
   $('#sign-in-browser').hidden = false;
-});
+}
+$('#sign-in-use-oauth').addEventListener('click', () => startBrowserSignIn());
+/// States the callback address this sign-in registered instead of assuming one
+/// Endpoint type's address, which would describe another type's flow wrongly.
+function showCallbackAddress(redirectUri) {
+  const address = String(redirectUri || '');
+  $('#oauth-expected-origin').textContent = address || 'the registered callback address';
+  const placeholder = address ? `${address}?code=…&state=…` : 'http://…/callback?code=…&state=…';
+  $('#sign-in-callback').placeholder = placeholder;
+  $('#sign-in-callback-address').textContent = placeholder;
+}
 $('#sign-in-browser').addEventListener('submit', async event => {
   event.preventDefault();
   const submit = event.currentTarget.querySelector('[type="submit"]');

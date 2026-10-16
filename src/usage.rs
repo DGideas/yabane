@@ -270,13 +270,22 @@ fn merge_event_usage(protocol: Protocol, bytes: &[u8], combined: &mut TokenUsage
 
     let input = first_u64(usage, &[&["input_tokens"], &["prompt_tokens"]]);
     let output = first_u64(usage, &[&["output_tokens"], &["completion_tokens"]]);
-    let cached = first_u64(
+    // ACTIVITY-16: cache reads have no single place across upstreams. DeepSeek
+    // reports prompt_cache_hit_tokens, OpenAI reports it inside the prompt-token
+    // details, Anthropic reports cache_read_input_tokens, and Kimi uses a
+    // top-level cached_tokens. Names take precedence over details; a top-level
+    // cached_tokens is a last resort because DeepSeek-derived responses carry a
+    // permanent zero there that would otherwise shadow the hit count. A field
+    // that reports zero counts as unreported, so such a placeholder cannot hide
+    // a later field that carries the value either.
+    let cached = first_u64_nonzero(
         usage,
         &[
-            &["cache_read_input_tokens"],
-            &["cached_tokens"],
+            &["prompt_cache_hit_tokens"],
             &["prompt_tokens_details", "cached_tokens"],
             &["input_tokens_details", "cached_tokens"],
+            &["cache_read_input_tokens"],
+            &["cached_tokens"],
         ],
     );
     let normalized_input = match protocol {
@@ -356,6 +365,22 @@ fn first_u64(value: &serde_json::Value, paths: &[&[&str]]) -> u64 {
             path.iter()
                 .try_fold(value, |current, segment| current.get(segment))
                 .and_then(serde_json::Value::as_u64)
+        })
+        .unwrap_or(0)
+}
+
+/// Reads the first path a Provider response actually reports. A field that is
+/// present but zero is treated as unreported so that a placeholder cannot hide a
+/// later field that carries the value; a response with no cached tokens reaches
+/// zero through the final fallback.
+fn first_u64_nonzero(value: &serde_json::Value, paths: &[&[&str]]) -> u64 {
+    paths
+        .iter()
+        .find_map(|path| {
+            path.iter()
+                .try_fold(value, |current, segment| current.get(segment))
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value > 0)
         })
         .unwrap_or(0)
 }
@@ -487,6 +512,36 @@ mod tests {
                 finish_reason: None,
             }
         );
+    }
+
+    // ACTIVITY-16: a Provider that ships a permanent zero next to a real hit
+    // count must not read as a cache miss.
+    #[test]
+    fn prefers_a_reported_cache_hit_count_over_a_deepseek_zero_placeholder() {
+        let mut tracker = UsageTracker::new(Protocol::OpenAiChat, true);
+        tracker.observe(b"data: {\"usage\":{\"prompt_tokens\":5202,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":4352},\"prompt_cache_hit_tokens\":4352,\"cached_tokens\":0,\"cache_read_input_tokens\":0}}\n\n");
+        assert_eq!(tracker.finish().0.cached, 4352);
+
+        // The same response without the mirrored detail: the named field still wins.
+        let mut named_only = UsageTracker::new(Protocol::OpenAiChat, true);
+        named_only.observe(b"data: {\"usage\":{\"prompt_tokens\":5202,\"completion_tokens\":4,\"prompt_cache_hit_tokens\":4480,\"cached_tokens\":0}}\n\n");
+        assert_eq!(named_only.finish().0.cached, 4480);
+
+        // A zero placeholder in front of a populated detail field falls through too.
+        let mut placeholder_first = UsageTracker::new(Protocol::OpenAiChat, false);
+        placeholder_first.observe(br#"{"usage":{"prompt_tokens":10,"completion_tokens":1,"prompt_cache_hit_tokens":0,"prompt_tokens_details":{"cached_tokens":7}}}"#);
+        assert_eq!(placeholder_first.finish().0.cached, 7);
+
+        // A top-level cached_tokens remains the only source for Providers that
+        // report nothing else, including when it is zero.
+        let mut top_level_only = UsageTracker::new(Protocol::OpenAiChat, false);
+        top_level_only
+            .observe(br#"{"usage":{"prompt_tokens":9,"completion_tokens":2,"cached_tokens":512}}"#);
+        assert_eq!(top_level_only.finish().0.cached, 512);
+        let mut no_cache_reported = UsageTracker::new(Protocol::OpenAiChat, false);
+        no_cache_reported
+            .observe(br#"{"usage":{"prompt_tokens":5,"completion_tokens":1,"cached_tokens":0}}"#);
+        assert_eq!(no_cache_reported.finish().0.cached, 0);
     }
 
     #[test]
