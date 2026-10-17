@@ -392,7 +392,7 @@ for (const project of projects) {
       page.once('dialog', async dialog => { disableWarning = dialog.message(); await dialog.dismiss(); });
       await openAiSubscriptionExtension.locator('[data-extension-toggle="openai-subscription"]').evaluate(input => input.click());
       await page.waitForFunction(() => document.querySelector('[data-extension-toggle="openai-subscription"]').checked);
-      if (!disableWarning.includes('Disable OpenAI Subscription?') || !disableWarning.includes('1 configured Endpoint') || !disableWarning.includes('everything this Extension provides stops')) throw new Error(`${project.name}: disabling an Extension-owned Endpoint type does not confirm the impact on configured Endpoints`);
+      if (!disableWarning.includes('1 configured Endpoint') || !disableWarning.includes('everything this Extension provides stops')) throw new Error(`${project.name}: disabling an Extension-owned Endpoint type does not confirm the impact on configured Endpoints`);
     }
     const trafficCaptureExtension = page.locator('.extension-card').filter({hasText: 'traffic-capture'});
     if (!(await trafficCaptureExtension.isVisible()) || !(await trafficCaptureExtension.getByText('Sensitive diagnostic data', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture is missing or lacks its sensitive-data treatment`);

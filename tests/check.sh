@@ -19,7 +19,7 @@ bash -n tests/e2e.sh tests/behavior-map.sh
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 
-# Check all remaining subsets of the four independently optional Extensions.
+# Check all remaining subsets of the five independently optional Extensions.
 # Keep Core tests active here: adding a dev dependency or disabling those tests
 # would hide accidental coupling to a bundled implementation.
 for features in \

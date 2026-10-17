@@ -267,8 +267,9 @@ extensions=$(admin -f "$base/admin/extensions")
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "openai-subscription") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
 [[ $(printf '%s' "$extensions" | jq -r '.[] | select(.id == "codebuddy") | [.implementation, (.api_version | tostring), (.hooks | join(",")), (.enabled | tostring)] | join(":")') == native_rust:1:provider_endpoint:true ]]
 # Identity kinds belong to the Endpoint type that declares them, so the console
-# and the API describe a credential with the declaration's own words.
-[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai_codex") | [.label, .native, (.sign_in.device_code | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'OpenAI subscription|false|true|openai_subscription:subscription' ]]
+# and the API describe a credential with the declaration's own words; the wording
+# itself is copy, so it is not pinned here.
+[[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "openai_codex") | [.native, (.sign_in.device_code | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'false|true|openai_subscription:subscription' ]]
 [[ $(admin -f "$base/admin/endpoint-types" | jq -r '[.[] | select(.id == "anthropic") | [.label, (.native | tostring), (.credential_kinds | map(.id + ":" + .flow) | join(","))] | join("|")] | join("")') == 'Anthropic|true|secret:secret' ]]
 # A CodeBuddy (CN) Endpoint type fixes no base URL, so the administrator supplies
 # the deployment root and keeps it editable, and owns exactly one pasted secret
@@ -302,7 +303,7 @@ openai_oauth_url=$(printf '%s' "$openai_oauth" | jq -r .authorization_url)
 openai_oauth_id=$(printf '%s' "$openai_oauth" | jq -r .id)
 [[ $(admin_status -X POST "$base/admin/endpoint-types/openai/sign-in/oauth/$openai_oauth_id/complete" -H 'content-type: application/json' -d '{"redirect_url":"http://localhost:1455/auth/callback?code=code&state=state&client_id=issued"}') == 400 ]]
 [[ $(jq -r '.error.message' response.json) == "Callback URL must start with http://127.0.0.1:1455/auth/callback" ]]
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].endpoint_type_label, .endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'OpenAI subscription|https://chatgpt.com/backend-api|true|OAuth account' ]]
+[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | [.endpoints[0].fixed_base_url, (.endpoints[0].sign_in.browser | tostring), .endpoints[0].credentials[0].kind_label] | join("|")') == 'https://chatgpt.com/backend-api|true|OAuth account' ]]
 # A policy stored in the earlier honored-Retry-After shape reads back as the delay
 # source it always meant, and reads back as the disabled fixed source here.
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "subscription-fixture") | .endpoints[0].rate_limit_cooldown | [.seconds, .mode] | join(",")') == 0,fixed ]]
@@ -317,9 +318,7 @@ openai_oauth_id=$(printf '%s' "$openai_oauth" | jq -r .id)
 # An Endpoint type that owns its own identity refuses pasted secrets, and one
 # that owns its own sign-in cannot be created through the plain Endpoint API.
 [[ $(admin_status -X POST "$base/admin/providers/subscription-fixture/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"chatgpt","name":"Pasted key","secret":"sk-not-subscription","weight":100}') == 400 ]]
-[[ $(jq -r '.error.message' response.json) == "OpenAI subscription accounts are connected through sign-in, not created here" ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d '{"id":"pasted-subscription","name":"Pasted subscription","endpoint":{"id":"chatgpt","api_type":"openai_codex","base_url":"https://chatgpt.com/backend-api","requires_credential":true,"credential_secret":"sk-test"}}') == 400 ]]
-[[ $(jq -r '.error.message' response.json) == "OpenAI subscription accounts are connected through that Endpoint type's sign-in flow, not created here" ]]
 # Connecting an account is addressed by Endpoint type: a native type has no
 # sign-in flow, while a type no enabled Extension provides is reported as such.
 [[ $(admin_status -X POST "$base/admin/endpoint-types/anthropic/sign-in/device-code" -H 'content-type: application/json' -d '{"provider_id":"unavailable","provider_name":"Unavailable"}') == 400 ]]

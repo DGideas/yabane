@@ -51,10 +51,10 @@ const MODELS: &[&str] = &[
 pub fn metadata() -> Extension {
     Extension {
         id: ID,
-        name: "OpenAI Subscription",
+        name: "OpenAI Subscription (legacy)",
         version: env!("CARGO_PKG_VERSION"),
         api_version: EXTENSION_API_VERSION,
-        description: "Connects ChatGPT Plus or Pro subscriptions through OpenAI device authorization and the Codex Responses backend.",
+        description: "Connects ChatGPT Plus or Pro subscriptions through OpenAI device authorization and the Codex Responses backend. Superseded by the OpenAI Endpoint type, which signs in with ChatGPT.",
         hooks: &[HookStage::ProviderEndpoint],
     }
 }
@@ -142,8 +142,8 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
     fn endpoint_type(&self) -> ProviderEndpointType {
         ProviderEndpointType {
             id: ENDPOINT_TYPE,
-            display_name: "OpenAI subscription",
-            description: "Responses API with ChatGPT Plus or Pro",
+            display_name: "OpenAI subscription (legacy)",
+            description: "Responses API with ChatGPT Plus or Pro; superseded by the OpenAI Endpoint type",
             default_endpoint_id: "chatgpt",
             fixed_base_url: Some(BASE_URL),
             upstream_protocol: Protocol::OpenAiResponses,
