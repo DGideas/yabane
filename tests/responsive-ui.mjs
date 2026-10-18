@@ -593,9 +593,13 @@ for (const project of projects) {
       const liveCredential = page.locator('.subscription-credential');
       await liveCredential.locator('.credential-cooldown').waitFor({state: 'visible'});
       await page.locator('#provider-detail .credential-details summary').click();
+      await page.locator('#provider-detail .pool-cooldown-summary').click();
+      await page.locator('#provider-detail .pool-routing-summary').click();
+      await page.locator('#provider-detail .credential-actions-summary').first().click();
       await page.locator('.browse-provider-models').click();
       await page.locator('#provider-detail .provider-model-browser').waitFor({state: 'visible'});
       await page.locator('.model-browser-toolbar [role="searchbox"]').fill('gpt');
+      await page.locator('#provider-detail .pool-routing-summary').focus();
       providerRuntimeFixture.chatgptAccountCooldown = 0;
       await page.clock.fastForward(liveRefreshIntervalMs);
       await page.waitForFunction(() => !document.querySelector('.subscription-credential .credential-cooldown'));
@@ -605,7 +609,11 @@ for (const project of projects) {
       if (!liveShares.some(text => text.includes('50%') && !text.includes('while cooling down'))) throw new Error(`${project.name}: a live refresh kept the cooling share (${liveShares.join(' | ')})`);
       if (await page.locator('#provider-detail .provider-model-browser').isHidden()) throw new Error(`${project.name}: a live refresh closed the model catalog it redrew around`);
       if (await page.locator('.model-browser-toolbar [role="searchbox"]').inputValue() !== 'gpt') throw new Error(`${project.name}: a live refresh discarded the model catalog search`);
-      if (await page.locator('#provider-detail .credential-details').getAttribute('open') === null) throw new Error(`${project.name}: a live refresh collapsed expanded credential details`);
+      for (const selector of ['.credential-details', '.pool-cooldown-details', '.pool-routing-details', '.credential-actions']) {
+        if (await page.locator(`#provider-detail ${selector}`).first().getAttribute('open') === null) throw new Error(`${project.name}: a live refresh collapsed ${selector}`);
+      }
+      if (!await page.locator('#provider-detail .pool-routing-summary').evaluate(summary => summary === document.activeElement)) throw new Error(`${project.name}: a live refresh lost keyboard focus on routing details`);
+      if (await page.locator('#provider-detail .endpoint-card .endpoint-card').count()) throw new Error(`${project.name}: a live refresh nested Endpoint cards`);
       if (await liveProvider.locator('.provider-cooling').count()) throw new Error(`${project.name}: the Provider list kept its cooling note after the cooldown ended`);
       // Restore the fixture and let the same refresh pick the cooldown up again: a
       // cooldown that begins while the page stays open is shown without a reload, and
@@ -857,13 +865,13 @@ for (const project of projects) {
     await page.locator('#help-dialog .close-help').first().click();
     await page.evaluate(() => { authSettings.api_keys = window.__helpTestKeys; delete window.__helpTestKeys; });
     if (await credential.getByText('Automatic renewal enabled', {exact: true}).count() !== 1) throw new Error(`${project.name}: a connected account does not present automatic renewal as its primary state`);
-    if (!(await credential.innerText()).includes('the Provider revokes access')) throw new Error(`${project.name}: automatic renewal names a vendor instead of the Provider`);
     if (await credential.getByText(/^Token expires /).count()) throw new Error(`${project.name}: OpenAI subscription still presents access-token expiry as its primary state`);
     const details = credential.locator('.credential-details');
     if (await details.count() !== 1 || await details.getAttribute('open') !== null) throw new Error(`${project.name}: OpenAI access-token details are missing or expanded by default`);
     await details.locator('summary').click();
     const detailText = await details.locator('p').textContent();
-    if (!detailText.includes('current access token') || !detailText.includes('next request')) throw new Error(`${project.name}: elapsed OpenAI access-token detail does not explain lazy renewal`);
+    if (!detailText.includes('current access token') || !detailText.includes('next request') || !detailText.includes('the Provider revokes access')) throw new Error(`${project.name}: elapsed access-token detail does not explain lazy renewal and reconnection`);
+    if ((await credential.locator('.key-list').innerText()).includes('access token')) throw new Error(`${project.name}: token diagnostics still dominate the live account list`);
     const cooldown = credential.locator('.credential-cooldown');
     if (await cooldown.count() !== 1 || !(await cooldown.textContent()).includes('Cooling down')) throw new Error(`${project.name}: a cooling credential does not state that it is out of selection`);
     if (await cooldown.locator('.clear-cooldown').count() !== 1) throw new Error(`${project.name}: a cooling credential offers no explicit action that returns it to selection`);
@@ -875,13 +883,25 @@ for (const project of projects) {
     if (await page.locator('.endpoint-pool').count() !== 1) throw new Error(`${project.name}: the Endpoint does not state its identity pool exactly once`);
     const poolText = await page.locator('.endpoint-pool').textContent();
     if (!poolText.includes('leaves the pool for the delay the Provider reports') || !poolText.includes('never longer than 1 hour')) throw new Error(`${project.name}: the identity pool does not state what a Provider rate limit does to the rotation (${poolText})`);
-    if (!poolText.includes('is out until') || !poolText.includes('carries every request')) throw new Error(`${project.name}: the identity pool does not state which identity is out now and who carries the traffic instead (${poolText})`);
+    if (!poolText.includes('is cooling down until') || !poolText.includes('carries every request')) throw new Error(`${project.name}: the identity pool does not state which identity is out now and who carries the traffic instead (${poolText})`);
     // A policy whose length can come from the Provider may never fire, so the
     // Endpoint states what it has actually done instead of only what it allows,
     // including whether the Provider's own number was capped by the ceiling.
-    if (!poolText.includes('selected a cooldown duration 3 times') || !poolText.includes('took an identity out for 1 hour') || !poolText.includes('The Provider asked for 2 hours') || !poolText.includes('so this cooldown was capped') || !poolText.includes('reported no usable delay')) throw new Error(`${project.name}: the identity pool does not report what the cooldown policy has observed (${poolText})`);
+    if (!poolText.includes('Durations selected3') || !poolText.includes('Last selected') || !poolText.includes('1 hour') || !poolText.includes('The Provider asked for 2 hours') || !poolText.includes('so this cooldown was capped') || !poolText.includes('reported no usable delay')) throw new Error(`${project.name}: the identity pool does not report what the cooldown policy has observed (${poolText})`);
+    // ENDPOINT-40 / ENDPOINT-42: state is visible, rules and structured diagnostics
+    // are progressively disclosed, and normal takeover is not an Endpoint warning.
+    for (const selector of ['.pool-cooldown-details', '.pool-routing-details']) {
+      const disclosure = page.locator(selector);
+      if (await disclosure.getAttribute('open') !== null) throw new Error(`${project.name}: ${selector} starts expanded`);
+      if (await disclosure.locator('.pool-detail-body').isVisible()) throw new Error(`${project.name}: ${selector} leaks collapsed content`);
+      await disclosure.locator('summary').click();
+      if (!await disclosure.locator('.pool-detail-body').isVisible()) throw new Error(`${project.name}: ${selector} cannot be expanded`);
+      await assertNoPageOverflow(page, project.name, 'expanded Endpoint details');
+      await disclosure.locator('summary').click();
+    }
+    if (await page.locator('.endpoint-pool').getAttribute('data-tone') !== 'steady') throw new Error(`${project.name}: a normal takeover is presented as an Endpoint warning`);
     const identityShares = await credential.locator('.traffic-share').allTextContents();
-    if (!identityShares.some(text => text.includes('0%') && text.includes('while cooling down'))) throw new Error(`${project.name}: a cooling identity keeps presenting its configured share as what it carries (${identityShares.join(' | ')})`);
+    if (!identityShares.some(text => text.startsWith('0%') && text.includes('normally 50%'))) throw new Error(`${project.name}: a cooling identity keeps presenting its configured share as what it carries (${identityShares.join(' | ')})`);
     if (!identityShares.some(text => text.includes('100%') && text.includes('normally 50%'))) throw new Error(`${project.name}: an identity carrying the whole pool does not state both the effective and the configured share (${identityShares.join(' | ')})`);
     // Setting the split and setting the policy that changes what the split means
     // are one mechanism, so each screen states the other half of it.
@@ -1069,16 +1089,49 @@ for (const project of projects) {
       const tieredPool = await tieredCard.locator('.endpoint-pool').textContent();
       if (!tieredPool.includes('Traffic always uses Priority 1 first (Primary account)')) throw new Error(`${project.name}: a tiered pool does not state which group carries traffic (${tieredPool})`);
       if (!tieredPool.includes('Priority 2 (Standby account) only carries it while every identity in the group above it is cooling down')) throw new Error(`${project.name}: a standby group is not stated as a standby (${tieredPool})`);
-      if (!tieredPool.includes('took an identity out for 1 hour') || !tieredPool.includes('which was used unchanged')) throw new Error(`${project.name}: a tiered pool does not state that the Provider's own delay armed the last cooldown (${tieredPool})`);
+      if (!tieredPool.includes('Last selected') || !tieredPool.includes('1 hour') || !tieredPool.includes('which was used unchanged')) throw new Error(`${project.name}: a tiered pool does not state that the Provider's own delay armed the last cooldown (${tieredPool})`);
       // The list itself says the numbers are read per group, so a standby row's
       // 0% is not mistaken for a sharing mistake.
       const tierCopy = await tieredCard.locator('.endpoint-keys-head p').first().textContent();
       if (!tierCopy.includes('Each priority group splits its own traffic between the credentials in it')) throw new Error(`${project.name}: the credential list describes one split for a tiered Endpoint (${tierCopy})`);
       const tiers = await tieredCard.locator('.credential-tier').allTextContents();
-      if (tiers.join('|') !== 'Priority 1 · first|Priority 2 · standby') throw new Error(`${project.name}: identity rows do not name their priority group (${tiers.join(' | ')})`);
+      if (tiers.join('|') !== 'Priority 1 · preferred|Priority 2 · standby') throw new Error(`${project.name}: identity rows do not name their priority group (${tiers.join(' | ')})`);
       const tierShares = await tieredCard.locator('.traffic-share').allTextContents();
       if (!tierShares[0].includes('100%') || !tierShares[0].includes('of Priority 1 traffic')) throw new Error(`${project.name}: the group that carries traffic does not state its share (${tierShares.join(' | ')})`);
-      if (!tierShares[1].includes('0%') || !tierShares[1].includes('only while Priority 1 is out')) throw new Error(`${project.name}: a standby identity presents its configured share as traffic it carries (${tierShares.join(' | ')})`);
+      if (!tierShares[1].startsWith('0%') || !tierShares[1].includes('normally 100%')) throw new Error(`${project.name}: a standby identity presents its configured share as traffic it carries (${tierShares.join(' | ')})`);
+      // ENDPOINT-40: unsorted configuration does not change the displayed order;
+      // taking over changes live state, never the account's standby configuration.
+      await page.evaluate(() => {
+        const provider = providers.find(item => item.id === 'ui-tiered');
+        const endpoint = provider.endpoints[0];
+        endpoint.credentials.reverse();
+        endpoint.credentials.find(key => key.id === 'primary').cooldown_seconds_remaining = 90;
+        renderProviderRuntimeState(provider);
+      });
+      const accountOrder = await tieredCard.locator('.key-name>strong').allTextContents();
+      if (accountOrder.join('|') !== 'Primary account|Standby account') throw new Error(`${project.name}: accounts do not follow priority order (${accountOrder})`);
+      if (!(await tieredCard.locator('.pool-now').textContent()).includes('Priority 2 is carrying all traffic')) throw new Error(`${project.name}: standby takeover is missing from the live summary`);
+      if (!(await tieredCard.locator('.key-row').nth(1).innerText()).includes('Carrying traffic')) throw new Error(`${project.name}: an account carrying traffic is still labelled as merely waiting`);
+      await tieredCard.locator('.pool-cooldown-summary').click();
+      await tieredCard.locator('.pool-routing-summary').click();
+      await tieredCard.locator('.credential-actions-summary').nth(1).click();
+      await tieredCard.locator('.pool-routing-summary').focus();
+      await page.evaluate(() => {
+        const provider = providers.find(item => item.id === 'ui-tiered');
+        provider.endpoints[0].credentials.forEach(key => { key.cooldown_seconds_remaining = 90; });
+        for (let i = 0; i < 3; i++) renderProviderRuntimeState(provider);
+      });
+      if (await tieredCard.locator('.endpoint-pool').getAttribute('data-tone') !== 'exhausted') throw new Error(`${project.name}: all-cooling fallback is not visibly cautioned`);
+      const fallbackShare = await tieredCard.locator('.key-row').first().locator('.traffic-share').textContent();
+      if (!fallbackShare.startsWith('100%') || !fallbackShare.includes('requests still go out')) throw new Error(`${project.name}: all-cooling fallback incorrectly reports zero traffic (${fallbackShare})`);
+      if (await page.locator('.endpoint-card .endpoint-card').count()) throw new Error(`${project.name}: repeated runtime refresh nests Endpoint cards`);
+      for (const selector of ['.pool-cooldown-details', '.pool-routing-details', '.credential-actions']) {
+        const disclosure = tieredCard.locator(selector).nth(selector === '.credential-actions' ? 1 : 0);
+        if (await disclosure.getAttribute('open') === null) throw new Error(`${project.name}: all-cooling refresh lost ${selector}`);
+      }
+      if (!await tieredCard.locator('.pool-routing-summary').evaluate(summary => summary === document.activeElement)) throw new Error(`${project.name}: repeated refresh lost disclosure focus`);
+      await assertNoPageOverflow(page, project.name, 'all-cooling pool and expanded actions');
+      await page.evaluate(() => loadProviders());
       // The dialog that sets the split is also where a group is chosen, and every
       // group totals 100 on its own because each one describes what happens while
       // it is the group carrying the traffic.
@@ -1283,6 +1336,7 @@ for (const project of projects) {
         await page.locator('#credential-dialog .close-credential').first().click();
         await page.locator('#credential-dialog').waitFor({state: 'hidden'});
       }
+      await page.locator('.credential-actions-summary').first().click();
       const renameKey = page.locator('.credential-rename').first();
       if (await renameKey.count()) {
         await renameKey.click();

@@ -574,7 +574,7 @@ function identityGroups(endpoint) {
     byPriority.get(priority).push(credential);
   });
   return [...byPriority.entries()].sort((a, b) => a[0] - b[0]).map(([, members], index) => {
-    const eligible = members.filter(credential => !credential.cooldown_seconds_remaining);
+    const eligible = members.filter(credential => credential.weight > 0 && !credential.cooldown_seconds_remaining);
     return {priority: index + 1, members, eligible, standby: index > 0, configured: trafficShares(members), effective: trafficShares(eligible)};
   });
 }
@@ -593,10 +593,10 @@ function evenShares(count) {
   return Array.from({length: count}, (_, index) => base + (index < remainder ? 1 : 0));
 }
 function credentialRows(provider, endpoint) {
-  const pool = identityPool(endpoint);
   const groups = identityGroups(endpoint);
   const carrier = carryingGroup(groups);
-  return endpoint.credentials.map(credential => {
+  const ordered = [...endpoint.credentials].sort((a, b) => (a.priority || 1) - (b.priority || 1));
+  return ordered.map(credential => {
     const group = groups.find(item => item.members.some(member => member.id === credential.id));
     const cooldown = credential.cooldown_seconds_remaining
       ? `<span class="credential-cooldown">Cooling down · resumes in ${formatCooldown(credential.cooldown_seconds_remaining)} <button class="text-link clear-cooldown" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}">Resume now</button></span>`
@@ -608,19 +608,23 @@ function credentialRows(provider, endpoint) {
     const carries = group && carrier && group.priority === carrier.priority;
     const configured = group?.configured.get(credential.id) ?? 0;
     const scope = groups.length > 1 ? `of Priority ${group?.priority} traffic` : 'of default traffic';
+    const fallback = carries && !carrier.eligible.length;
+    const current = !credential.enabled || !credential.weight || !carries
+      ? 0
+      : fallback ? configured : carrier.effective.get(credential.id) ?? 0;
+    const state = !credential.enabled ? 'Disabled'
+      : !credential.weight ? 'No traffic configured'
+        : credential.cooldown_seconds_remaining ? ''
+          : carries ? 'Carrying traffic' : 'Waiting for higher-priority groups';
     const share = !credential.enabled
       ? {value: '—', note: 'no traffic'}
-      : credential.cooldown_seconds_remaining
-        ? {value: '0%', note: 'while cooling down'}
-        : !carries
-          ? {value: '0%', note: `only while Priority ${carrier?.priority} is out`}
-          : carrier.eligible.length < carrier.members.length
-            ? {value: `${carrier.effective.get(credential.id) ?? 0}%`, note: `right now · normally ${configured}%`}
-            : {value: `${configured}%`, note: scope};
-    const tier = groups.length > 1
-      ? `<span class="credential-tier" data-tone="${group?.standby ? 'standby' : 'first'}">${group?.standby ? `Priority ${group.priority} · standby` : 'Priority 1 · first'}</span>`
+      : {value: `${current}%`, note: current !== configured
+        ? `normally ${configured}%`
+        : fallback ? 'all cooling · requests still go out' : scope};
+    const tier = groups.length > 1 && group
+      ? `<span class="credential-tier" data-tone="${group.standby ? 'standby' : 'first'}">Priority ${group.priority} · ${group.standby ? 'standby' : 'preferred'}</span>`
       : '';
-    return `<div class="key-row"><span class="status ${credential.enabled ? 'enabled' : ''}"></span><span class="key-name"><strong>${escapeHtml(credential.name)}</strong>${tier}<small>${escapeHtml(credentialDetail(credential))}</small>${cooldown}</span><span class="traffic-share"><strong>${share.value}</strong><small>${share.note}</small></span><button class="credential-rename text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" aria-label="Rename credential ${escapeHtml(credential.name)}">Rename</button><button class="credential-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-enabled="${credential.enabled}">${credential.enabled ? 'Disable' : 'Enable'}</button><button class="credential-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-name="${escapeHtml(credential.name)}" aria-label="Delete credential ${escapeHtml(credential.name)}">Delete</button></div>`;
+    return `<div class="key-row" data-credential="${credential.id}" data-state="${!credential.enabled ? 'disabled' : fallback ? 'fallback' : credential.cooldown_seconds_remaining ? 'cooling' : current > 0 ? 'carrying' : 'waiting'}"><span class="key-name"><strong>${escapeHtml(credential.name)}</strong>${tier}${state ? `<small class="credential-state">${state}</small>` : ''}${cooldown}</span><span class="traffic-share"><strong>${share.value}</strong><small${credential.enabled ? ` title="Configured ${configured}% ${scope}"` : ''}>${share.note}</small></span><details class="credential-actions" data-detail="actions-${escapeHtml(credential.id)}"><summary class="credential-actions-summary" aria-label="Actions for ${escapeHtml(credential.name)}">${icon('more')}</summary><div><button class="credential-rename text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" aria-label="Rename credential ${escapeHtml(credential.name)}">Rename</button><button class="credential-toggle text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-enabled="${credential.enabled}">${credential.enabled ? 'Disable' : 'Enable'}</button><button class="credential-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" data-credential="${credential.id}" data-name="${escapeHtml(credential.name)}" aria-label="Delete credential ${escapeHtml(credential.name)}">Delete</button></div></details></div>`;
   }).join('');
 }
 
@@ -681,11 +685,11 @@ function endpointCard(provider, endpoint, index) {
   const headCopy = !subscription
     ? `<h4>Credentials</h4><p>${endpoint.requires_credential ? `Credentials belong only to <code>${escapeHtml(endpoint.id)}</code>. ${identityGroups(endpoint).length > 1 ? 'Each priority group splits its own traffic between the credentials in it.' : 'Traffic is distributed between enabled credentials.'}` : 'This Endpoint sends requests without an identity.'}</p>`
     : enabled.length
-      ? `<h4>Automatic renewal enabled</h4><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or the Provider revokes access.</p><details class="credential-details"><summary>Credential details</summary><p>${escapeHtml(accountCredentialDetail(endpoint))} Access and refresh tokens are never shown in the console or API.</p></details>`
+      ? '<h4>Connected accounts</h4>'
       : '<h4>Reconnect required</h4><p>No account is connected. Use Connect account to sign in and resume requests through this Endpoint.</p>';
   const renewalStatus = subscription
     ? enabled.length
-      ? '<span class="renewal-status">Automatic renewal</span>'
+      ? '<span class="renewal-status">Automatic renewal enabled</span>'
       : '<span class="renewal-status attention">Not connected</span>'
     : '';
   const emptyRow = !endpoint.requires_credential
@@ -698,8 +702,11 @@ function endpointCard(provider, endpoint, index) {
     : subscription
       ? `<button class="button secondary connect-account" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Connect account</button>`
       : `<button class="button secondary add-credential" data-provider="${provider.id}" data-endpoint="${endpoint.id}">${icon('plus', 'button-icon')}Add credential</button>`;
+  const credentialDetails = subscription && endpoint.credentials.length
+    ? `<details class="credential-details" data-detail="credentials"><summary class="credential-details-summary">Credential details</summary><p>Yabane renews temporary access credentials when needed. Reconnect only if renewal fails or the Provider revokes access. ${escapeHtml(accountCredentialDetail(endpoint))} Access and refresh tokens are never shown in the console or API.</p><dl class="credential-facts">${endpoint.credentials.map(credential => `<div><dt>${escapeHtml(credential.name)}</dt><dd>${escapeHtml(credentialDetail(credential))}</dd></div>`).join('')}</dl></details>`
+    : '';
   const endpointKind = endpoint.endpoint_type_label || formatType(endpoint.api_type);
-  return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}" data-endpoint="${escapeHtml(endpoint.id)}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header>${poolSummary}<section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list">${rows}${emptyRow}</div>` : ''}</section></article>`;
+  return `<article class="endpoint-card${subscription ? ' subscription-endpoint' : ''}" data-endpoint="${escapeHtml(endpoint.id)}"><header class="endpoint-head"><span class="endpoint-index">${index + 1}</span><div class="endpoint-identity"><div><h3>${escapeHtml(endpoint.id)}</h3><span class="kind">${escapeHtml(endpointKind)}</span></div><code>${escapeHtml(endpoint.fixed_base_url || endpoint.base_url)}</code></div><div class="endpoint-facts"><span><strong>${endpointModels}</strong> models</span>${credentialFact}${endpoint.socks5_proxy ? `<span>Proxy <code>${escapeHtml(endpoint.socks5_proxy)}</code></span>` : ''}${cooldownPolicy}</div><div class="endpoint-actions"><button class="endpoint-edit text-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Edit settings</button><button class="endpoint-delete text-link danger-link" data-provider="${provider.id}" data-endpoint="${endpoint.id}" aria-label="Delete endpoint ${escapeHtml(endpoint.id)}">Delete endpoint</button></div></header>${poolSummary}<section class="endpoint-keys${subscription ? ' subscription-credential' : ''}"><div class="endpoint-keys-head"><div>${headCopy}</div><div class="endpoint-key-actions">${renewalStatus}${enabled.length > 1 ? `<button class="text-link edit-traffic" data-provider="${provider.id}" data-endpoint="${endpoint.id}">Distribute traffic</button>` : ''}${addAction}</div></div>${endpoint.requires_credential ? `<div class="key-list"><div class="credential-list-label">Current traffic allocation <small>Routing shares, not measured request volume</small></div>${rows}${emptyRow}</div>` : ''}${credentialDetails}</section></article>`;
 }
 
 function renderProviderPage() {
@@ -897,20 +904,23 @@ function cooldownProviderNote(activity) {
 /// itself asked for, instead of leaving the administrator unable to tell a
 /// working policy from a dead one or a capped number from a missing one.
 function endpointPolicyActivity(endpoint) {
+  if (!endpoint.rate_limit_cooldown?.seconds) return '';
   const activity = endpoint.rate_limit_cooldown_activity;
-  if (!activity || !endpoint.rate_limit_cooldown?.seconds) return '';
+  if (!activity) return '<p class="pool-observed">Runtime observations are not available.</p>';
   const applied = activity.applied || 0;
   const skipped = activity.skipped || 0;
-  const plural = (count, noun) => `${count} ${noun}${count === 1 ? '' : 's'}`;
-  if (!applied && !skipped) return 'No rate-limit answer has reached this Endpoint since Yabane started.';
-  if (!applied) return `${plural(skipped, 'rate-limit answer')} reported no usable delay, so no identity has been taken out yet.`;
-  const last = activity.last_applied_at
-    ? activity.last_seconds === 0
-      ? ` Most recently it selected a 0-second delay at ${formatClock(activity.last_applied_at)}; no new cooldown was started.${cooldownProviderNote(activity)}`
-      : ` Most recently it took an identity out for ${formatCooldown(activity.last_seconds)} at ${formatClock(activity.last_applied_at)}.${cooldownProviderNote(activity)}`
-    : '';
-  const skippedNote = skipped ? ` ${plural(skipped, 'rate-limit answer')} reported no usable delay.` : '';
-  return `This Endpoint has selected a cooldown duration ${plural(applied, 'time')} since Yabane started.${last}${skippedNote}`;
+  const facts = [
+    ['Durations selected', `${applied} · since Yabane started`],
+    ['Missing delay, no change', `${skipped}${skipped ? ' · reported no usable delay' : ''}`],
+  ];
+  if (!applied && !skipped) facts.push(['Observation', 'No rate-limit answer has reached this Endpoint since Yabane started.']);
+  if (activity.last_applied_at) {
+    facts.push(['Last selected', `${formatClock(activity.last_applied_at)} · ${formatCooldown(activity.last_seconds)}`]);
+    facts.push(['Recorded source', cooldownProviderNote(activity).trim()]);
+    if (activity.last_seconds === 0) facts.push(['Effect', 'A 0-second delay was selected; no new cooldown was started.']);
+  }
+  if (activity.last_observed_at) facts.push(['Last rate-limit answer', formatClock(activity.last_observed_at)]);
+  return `<dl class="pool-facts pool-observed">${facts.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>`;
 }
 /// How a group splits its own traffic, named the way the pool states it: a single
 /// identity is just itself, because 100% of one group states nothing.
@@ -966,24 +976,28 @@ function endpointPoolSummary(endpoint) {
         ? 'Rate limits are not tracked here, so a request that hits one receives the Provider’s own answer.'
         : 'Rate limits are not tracked here, so an identity the Provider rate-limits keeps its configured share. Edit settings to let the others take over while it is limited.';
   }
-  let now = '';
-  let tone = 'steady';
-  if (pool.cooling.length) {
-    tone = 'cooling';
-    // Under priority groups only the group that carries traffic hands it out, so
-    // this sentence names that group's identities rather than every healthy
-    // identity, which would include the ones waiting in a standby group.
-    const carrying = standbyGroups.length ? carrier.members.filter(key => !key.cooldown_seconds_remaining) : pool.eligible;
-    now = pool.cooling.length === pool.enabled.length
-      ? `Every ${escapeHtml(noun)} is cooling down right now, so requests still go out and the Provider’s own 429 reaches the caller.`
-      : `Right now ${identityList(pool.cooling)} ${pool.cooling.length === 1 ? 'is' : 'are'} out until ${pool.cooling.map(key => cooldownEndsAt(key.cooldown_seconds_remaining)).join(' / ')}, so ${identityList(carrying)} carr${carrying.length === 1 ? 'ies' : 'y'} every request.`;
-    if (standbyGroups.length) {
-      now += carrier.standby
-        ? ` Priority ${carrier.priority} is carrying the traffic while the groups above it are out, and hands it back as they return.`
-        : ` Priority ${carrier.priority} still carries the traffic, so the groups below it wait.`;
-    }
-  }
+  const carrying = carrier ? (carrier.eligible.length ? carrier.eligible : carrier.members.filter(key => key.weight > 0)) : [];
+  const allCooling = pool.cooling.length > 0 && !pool.eligible.length;
+  const title = allCooling
+    ? `All ${escapeHtml(noun)} are cooling down`
+    : standbyGroups.length
+      ? `Priority ${carrier.priority} is carrying all traffic${carrying.length === 1 ? ` · ${identityList(carrying)}` : ''}`
+      : carrying.length === 1
+        ? `${identityList(carrying)} carries every request`
+        : `Traffic rotates between ${carrying.length} ${escapeHtml(noun)}`;
+  const next = pool.cooling.length ? Math.min(...pool.cooling.map(key => key.cooldown_seconds_remaining)) : 0;
+  let now = pool.cooling.length === 1
+    ? `${identityList(pool.cooling)} is cooling down until <strong>${cooldownEndsAt(next)}</strong>.`
+    : pool.cooling.length ? `${pool.cooling.length} ${escapeHtml(noun)} are cooling down; next resumes at <strong>${cooldownEndsAt(next)}</strong>.` : '';
+  if (allCooling) now += ` Requests still go out${standbyGroups.length ? ` through Priority ${carrier.priority}` : ''}; the Provider’s response is returned unchanged.`;
+  else if (carrier?.standby) now += ' Traffic returns to a higher-priority group as soon as it resumes.';
   const observed = endpointPolicyActivity(endpoint);
+  const policyFacts = pool.seconds > 0
+    ? `<dl class="pool-facts"><div><dt>Delay source</dt><dd>${policy.mode === 'fixed' ? 'Fixed duration' : 'Provider’s Retry-After · integer seconds'}</dd></div><div><dt>${policy.mode === 'fixed' ? 'Fixed cooldown' : 'Maximum cooldown'}</dt><dd>${formatCooldown(pool.seconds)}</dd></div>${policy.mode !== 'fixed' ? `<div><dt>Missing usable delay</dt><dd>${policy.mode === 'provider_only' ? 'No cooldown; keep the identity in rotation' : `Use the maximum · ${formatCooldown(pool.seconds)}`}</dd></div>` : ''}</dl>`
+    : '';
+  const cooldownDetails = pool.seconds > 0
+    ? `<details class="pool-details pool-cooldown-details" data-detail="cooldown"><summary class="pool-cooldown-summary">Cooldown details<span>${cooldownPolicyLabel(policy) || 'Fixed duration'} · ${formatCooldown(pool.seconds)}</span></summary><div class="pool-detail-body">${policyFacts}${observed}</div></details>`
+    : '';
   // A standby group that can never be reached is a configuration the
   // administrator has to see: nothing leaves the rotation while no cooldown
   // policy is configured, so the lower group would only take over by disabling
@@ -991,7 +1005,7 @@ function endpointPoolSummary(endpoint) {
   const unreachable = standbyGroups.length && pool.seconds === 0
     ? `<p class="pool-standby">Priority ${standbyGroups[0].priority} never takes over: this Endpoint does not track rate limits, so no identity above it ever leaves the rotation. Set a rate-limit cooldown, or move those identities into Priority ${groups[0].priority}.</p>`
     : '';
-  return `<div class="endpoint-pool" data-tone="${tone}">${now ? `<p class="pool-now">${now}</p>` : ''}<p class="pool-steady">${steady}</p><p class="pool-failure">${failure}</p>${unreachable}${observed ? `<p class="pool-observed">${observed}</p>` : ''}</div>`;
+  return `<div class="endpoint-pool" data-tone="${allCooling ? 'exhausted' : unreachable ? 'attention' : 'steady'}"><div class="pool-status"><p class="pool-now">${title}</p>${now ? `<p class="pool-return">${now}</p>` : ''}${unreachable}</div>${cooldownDetails}<details class="pool-details pool-routing-details" data-detail="routing"><summary class="pool-routing-summary">How traffic is assigned${groups.length > 1 ? `<span>${groups.map(group => `Priority ${group.priority}`).join(' → ')}</span>` : ''}</summary><div class="pool-detail-body"><p class="pool-steady">${steady}</p><p class="pool-failure">${failure}</p><p>When every eligible identity is cooling down, requests still go out and return the Provider’s own response. No request is retried. A route that pins one identity uses it exactly as configured, without switching identities.</p><p>Percentages show current routing allocation, not measured request volume.</p></div></details></div>`;
 }
 
 function bindProviderActions() {
@@ -1115,9 +1129,11 @@ function renderProviderRuntimeState(provider) {
     const index = provider.endpoints.findIndex(endpoint => endpoint.id === card.dataset.endpoint);
     if (index < 0) return;
     const active = card.contains(document.activeElement) ? controlIdentity(document.activeElement) : null;
-    const expanded = [...card.querySelectorAll('details')].map(details => details.open);
-    card.innerHTML = endpointCard(provider, provider.endpoints[index], index);
-    [...card.querySelectorAll('details')].forEach((details, position) => { details.open = Boolean(expanded[position]); });
+    const expanded = new Map([...card.querySelectorAll('details[data-detail]')].map(details => [details.dataset.detail, details.open]));
+    const template = document.createElement('template');
+    template.innerHTML = endpointCard(provider, provider.endpoints[index], index);
+    card.replaceChildren(...template.content.firstElementChild.childNodes);
+    card.querySelectorAll('details[data-detail]').forEach(details => { details.open = Boolean(expanded.get(details.dataset.detail)); });
     if (active) cardControls(card).find(control => controlIdentity(control) === active)?.focus({preventScroll: true});
   });
   bindEndpointCardActions($('#provider-detail .endpoint-stack'));
@@ -1127,7 +1143,7 @@ function renderProviderRuntimeState(provider) {
 /// redrawn by what it addresses rather than by its position, because a cooldown
 /// ending adds or removes the Resume action the row around it holds.
 function cardControls(card) { return [...card.querySelectorAll('button, summary, a[href], input, select, textarea')]; }
-function controlIdentity(control) { return `${control.tagName}|${control.className}|${control.dataset?.credential || ''}`; }
+function controlIdentity(control) { return `${control.tagName}|${control.className}|${control.dataset?.credential || ''}|${control.closest('details')?.dataset.detail || ''}`; }
 
 function openProviderIdentityDialog(providerId) {
   const provider = providers.find(item => item.id === providerId);

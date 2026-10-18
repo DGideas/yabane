@@ -49,6 +49,7 @@ done
 cargo build --locked
 node tests/openapi-paths.mjs
 node tests/cooldown-copy.mjs
+node tests/cooldown-layout.mjs
 node tests/activity-outcomes.mjs
 node tests/cooldown-history.mjs "$repo/target/debug/yabane"
 node tests/http-redirects.mjs "$repo/target/debug/yabane"

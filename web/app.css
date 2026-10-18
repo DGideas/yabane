@@ -108,19 +108,65 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .credential-cooldown{display:inline-flex;flex-wrap:wrap;align-items:center;gap:8px;width:max-content;padding:3px 9px;color:#8a5300;background:#fef3d7;border-radius:10px;font-size:11px}
 .provider-cooling{max-width:100%;padding:2px 8px;color:#8a5300;background:#fef3d7;border-radius:9px;font-size:11px;line-height:1.4}
 .credential-tier{width:max-content;margin-top:4px;padding:2px 7px;color:#0842a0;background:#e8f0fe;border-radius:7px;font-size:10px;font-weight:500}
-.credential-tier[data-tone=standby]{color:#654600;background:#fff4d6}.credential-cooldown .text-link{font-size:11px}.traffic-row small{color:var(--muted);font-size:11px}
-/* A pool that only describes a configured policy is a note and takes the
-   console's note shape; a pool with an identity out of rotation is a condition
-   and takes the boxed shape the console's other warnings use. Both align with the
-   key panel below them rather than with the wider card padding. */
-.endpoint-pool{display:grid;gap:5px;margin:0 12px 12px;padding:12px 15px;background:#f6f8fc;border-left:3px solid #a8c7fa;border-radius:0 6px 6px 0}
-.endpoint-pool p{margin:0;color:#3c4043;font-size:12px;line-height:1.5}
-.endpoint-pool .pool-steady{color:#202124;font-weight:500}
-.endpoint-pool .pool-now{padding-bottom:9px;color:#7a4f01;font-weight:500;border-bottom:1px solid #f2e2bd}
-.endpoint-pool[data-tone=cooling]{background:#fef7e0;border:1px solid #f2cc70;border-left:3px solid #b06d00;border-radius:10px}
-.endpoint-pool[data-tone=idle]{background:#fce8e6;border:1px solid #f4c7c3;border-left:3px solid #b3261e;border-radius:10px}
+.credential-tier[data-tone=standby]{color:#596579;background:#eef1f6}.credential-cooldown .text-link{font-size:11px}.traffic-row small{color:var(--muted);font-size:11px}
+/* Keep Yabane's blue directional accent on the live summary. A normal takeover
+   is not an Endpoint warning: amber belongs to a cooling identity, or a pool
+   with no alternative left. Stable rules and diagnostics are read on demand. */
+.endpoint-pool{margin:0 12px 14px;min-width:0}
+.endpoint-pool p{margin:0;color:#3c4043;font-size:12px;line-height:1.55;overflow-wrap:anywhere}
+.pool-status{padding:13px 16px;background:#f0f5fd;border:1px solid #dce6f7;border-left:3px solid var(--blue);border-radius:0 8px 8px 0}
+.endpoint-pool .pool-now{color:#24416a;font-size:14px;font-weight:500}
+.endpoint-pool .pool-return{margin-top:5px;color:#52647b}
+.endpoint-pool[data-tone=exhausted] .pool-status,.endpoint-pool[data-tone=attention] .pool-status{background:#fef7e0;border-color:#e8cf94;border-left-color:#b06d00}
+.endpoint-pool[data-tone=exhausted] .pool-now,.endpoint-pool[data-tone=attention] .pool-now{color:#7a4f01}
+.endpoint-pool[data-tone=idle]{padding:13px 16px;background:#fce8e6;border:1px solid #f4c7c3;border-left:3px solid #b3261e;border-radius:0 8px 8px 0}
 .endpoint-pool[data-tone=idle] p{color:#8c1d18}
-.endpoint-pool .pool-standby{padding:9px 12px;color:#654600;background:#fff4d6;border:1px solid #e8c66a;border-radius:8px;font-weight:500}
+.endpoint-pool .pool-standby{margin-top:6px;color:#654600}
+.pool-details{border-bottom:1px solid #e5e9ef}
+.pool-details summary,.credential-details summary{display:flex;align-items:center;gap:8px;min-height:42px;padding:10px 4px;color:var(--blue);font-size:12px;cursor:pointer;list-style:none;width:auto}
+.pool-details summary::-webkit-details-marker,.credential-details summary::-webkit-details-marker,.credential-actions summary::-webkit-details-marker{display:none}
+.pool-details summary:before,.credential-details summary:before{content:'›';font-size:18px;line-height:14px}
+.pool-details[open]>summary:before,.credential-details[open]>summary:before{transform:rotate(90deg)}
+.pool-details summary>span{margin-left:auto;color:#627187;font-size:11px;text-align:right}
+.pool-detail-body{padding:2px 8px 16px}
+.pool-detail-body p+p{margin-top:9px}
+.pool-detail-body .pool-steady{color:#202124;font-weight:500}
+.pool-facts,.credential-facts{display:grid;gap:9px;margin:0}
+.pool-facts>div,.credential-facts>div{display:grid;grid-template-columns:165px minmax(0,1fr);gap:16px;font-size:12px;line-height:1.5}
+.pool-facts dt,.credential-facts dt{color:var(--muted)}
+.pool-facts dd,.credential-facts dd{margin:0;color:#35465e;overflow-wrap:anywhere}
+.pool-observed{margin-top:16px;padding-top:14px;border-top:1px solid #e5e9ef}
+.endpoint-keys-head{padding:16px;align-items:center}
+.subscription-credential .endpoint-keys-head{align-items:center}
+.endpoint-keys-head h4{margin:0}
+.endpoint-key-actions{flex-wrap:wrap;justify-content:flex-end}
+.credential-list-label{display:flex;justify-content:space-between;gap:12px;padding:8px 16px;color:#596579;font-size:11px;border-bottom:1px solid #e5e9ef}
+.credential-list-label small{font-size:10px;color:var(--muted);text-align:right}
+.endpoint-keys .key-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) minmax(85px,140px) 40px;gap:12px;min-height:88px;padding:14px 12px 14px 16px;border-top:1px solid #e5e9ef}
+.key-row[data-state=carrying]{background:#f0f5fd}
+.key-row .key-name{min-width:0;overflow-wrap:anywhere}
+.key-row .key-name>strong{font-size:14px;font-weight:500}
+.key-row .credential-tier{max-width:100%;background:transparent;padding:0;color:#627187;border-radius:0;font-size:11px}
+.key-row .credential-state{color:#627187}
+.key-row[data-state=carrying] .credential-state{color:var(--blue)}
+.key-row .traffic-share{min-width:0;margin-left:0;gap:4px}
+.key-row .traffic-share strong{font-size:17px}
+.key-row[data-state=waiting] .traffic-share strong,.key-row[data-state=cooling] .traffic-share strong,.key-row[data-state=disabled] .traffic-share strong{color:#627187}
+.key-row .traffic-share small{line-height:1.45}
+.key-row .credential-cooldown{width:fit-content;max-width:100%;border-radius:6px;line-height:1.5}
+.credential-actions{align-self:start}
+.credential-actions summary{display:grid;place-items:center;width:40px;height:40px;list-style:none;border-radius:8px;color:#627187;cursor:pointer}
+.credential-actions summary:hover,.credential-actions[open]>summary{background:#e4ebf6;color:var(--blue)}
+.credential-actions[open]{grid-column:1/-1}
+.credential-actions[open]>summary{position:absolute;top:14px;right:12px}
+.credential-actions>div{display:flex;justify-content:flex-end;gap:18px;padding-top:8px;border-top:1px solid #e1e5ea}
+.credential-actions .text-link{min-height:36px;font-size:12px}
+.endpoint-keys>.credential-details{margin:0;padding:3px 16px 8px;border-top:1px solid #e5e9ef}
+.credential-details p{margin:2px 4px 12px;font-size:12px}
+.credential-facts{padding:0 4px 12px}
+.pool-details summary:focus-visible,.credential-details summary:focus-visible,.credential-actions summary:focus-visible,.endpoint-card button:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:4px}
+@media(max-width:760px){.endpoint-keys-head,.subscription-credential .endpoint-keys-head{align-items:stretch}.endpoint-key-actions{flex-direction:row;align-items:center;justify-content:flex-start;gap:12px}.pool-facts>div,.credential-facts>div{grid-template-columns:120px minmax(0,1fr);gap:12px}.pool-details summary{flex-wrap:wrap}.pool-details summary>span{font-size:10px}.credential-list-label{flex-wrap:wrap;gap:3px}.credential-list-label small{text-align:left}.endpoint-keys .key-row{grid-template-columns:minmax(0,1fr) 72px 40px;gap:8px;padding-left:12px}.key-row .traffic-share small{font-size:10px}.key-row .key-name>strong{font-size:13px}.credential-facts>div{grid-template-columns:1fr;gap:3px}}
+@media(max-width:430px){.pool-details summary>span{flex-basis:100%;margin-left:16px;text-align:left}.pool-facts>div{grid-template-columns:1fr;gap:3px}.endpoint-keys .key-row{grid-template-columns:minmax(0,1fr) 62px 32px}.credential-actions summary{width:32px}.key-row .traffic-share strong{font-size:16px}}
 /* The illustration explains selection for later requests, not a retry of the
    request that received 429. A lone identity must never look like a bypass. */
 /* Tab wrappers must keep the form's field rhythm. A collapsed initial-secret

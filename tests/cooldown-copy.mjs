@@ -13,7 +13,7 @@ const code = names.map(name => {
   assert.ok(end >= 0, `${name} has no closing brace`);
   return source.slice(start, end + 2);
 }).join('\n');
-const context = vm.createContext({});
+const context = vm.createContext({escapeHtml: value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')});
 vm.runInContext(code, context);
 const fixtures = [
   [{ last_seconds: 300, last_reported_seconds: 120, last_source: 'fixed' }, /fixed duration/, /used unchanged|capped/],
@@ -42,4 +42,12 @@ for (const [facts, expected, forbidden] of fixtures) {
     assert.equal(text, baseline, 'editing the policy cannot change the historical explanation');
   }
 }
-console.log('Cooldown copy passed: fixed/provider/capped/fallback, zero, policy edits, legacy observations');
+for (const activity of [undefined, {applied: 0, skipped: 0}, {applied: 0, skipped: 2, last_observed_at: 1700000000}]) {
+  const endpoint = {rate_limit_cooldown: {seconds: 300}, rate_limit_cooldown_activity: activity};
+  const text = context.endpointPolicyActivity(endpoint);
+  assert.match(text, activity ? /Durations selected/ : /not available/);
+  if (activity && !activity.skipped) assert.match(text, /No rate-limit answer/);
+  if (activity?.skipped) assert.match(text, /reported no usable delay/);
+  assert.equal(context.endpointPolicyActivity({...endpoint, rate_limit_cooldown: {seconds: 0}}), '');
+}
+console.log('Cooldown copy passed: structured history, fixed/provider/capped/fallback, zero, policy edits, legacy/unobserved/skipped observations');

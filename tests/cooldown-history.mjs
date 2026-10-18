@@ -183,6 +183,7 @@ try {
         ]) {
           history = facts;
           await page.goto(`${base}/providers/fixture`);
+          await page.locator('#provider-detail .pool-cooldown-summary').click();
           const observed = page.locator('#provider-detail .pool-observed');
           await observed.waitFor({ state: 'visible' });
           const text = await observed.textContent();
