@@ -10,10 +10,9 @@
 //!
 //! * Chat completions are streaming-only. A request without `stream: true` is
 //!   answered with error `11101`, so the prepared body always asks for a stream.
-//! * The service publishes no model catalog to an API-key client: `/v3/config`
-//!   reports `models: null` and there is no `/models` operation. The catalog is
-//!   therefore an explicit list maintained here rather than discovered over the
-//!   wire or inferred from model names. Its model IDs are the ones this
+//! * There is no standard `/models` operation. `/v3/config` is client-specific,
+//!   so this Endpoint uses an explicit catalog rather than generic discovery
+//!   or inference from model names. Its model IDs are the ones this
 //!   deployment actually serves to a key, which is why the CN catalog contains no
 //!   overseas model: those answer `11102 ... only available for authorized users`.
 
@@ -43,16 +42,15 @@ const DEFAULT_BASE_URL_HINT: &str = "https://copilot.tencent.com/v2";
 
 /// Models this deployment serves to a CodeBuddy API key.
 ///
-/// There is no `/models` operation, and `/v3/config` answers an API-key client
-/// with `models: null`, so this catalog is an explicit list maintained here
-/// rather than discovered over the wire or read from the bundled product
-/// configuration file, which is only an offline fallback that goes stale.
+/// There is no `/models` operation, and `/v3/config` depends on client identity.
+/// This catalog is maintained explicitly rather than discovered over the wire
+/// or read from the bundled product configuration, which can go stale.
 ///
-/// The entries below are the conversational models (`craft`, `ask`, and `plan`
-/// all advertise the same set) confirmed against the live CN service. Auxiliary
-/// models — completion, commit-message, image, and similar — are deliberately
-/// absent because they do not serve a chat-completions request. The service
-/// refuses overseas models for this credential kind, so none is offered.
+/// Snapshot fetched from the live CN `/v3/config` on 2026-10-12 using the CLI
+/// identity and an API key: only the IDs advertised by the `cli` agent, plus the
+/// separately verified `auto` selector. The config's full `models` array also
+/// includes legacy and image entries not advertised to this client; those are
+/// deliberately absent. Catalog membership is not a per-model invocation test.
 const MODELS: &[&str] = &[
     "auto",
     "deepseek-v4-pro",
@@ -64,25 +62,23 @@ const MODELS: &[&str] = &[
     "glm-5v-turbo",
     "hy3",
     "hy3-x",
-    "hy4-preview-f",
+    "hy4-preview",
     "kimi-k2.6",
     "kimi-k2.7",
+    "kimi-k2.8-preview",
     "kimi-k3-1",
+    "minimax-m2.7",
     "minimax-m3",
+    "space-bunny",
+    "step-5-preview",
 ];
 
-/// How this Endpoint identifies itself as a CodeBuddy client. The service reads
-/// these as metadata; a request is accepted without them, but sending them keeps
-/// Yabane's traffic indistinguishable from the official client's shape.
-///
-/// The official client resolves each of these from its client-info provider and
-/// falls back to the product configuration: the IDE type and name default to the
-/// product platform (`CLI`) and the version to the product version, which is the
-/// package version when the product configuration names no other one. Only the
-/// IDE version has a different last resort (`0.0.0`), which this Endpoint never
-/// reaches because it states the version it ships as.
+/// Client identity aligned with CodeBuddy CLI 2.164.0 (bundled in Agent SDK
+/// 0.3.276). The CLI's UserAgentHttpInterceptor sends both platform and product
+/// segments; IDE headers alone no longer suffice for CN channel verification.
+/// Keep their versions together, and do not claim a Node/Python SDK runtime.
 const IDE_TYPE: &str = "CLI";
-const IDE_VERSION: &str = "2.156.0";
+const IDE_VERSION: &str = "2.164.0";
 const AGENT_INTENT: &str = "craft";
 const AGENT_TYPE: &str = "main";
 
@@ -185,13 +181,17 @@ impl ProviderEndpoint for CodeBuddyEndpoint {
     }
 }
 
-/// Removes headers this Endpoint is about to author, so a caller cannot inject
-/// its own identity, conversation, or client-version values into the request
-/// Yabane sends. Header names in a `HeaderMap` are already lowercase.
+/// Removes gateway-internal markers and headers this Endpoint is about to
+/// author. This runs after Header Hooks, so caller headers and configured
+/// defaults cannot leak Yabane markers or override this client's identity.
+/// Header names in a `HeaderMap` are already lowercase.
 fn strip_endpoint_owned_headers(headers: &mut HeaderMap) {
     let stale: Vec<HeaderName> = headers
         .keys()
-        .filter(|name| ENDPOINT_OWNED_HEADERS.contains(&name.as_str()))
+        .filter(|name| {
+            let name = name.as_str();
+            ENDPOINT_OWNED_HEADERS.contains(&name) || name.starts_with("x-yabane-")
+        })
         .cloned()
         .collect();
     for name in stale {
@@ -289,6 +289,10 @@ fn write_client_identity(headers: &mut HeaderMap, caller: CallerIdentifiers) {
         header(HEADER_IDE_TYPE, IDE_TYPE),
         header(HEADER_IDE_NAME, IDE_TYPE),
         header(HEADER_IDE_VERSION, IDE_VERSION),
+        header(
+            "user-agent",
+            &format!("{IDE_TYPE}/{IDE_VERSION} CodeBuddy/{IDE_VERSION}"),
+        ),
         header(HEADER_AGENT_INTENT, AGENT_INTENT),
         header(HEADER_AGENT_TYPE, AGENT_TYPE),
     ] {
@@ -383,9 +387,8 @@ mod tests {
         assert!(declaration.sign_in.is_none());
     }
 
-    /// ENDPOINT-45: this Endpoint type serves one catalog and it contains only the
-    /// conversational models this credential kind can call, so it offers no overseas
-    /// model and no auxiliary model that cannot serve a chat-completions request.
+    /// ENDPOINT-45: the catalog uses the CN CLI snapshot rather than all config
+    /// entries, so unadvertised legacy, overseas, and auxiliary IDs stay absent.
     #[test]
     fn the_catalog_holds_only_models_this_credential_kind_may_call() {
         let models = CodeBuddyEndpoint.models();
@@ -426,6 +429,7 @@ mod tests {
         assert_eq!(headers["x-ide-type"], IDE_TYPE);
         assert_eq!(headers["x-ide-name"], IDE_TYPE);
         assert_eq!(headers["x-ide-version"], IDE_VERSION);
+        assert_eq!(headers["user-agent"], "CLI/2.164.0 CodeBuddy/2.164.0");
         assert_eq!(headers["x-agent-intent"], AGENT_INTENT);
         assert_eq!(headers["x-agent-type"], AGENT_TYPE);
     }
@@ -472,7 +476,21 @@ mod tests {
         headers.insert("x-ide-type", HeaderValue::from_static("VSCode"));
         headers.insert("x-agent-type", HeaderValue::from_static("subagent"));
         headers.insert("x-agent-intent", HeaderValue::from_static("ask"));
-        headers.insert("user-agent", HeaderValue::from_static("caller-agent"));
+        headers.insert("User-Agent", HeaderValue::from_static("caller-agent"));
+        headers.append(
+            "user-agent",
+            HeaderValue::from_static("second-caller-agent"),
+        );
+        let markers = [
+            "X-Yabane-Request-Id",
+            "x-yabane-error-origin",
+            "X-Yabane-Protocol-Conversion",
+            "x-yabane-custom",
+        ];
+        for name in markers {
+            headers.insert(name, HeaderValue::from_static("internal-marker"));
+        }
+        headers.append("x-yabane-custom", HeaderValue::from_static("second-marker"));
         // A header this Endpoint does not own is left for the caller.
         headers.insert("x-caller-note", HeaderValue::from_static("kept"));
 
@@ -484,8 +502,45 @@ mod tests {
         assert_eq!(headers["x-ide-type"], IDE_TYPE);
         assert_eq!(headers["x-agent-type"], AGENT_TYPE);
         assert_eq!(headers["x-agent-intent"], AGENT_INTENT);
-        assert!(!headers.contains_key("user-agent"));
+        assert_eq!(
+            headers["user-agent"],
+            format!("{IDE_TYPE}/{IDE_VERSION} CodeBuddy/{IDE_VERSION}")
+        );
+        assert_eq!(headers.get_all("user-agent").iter().count(), 1);
+        for name in markers {
+            assert!(
+                !headers.contains_key(name),
+                "{name} must not reach CodeBuddy"
+            );
+        }
         assert_eq!(headers["x-caller-note"], "kept");
+    }
+
+    /// PROXY-64: client identification must not introduce Agent SDK defaults or
+    /// change the caller's tools and controls beyond the required streaming flag.
+    #[test]
+    fn client_identity_preserves_chat_tools_and_parameters() {
+        let mut expected = serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "parameters": {"type": "object"}
+            }}],
+            "tool_choice": "auto",
+            "max_tokens": 32,
+            "temperature": 0.42,
+            "reasoning_effort": "low",
+            "stream": false
+        });
+        let mut headers = HeaderMap::new();
+        let mut body = serde_json::to_vec(&expected).unwrap();
+        prepare(&mut headers, &mut body, "ck_examplekey12345678");
+
+        expected["stream"] = serde_json::Value::Bool(true);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            expected
+        );
     }
 
     /// The identifiers this Endpoint states are always present and never empty,

@@ -243,6 +243,11 @@ class Handler(BaseHTTPRequestHandler):
             # answer as SSE.
             with open('codebuddy-requests.jsonl', 'a') as handle:
                 handle.write(json.dumps({'path': self.path, 'headers': dict(self.headers), 'body': request}, sort_keys=True) + '\n')
+            version = self.headers.get('x-ide-version', '')
+            expected_agent = f'CLI/{version} CodeBuddy/{version}'
+            if not version or self.headers.get('user-agent') != expected_agent or request.get('test_channel_failure'):
+                body = json.dumps({'code': 11128, 'msg': 'Illegal API invocation from an unapproved channel', 'requestId': 'channel-fixture'}).encode()
+                self.send_response(400); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
             frames = [
                 {'id': self.headers.get('x-request-id', ''), 'object': 'chat.completion.chunk', 'created': 1, 'model': request.get('model'), 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': 'from-codebuddy'}, 'finish_reason': None}]},
                 {'id': self.headers.get('x-request-id', ''), 'object': 'chat.completion.chunk', 'created': 1, 'model': request.get('model'), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 5, 'completion_tokens': 2, 'total_tokens': 7}},
@@ -516,10 +521,12 @@ codebuddy_models=$(jq -r '[.[] | select(.id == "codebuddy") | .endpoint_types[].
 admin -f -X POST "$base/admin/providers/codebuddy/models/refresh" >/dev/null
 # The catalog is explicit, so it is published without asking the deployment for a
 # `/models` operation that does not exist, and the refresh is not an error.
-[[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "codebuddy") | [(.model_discovery_error == null), (.discovered_models | length > 0)] | join(":")') == 'true:true' ]]
+admin -f "$base/admin/providers" | jq -e '.[] | select(.id == "codebuddy") | .model_discovery_error == null and (.discovered_models | length > 0)' >/dev/null
+admin -f -X PATCH "$base/admin/providers/codebuddy" -H 'content-type: application/json' -d '{"extra_headers":{"x-yabane-from-defaults":"internal-marker"}}' >/dev/null
 : >codebuddy-requests.jsonl
-codebuddy_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' \
-  -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' \
+codebuddy_call=$(curl -sf -D codebuddy-success-headers.txt -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' \
+  -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' -H 'User-Agent: caller-agent' -H 'user-agent: another-caller-agent' \
+  -H 'X-Yabane-Request-Id: internal-marker' -H 'x-yabane-custom: first-marker' -H 'X-Yabane-Custom: second-marker' -H 'x-caller-note: kept' \
   -d '{"model":"codebuddy/glm-5.3","messages":[{"role":"user","content":"hi"}]}')
 # The deployment answers SSE, and Yabane returns one aggregated response to a caller
 # that asked for one.
@@ -528,7 +535,11 @@ codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | ta
 [[ $(printf '%s' "$codebuddy_request" | jq -r .path) == /v2/chat/completions ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers.authorization') == 'Bearer ck-e2e-12345678' ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-user-id"]') == anonymous_12345678 ]]
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"]') == 'CLI|2.156.0|craft|main' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"]') == 'CLI|2.164.0|craft|main' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["user-agent"]') == 'CLI/2.164.0 CodeBuddy/2.164.0' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq '[.headers | keys[] | ascii_downcase | select(startswith("x-yabane-"))] | length') == 0 ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-caller-note"]') == kept ]]
+[[ $(tr -d '\r' <codebuddy-success-headers.txt | awk 'tolower($1) == "x-yabane-request-id:" { print $2 }') == req-* ]]
 # A caller cannot name an identity or a client version on this Endpoint...
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-version"] != "9.9.9"') == true ]]
 # ...while the conversation and tracing it declared are kept, and the per-exchange
@@ -543,9 +554,17 @@ codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | ta
 # An exchange that declares no conversation is a conversation of its own.
 curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"codebuddy/kimi-k3-1","messages":[]}' >/dev/null
 [[ $(jq -r 'select(.path != null) | .headers["x-conversation-id"]' <codebuddy-requests.jsonl | tail -1) == $(jq -r 'select(.path != null) | .headers["x-conversation-message-id"]' <codebuddy-requests.jsonl | tail -1) ]]
+# PROXY-23 / PROXY-43: channel verification can still fail upstream; preserve the
+# original JSON and status rather than retrying or treating it as malformed SSE.
+[[ $(status -D codebuddy-error-headers.txt -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"codebuddy/glm-5.3","messages":[],"test_channel_failure":true}') == 400 ]]
+[[ $(jq -r '[.code, .msg, .requestId] | join("|")' response.json) == '11128|Illegal API invocation from an unapproved channel|channel-fixture' ]]
+[[ $(tr -d '\r' <codebuddy-error-headers.txt | awk 'tolower($1) == "x-yabane-error-origin:" { print $2 }') == upstream ]]
+[[ $(wc -l <codebuddy-requests.jsonl | tr -d ' ') == 3 ]]
 codebuddy_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$codebuddy_logs" | jq '[.[] | select(.provider == "codebuddy" and .upstream_streaming == true and .status == 200)] | length') == 2 ]]
+[[ $(printf '%s' "$codebuddy_logs" | jq '[.[] | select(.provider == "codebuddy" and .status == 400)] | length') == 1 ]]
 admin -f -X DELETE "$base/admin/providers/codebuddy" >/dev/null
+echo 'CodeBuddy mock passed: CLI identity, internal header filtering, aggregation, upstream errors'
 
 # A Provider model ID removes only Yabane's first `provider/` segment, so a native
 # namespace that begins with the Provider ID survives route authoring and proxying:

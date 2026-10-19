@@ -1084,6 +1084,9 @@ for (const project of projects) {
     const tieredProvider = page.locator('#providers .provider-list-item').filter({has: page.locator('code', {hasText: 'ui-tiered/model-id'})});
     if (await tieredProvider.count()) {
       await tieredProvider.click();
+      // Finish the open-triggered read before mutating the local fixture, or
+      // its response can overwrite the cooldown state asserted below.
+      await page.evaluate(() => refreshProviderState());
       const tieredCard = page.locator('.endpoint-card').first();
       await tieredCard.locator('.endpoint-pool').waitFor({state: 'visible'});
       const tieredPool = await tieredCard.locator('.endpoint-pool').textContent();
