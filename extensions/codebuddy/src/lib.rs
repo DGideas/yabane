@@ -5,11 +5,14 @@
 //! URL and adds the client-identification headers the service expects on a chat
 //! request. Authentication is a pasted API key sent as `Authorization: Bearer`.
 //!
-//! Two service constraints shape this implementation and are stated here rather
+//! Service constraints shape this implementation and are stated here rather
 //! than hidden behind a fallback:
 //!
 //! * Chat completions are streaming-only. A request without `stream: true` is
 //!   answered with error `11101`, so the prepared body always asks for a stream.
+//! * A verified CN request with a `developer` message fails channel verification
+//!   (`11128`), while the same request with `system` succeeds. This Endpoint
+//!   therefore sends developer instructions as system messages, in place.
 //! * There is no standard `/models` operation. `/v3/config` is client-specific,
 //!   so this Endpoint uses an explicit catalog rather than generic discovery
 //!   or inference from model names. Its model IDs are the ones this
@@ -175,7 +178,7 @@ impl ProviderEndpoint for CodeBuddyEndpoint {
         strip_endpoint_owned_headers(request.headers);
         write_credentials(request.headers, secret)?;
         write_client_identity(request.headers, caller);
-        write_streaming_body(request.body)?;
+        write_chat_body(request.body)?;
 
         Ok(())
     }
@@ -309,20 +312,28 @@ fn generated_message_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()
 }
 
-/// Forces the streaming request the service requires.
-///
-/// Chat completions are streaming-only here: a request without `stream: true`
-/// is refused with error `11101`. Yabane's own streaming behavior already
-/// handles an always-event-stream Endpoint, so the caller may ask for one
-/// response and still receive a correct aggregate; this only makes the wire
-/// request one the service accepts.
-fn write_streaming_body(body: &mut Vec<u8>) -> Result<(), String> {
+/// Applies this Endpoint's declared streaming and instruction-role adaptation.
+/// Neither constraint is inferred from a model name; other Endpoint types keep
+/// their own wire behavior. Instructions stay separate and in their original order.
+fn write_chat_body(body: &mut Vec<u8>) -> Result<(), String> {
     let mut value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| format!("The request body is not valid JSON: {error}"))?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| "The request body must be a JSON object".to_owned())?;
     object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+    if let Some(messages) = object
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for message in messages {
+            if let Some(role) = message.get_mut("role")
+                && role.as_str() == Some("developer")
+            {
+                *role = serde_json::Value::String("system".to_owned());
+            }
+        }
+    }
     let encoded = serde_json::to_vec(&value)
         .map_err(|error| format!("Could not serialize the request: {error}"))?;
     *body = encoded;
@@ -516,13 +527,27 @@ mod tests {
         assert_eq!(headers["x-caller-note"], "kept");
     }
 
-    /// PROXY-64: client identification must not introduce Agent SDK defaults or
-    /// change the caller's tools and controls beyond the required streaming flag.
+    /// PROXY-64 / PROXY-65: only streaming and exact developer roles change;
+    /// separate instructions, structured content, tool history and controls survive.
     #[test]
-    fn client_identity_preserves_chat_tools_and_parameters() {
+    fn chat_adaptation_preserves_messages_tools_and_parameters() {
         let mut expected = serde_json::json!({
             "model": "auto",
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [
+                {"role": "system", "content": "existing instructions"},
+                {"role": "developer", "content": "first instructions", "name": "app"},
+                {"role": "user", "content": [{"type": "text", "text": "developer"}]},
+                {"role": "assistant", "content": null, "reasoning_content": "kept", "tool_calls": [
+                    {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{ }"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+                {"role": "developer", "content": [{"type": "text", "text": "later instructions"}],
+                 "metadata": {"role": "developer"}},
+                {"role": "Developer", "content": "leave unknown roles to the Provider"},
+                {"content": "no role"},
+                {"role": null},
+                "developer"
+            ],
             "tools": [{"type": "function", "function": {
                 "name": "lookup", "parameters": {"type": "object"}
             }}],
@@ -537,10 +562,36 @@ mod tests {
         prepare(&mut headers, &mut body, "ck_examplekey12345678");
 
         expected["stream"] = serde_json::Value::Bool(true);
+        expected["messages"][1]["role"] = serde_json::json!("system");
+        expected["messages"][5]["role"] = serde_json::json!("system");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             expected
         );
+    }
+
+    /// PROXY-65: role adaptation is not a message validator or a fallback;
+    /// an absent or non-array messages field is left for the Provider to handle.
+    #[test]
+    fn absent_or_non_array_messages_are_not_normalized() {
+        for messages in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("developer")),
+            Some(serde_json::json!({"role": "developer", "content": "kept"})),
+        ] {
+            let mut expected = serde_json::json!({"model": "auto", "stream": true});
+            if let Some(messages) = messages {
+                expected["messages"] = messages;
+            }
+            let mut headers = HeaderMap::new();
+            let mut body = serde_json::to_vec(&expected).unwrap();
+            prepare(&mut headers, &mut body, "ck_examplekey12345678");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                expected
+            );
+        }
     }
 
     /// The identifiers this Endpoint states are always present and never empty,

@@ -245,7 +245,9 @@ class Handler(BaseHTTPRequestHandler):
                 handle.write(json.dumps({'path': self.path, 'headers': dict(self.headers), 'body': request}, sort_keys=True) + '\n')
             version = self.headers.get('x-ide-version', '')
             expected_agent = f'CLI/{version} CodeBuddy/{version}'
-            if not version or self.headers.get('user-agent') != expected_agent or request.get('test_channel_failure'):
+            # PROXY-65: the verified CN request rejects developer instructions.
+            has_developer = any(message.get('role') == 'developer' for message in request.get('messages', []))
+            if not version or self.headers.get('user-agent') != expected_agent or has_developer or request.get('test_channel_failure'):
                 body = json.dumps({'code': 11128, 'msg': 'Illegal API invocation from an unapproved channel', 'requestId': 'channel-fixture'}).encode()
                 self.send_response(400); self.send_header('content-type', 'application/json'); self.end_headers(); self.wfile.write(body); return
             frames = [
@@ -254,7 +256,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
             body = ''.join(f'data: {json.dumps(frame)}\n\n' for frame in frames).encode() + b'data: [DONE]\n\n'
             self.send_response(200); self.send_header('content-type', 'text/event-stream'); self.end_headers(); self.wfile.write(body); return
-        body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
+        body = json.dumps({'endpoint': endpoint, 'model': request['model'], 'headers': {'x-provider': self.headers.get('x-provider'), 'x-endpoint': self.headers.get('x-endpoint'), 'cookie': self.headers.get('cookie')}, 'extra': request.get('extra'), 'endpoint_extra': request.get('endpoint_extra'), 'messages': request.get('messages'), 'usage': {'prompt_tokens': 1200, 'completion_tokens': 300, 'prompt_tokens_details': {'cached_tokens': 200}, 'cost': 0.0042}}).encode()
         self.send_response(200); self.send_header('content-type', 'application/json'); self.send_header('set-cookie', 'yabane_session=upstream'); self.end_headers(); self.wfile.write(body)
     def log_message(self, *_): pass
 
@@ -501,13 +503,21 @@ unrestricted_id=$(printf '%s' "$unrestricted" | jq -r .api_key.id)
 unrestricted_prefix=$(printf '%s' "$unrestricted" | jq -r .api_key.prefix)
 unrestricted_secret=$(printf '%s' "$unrestricted" | jq -r .secret)
 
+# PROXY-65: use the same instruction and tool history for an ordinary Endpoint
+# and CodeBuddy; only CodeBuddy may adapt developer roles. Nested roles are data.
+cat >instruction-role-request.json <<'JSON'
+{"messages":[{"role":"system","content":"Existing instructions"},{"role":"developer","content":"First instructions","name":"app"},{"role":"user","content":"hi"},{"role":"assistant","content":null,"reasoning_content":"kept","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{ }"}}]},{"role":"tool","tool_call_id":"call-1","content":"result"},{"role":"developer","content":[{"type":"text","text":"Later instructions"}],"metadata":{"role":"developer"}},{"role":"user","content":"continue"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"role":{"type":"string","const":"developer"}}}}}],"tool_choice":"auto","reasoning_effort":"max","max_completion_tokens":32768,"prompt_cache_key":"role-fixture","stream":false}
+JSON
+
 # A Provider that versions its API itself owns that version segment: a `/v2` root is
 # called at `/v2/chat/completions` and `/v2/models`, never at `/v2/v1/...`.
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"versioned-root\",\"name\":\"Versioned root\",\"endpoint\":{\"api_type\":\"openai_compatible\",\"base_url\":\"http://127.0.0.1:$upstream_port/v2\",\"requires_credential\":true,\"credential_secret\":\"versioned\"}}") == 204 ]]
 admin -f -X POST "$base/admin/providers/versioned-root/models/refresh" >/dev/null
 [[ $(admin -f "$base/admin/providers" | jq -r '.[] | select(.id == "versioned-root") | .discovered_models[0]') == versioned-model ]]
-versioned_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"versioned-root/versioned-model","messages":[]}')
+jq '.model = "versioned-root/versioned-model"' instruction-role-request.json >versioned-request.json
+versioned_call=$(curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' --data-binary @versioned-request.json)
 [[ $(printf '%s' "$versioned_call" | jq -r .endpoint) == versioned ]]
+printf '%s' "$versioned_call" | jq -e --slurpfile original instruction-role-request.json '.messages == $original[0].messages' >/dev/null
 admin -f -X DELETE "$base/admin/providers/versioned-root" >/dev/null
 
 # ENDPOINT-45 / DISCOVERY-06: a CodeBuddy (CN) Endpoint type owns its catalog
@@ -524,10 +534,11 @@ admin -f -X POST "$base/admin/providers/codebuddy/models/refresh" >/dev/null
 admin -f "$base/admin/providers" | jq -e '.[] | select(.id == "codebuddy") | .model_discovery_error == null and (.discovered_models | length > 0)' >/dev/null
 admin -f -X PATCH "$base/admin/providers/codebuddy" -H 'content-type: application/json' -d '{"extra_headers":{"x-yabane-from-defaults":"internal-marker"}}' >/dev/null
 : >codebuddy-requests.jsonl
+jq '.model = "codebuddy/glm-5.3"' instruction-role-request.json >codebuddy-request.json
 codebuddy_call=$(curl -sf -D codebuddy-success-headers.txt -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' \
   -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' -H 'User-Agent: caller-agent' -H 'user-agent: another-caller-agent' \
   -H 'X-Yabane-Request-Id: internal-marker' -H 'x-yabane-custom: first-marker' -H 'X-Yabane-Custom: second-marker' -H 'x-caller-note: kept' \
-  -d '{"model":"codebuddy/glm-5.3","messages":[{"role":"user","content":"hi"}]}')
+  --data-binary @codebuddy-request.json)
 # The deployment answers SSE, and Yabane returns one aggregated response to a caller
 # that asked for one.
 [[ $(printf '%s' "$codebuddy_call" | jq -r '[.object, .choices[0].message.content, .choices[0].finish_reason, .usage.total_tokens] | join("|")') == 'chat.completion|from-codebuddy|stop|7' ]]
@@ -551,6 +562,11 @@ codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | ta
 # request is prepared as one whatever the caller sent.
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.body.stream') == true ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.body.model') == glm-5.3 ]]
+# Assert the whole outgoing body, not only the role: content, order, tool history,
+# schemas, reasoning and unknown nested fields must survive both adaptations.
+printf '%s' "$codebuddy_request" | jq -e --slurpfile original codebuddy-request.json '
+  .body == ($original[0] | .model = "glm-5.3" | .stream = true |
+    .messages |= map(if .role == "developer" then .role = "system" else . end))' >/dev/null
 # An exchange that declares no conversation is a conversation of its own.
 curl -sf -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' -d '{"model":"codebuddy/kimi-k3-1","messages":[]}' >/dev/null
 [[ $(jq -r 'select(.path != null) | .headers["x-conversation-id"]' <codebuddy-requests.jsonl | tail -1) == $(jq -r 'select(.path != null) | .headers["x-conversation-message-id"]' <codebuddy-requests.jsonl | tail -1) ]]
@@ -564,7 +580,7 @@ codebuddy_logs=$(admin -f "$base/admin/activity/logs?since=0&limit=1000")
 [[ $(printf '%s' "$codebuddy_logs" | jq '[.[] | select(.provider == "codebuddy" and .upstream_streaming == true and .status == 200)] | length') == 2 ]]
 [[ $(printf '%s' "$codebuddy_logs" | jq '[.[] | select(.provider == "codebuddy" and .status == 400)] | length') == 1 ]]
 admin -f -X DELETE "$base/admin/providers/codebuddy" >/dev/null
-echo 'CodeBuddy mock passed: CLI identity, internal header filtering, aggregation, upstream errors'
+echo 'CodeBuddy mock passed: CLI identity, internal header filtering, instruction roles, aggregation, upstream errors'
 
 # A Provider model ID removes only Yabane's first `provider/` segment, so a native
 # namespace that begins with the Provider ID survives route authoring and proxying:
