@@ -67,9 +67,15 @@ function fixture(protocol, model) {
       + frame({ type: 'message_delta', delta: { stop_reason: incomplete ? 'max_tokens' : 'end_turn' }, usage: { output_tokens: 3 } });
     terminal = frame({ type: 'message_stop' });
   }
-  if (failed) prefix += protocol === 'responses'
-    ? frame({ type: 'response.failed', response: { status: 'failed', error: { message: 'private fixture detail' } } })
-    : frame({ type: 'error', error: { message: 'private fixture detail' } });
+  if (failed) {
+    const error = {
+      message: 'private fixture detail: servers are overloaded', code: 'server_is_overloaded',
+      type: protocol === 'messages' ? 'overloaded_error' : 'service_unavailable_error',
+      metadata: { private: 'PRIVATE_ERROR_METADATA' },
+    };
+    prefix += frame({ type: 'error', error });
+    if (protocol === 'responses') prefix += frame({ type: 'response.failed', response: { status: 'failed', error } });
+  }
   if (model === 'finish-only') terminal = '';
   if (model === 'partial-terminal') terminal = terminal.slice(0, -1);
   return prefix + terminal;
@@ -163,6 +169,18 @@ try {
       raw += decoder.decode(chunk.value, { stream: true });
     }
     if (source === target) assert.equal(raw, fixture(source, model === 'http-error' ? 'error' : model), 'native bytes unchanged: ' + label);
+    if (model === 'error' && source !== target) {
+      // PROXY-66: the first nested error carries the original diagnosis through
+      // conversion; later failure/completion frames cannot replace it.
+      const events = raw.split(/\r?\n/).filter(line => line.startsWith('data: ') && line !== 'data: [DONE]').map(line => JSON.parse(line.slice(6)));
+      const failedEvents = events.filter(event => event.error || event.type === 'response.failed');
+      assert.equal(failedEvents.length, 1, label);
+      const error = target === 'responses' ? failedEvents[0].response.error : failedEvents[0].error;
+      assert.equal(error.message, 'private fixture detail: servers are overloaded', label);
+      assert.equal(error.code, 'server_is_overloaded', label);
+      assert.equal(error.type, target === 'messages' ? 'api_error' : source === 'messages' ? 'overloaded_error' : 'service_unavailable_error', label);
+      assert.ok(!raw.includes('PRIVATE_ERROR_METADATA'), label);
+    }
     if (cancelWithAbort) abort.abort();
     await reader.cancel().catch(() => {});
     let records = [];

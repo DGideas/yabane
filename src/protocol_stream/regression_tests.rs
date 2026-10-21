@@ -782,6 +782,129 @@ fn provider_error_events_are_not_overwritten_by_a_later_done_marker() {
 }
 
 #[test]
+fn provider_stream_errors_preserve_portable_details_and_end_once() {
+    // PROXY-66 / PROXY-30: nested Responses errors must retain their diagnosis
+    // immediately, even if response.failed arrives later or in the same chunk.
+    let message = "Our servers are currently overloaded. Please try again later.";
+    let details = json!({
+        "message": message, "code": "server_is_overloaded", "type": "service_unavailable_error",
+        "metadata": {"private": "DO_NOT_FORWARD"}, "param": "DO_NOT_FORWARD"
+    });
+    for (source, error, source_type) in [
+        (
+            Protocol::OpenAiChat,
+            json!({"error": details}),
+            Some("service_unavailable_error"),
+        ),
+        (
+            Protocol::AnthropicMessages,
+            json!({"type":"error", "error": details}),
+            Some("service_unavailable_error"),
+        ),
+        (
+            Protocol::OpenAiResponses,
+            json!({"type":"error", "error": details, "message":"wrong outer message", "code":"wrong_outer_code"}),
+            Some("service_unavailable_error"),
+        ),
+        (
+            Protocol::OpenAiResponses,
+            json!({"type":"error", "message":message, "code":"server_is_overloaded"}),
+            None,
+        ),
+        (
+            Protocol::OpenAiResponses,
+            json!({"type":"response.failed", "response":{"id":"r1", "status":"failed", "error":details}}),
+            Some("service_unavailable_error"),
+        ),
+    ] {
+        let input = frame(error)
+            + &frame(
+                json!({"type":"response.failed", "response":{"error":{"message":"later error"}}}),
+            )
+            + "data: [DONE]\n\n";
+        for target in [
+            Protocol::OpenAiChat,
+            Protocol::OpenAiResponses,
+            Protocol::AnthropicMessages,
+        ] {
+            for chunk_size in [1, input.len()] {
+                let mut converter = StreamConverter::new_aggregating(source, target);
+                let mut output = Vec::new();
+                for chunk in input.as_bytes().chunks(chunk_size) {
+                    output.extend(converter.push(chunk).unwrap());
+                }
+                assert!(converter.has_failed());
+                assert!(converter.has_ended());
+                assert!(converter.finish().unwrap().is_empty());
+                let failure = converter.non_stream_response().unwrap_err();
+                assert!(failure.contains(message));
+                let converted = events(&output);
+                assert_eq!(converted.len(), 1);
+                let error = if target == Protocol::OpenAiResponses {
+                    assert_eq!(converted[0]["type"], "response.failed");
+                    &converted[0]["response"]["error"]
+                } else {
+                    &converted[0]["error"]
+                };
+                assert_eq!(error["message"], message);
+                assert_eq!(error["code"], "server_is_overloaded");
+                match target {
+                    Protocol::OpenAiChat => assert_eq!(
+                        error["type"],
+                        source_type.unwrap_or("upstream_stream_error")
+                    ),
+                    Protocol::OpenAiResponses => {
+                        assert_eq!(error.get("type").and_then(Value::as_str), source_type)
+                    }
+                    Protocol::AnthropicMessages => assert_eq!(error["type"], "api_error"),
+                }
+                let raw = std::str::from_utf8(&output).unwrap();
+                assert!(!raw.contains("DO_NOT_FORWARD"));
+                assert!(!raw.contains("later error"));
+                assert!(!raw.contains("[DONE]"));
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_errors_keep_fallbacks_for_missing_or_invalid_fields() {
+    // PROXY-66: event envelopes are not error types; malformed optional fields
+    // cannot escape as arbitrary metadata or turn a failed stream into success.
+    for value in [
+        json!({"type":"error"}),
+        json!({"type":"error", "error":null}),
+        json!({"type":"error", "error":{"message":42, "code":{}, "type":[]}}),
+    ] {
+        let mut converter = StreamConverter::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+        let output = events(&converter.push(frame(value).as_bytes()).unwrap());
+        assert_eq!(
+            output,
+            vec![
+                json!({"error":{"message":"Provider stream failed", "type":"upstream_stream_error"}})
+            ]
+        );
+        assert!(converter.has_failed());
+    }
+    let mut converter = StreamConverter::new(Protocol::OpenAiResponses, Protocol::OpenAiChat);
+    let output = events(
+        &converter
+            .push(
+                frame(json!({
+                    "type":"error", "message":"outer diagnosis", "code":"server_error",
+                    "error":{"message":null, "code":null, "type":""}
+                }))
+                .as_bytes(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        output[0]["error"],
+        json!({"message":"outer diagnosis", "code":"server_error", "type":"upstream_stream_error"})
+    );
+}
+
+#[test]
 fn incomplete_tool_arguments_are_never_repaired_or_labelled_complete() {
     // PROXY-48 / PROXY-49: preserve partial argument bytes, not an invented {}.
     for arguments in ["", "{\"x\":"] {

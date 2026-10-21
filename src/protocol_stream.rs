@@ -90,6 +90,74 @@ enum ResponseItem {
     Tool(usize),
 }
 
+/// Only portable error fields reach the caller; arbitrary Provider metadata is not copied.
+struct StreamFailure {
+    message: String,
+    code: Option<String>,
+    error_type: Option<String>,
+}
+
+impl StreamFailure {
+    fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            code: None,
+            error_type: None,
+        }
+    }
+
+    fn from_value(value: &Value, fallback: &str) -> Self {
+        let error = value.get("error").filter(|error| error.is_object());
+        let field = |name| {
+            error
+                .and_then(|error| error.get(name))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .or_else(|| {
+                    value
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                })
+        };
+        Self {
+            message: field("message").unwrap_or(fallback).to_owned(),
+            code: field("code").map(str::to_owned),
+            // A Responses event's top-level `type: error` is not an error classification.
+            error_type: field("type")
+                .filter(|kind| *kind != "error")
+                .map(str::to_owned),
+        }
+    }
+
+    fn render(&self, target: Protocol) -> Value {
+        let mut error = json!({"message": self.message});
+        if let Some(code) = &self.code {
+            error["code"] = json!(code);
+        }
+        match target {
+            Protocol::OpenAiChat => {
+                error["type"] = json!(
+                    self.error_type
+                        .as_deref()
+                        .unwrap_or("upstream_stream_error")
+                );
+            }
+            Protocol::OpenAiResponses => {
+                if self.code.is_none() {
+                    error["code"] = json!("upstream_error");
+                }
+                if let Some(kind) = &self.error_type {
+                    error["type"] = json!(kind);
+                }
+            }
+            // Anthropic's error types are protocol-specific, not arbitrary OpenAI classifications.
+            Protocol::AnthropicMessages => error["type"] = json!("api_error"),
+        }
+        error
+    }
+}
+
 enum Event {
     Start,
     Text(String),
@@ -104,7 +172,7 @@ enum Event {
         delta: String,
     },
     Finish(ResponseTermination),
-    Failure(String),
+    Failure(StreamFailure),
     Done,
 }
 
@@ -286,14 +354,11 @@ impl StreamConverter {
     }
 
     fn parse_chat(&mut self, value: &Value) -> Vec<Event> {
-        if let Some(error) = value.get("error") {
-            return vec![Event::Failure(
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Provider stream failed")
-                    .to_owned(),
-            )];
+        if value.get("error").is_some() {
+            return vec![Event::Failure(StreamFailure::from_value(
+                value,
+                "Provider stream failed",
+            ))];
         }
         self.read_metadata(value, "created");
         read_chat_usage(value.get("usage"), &mut self.state);
@@ -412,13 +477,10 @@ impl StreamConverter {
                     .collect()
             }
             Some("message_stop") => vec![Event::Done],
-            Some("error") => vec![Event::Failure(
-                value
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Provider stream failed")
-                    .to_owned(),
-            )],
+            Some("error") => vec![Event::Failure(StreamFailure::from_value(
+                value,
+                "Provider stream failed",
+            ))],
             _ => Vec::new(),
         }
     }
@@ -597,21 +659,15 @@ impl StreamConverter {
                 events.push(Event::Done);
                 events
             }
-            "error" => vec![Event::Failure(
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Provider stream failed")
-                    .to_owned(),
-            )],
+            "error" => vec![Event::Failure(StreamFailure::from_value(
+                value,
+                "Provider stream failed",
+            ))],
             "response.failed" => vec![
-                Event::Failure(
-                    response
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Provider response failed")
-                        .to_owned(),
-                ),
+                Event::Failure(StreamFailure::from_value(
+                    response,
+                    "Provider response failed",
+                )),
                 Event::Done,
             ],
             _ => Vec::new(),
@@ -725,7 +781,9 @@ impl StreamConverter {
         }
         if matches!(event, Event::Done) && !self.state.generation_finished {
             return self.render(
-                Event::Failure("Provider stream ended before a generation finish event".to_owned()),
+                Event::Failure(StreamFailure::new(
+                    "Provider stream ended before a generation finish event",
+                )),
                 output,
             );
         }
@@ -737,24 +795,22 @@ impl StreamConverter {
                 Protocol::AnthropicMessages => self.render_anthropic(finish, output)?,
             }
         }
-        if let Event::Failure(message) = event {
-            self.state.failure = Some(message.clone());
+        if let Event::Failure(failure) = event {
+            self.state.failure = Some(failure.message.clone());
             self.state.finished = true;
             self.state.done = true;
+            let error = failure.render(self.target);
             return match self.target {
-                Protocol::OpenAiChat => emit_data(
-                    output,
-                    &json!({"error": {"message": message, "type": "upstream_stream_error"}}),
-                ),
+                Protocol::OpenAiChat => emit_data(output, &json!({"error": error})),
                 Protocol::AnthropicMessages => emit_event(
                     output,
                     "error",
-                    &json!({"type": "error", "error": {"type": "api_error", "message": message}}),
+                    &json!({"type": "error", "error": error}),
                 ),
                 Protocol::OpenAiResponses => self.emit_responses_event(
                     output,
                     "response.failed",
-                    json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": {"code": "upstream_error", "message": message}}}),
+                    json!({"type": "response.failed", "response": {"id": self.state.id, "object": "response", "status": "failed", "model": self.state.model, "error": error}}),
                 ),
             };
         }
