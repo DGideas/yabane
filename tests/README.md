@@ -3,12 +3,20 @@
 ## Quality gate
 
 ```bash
-bash tests/check.sh
-bash tests/check.sh --full
+bash tests/check.sh --quick # syntax, Clippy and all workspace unit tests once
+bash tests/check.sh         # also Core-only, feature-sensitive singles/pairs and HTTP
+bash tests/check.sh --matrix # all 32 Extension subsets, plus the offline HTTP gate
+bash tests/check.sh --full  # complete matrix and browser/authentication E2E
 bash tests/check.sh --load
 ```
 
-Both offline modes check Rust formatting, JS/shell syntax, strict Clippy, workspace tests, and all eleven combinations of the four optional Extensions. They then rebuild the default binary and run the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
+`--quick` checks Rust formatting, JS/shell syntax, strict workspace Clippy and every workspace unit test with all five Extensions enabled. It explicitly omits the feature matrix, HTTP and browser coverage: add relevant process-level tests during iteration and use the default gate before delivery.
+
+The default offline gate additionally lints and compiles **all Core tests** in the Core-only, five single-Extension and ten pair builds. Core-only runs every Core test; each other subset runs the feature-sensitive `extensions`, `config`, `control`, `gateway`, `endpoint_signin` and `models` modules. Protocol conversion, Activity durability, storage and authentication still run unfiltered in both all-feature and Core-only builds; they are not repeated in every pair. No bundled Extension is added as a test dependency. `--matrix` and `--full` extend this to **all 32 subsets**, including triples and quadruples (the old gate covered only 17 configurations, not every combination).
+
+Stage timings and exit statuses are printed as `TIMING`; compilation, test execution and process-level verification are separate stages. Cargo uses its normal parallel test runner; do not increase threads or disable safety cases just to improve a duration. A first uncached build is not comparable to a warm test run. `node tests/check-gate.mjs` verifies mode selection, matrix completeness, test filtering and failure propagation without running a compiler or gateway. `tests/build-identity.mjs` runs the build script against temporary normal/worktree, packed/loose and detached Git references, ensuring build identity stays fresh without watching nonexistent paths.
+
+Every non-quick mode then rebuilds the default binary and runs the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
 
 - `tests/cooldown-copy.mjs` — structured console history uses recorded delay sources, stays unchanged after policy edits, distinguishes zero from missing, and avoids guessing older/unavailable observations (ENDPOINT-42).
 - `tests/cooldown-layout.mjs` — production console helpers render compact state and collapsed explanations, sort identities without mutating configuration, distinguish weighted/standby/all-cooling allocations, keep disabled cooldowns explicit, exclude zero-weight identities from takeover and escape names (ENDPOINT-40 / ENDPOINT-31 / ENDPOINT-42).
@@ -23,6 +31,8 @@ Both offline modes check Rust formatting, JS/shell syntax, strict Clippy, worksp
 - `tests/shutdown.mjs` — `SIGTERM` is bounded by the grace period and the request it interrupts is recorded as a shutdown and flushed before exit (SVC-60).
 - `tests/response-limits.mjs` — conversion bounds reject an oversized answer with an explained `502`, while native passthrough stays byte-transparent for a response the observer must skip (PROXY-46).
 - `tests/openapi-paths.mjs` — every route and method served by the router is documented in `web/openapi.json`, and nothing else is.
+
+Persistence concurrency tests use path-scoped I/O gates, with an explicit reached/release handshake instead of sleeps: the read/record assertions happen while the writer is definitely blocked, and dropping a gate releases it without clearing another test's injection. Cancellation recovery aborts only after the journal write has reached its gate. Unit aggregate-limit tests exercise the exact production counter boundary without parsing 128 MiB repeatedly; `tests/response-limits.mjs` still sends real oversized/accumulated production payloads and is mandatory in every non-quick gate.
 
 Request/JSON regression cases are in `src/protocol/regression_tests.rs`; streaming regressions are in `src/protocol_stream/regression_tests.rs`. They cover exact argument strings, tool-batch boundaries, parameter shapes, MIME-preserving document round trips, bounded cumulative-content reconciliation and strict block identities, alongside the process-level fixtures above.
 

@@ -1518,23 +1518,32 @@ mod tests {
     fn aggregated_output_past_the_memory_limit_fails_instead_of_growing() {
         let mut converter =
             StreamConverter::new_aggregating(Protocol::OpenAiChat, Protocol::OpenAiResponses);
-        let chunk = format!(
-            "data: {}\n\n",
-            serde_json::json!({
-                "id": "c", "model": "gpt",
-                "choices": [{"delta": {"content": "x".repeat(1024 * 1024)}, "finish_reason": null}]
-            })
+        // Test the real counter at the exact boundary without allocating/parsing
+        // 128 MiB on every feature build. tests/response-limits.mjs still drives
+        // the actual production ceiling over HTTP with real accumulated chunks.
+        converter.state.collected = MAX_BUFFERED_BODY_BYTES - 4;
+        let chunk = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id": "c", "model": "gpt",
+                    "choices": [{"delta": {"content": text}, "finish_reason": null}]
+                })
+            )
+        };
+        converter
+            .push(chunk("xxxx").as_bytes())
+            .expect("exact limit is accepted");
+        assert_eq!(converter.state.collected, MAX_BUFFERED_BODY_BYTES);
+        assert_eq!(converter.state.text, "xxxx");
+        let error = converter
+            .push(chunk("y").as_bytes())
+            .expect_err("one byte past the limit must fail");
+        assert_eq!(converter.state.collected, MAX_BUFFERED_BODY_BYTES + 1);
+        assert_eq!(
+            converter.state.text, "xxxx",
+            "rejected output is not retained"
         );
-        let mut failure = None;
-        // Each push carries one MiB, so this covers the shared ceiling plus a
-        // margin; the bound must stop the loop before it runs out of attempts.
-        for _ in 0..MAX_BUFFERED_BODY_BYTES / (1024 * 1024) + 4 {
-            if let Err(error) = converter.push(chunk.as_bytes()) {
-                failure = Some(error);
-                break;
-            }
-        }
-        let error = failure.expect("the aggregate limit must stop an unbounded response");
         assert!(error.contains("conversion limit"), "{error}");
     }
 

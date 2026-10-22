@@ -1289,8 +1289,6 @@ impl ActivityStore {
 struct AppendFaults {
     prefix: String,
     partial_bytes: usize,
-    hold_ms: u64,
-    reached: bool,
 }
 
 #[cfg(test)]
@@ -1304,38 +1302,17 @@ fn append_faults() -> std::sync::MutexGuard<'static, Vec<AppendFaults>> {
 }
 
 #[cfg(test)]
-pub(crate) fn arm_append_faults(prefix: &str, partial_bytes: usize, hold_ms: u64) {
+pub(crate) fn arm_append_faults(prefix: &str, partial_bytes: usize) {
     let mut faults = append_faults();
     faults.retain(|fault| fault.prefix != prefix);
     faults.push(AppendFaults {
         prefix: prefix.to_owned(),
         partial_bytes,
-        hold_ms,
-        reached: false,
     });
 }
 
-/// Whether the hold armed for this prefix was reached. It stays true until the
-/// prefix is armed again.
 #[cfg(test)]
-pub(crate) fn append_hold_reached(prefix: &str) -> bool {
-    append_faults()
-        .iter()
-        .any(|fault| fault.prefix == prefix && fault.reached)
-}
-
-#[cfg(test)]
-fn take_append_hold(path: &Path) -> Option<u64> {
-    let mut faults = append_faults();
-    let fault = faults
-        .iter_mut()
-        .find(|fault| path.to_string_lossy().starts_with(&fault.prefix))?;
-    if fault.hold_ms == 0 {
-        return None;
-    }
-    fault.reached = true;
-    Some(std::mem::take(&mut fault.hold_ms))
-}
+static APPEND_GATES: crate::test_support::IoGates = crate::test_support::IoGates::new();
 
 #[cfg(test)]
 fn take_partial_append(path: &Path) -> usize {
@@ -1343,11 +1320,6 @@ fn take_partial_append(path: &Path) -> usize {
         .iter_mut()
         .find(|fault| path.to_string_lossy().starts_with(&fault.prefix))
         .map_or(0, |fault| std::mem::take(&mut fault.partial_bytes))
-}
-
-#[cfg(not(test))]
-fn take_append_hold(_path: &Path) -> Option<u64> {
-    None
 }
 
 #[cfg(not(test))]
@@ -1378,9 +1350,8 @@ async fn append_bytes(path: &Path, contents: &[u8]) -> Result<(), std::io::Error
         .open(path)
         .await?;
     let previous_len = file.metadata().await?.len();
-    if let Some(hold_ms) = take_append_hold(path) {
-        tokio::time::sleep(Duration::from_millis(hold_ms)).await;
-    }
+    #[cfg(test)]
+    APPEND_GATES.hold(path).await;
     let partial = take_partial_append(path);
     let result = async {
         write_batch(&mut file, contents, partial).await?;
@@ -1883,7 +1854,7 @@ mod tests {
         let store = store(Vec::new());
         store.record(request(now, "first", "alpha", 200)).await;
 
-        arm_append_faults(directory.to_str().unwrap(), 64, 0);
+        arm_append_faults(directory.to_str().unwrap(), 64);
         store.flush_at(paths.as_paths()).await;
 
         let today = paths.day_file(now);
@@ -1918,15 +1889,13 @@ mod tests {
         let store = store(Vec::new());
         store.record(request(now, "inflight", "alpha", 200)).await;
 
-        arm_append_faults(directory.to_str().unwrap(), 0, 1_000);
+        let mut gate = APPEND_GATES.arm(directory.to_str().unwrap(), 0);
         let flushing = {
             let store = store.clone();
             let paths = paths.clone();
             tokio::spawn(async move { store.flush_at(paths.as_paths()).await })
         };
-        while !append_hold_reached(directory.to_str().unwrap()) {
-            tokio::task::yield_now().await;
-        }
+        gate.entered().await;
 
         let visible = store
             .logs(0, u64::MAX, ActivityFilters::default(), 10)
@@ -1937,6 +1906,8 @@ mod tests {
             "the record being appended is still visible"
         );
         assert_eq!(visible[0].request_id, "inflight");
+        assert!(!flushing.is_finished());
+        gate.release();
         flushing.await.unwrap();
 
         // After the append publishes it, the same record is visible exactly once.
@@ -2296,15 +2267,13 @@ mod tests {
             records: vec![request(now, "imported", "alpha", 200)],
         };
 
-        crate::storage::arm_write_hold(directory.to_str().unwrap(), 1, 1_000);
+        let mut gate = crate::storage::arm_write_hold(directory.to_str().unwrap(), 1);
         let importing = {
             let store = store.clone();
             let paths = paths.clone();
             tokio::spawn(async move { store.import_at(paths.as_paths(), import).await })
         };
-        while !crate::storage::write_hold_reached(directory.to_str().unwrap()) {
-            tokio::task::yield_now().await;
-        }
+        gate.entered().await;
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -2322,6 +2291,8 @@ mod tests {
         );
         assert_eq!(visible[0].request_id, "during");
 
+        assert!(!importing.is_finished());
+        gate.release();
         importing.await.unwrap().expect("import succeeds");
         let after = store.export_records(0).await;
         assert_eq!(after.len(), 2);
@@ -2362,7 +2333,7 @@ mod tests {
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let paths = TestPaths::new(&directory);
 
-        crate::storage::arm_write_hold(directory.to_str().unwrap(), 1, 1_000);
+        let mut gate = crate::storage::arm_write_hold(directory.to_str().unwrap(), 1);
         let recalculating = {
             let store = store.clone();
             let paths = paths.clone();
@@ -2374,9 +2345,7 @@ mod tests {
                     .await
             })
         };
-        while !crate::storage::write_hold_reached(directory.to_str().unwrap()) {
-            tokio::task::yield_now().await;
-        }
+        gate.entered().await;
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -2389,6 +2358,8 @@ mod tests {
             .expect("queries must not wait for a recalculation to finish");
         assert_eq!(visible.len(), 2);
 
+        assert!(!recalculating.is_finished());
+        gate.release();
         let result = recalculating
             .await
             .unwrap()

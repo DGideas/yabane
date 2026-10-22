@@ -607,7 +607,7 @@ async fn authenticate_management_key(state: &AppState, headers: &axum::http::Hea
     };
     let Some(key_index) = user.management_api_keys.iter().position(|key| {
         constant_time_eq(&key.secret_hash, &hash)
-            && !key.expires_at.is_some_and(|expires| expires <= now)
+            && key.expires_at.is_none_or(|expires| expires > now)
     }) else {
         return false;
     };

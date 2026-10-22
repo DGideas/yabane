@@ -95,7 +95,7 @@ fn cached_models<'a>(providers: impl Iterator<Item = &'a Provider>) -> Vec<Model
         data.extend(provider.discovered_models.iter().map(|model_id| {
             let upstream_id = model_id.strip_prefix(&prefix).unwrap_or(model_id);
             Model {
-                id: format!("{}{upstream_id}", prefix),
+                id: format!("{prefix}{upstream_id}"),
                 object: model_object(),
                 owned_by: provider.id.clone(),
                 created: None,

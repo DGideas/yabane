@@ -7,3 +7,4 @@
 * Provider-facing model IDs remove only Yabane's first `provider/` segment. Preserve the remainder exactly, including native upstream namespaces such as `google/model-name`.
 * Activity records routing metadata and usage only; never persist prompt or response content.
 * Web assets are embedded with `include_str!` and `include_bytes!`; rebuild the binary before browser or E2E verification, otherwise tests may exercise stale UI resources.
+* `tests/check.sh --quick` is an iteration gate, not full acceptance. Default checks all-feature/Core-only tests unfiltered and feature-sensitive modules in single/pair builds; `--matrix`/`--full` cover all 32 subsets. Keep real HTTP bounds, credential isolation, recovery, cancellation and stream transparency coverage. Concurrency fixtures use explicit reached/release gates, never a sleep as proof that an operation is still in flight.

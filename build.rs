@@ -15,10 +15,24 @@ fn main() {
         if let Ok(contents) = fs::read_to_string(&head)
             && let Some(reference) = contents.trim().strip_prefix("ref: ")
         {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(reference).display()
-            );
+            // In a worktree HEAD is private, but branch refs live in the common
+            // Git directory. Watching a nonexistent private ref makes Cargo
+            // rebuild on every invocation. --git-path handles both layouts.
+            let loose_ref = PathBuf::from(git_output(&["rev-parse", "--git-path", reference]));
+            if loose_ref.exists() {
+                println!("cargo:rerun-if-changed={}", loose_ref.display());
+            } else {
+                let packed = PathBuf::from(git_output(&["rev-parse", "--git-path", "packed-refs"]));
+                if packed.exists() {
+                    println!("cargo:rerun-if-changed={}", packed.display());
+                }
+                // A later commit can create a loose ref for a packed branch.
+                // Watch the existing refs tree too, never a missing ref path.
+                let refs = PathBuf::from(git_output(&["rev-parse", "--git-path", "refs"]));
+                if refs.exists() {
+                    println!("cargo:rerun-if-changed={}", refs.display());
+                }
+            }
         }
     }
 

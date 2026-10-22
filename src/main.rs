@@ -25,6 +25,8 @@ mod protocol;
 mod protocol_stream;
 mod routes;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod usage;
 mod web;
 

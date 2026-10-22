@@ -2012,7 +2012,7 @@ async fn update_endpoint(
     if let Some(pricing) = &input.pricing
         && let Err(message) = crate::pricing::validate_table(
             pricing,
-            &format!("Endpoint '{}/{}'", provider_id, endpoint_id),
+            &format!("Endpoint '{provider_id}/{endpoint_id}'"),
             false,
         )
     {
