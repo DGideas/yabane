@@ -1,6 +1,6 @@
 [package]
 name = "yabane-extension-codebuddy"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Tencent CodeBuddy CN Endpoint type for Yabane"
 license = "MIT"

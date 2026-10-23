@@ -49,7 +49,7 @@ const DEFAULT_BASE_URL_HINT: &str = "https://copilot.tencent.com/v2";
 /// This catalog is maintained explicitly rather than discovered over the wire
 /// or read from the bundled product configuration, which can go stale.
 ///
-/// Snapshot fetched from the live CN `/v3/config` on 2026-10-12 using the CLI
+/// Snapshot fetched from the live CN `/v3/config` on 2026-10-21 using the CLI
 /// identity and an API key: only the IDs advertised by the `cli` agent, plus the
 /// separately verified `auto` selector. The config's full `models` array also
 /// includes legacy and image entries not advertised to this client; those are
@@ -70,8 +70,10 @@ const MODELS: &[&str] = &[
     "kimi-k2.7",
     "kimi-k2.8-preview",
     "kimi-k3-1",
+    "mimo-v2.6-pro",
     "minimax-m2.7",
     "minimax-m3",
+    "minimax-m3.1-flash",
     "space-bunny",
     "step-5-preview",
 ];
