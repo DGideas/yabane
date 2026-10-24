@@ -6,6 +6,7 @@
     "test": "tests"
   },
   "scripts": {
+    "test:accessibility": "node tests/accessibility.mjs",
     "test:responsive": "node tests/responsive-ui.mjs"
   },
   "repository": {
@@ -20,6 +21,7 @@
   },
   "homepage": "https://github.com/DGideas/yabane#readme",
   "devDependencies": {
+    "axe-core": "4.11.1",
     "playwright": "1.62.1"
   },
   "engines": {

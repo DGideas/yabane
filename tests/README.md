@@ -56,6 +56,8 @@ See `ENGINEERING_REVIEW.md` for the engineering findings, validation limits, and
 
 ## UI verification
 
+Run `npm run test:accessibility` to rebuild and scan WCAG 2.1 A/AA rules in isolated system Chrome and 320px Playwright WebKit contexts. Tests include empty and populated views, all static dialogs, initialized resource workflows, keyboard skip links/tabs/destination pickers, modal focus return, and pause/resume of automatic data refresh (SVC-62). Safari's default keyboard mode uses Option+Tab to reach links. The full gate runs this separately before E2E. Automated scans cover only machine-checkable criteria; screen-reader reading order, meaningful alternatives, zoom/text-spacing usability, and complete workflows also require manual evaluation.
+
 The admin console must be checked at desktop, tablet, and mobile/iOS-sized viewports whenever layouts, dialogs, forms, navigation, or embedded assets change.
 
 ### Automated responsive smoke test

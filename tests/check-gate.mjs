@@ -21,6 +21,7 @@ tool=\${0##*/}
 { printf '%s\\t' "$tool" "$@"; printf '\\n'; } >> "$GATE_CALLS"
 if [[ $tool == rustc ]]; then echo 'rustc 1.88.0'; fi
 if [[ $GATE_FAIL == cargo && $tool == cargo && \${1:-} == test ]] ||
+   [[ $GATE_FAIL == accessibility && $tool == node && \${1:-} == tests/accessibility.mjs ]] ||
    [[ $GATE_FAIL == http && $tool == node && \${1:-} == tests/response-limits.mjs ]]; then exit 7; fi
 exit 0
 `;
@@ -75,8 +76,13 @@ exit 0
     }, 0)).sort((a, b) => a - b);
     assert.deepEqual(masks, Array.from({length: 32}, (_, i) => i));
     assert.ok(complete.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/response-limits.mjs'));
+    assert.equal(complete.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/accessibility.mjs'), mode === '--full');
     assert.equal(complete.calls.some(c => c.tool === 'browser'), mode === '--full');
   }
+  const accessibilityFailed = await run(['--full'], 'accessibility');
+  assert.equal(accessibilityFailed.result.status, 7);
+  assert.ok(!accessibilityFailed.calls.some(c => c.tool === 'browser'), 'accessibility failure blocks browser/success');
+  assert.doesNotMatch(accessibilityFailed.result.stdout, /quality checks passed/);
   const failed = await run([], 'cargo');
   assert.equal(failed.result.status, 7);
   assert.equal(argsFor(failed.calls, 'build').length, 0);

@@ -97,6 +97,7 @@ for script in cooldown-history http-redirects reasoning-conversion stream-semant
   stage "$script" node "tests/$script.mjs" "$repo/target/debug/yabane"
 done
 if [[ $full == true ]]; then
+  stage accessibility node tests/accessibility.mjs "$repo/target/debug/yabane"
   stage browser-auth bash tests/e2e.sh "$repo/target/debug/yabane"
 fi
 if command -v cargo-audit >/dev/null; then

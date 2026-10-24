@@ -19,7 +19,7 @@
 .docs-op.active{background:#eaf2ff;color:#001d35}
 .docs-op .method{flex:0 0 52px;padding:3px 0;text-align:center;border-radius:6px;color:#fff;font:600 10px 'Ubuntu Sans';text-transform:uppercase}
 .docs-op span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.m-get{background:#1e8e3e}.m-post{background:#0b57d0}.m-patch{background:#ff8f00}.m-delete{background:#d93025}
+.m-get{background:#167332}.m-post{background:#0b57d0}.m-patch{background:#925000}.m-delete{background:#b3261e}
 .docs-main{padding:32px clamp(24px,3vw,56px);min-width:0}
 .docs-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}
 .docs-head .method{padding:6px 12px;border-radius:8px;color:#fff;font:600 12px 'Ubuntu Sans';text-transform:uppercase}
@@ -45,17 +45,18 @@
 </style>
 </head>
 <body>
+<a class="skip-link" href="#docs-main">Skip to API reference</a>
 <header class="topbar">
-  <a class="brand" href="/"><img class="brand-mark" src="/favicon.svg" alt=""><span>Yabane</span></a>
+  <a class="brand" href="/" aria-label="Yabane home"><img class="brand-mark" src="/favicon.svg" alt=""><span>Yabane</span></a>
   <span class="docs-title">Live API reference</span>
   <div class="docs-auth">
-    <select id="auth-mode"><option value="session">Browser session</option><option value="bearer">Bearer key</option></select>
-    <input id="auth-key" class="technical-input" hidden placeholder="yab_mgmt_… or sk-…" autocomplete="off" spellcheck="false">
+    <select id="auth-mode" aria-label="Request authentication"><option value="session">Browser session</option><option value="bearer">Bearer key</option></select>
+    <input id="auth-key" aria-label="Bearer API key" class="technical-input" hidden placeholder="yab_mgmt_… or sk-…" autocomplete="off" spellcheck="false">
   </div>
 </header>
 <div class="docs-layout">
-  <aside class="docs-nav" id="docs-nav"></aside>
-  <main class="docs-main" id="docs-main"><div class="docs-empty">Loading OpenAPI specification…</div></main>
+  <aside class="docs-nav" id="docs-nav" aria-label="API operations"></aside>
+  <main class="docs-main" id="docs-main" tabindex="-1"><div class="docs-empty">Loading OpenAPI specification…</div></main>
 </div>
 <script>
 const $ = selector => document.querySelector(selector);
@@ -83,7 +84,7 @@ async function load() {
     .filter(operation => (operation.op.tags || ['Other'])[0] === tag)
     .map((operation, index) => `<button class="docs-op" data-path="${operation.path}" data-method="${operation.method}"><span class="method m-${operation.method}">${operation.method}</span><span>${operation.path}</span></button>`).join('')).join('');
   $('#docs-nav').addEventListener('click', event => { const button = event.target.closest('.docs-op'); if (button) render(button.dataset.method, button.dataset.path); });
-  $('#docs-main').innerHTML = `<div class="docs-empty"><h3>${operations.length} operations</h3><p>Select an operation on the left. Requests execute against this Yabane instance using the selected authentication.</p></div>`;
+  $('#docs-main').innerHTML = `<div class="docs-empty"><h1>${operations.length} operations</h1><p>Select an operation on the left. Requests execute against this Yabane instance using the selected authentication.</p></div>`;
 }
 
 function schemaExample(schema) {
@@ -110,13 +111,14 @@ function render(method, path) {
   const security = (operation.op.security || []).map(schemes => Object.keys(schemes).map(name => spec.components.securitySchemes[name]?.description || name).join(' or '));
   $('#docs-main').innerHTML = `
     <div class="docs-head"><span class="method m-${method}">${method}</span><code>${path}</code></div>
-    <p class="docs-summary">${operation.op.summary || ''}</p>
+    <h1 class="docs-summary" tabindex="-1">${operation.op.summary || `${method.toUpperCase()} ${path}`}</h1>
     ${operation.op.description ? `<p class="docs-desc">${operation.op.description}</p>` : ''}
     ${security.length ? `<p class="docs-security"><strong>Authentication:</strong> ${security.join(' · ')}</p>` : '<p class="docs-security"><strong>Authentication:</strong> none</p>'}
-    ${pathParams.length || queryParams.length ? `<h4 class="docs-section">Parameters</h4><table class="docs-table"><thead><tr><th>Name</th><th>In</th><th>Value</th></tr></thead><tbody>${parameters.map(parameter => `<tr><td><code>${parameter.name}</code></td><td>${parameter.in}</td><td><input class="technical-input param-input" data-in="${parameter.in}" data-name="${parameter.name}" placeholder="${parameter.schema?.default ?? parameter.schema?.pattern ?? ''}"></td></tr>`).join('')}</tbody></table>` : ''}
-    ${bodyExample !== undefined ? `<h4 class="docs-section">Request body</h4><div class="docs-card"><textarea id="docs-body" spellcheck="false">${JSON.stringify(bodyExample, null, 2)}</textarea></div>` : ''}
+    ${pathParams.length || queryParams.length ? `<h2 class="docs-section">Parameters</h2><table class="docs-table"><thead><tr><th>Name</th><th>In</th><th>Value</th></tr></thead><tbody>${parameters.map(parameter => `<tr><td><code>${parameter.name}</code></td><td>${parameter.in}</td><td><input class="technical-input param-input" aria-label="${parameter.name} (${parameter.in})" data-in="${parameter.in}" data-name="${parameter.name}" placeholder="${parameter.schema?.default ?? parameter.schema?.pattern ?? ''}"></td></tr>`).join('')}</tbody></table>` : ''}
+    ${bodyExample !== undefined ? `<h2 class="docs-section">Request body</h2><div class="docs-card"><textarea id="docs-body" aria-label="JSON request body" spellcheck="false">${JSON.stringify(bodyExample, null, 2)}</textarea></div>` : ''}
     <div class="docs-run-row"><button class="button primary" id="docs-run">Send request</button><span class="docs-desc">Executed live against this instance.</span></div>
-    <div class="docs-response" id="docs-response" hidden></div>`;
+    <div class="docs-response" id="docs-response" role="status" hidden></div>`;
+  $('#docs-main h1').focus({preventScroll: true});
   $('#docs-run').addEventListener('click', async () => {
     let url = path;
     for (const input of $$('#docs-main .param-input[data-in="path"]')) url = url.replace(`{${input.dataset.name}}`, encodeURIComponent(input.value || input.dataset.name));

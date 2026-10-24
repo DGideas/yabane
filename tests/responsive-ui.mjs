@@ -447,7 +447,7 @@ for (const project of projects) {
     await page.locator('#traffic-capture-detail-dialog').waitFor({state: 'visible'});
     const requestBodyWasScrollable = await page.locator('#traffic-capture-detail-dialog').evaluate(dialog => { const body = dialog.querySelector('#capture-detail-body'); const detail = dialog.querySelector('.capture-detail-body'); body.scrollTop = body.scrollHeight; detail.scrollTop = detail.scrollHeight; return body.scrollTop > 0 || detail.scrollTop > 0; });
     if (!requestBodyWasScrollable) throw new Error(`${project.name}: Traffic Capture request fixture does not exercise body scrolling`);
-    await page.locator('#traffic-capture-detail-dialog').getByRole('tab', {name: 'Response'}).click();
+    await page.locator('#traffic-capture-detail-dialog').getByRole('button', {name: 'Response', exact: true}).click();
     if (await page.locator('#capture-detail-body').evaluate(element => element.scrollTop) !== 0 || await page.locator('.capture-detail-body').evaluate(element => element.scrollTop) !== 0) throw new Error(`${project.name}: Traffic Capture direction change preserves stale scroll position`);
     await assertDialog(page, '#traffic-capture-detail-dialog', project.name);
     const captureDialog = page.locator('#traffic-capture-detail-dialog');
@@ -456,20 +456,22 @@ for (const project of projects) {
       const dialogBox = await captureDialog.boundingBox();
       if (!dialogBox || dialogBox.width < project.width * .8 || dialogBox.height < project.height * .8) throw new Error(`${project.name}: Traffic Capture detail is still too small for captured payloads`);
     }
-    await captureDialog.getByRole('tab', {name: 'Response'}).click();
+    const responseDirection = captureDialog.getByRole('button', {name: 'Response', exact: true});
+    await responseDirection.click();
+    if (await responseDirection.getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: Traffic Capture does not expose the selected direction`);
     if (!(await captureDialog.getByText(/17.7 s at the Provider/).isVisible()) || !(await page.locator('[data-capture-id="ui-capture"]').getByText('17.7 s', {exact: true}).isVisible())) throw new Error(`${project.name}: Traffic Capture does not show Provider duration in its list and detail`);
     await assertNoUpstreamCopy(page, project.name, 'Traffic Capture');
-    const assembledTab = captureDialog.getByRole('tab', {name: 'Assembled'});
-    if (!(await assembledTab.isVisible()) || await assembledTab.getAttribute('aria-selected') !== 'true') throw new Error(`${project.name}: streaming response does not default to its assembled non-streaming structure`);
+    const assembledTab = captureDialog.getByRole('button', {name: 'Assembled', exact: true});
+    if (!(await assembledTab.isVisible()) || await assembledTab.getAttribute('aria-pressed') !== 'true') throw new Error(`${project.name}: streaming response does not default to its assembled non-streaming structure`);
     const assembledBody = captureDialog.locator('#capture-detail-body');
     if (!(await assembledBody.getByText(/"status": "completed"/).isVisible()) || !(await assembledBody.getByText(/"text": "hello <script>"/).isVisible())) throw new Error(`${project.name}: assembled response does not use the terminal response object`);
     if (await assembledBody.locator('script').count()) throw new Error(`${project.name}: syntax highlighting injects captured markup`);
     if (!(await assembledBody.locator('.syntax-key').count()) || !(await assembledBody.locator('.syntax-string').count()) || !(await assembledBody.locator('.syntax-number').count())) throw new Error(`${project.name}: assembled JSON lacks syntax highlighting`);
-    await captureDialog.getByRole('tab', {name: 'Raw'}).click();
+    await captureDialog.getByRole('button', {name: 'Raw', exact: true}).click();
     await assembledBody.evaluate(element => { element.scrollTop = element.scrollHeight; });
     await assembledTab.click();
     if (await assembledBody.evaluate(element => element.scrollTop) !== 0) throw new Error(`${project.name}: Traffic Capture body mode preserves stale scroll position`);
-    await captureDialog.getByRole('tab', {name: 'Raw'}).click();
+    await captureDialog.getByRole('button', {name: 'Raw', exact: true}).click();
     if (!(await assembledBody.getByText(/event: response.created/).isVisible()) || !(await assembledBody.locator('.syntax-sse').count())) throw new Error(`${project.name}: assembled response cannot return to highlighted raw SSE`);
     if (project.name === 'desktop-chrome') {
       await captureDialog.getByRole('button', {name: 'Copy body'}).click();

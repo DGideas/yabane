@@ -17,6 +17,108 @@ const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
 const $$in = (root, selector) => [...root.querySelectorAll(selector)];
 const icon = (name, className = 'ui-icon') => `<svg class="${className}" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
+
+// Native modal dialogs provide the modal interaction boundary, while this small
+// layer gives every dialog a predictable name, initial focus, and focus return.
+const dialogReturnFocus = new WeakMap();
+let lastActivationTarget = null;
+let lastActivationEvent = null;
+document.addEventListener('click', event => { lastActivationEvent = event; lastActivationTarget = event.target.closest('button, a, summary, [tabindex]'); }, true);
+function dialogFocusable(dialog) {
+  return [...dialog.querySelectorAll('[autofocus], input:not([type="hidden"]):not(:disabled), select:not(:disabled), textarea:not(:disabled), button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])')].find(element => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden');
+}
+function showDialog(dialog, returnFocus = lastActivationEvent?.eventPhase ? lastActivationTarget : document.activeElement) {
+  prepareFormAccessibility(dialog);
+  syncTabs();
+  if (returnFocus === document.body || returnFocus === document.documentElement || dialog.contains(returnFocus)) returnFocus = lastActivationTarget;
+  const previousDialog = returnFocus?.closest?.('dialog');
+  if (previousDialog && !previousDialog.open) returnFocus = dialogReturnFocus.get(previousDialog) || returnFocus;
+  if (returnFocus?.closest?.('.account-control')) returnFocus = $('#account-menu');
+  dialogReturnFocus.set(dialog, returnFocus instanceof HTMLElement ? returnFocus : null);
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.showModal();
+  dialogFocusable(dialog)?.focus({preventScroll: true});
+}
+function wireDialogAccessibility() {
+  document.querySelectorAll('dialog').forEach(dialog => {
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.addEventListener('close', () => {
+      const returnFocus = dialogReturnFocus.get(dialog);
+      dialogReturnFocus.delete(dialog);
+      const focusWasLost = document.activeElement === document.body || document.activeElement === document.documentElement || dialog.contains(document.activeElement);
+      if (focusWasLost && !document.querySelector('dialog[open]')) {
+        if (returnFocus?.isConnected && returnFocus.getClientRects().length > 0 && !returnFocus.disabled) returnFocus.focus({preventScroll: true});
+        else focusPageHeading();
+      }
+    });
+  });
+}
+wireDialogAccessibility();
+
+let accessibleId = 0;
+function prepareFormAccessibility(root) {
+  root.querySelectorAll('label.field').forEach(label => {
+    const title = label.querySelector('.field-label');
+    if (!title) return;
+    const previousTitleId = title.id;
+    if (!title.id || document.getElementById(title.id) !== title) title.id = `field-label-${++accessibleId}`;
+    const help = label.querySelector('.field-help');
+    const previousHelpId = help?.id;
+    if (help && (!help.id || document.getElementById(help.id) !== help)) help.id = `field-help-${++accessibleId}`;
+    label.querySelectorAll('input:not([type="hidden"]), select, textarea').forEach(control => {
+      if ((!control.hasAttribute('aria-labelledby') && !control.hasAttribute('aria-label')) || (previousTitleId && control.getAttribute('aria-labelledby') === previousTitleId)) control.setAttribute('aria-labelledby', title.id);
+      if (help) {
+        const descriptions = (control.getAttribute('aria-describedby') || '').split(/\s+/).filter(id => id && id !== previousHelpId);
+        control.setAttribute('aria-describedby', [...new Set([...descriptions, help.id])].join(' '));
+      }
+    });
+  });
+  root.querySelectorAll('.error, .row-error').forEach(error => error.setAttribute('role', 'alert'));
+  root.querySelectorAll('pre, .extension-build-commands code, .activity-metrics').forEach(region => { region.tabIndex = 0; });
+}
+prepareFormAccessibility(document);
+
+// All tab sets use one roving tab stop and the same keyboard interaction.
+function syncTabs() {
+  document.querySelectorAll('[role="tablist"]').forEach((list, listIndex) => {
+    list.setAttribute('aria-label', list.getAttribute('aria-label') || 'View options');
+    list.querySelectorAll('[role="tab"]').forEach((tab, index) => {
+      tab.id ||= `view-tab-${listIndex}-${index}`;
+      const active = tab.classList.contains('active');
+      tab.tabIndex = active ? 0 : -1;
+      tab.setAttribute('aria-selected', String(active));
+      let panels = [];
+      if (tab.dataset.endpointTab) panels = $$(`[data-endpoint-panel="${tab.dataset.endpointTab}"]`);
+      if (tab.dataset.activityTab) panels = [$(`#activity-${tab.dataset.activityTab}-panel`)];
+      if (tab.dataset.activityDataTab) panels = $$(`[data-activity-data-panel="${tab.dataset.activityDataTab}"]`);
+      if (tab.dataset.helpTab) panels = tab.dataset.helpTab === 'agent' ? $$('[data-help-agent="true"]') : $$(`[data-help-panel="${tab.dataset.helpTab}"]`);
+      panels.filter(Boolean).forEach((panel, panelIndex) => {
+        panel.id ||= `${tab.id}-panel-${panelIndex}`;
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+        panel.tabIndex = 0;
+      });
+      if (panels.length) tab.setAttribute('aria-controls', panels.map(panel => panel.id).join(' '));
+    });
+  });
+}
+syncTabs();
+document.addEventListener('click', event => { if (event.target.closest('[role="tab"]')) syncTabs(); });
+document.addEventListener('keydown', event => {
+  const tab = event.target.closest('[role="tab"]');
+  if (!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  const tabs = [...tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]')].filter(item => !item.disabled);
+  const index = tabs.indexOf(tab);
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  event.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+});
+function focusPageHeading() {
+  const heading = [...document.querySelectorAll('main h1, #login-title')].find(element => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== 'hidden');
+  if (heading) { heading.tabIndex = -1; heading.focus({preventScroll: true}); }
+}
+$('.skip-link').addEventListener('click', event => { event.preventDefault(); focusPageHeading(); });
 const providerDialog = $('#provider-dialog');
 const providerForm = $('#provider-form');
 const providerIdentityDialog = $('#provider-identity-dialog');
@@ -127,12 +229,12 @@ function setMobileNavigation(open, returnFocus = false) {
 mobileNavToggle.addEventListener('click', () => setMobileNavigation(mobileNavToggle.getAttribute('aria-expanded') !== 'true', true));
 mobileNavBackdrop.addEventListener('click', () => setMobileNavigation(false, true));
 window.addEventListener('resize', () => { if (innerWidth > 760) setMobileNavigation(false); });
-accountMenu.addEventListener('click', event => { event.stopPropagation(); const opening = accountPopover.hidden; accountPopover.hidden = !opening; accountMenu.setAttribute('aria-expanded', String(opening)); });
+accountMenu.addEventListener('click', event => { event.stopPropagation(); const opening = accountPopover.hidden; accountPopover.hidden = !opening; accountMenu.setAttribute('aria-expanded', String(opening)); if (opening) $('#open-profile').focus(); });
 document.addEventListener('click', event => { if (!event.target.closest('.account-control')) closeAccountMenu(); });
-document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeAccountMenu(); if (mobileNavToggle.getAttribute('aria-expanded') === 'true') setMobileNavigation(false, true); } });
+document.addEventListener('keydown', event => { if (event.key === 'Escape') { const accountOpen = !accountPopover.hidden; closeAccountMenu(); if (accountOpen) accountMenu.focus(); if (mobileNavToggle.getAttribute('aria-expanded') === 'true') setMobileNavigation(false, true); } });
 $('#logout').addEventListener('click', async () => { await fetch('/admin/logout', {method: 'POST'}); location.href = '/login'; });
 const profileDialog = $('#profile-dialog');
-$('#open-profile').addEventListener('click', () => { closeAccountMenu(); const form = $('#profile-form'); form.reset(); form.elements.username.value = adminSession.username || ''; form.elements.email.value = adminSession.email || ''; $('#profile-error').textContent = ''; bindSecretToggles(profileDialog); profileDialog.showModal(); });
+$('#open-profile').addEventListener('click', () => { closeAccountMenu(); const form = $('#profile-form'); form.reset(); form.elements.username.value = adminSession.username || ''; form.elements.email.value = adminSession.email || ''; $('#profile-error').textContent = ''; bindSecretToggles(profileDialog); showDialog(profileDialog); });
 $$('.close-profile').forEach(button => button.addEventListener('click', () => profileDialog.close()));
 $('#profile-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.target);
@@ -157,7 +259,11 @@ function showView(name, updateHistory = true) {
   $('#activity-view').hidden = name !== 'activity';
   $('#management-view').hidden = name !== 'management';
   const navName = name === 'capture' ? 'extensions' : name;
-  $$('.nav[data-view]').forEach(item => item.classList.toggle('active', item.dataset.view === navName));
+  $$('.nav[data-view]').forEach(item => {
+    const active = item.dataset.view === navName;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page'); else item.removeAttribute('aria-current');
+  });
   const active = $(`.nav[data-view="${navName}"]`);
   const indicator = $('.nav-indicator');
   indicator.style.transform = `translateY(${active.offsetTop}px)`;
@@ -175,6 +281,7 @@ function showView(name, updateHistory = true) {
   if (name === 'management' && adminSession?.authenticated) loadManagementKeys();
   if (updateHistory) history.pushState({}, '', selectedProviderId && name === 'providers' ? `/providers/${encodeURIComponent(selectedProviderId)}` : viewPaths[name]);
   document.title = `${name === 'capture' ? 'Traffic Capture' : active.textContent.trim()} · Yabane`;
+  if (updateHistory && adminSession?.authenticated) focusPageHeading();
 }
 $$('.nav[data-view]').forEach(item => item.addEventListener('click', () => { showView(item.dataset.view); if (innerWidth <= 760) setMobileNavigation(false); }));
 function routeFromLocation() {
@@ -214,7 +321,7 @@ function openProviderDialog() {
   setApiType('openai_compatible');
   toggleCredentialRequirement();
   setProviderStep(1);
-  providerDialog.showModal();
+  showDialog(providerDialog);
 }
 $('#open-provider').addEventListener('click', openProviderDialog);
 $('#empty-add').addEventListener('click', openProviderDialog);
@@ -321,10 +428,12 @@ function bindSecretToggles(root = document) {
   root.querySelectorAll('.toggle-key').forEach(button => {
     if (button.dataset.bound) return;
     button.dataset.bound = 'true';
+    button.setAttribute('aria-pressed', String(button.parentElement.querySelector('input').type !== 'password'));
     button.addEventListener('click', () => {
       const input = button.parentElement.querySelector('input');
       input.type = input.type === 'password' ? 'text' : 'password';
       button.textContent = input.type === 'password' ? 'Show' : 'Hide';
+      button.setAttribute('aria-pressed', String(input.type !== 'password'));
     });
   });
 }
@@ -382,7 +491,7 @@ function showDeviceSignIn(target, flow = null) {
       ? 'Device-code sign-in could not start. You can use browser sign-in instead.'
       : 'This Endpoint type signs in through the browser.';
   }
-  signInDialog.showModal();
+  showDialog(signInDialog);
 }
 async function beginEndpointSignIn(target, errorElement, parentDialog = null) {
   signInFlowId = null;
@@ -790,7 +899,7 @@ function openModelEndpointsDialog(provider) {
   $('#model-endpoints-description').textContent = `Choose the default endpoint for shared models in ${provider.name}. Without a preference, the first configured compatible endpoint is used.`;
   $('#model-endpoints-error').textContent = '';
   $('#model-endpoint-search').value = '';
-  renderModelEndpointPreferences(); modelEndpointsDialog.showModal();
+  renderModelEndpointPreferences(); showDialog(modelEndpointsDialog);
 }
 function renderModelEndpointPreferences() {
   const query = $('#model-endpoint-search').value.trim().toLowerCase();
@@ -1153,7 +1262,7 @@ function openProviderIdentityDialog(providerId) {
   form.elements.name.value = provider.name;
   form.elements.id.value = provider.id;
   $('#provider-identity-error').textContent = '';
-  providerIdentityDialog.showModal();
+  showDialog(providerIdentityDialog);
   form.elements.name.focus();
 }
 $$('.close-provider-identity').forEach(button => button.addEventListener('click', () => providerIdentityDialog.close()));
@@ -1493,6 +1602,7 @@ function selectEndpointTab(tab) {
     item.setAttribute('aria-selected', String(active));
   });
   $$('#endpoint-form [data-endpoint-panel]').forEach(panel => { panel.hidden = panel.dataset.endpointPanel !== tab; });
+  syncTabs();
 }
 /// Brings the tab that owns a control forward, so a required field or a rejected
 /// value is never reported while its field is on the other tab.
@@ -1539,7 +1649,7 @@ function openEndpointDialog(providerId, endpointId = null) {
   // What the chosen policy does depends on how many identities could take over,
   // so the dialog states the scenario for this Endpoint instead of a definition.
   form.dataset.identityCount = String(endpoint ? enabledCredentials(endpoint).filter(key => key.weight > 0).length : 1);
-  toggleEndpointMode(); updateCooldownPreview(); bindSecretToggles(endpointDialog); selectEndpointTab('connection'); endpointDialog.showModal();
+  toggleEndpointMode(); updateCooldownPreview(); bindSecretToggles(endpointDialog); selectEndpointTab('connection'); showDialog(endpointDialog);
 }
 // The figure is a configuration illustration, not live health or a rescued
 // request. Its bypass only exists when another positive-weight identity exists.
@@ -1665,7 +1775,7 @@ function openCredentialDialog(providerId, endpointId = null) {
   if (endpointId) $('#credential-endpoint').value = endpointId;
   $('#credential-dialog-title').textContent = endpointId ? `Add credential to ${endpointId}` : 'Add credential';
   $('#credential-dialog-description').textContent = `Add an identity under ${provider.name}${endpointId ? ` / ${endpointId}` : ''}.`;
-  credentialDialog.showModal();
+  showDialog(credentialDialog);
 }
 $$('.close-credential').forEach(button => button.addEventListener('click', () => credentialDialog.close()));
 $('#credential-form').addEventListener('submit', async event => {
@@ -1690,7 +1800,7 @@ function openCredentialNameDialog(providerId, endpointId, credentialId) {
   form.elements.name.value = credential.name;
   $('#credential-name-description').textContent = `Rename this ${credentialKindLabel(credential).toLowerCase()} under ${provider.name} / ${endpoint.id}. Model routes keep using the same identity.`;
   $('#credential-name-error').textContent = '';
-  credentialNameDialog.showModal();
+  showDialog(credentialNameDialog);
   form.elements.name.focus();
   form.elements.name.select();
 }
@@ -1886,7 +1996,7 @@ function openTrafficDialog(providerId, endpointId) {
   $('#traffic-set-cooldown').hidden = cooldown.seconds > 0;
   $('#traffic-error').textContent = '';
   renderTrafficGroups(endpoint);
-  trafficDialog.showModal();
+  showDialog(trafficDialog);
 }
 function validateTrafficDistribution() {
   const groups = trafficRowGroups();
@@ -1977,6 +2087,7 @@ function addDefaultsRow(container, kind, name = '', value = '') {
   row.querySelector('.remove-default-row').addEventListener('click', () => { row.remove(); validateRequestDefaults(); });
   row.querySelectorAll('input, textarea').forEach(input => input.addEventListener('input', validateRequestDefaults));
   container.append(row);
+  prepareFormAccessibility(row);
   return row;
 }
 
@@ -2033,7 +2144,7 @@ function openRequestDefaultsDialog(provider) {
   $('#defaults-endpoint-selection').hidden = selectedScope !== 'selected';
   Object.entries(provider.extra_headers || {}).forEach(([name, value]) => addDefaultsRow($('#default-header-rows'), 'header', name, value));
   Object.entries(provider.extra_body || {}).forEach(([name, value]) => addDefaultsRow($('#default-body-rows'), 'body', name, JSON.stringify(value, null, 2)));
-  validateRequestDefaults(); requestDefaultsDialog.showModal();
+  validateRequestDefaults(); showDialog(requestDefaultsDialog);
 }
 $$('#request-defaults-form [name="defaults_scope"]').forEach(input => input.addEventListener('change', () => { $('#defaults-endpoint-selection').hidden = input.value !== 'selected' || !input.checked; validateRequestDefaults(); }));
 $('.add-default-header').addEventListener('click', () => addDefaultsRow($('#default-header-rows'), 'header').querySelector('.defaults-name').focus());
@@ -2052,6 +2163,7 @@ let editingRoutePattern = null;
 /// system's dropdown, which cannot show Provider → Endpoint → identity as three
 /// levels, cannot annotate a row with weight, cooling, or availability, and
 /// cannot use this console's wording.
+let pickerSequence = 0;
 function createPicker(host) {
   if (host.pickerApi) return host.pickerApi;
   host.classList.add('picker');
@@ -2064,6 +2176,9 @@ function createPicker(host) {
   const popup = document.createElement('div');
   popup.className = 'picker-popup';
   popup.setAttribute('role', 'listbox');
+  popup.id = `destination-options-${++pickerSequence}`;
+  popup.setAttribute('aria-label', host.dataset.pickerLabel || 'Destination');
+  trigger.setAttribute('aria-controls', popup.id);
   popup.hidden = true;
   // A cloned destination editor carries the previous picker markup, so the host is
   // reset before this picker builds its own trigger and list.
@@ -2078,6 +2193,7 @@ function createPicker(host) {
   const renderTrigger = () => {
     const option = selected();
     trigger.querySelector('.picker-value').textContent = option ? (option.trigger ?? option.title) : (api.placeholder || 'Nothing available');
+    trigger.setAttribute('aria-label', `${host.dataset.pickerLabel || 'Destination'}: ${trigger.querySelector('.picker-value').textContent}`);
     trigger.classList.toggle('is-empty', !option);
     trigger.classList.toggle('is-warning', Boolean(option?.warning));
     trigger.classList.toggle('is-disabled', Boolean(option?.disabled));
@@ -2134,6 +2250,7 @@ function createPicker(host) {
     api.highlighted = Math.max(0, Math.min(index, options.length - 1));
     options.forEach((row, position) => row.classList.toggle('is-highlighted', position === api.highlighted));
     options[api.highlighted].scrollIntoView({block: 'nearest'});
+    if (host.dataset.open) options[api.highlighted].focus({preventScroll: true});
   };
   const open = () => {
     if (api.disabled || !rows().length) return;
@@ -2782,6 +2899,7 @@ function initializeRouteTarget(editor, target = null) {
   editor.querySelectorAll('.route-identity-policy input').forEach(input => { input.onchange = () => renderDestinationIdentityState(editor); });
   input.addEventListener('input', () => updateDestinationNotice(editor));
   updateDestinationNotice(editor);
+  prepareFormAccessibility(editor);
 }
 function addRouteTargetEditor(target = null) {
   const template = $('#route-targets .route-target-editor');
@@ -2840,7 +2958,7 @@ function openRouteDialog(route = null) {
   const hasDestinations = Boolean(destinationValue($('#route-targets .route-target-editor'), 'endpoint'));
   $('#route-error').textContent = hasDestinations ? '' : 'Configure an eligible Endpoint before creating a route.';
   validateRouteSplit();
-  routeDialog.showModal();
+  showDialog(routeDialog);
 }
 $('#models-view').addEventListener('click', event => {
   if (event.target.closest('#open-route, #empty-add-route')) openRouteDialog();
@@ -3085,7 +3203,7 @@ $$('.open-about').forEach(button => button.addEventListener('click', async () =>
   $('#about-commit').textContent = aboutInfo.commit;
   $('#about-commit-time').textContent = aboutInfo.commit_time; $('#about-commit-time').dateTime = aboutInfo.commit_time === 'unknown' ? '' : aboutInfo.commit_time;
   $('#about-license').textContent = aboutInfo.license; $('#about-license-text').textContent = aboutInfo.license_text;
-  aboutDialog.showModal();
+  showDialog(aboutDialog, button);
 }));
 $$('.close-about').forEach(button => button.addEventListener('click', () => aboutDialog.close()));
 
@@ -3095,7 +3213,7 @@ function openHelp(context = 'general', providerId = null) {
   helpDialog.dataset.provider = providerId || '';
   selectHelpTab('agent');
   updateHelpGuide(providerId);
-  helpDialog.showModal();
+  showDialog(helpDialog);
 }
 function helpModels() {
   const discovered = providers.flatMap(provider => provider.discovered_models.map(model => `${provider.id}/${model}`));
@@ -3158,6 +3276,7 @@ function selectHelpTab(tab) {
     const visible = tab === 'agent' ? panel.dataset.helpAgent === 'true' && panel.dataset.helpPanel === agent : panel.dataset.helpPanel === tab;
     panel.hidden = !visible;
   });
+  syncTabs();
   const endHeight = body.getBoundingClientRect().height;
   if (!animateHeight) {
     body.style.transition = '';
@@ -3185,7 +3304,7 @@ const gatewayKeyDialog = $('#gateway-key-dialog');
 $('#open-gateway-key').addEventListener('click', () => {
   $('#gateway-key-form').reset(); $('#gateway-key-error').textContent = '';
   gatewayProviderChecks($('#gateway-key-providers'));
-  gatewayKeyDialog.showModal();
+  showDialog(gatewayKeyDialog);
 });
 $('#empty-gateway-key').addEventListener('click', () => $('#open-gateway-key').click());
 $$('.close-gateway-key').forEach(button => button.addEventListener('click', () => gatewayKeyDialog.close()));
@@ -3199,7 +3318,7 @@ $('#gateway-key-form').addEventListener('submit', async event => {
   const payload = {note: data.get('note'), expires_at: expiry ? Math.floor(new Date(expiry).getTime() / 1000) : null, provider_ids: data.getAll('provider_ids')};
   const response = await fetch('/admin/auth/keys', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(payload)});
   if (!response.ok) return showApiError(response, $('#gateway-key-error'));
-  const created = await response.json(); gatewayKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now or retrieve it later from the API key list.'; $('#generated-key-dialog').showModal(); await loadAuth();
+  const created = await response.json(); gatewayKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now or retrieve it later from the API key list.'; showDialog($('#generated-key-dialog')); await loadAuth();
 });
 $('#copy-generated-key').addEventListener('click', async () => {
   const button = $('#copy-generated-key');
@@ -3229,7 +3348,7 @@ function openEditGatewayKey(key) {
   const form = $('#edit-gateway-key-form'); form.reset(); $('#edit-gateway-key-error').textContent = '';
   form.elements.id.value = key.id; form.elements.note.value = key.note || ''; form.elements.expires_at.value = localDateTimeValue(key.expires_at);
   gatewayProviderChecks($('#edit-gateway-key-providers'), key.provider_ids);
-  editGatewayKeyDialog.showModal();
+  showDialog(editGatewayKeyDialog);
 }
 $$('.close-edit-gateway-key').forEach(button => button.addEventListener('click', () => editGatewayKeyDialog.close()));
 $('#edit-gateway-key-form').addEventListener('submit', async event => {
@@ -3261,14 +3380,14 @@ function renderAuth() {
 async function loadAuth() { const response = await fetch('/admin/auth'); authSettings = await response.json(); renderAuth(); }
 
 const managementKeyDialog = $('#management-key-dialog');
-$('#open-management-key').addEventListener('click', () => { $('#management-key-form').reset(); $('#management-key-error').textContent = ''; managementKeyDialog.showModal(); });
+$('#open-management-key').addEventListener('click', () => { $('#management-key-form').reset(); $('#management-key-error').textContent = ''; showDialog(managementKeyDialog); });
 $('#empty-management-key').addEventListener('click', () => $('#open-management-key').click());
 $$('.close-management-key').forEach(button => button.addEventListener('click', () => managementKeyDialog.close()));
 $('#management-key-form').addEventListener('submit', async event => {
   event.preventDefault(); const data = new FormData(event.target); const expiry = data.get('expires_at');
   const response = await fetch('/admin/management-keys', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({name: data.get('name'), expires_at: expiry ? Math.floor(new Date(expiry).getTime() / 1000) : null})});
   if (!response.ok) return showApiError(response, $('#management-key-error'));
-  const created = await response.json(); managementKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now. Management API key secrets are shown only once.'; $('#generated-key-dialog').showModal(); await loadManagementKeys();
+  const created = await response.json(); managementKeyDialog.close(); $('#generated-key').value = created.secret; $('#generated-key-description').textContent = 'Copy this key now. Management API key secrets are shown only once.'; showDialog($('#generated-key-dialog')); await loadManagementKeys();
 });
 function renderManagementKeys(keys) {
   $('#management-keys-empty').hidden = keys.length > 0; $('#management-keys-table').hidden = keys.length === 0;
@@ -3755,7 +3874,7 @@ function openActivityDetail(log) {
   });
   const gatewayKey = log.gateway_api_key_note ? `${log.gateway_api_key_note} (${log.gateway_api_key_prefix || log.gateway_api_key_id})` : log.gateway_api_key_prefix || log.gateway_api_key_id || 'Unattributed (authentication disabled or older record)';
   $('#activity-detail-request').innerHTML = [['Request ID', log.request_id], ['Gateway API key', gatewayKey], ['API path', log.path], ['Provider finish reason', log.finish_reason || 'Not reported']].map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd><code>${escapeHtml(value)}</code></dd></div>`).join('');
-  dialog.showModal();
+  showDialog(dialog);
 }
 $$('.close-activity-detail').forEach(button => button.addEventListener('click', () => $('#activity-detail-dialog').close()));
 $('#activity-detail-dialog').addEventListener('click', event => { if (event.target === event.currentTarget) event.currentTarget.close(); });
@@ -3821,6 +3940,7 @@ async function loadActivity(requestedLogLimit) {
 function showActivityTab(tab) {
   $$('.activity-tabs button').forEach(button => { const active = button.dataset.activityTab === tab; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
   $('#activity-overview-panel').hidden = tab !== 'overview'; $('#activity-requests-panel').hidden = tab !== 'requests';
+  syncTabs();
   if (tab === 'overview') requestAnimationFrame(() => renderActivityChart());
   if (tab === 'requests') { activityPage = 0; $('#activity-page-previous').disabled = true; loadActivityPage(); }
 }
@@ -3962,9 +4082,10 @@ async function loadActivityStorage() {
 function showActivityDataTab(tab) {
   $$('.activity-data-tabs button').forEach(button => button.classList.toggle('active', button.dataset.activityDataTab === tab));
   $$('[data-activity-data-panel]').forEach(panel => panel.hidden = panel.dataset.activityDataPanel !== tab);
+  syncTabs();
   if (tab === 'export') loadActivityExportPreview(); if (tab === 'storage') loadActivityStorage();
 }
-$('#manage-activity-data').addEventListener('click', () => { showActivityDataTab('export'); activityDataDialog.showModal(); });
+$('#manage-activity-data').addEventListener('click', () => { showActivityDataTab('export'); showDialog(activityDataDialog); });
 $$('.close-activity-data').forEach(button => button.addEventListener('click', () => activityDataDialog.close()));
 $('.activity-data-tabs').addEventListener('click', event => { const button = event.target.closest('[data-activity-data-tab]'); if (button) showActivityDataTab(button.dataset.activityDataTab); });
 $('#activity-export-range').addEventListener('change', loadActivityExportPreview);
@@ -4082,8 +4203,15 @@ function refreshVisibleView() {
     if (!selectedProviderId) loadProviderActivity();
   }
 }
-setInterval(refreshVisibleView, LIVE_REFRESH_INTERVAL_MS);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshVisibleView(); });
+let liveUpdatesPaused = false;
+$('#pause-live-updates').addEventListener('click', event => {
+  liveUpdatesPaused = !liveUpdatesPaused;
+  event.currentTarget.setAttribute('aria-pressed', String(liveUpdatesPaused));
+  event.currentTarget.textContent = liveUpdatesPaused ? 'Resume live updates' : 'Pause live updates';
+  if (!liveUpdatesPaused) refreshVisibleView();
+});
+setInterval(() => { if (!liveUpdatesPaused) refreshVisibleView(); }, LIVE_REFRESH_INTERVAL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !liveUpdatesPaused) refreshVisibleView(); });
 
 $$('.copy-extension-command').forEach(button => button.addEventListener('click', async () => {
   await navigator.clipboard.writeText(button.dataset.command);
@@ -4107,7 +4235,7 @@ function renderExtensions() {
     const ownedEndpoints = providers.reduce((count, provider) => count + provider.endpoints.filter(endpoint => ownedTypes.has(endpoint.api_type)).length, 0);
     const configured = extension.id === 'request-defaults' ? `${configuredProviders.length} Provider${configuredProviders.length === 1 ? '' : 's'}` : ownedTypes.size ? `${ownedEndpoints} Endpoint${ownedEndpoints === 1 ? '' : 's'}` : 'On demand';
     const footer = extension.id === 'request-defaults' ? `<footer><div><strong>Configured in Provider context</strong><p>Header and body defaults remain next to the Provider and Endpoint resources they affect.${extension.enabled ? '' : ' They are retained while this Extension is disabled.'}</p></div>${configuredProviders.length ? `<div class="extension-provider-links">${configuredProviders.map(provider => `<button class="text-link" type="button" data-extension-provider="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</button>`).join('')}</div>` : '<button class="button secondary extension-open-providers" type="button">Choose a Provider</button>'}</footer>` : extension.id === 'traffic-capture' ? `<footer><div><strong>Sensitive diagnostic data</strong><p>Capture is stopped by default. Credentials are always redacted and content remains separate from Activity.</p></div><button class="button secondary open-traffic-capture" type="button" ${extension.enabled ? '' : 'disabled'}>Configure capture</button></footer>` : '';
-    return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(extensionHookLabel).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
+    return `<article class="extension-card${extension.enabled ? '' : ' extension-disabled'}"><header><span class="extension-mark">${icon('extension')}</span><div><span class="section-kicker">Included in this build</span><h2>${escapeHtml(extension.name)}</h2><code>${escapeHtml(extension.id)} · v${escapeHtml(extension.version)}</code></div><label class="switch-label extension-toggle" title="${extension.runtime_configurable ? 'Enable or disable this Extension' : 'Restart without --no-extensions to manage Extensions'}"><input type="checkbox" aria-label="Enable ${escapeHtml(extension.name)}" data-extension-toggle="${escapeHtml(extension.id)}" ${extension.enabled ? 'checked' : ''} ${extension.runtime_configurable ? '' : 'disabled'}><span class="switch-track" aria-hidden="true"><i></i></span><span class="switch-status">${status}</span></label></header><p>${escapeHtml(extension.description)}</p><div class="extension-facts"><span><small>Implementation</small><strong>Native Rust</strong></span><span><small>Extension API</small><strong>v${extension.api_version}</strong></span><span><small>Hooks</small><strong>${extension.hooks.map(extensionHookLabel).join(' · ')}</strong></span><span><small>Configuration</small><strong>${configured}</strong></span></div>${footer}</article>`;
   }).join('');
   $$('[data-extension-toggle]').forEach(toggle => toggle.addEventListener('change', async () => {
     const extensionId = toggle.dataset.extensionToggle;
@@ -4290,7 +4418,7 @@ function resetCaptureDetailScroll() {
 function renderCaptureBodyMode() {
   const assembled = captureDetailBodyMode === 'assembled'; const display = assembled ? captureDetailAssembled : captureDetailBody;
   $('#capture-detail-body').innerHTML = assembled ? highlightJson(display) : captureDetailIsSse ? highlightSse(display) : (() => { try { return highlightJson(JSON.stringify(JSON.parse(display), null, 2)); } catch { return escapeHtml(display || '(empty)'); } })();
-  $$('#capture-body-modes button').forEach(button => { const active = button.dataset.captureBodyMode === captureDetailBodyMode; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
+  $$('#capture-body-modes button').forEach(button => { const active = button.dataset.captureBodyMode === captureDetailBodyMode; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
   $('#capture-detail-body').scrollTop = 0; $('#capture-detail-body').scrollLeft = 0; $('.capture-detail-body').scrollTop = 0;
 }
 function renderCaptureBody(body, protocol, canAssemble) {
@@ -4301,7 +4429,7 @@ function renderCaptureBody(body, protocol, canAssemble) {
   captureDetailBodyMode = captureDetailAssembled ? 'assembled' : 'raw'; renderCaptureBodyMode();
 }
 function renderCaptureDetail(direction) {
-  const response = direction === 'response'; $$('.capture-direction-tabs button').forEach(button => { const active = button.dataset.captureDirection === direction; button.classList.toggle('active', active); button.setAttribute('aria-selected', String(active)); });
+  const response = direction === 'response'; $$('.capture-direction-tabs button').forEach(button => { const active = button.dataset.captureDirection === direction; button.classList.toggle('active', active); button.setAttribute('aria-pressed', String(active)); });
   $('#capture-detail-headers-title').textContent = `${response ? 'Received from Provider' : 'Sent to Provider'} · Headers`; $('#capture-detail-body-title').textContent = `${response ? 'Received from Provider' : 'Sent to Provider'} · Body`;
   const headers = response ? selectedCapture.response_headers : selectedCapture.request_headers; const body = captureBytes(response ? selectedCapture.response_body : selectedCapture.request_body); const truncated = response ? selectedCapture.response_truncated : selectedCapture.request_truncated;
   $('#capture-detail-headers').innerHTML = headers.map(header => `<span class="syntax-key">${escapeHtml(header.name)}</span>: ${escapeHtml(header.value)}`).join('\n') || '(none)'; $('#capture-detail-truncated').hidden = !truncated; renderCaptureBody(body, selectedCapture.upstream_protocol, response && !truncated && selectedCapture.outcome === 'complete'); resetCaptureDetailScroll();
@@ -4312,7 +4440,7 @@ async function copyCaptureText(button, text) {
 }
 async function openCaptureDetail(requestId) {
   const response = await fetch(`/admin/extensions/traffic-capture/captures/${encodeURIComponent(requestId)}`); if (!response.ok) return;
-  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} → ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} at the Provider`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); $('#traffic-capture-detail-dialog').showModal();
+  selectedCapture = await response.json(); $('#capture-detail-title').textContent = selectedCapture.public_model; $('#capture-detail-meta').textContent = `${selectedCapture.provider_id} → ${selectedCapture.endpoint_id} · ${selectedCapture.outcome} · ${selectedCapture.duration_ms == null ? 'Duration unavailable' : `${formatDuration(selectedCapture.duration_ms)} at the Provider`}`; renderCaptureDetail('request'); resetCaptureDetailScroll(); showDialog($('#traffic-capture-detail-dialog'));
 }
 $('#captures-list').addEventListener('click', event => { const row = event.target.closest('[data-capture-id]'); if (row) openCaptureDetail(row.dataset.captureId); });
 $$('.capture-direction-tabs button').forEach(button => button.addEventListener('click', () => renderCaptureDetail(button.dataset.captureDirection)));
