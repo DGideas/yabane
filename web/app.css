@@ -326,6 +326,13 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .skip-link{position:fixed;z-index:1000;top:8px;left:8px;padding:12px 18px;color:#fff;background:#0b57d0;border:2px solid #fff;border-radius:6px;transform:translateY(-150%)}
 .skip-link:focus{transform:none}
 :where(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline:3px solid #0b57d0!important;outline-offset:3px}
+/* Text fields use one high-contrast edge and a diffuse glow, without an outer ring. */
+:root{--field-focus-glow:0 0 5px #0b57d04d,0 0 14px #0b57d029}
+:where(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="color"],[type="file"],[type="button"],[type="submit"],[type="reset"],[type="image"]),textarea,select):focus{outline:none!important;box-shadow:var(--field-focus-glow)}
+.password-input:focus-within{box-shadow:var(--field-focus-glow)}
+.search:focus-within,.model-filter:focus-within{box-shadow:inset 0 0 0 2px var(--blue),var(--field-focus-glow)}
+.password-input input{height:100%;min-width:0}
+.password-input input:focus,.search>input:focus,.model-filter input:focus{border:0;box-shadow:none;outline:none!important}
 :where(h1,[role="tabpanel"]){scroll-margin-top:88px}
 .choice:has(input:focus-visible),.animated-checkbox:has(input:focus-visible),.pricing-scope-options label:has(input:focus-visible),.pricing-target-options label:has(input:focus-visible){outline:3px solid #0b57d0;outline-offset:3px}
 .switch-label>input:focus-visible+.switch-track,.activity-filter-option>input:focus-visible+.activity-filter-check{outline:3px solid #0b57d0;outline-offset:3px}
@@ -342,4 +349,9 @@ input::placeholder,textarea::placeholder{color:#626b77;opacity:1}
 #pause-live-updates{margin:auto 8px 0;padding:10px;color:var(--muted);background:none;border:0;text-align:left;font:12px 'Ubuntu Sans';cursor:pointer}
 #pause-live-updates+.about-link{margin-top:0}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
-@media(forced-colors:active){.switch-track,.animated-check,.activity-filter-check{border:1px solid ButtonText}.switch-label>input:checked+.switch-track,.activity-filter-option>input:checked+.activity-filter-check{background:Highlight}.switch-track i{background:ButtonText}.choice.selected{border-color:Highlight}}
+@media(forced-colors:active){
+ :where(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="color"],[type="file"],[type="button"],[type="submit"],[type="reset"],[type="image"]),textarea,select):focus-visible{outline:2px solid Highlight!important;outline-offset:2px}
+ .password-input:focus-within,.search:focus-within,.model-filter:focus-within{outline:2px solid Highlight;outline-offset:2px}
+ .password-input input:focus-visible,.search>input:focus-visible,.model-filter input:focus-visible{outline:none!important}
+ .switch-track,.animated-check,.activity-filter-check{border:1px solid ButtonText}.switch-label>input:checked+.switch-track,.activity-filter-option>input:checked+.activity-filter-check{background:Highlight}.switch-track i{background:ButtonText}.choice.selected{border-color:Highlight}
+}

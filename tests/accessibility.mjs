@@ -57,6 +57,54 @@ async function audit(page, label) {
     console.log(JSON.stringify(failure, null, 2));
   }
 }
+async function checkFieldFocus(page, project, selector, frameSelector = selector) {
+  const control = page.locator(selector);
+  const frame = page.locator(frameSelector);
+  await control.evaluate(element => element.blur());
+  const before = await frame.boundingBox();
+  await control.focus();
+  const focused = await frame.evaluate(element => {
+    const style = getComputedStyle(element);
+    const rgb = value => (value.match(/[\d.]+/g) || []).slice(0, 3).map(Number);
+    const luminance = color => rgb(color).map(value => {
+      const channel = value / 255;
+      return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+    // These fields sit on solid surfaces; follow transparent ancestors to that surface.
+    let surface = element;
+    while (getComputedStyle(surface).backgroundColor === 'rgba(0, 0, 0, 0)' && surface.parentElement) surface = surface.parentElement;
+    const background = getComputedStyle(surface).backgroundColor;
+    const border = parseFloat(style.borderTopWidth) >= 1 && style.borderTopStyle === 'solid';
+    const edge = border ? style.borderTopColor : style.boxShadow.match(/rgba?\([^)]+\)[^,]*inset/)?.[0].match(/rgba?\([^)]+\)/)?.[0];
+    const colors = edge ? [luminance(edge), luminance(background)].sort((a, b) => b - a) : [];
+    return {
+      active: element === document.activeElement || element.contains(document.activeElement),
+      outline: style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0,
+      shadow: style.boxShadow,
+      contrast: colors.length ? (colors[0] + .05) / (colors[1] + .05) : 0,
+    };
+  });
+  assert.equal(focused.active, true, `${selector}: keyboard focus`);
+  assert.equal(focused.outline, false, `${selector}: duplicate outer focus outline`);
+  assert.notEqual(focused.shadow, 'none', `${selector}: missing focus glow`);
+  assert.ok(focused.contrast >= 3, `${selector}: focus edge contrast ${focused.contrast.toFixed(2)}:1`);
+  const after = await frame.boundingBox();
+  assert.equal(after.width, before.width, `${selector}: focus changes field width`);
+  assert.equal(after.height, before.height, `${selector}: focus changes field height`);
+  if (frameSelector !== selector) {
+    assert.equal(await control.evaluate(element => getComputedStyle(element).boxShadow), 'none', `${selector}: nested focus glow`);
+  }
+  if (process.env.YABANE_UI_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.YABANE_UI_SCREENSHOT_DIR, `${project.name}-${selector.replace(/[^a-z0-9]+/gi, '-')}-focus.png`)});
+  if (project.engine === chromium) {
+    await page.emulateMedia({forcedColors: 'active'});
+    const fallback = await frame.evaluate(element => {
+      const style = getComputedStyle(element);
+      return {width: parseFloat(style.outlineWidth), style: style.outlineStyle};
+    });
+    assert.ok(fallback.width >= 2 && fallback.style !== 'none', `${selector}: focus lost when forced colors remove shadows`);
+    await page.emulateMedia({forcedColors: 'none'});
+  }
+}
 async function noOverflow(page, label) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false, `${label}: horizontal overflow`);
 }
@@ -90,6 +138,8 @@ try {
       await page.goto(base);
       await page.locator('#login-screen').waitFor({state: 'visible'});
       await audit(page, `${project.name}: ${project.name === 'chrome-desktop' ? 'setup' : 'login'}`);
+      await checkFieldFocus(page, project, '#login-form [name="username"]');
+      await checkFieldFocus(page, project, '#login-form [name="password"]', '#login-form .password-input');
       await page.locator('.skip-link').focus();
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate(() => document.activeElement.id), 'login-title');
@@ -102,6 +152,7 @@ try {
       assert.equal(await page.locator('.skip-link').evaluate(element => element === document.activeElement), true);
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate(() => document.activeElement.matches('main h1')), true);
+      if (await page.locator('#settings-search').isVisible()) await checkFieldFocus(page, project, '#settings-search', '.topbar .search');
       await page.emulateMedia({reducedMotion: 'no-preference'});
       const longAnimations = await page.evaluate(() => document.getAnimations().filter(animation => {
         const timing = animation.effect.getComputedTiming();
@@ -127,6 +178,7 @@ try {
       await page.locator('#open-provider').focus();
       await page.keyboard.press('Enter');
       await audit(page, `${project.name}: provider step 1`);
+      await checkFieldFocus(page, project, '#display-name');
       await page.locator('#display-name').fill('Accessible fixture');
       await page.locator('#next-step').click();
       await audit(page, `${project.name}: provider step 2`);
@@ -188,7 +240,10 @@ try {
       await audit(page, `${project.name}: Provider detail`);
       await page.locator('.browse-provider-models').click();
       await audit(page, `${project.name}: Provider catalog`);
+      await checkFieldFocus(page, project, '#provider-detail .model-filter input', '#provider-detail .model-filter');
       await page.locator('.edit-provider-options').click();
+      await page.locator('.add-default-body-field').click();
+      await checkFieldFocus(page, project, '#default-body-rows textarea');
       await page.locator('.add-default-header').click();
       await page.locator('#default-header-rows .defaults-name').last().fill('authorization');
       await page.locator('#default-header-rows .defaults-value').last().fill('fixture');
@@ -255,6 +310,7 @@ try {
       await noOverflow(page, `${project.name}: docs`);
       await page.locator('.docs-op[data-method="post"]').first().click();
       await audit(page, `${project.name}: docs operation`);
+      await checkFieldFocus(page, project, '#docs-body');
       await noOverflow(page, `${project.name}: docs operation`);
       assert.deepEqual(errors, [], `${project.name}: browser errors`);
       await context.close();
