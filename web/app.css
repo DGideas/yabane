@@ -164,7 +164,7 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .endpoint-keys>.credential-details{margin:0;padding:3px 16px 8px;border-top:1px solid #e5e9ef}
 .credential-details p{margin:2px 4px 12px;font-size:12px}
 .credential-facts{padding:0 4px 12px}
-.pool-details summary:focus-visible,.credential-details summary:focus-visible,.credential-actions summary:focus-visible,.endpoint-card button:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:4px}
+.pool-details summary:focus-visible,.credential-details summary:focus-visible,.credential-actions summary:focus-visible,.endpoint-card button:focus-visible{border-radius:4px}
 @media(max-width:760px){.endpoint-keys-head,.subscription-credential .endpoint-keys-head{align-items:stretch}.endpoint-key-actions{flex-direction:row;align-items:center;justify-content:flex-start;gap:12px}.pool-facts>div,.credential-facts>div{grid-template-columns:120px minmax(0,1fr);gap:12px}.pool-details summary{flex-wrap:wrap}.pool-details summary>span{font-size:10px}.credential-list-label{flex-wrap:wrap;gap:3px}.credential-list-label small{text-align:left}.endpoint-keys .key-row{grid-template-columns:minmax(0,1fr) 72px 40px;gap:8px;padding-left:12px}.key-row .traffic-share small{font-size:10px}.key-row .key-name>strong{font-size:13px}.credential-facts>div{grid-template-columns:1fr;gap:3px}}
 @media(max-width:430px){.pool-details summary>span{flex-basis:100%;margin-left:16px;text-align:left}.pool-facts>div{grid-template-columns:1fr;gap:3px}.endpoint-keys .key-row{grid-template-columns:minmax(0,1fr) 62px 32px}.credential-actions summary{width:32px}.key-row .traffic-share strong{font-size:16px}}
 /* The illustration explains selection for later requests, not a retry of the
@@ -215,7 +215,6 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 .radio-list>label{display:flex;align-items:center;gap:10px;min-height:34px;cursor:pointer;line-height:1.4}
 .radio-list input{flex:0 0 17px;width:17px;height:17px;margin:0;accent-color:var(--blue)}
 .radio-list input:checked+span{color:#0842a0;font-weight:500}
-.radio-list input:focus-visible{outline:2px solid #a8c7fa;outline-offset:3px}
 .cooldown-duration{display:grid;grid-template-columns:minmax(0,1fr) 170px;align-items:center;gap:6px 14px}
 .cooldown-duration .field-label{margin:0}
 .cooldown-duration .field-help{grid-column:1/-1;margin-top:0}
@@ -323,33 +322,40 @@ dialog{width:min(560px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-heig
 }
 
 /* WCAG AA: shared keyboard focus, readable controls and motion preferences. */
-.skip-link{position:fixed;z-index:1000;top:8px;left:8px;padding:12px 18px;color:#fff;background:#0b57d0;border:2px solid #fff;border-radius:6px;transform:translateY(-150%)}
+.skip-link{position:fixed;z-index:1000;top:8px;left:8px;padding:12px 18px;color:#fff;background:#0b57d0;border:2px solid transparent;border-radius:6px;transform:translateY(-150%)}
 .skip-link:focus{transform:none}
-:where(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline:3px solid #0b57d0!important;outline-offset:3px}
-/* Text fields use one high-contrast edge and a diffuse glow, without an outer ring. */
 :root{--field-focus-glow:0 0 5px #0b57d04d,0 0 14px #0b57d029}
+/* Overlap the existing border: one solid edge, not two separated rings. */
+:where(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline:3px solid #0b57d0!important;outline-offset:-1px;box-shadow:var(--field-focus-glow)!important}
+/* Text fields use one high-contrast edge and a diffuse glow, without an outer ring. */
 :where(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="color"],[type="file"],[type="button"],[type="submit"],[type="reset"],[type="image"]),textarea,select):focus{outline:none!important;box-shadow:var(--field-focus-glow)}
 .password-input:focus-within{box-shadow:var(--field-focus-glow)}
 .search:focus-within,.model-filter:focus-within{box-shadow:inset 0 0 0 2px var(--blue),var(--field-focus-glow)}
 .password-input input{height:100%;min-width:0}
-.password-input input:focus,.search>input:focus,.model-filter input:focus{border:0;box-shadow:none;outline:none!important}
+.password-input input:focus,.search>input:focus,.model-filter input:focus{border:0;box-shadow:none!important;outline:none!important}
 :where(h1,[role="tabpanel"]){scroll-margin-top:88px}
-.choice:has(input:focus-visible),.animated-checkbox:has(input:focus-visible),.pricing-scope-options label:has(input:focus-visible),.pricing-target-options label:has(input:focus-visible){outline:3px solid #0b57d0;outline-offset:3px}
-.switch-label>input:focus-visible+.switch-track,.activity-filter-option>input:focus-visible+.activity-filter-check{outline:3px solid #0b57d0;outline-offset:3px}
+.choice:has(input:focus-visible),.animated-checkbox:has(input:focus-visible),.pricing-scope-options label:has(input:focus-visible),.pricing-target-options label:has(input:focus-visible){outline:3px solid #0b57d0;outline-offset:-1px;box-shadow:var(--field-focus-glow)}
+.switch-label>input:focus-visible+.switch-track,.activity-filter-option>input:focus-visible+.activity-filter-check{outline:3px solid #0b57d0;outline-offset:-1px;box-shadow:var(--field-focus-glow)}
+/* A composite control gets one indicator on its visible frame, never another on its input. */
+:is(.choice,.animated-checkbox,.pricing-scope-options label,.pricing-target-options label,.switch-label,.activity-filter-option)>input:focus-visible{outline:none!important;box-shadow:none!important}
+.animated-checkbox>input:focus-visible+.animated-check{box-shadow:none}
 input::placeholder,textarea::placeholder{color:#626b77;opacity:1}
 .home-traffic-chart:has(.home-chart-empty) .home-chart-bars{opacity:1}.home-traffic-chart:has(.home-chart-empty) .home-chart-column>span{opacity:.18}
 .home-chart-column small,.activity-chart .chart-column small{color:#596579}
 .model-analysis-table th,.model-analysis-table td small,.model-analysis-table td:before,.provider-analysis-panel .activity-ranking>div>small,.model-table>header,.activity-model small,.activity-log-table .route-cell small,.activity-model-unavailable{color:#596579}
 .traffic-axis-right.token-axis{fill:#00695c}.traffic-axis-right.error-axis{fill:#89554f}
 .error-rate-line{stroke:#842d25}.activity-chart-legend .request-errors{border-color:#842d25}
-.about-hero :focus-visible,.home-hero :focus-visible{outline-color:#fff!important}
+.about-hero :focus-visible,.home-hero :focus-visible{outline-color:#fff!important;outline-offset:-1px}
+.home-hero .home-hero-primary:focus-visible{outline-color:#0b57d0!important}
 .cooldown-flow header small{color:#53677d}
-/* Decorative motion finishes within five seconds, without requiring a preference. */
-.auth-facets,.auth-arrows,.console-backdrop .backdrop-facets,.console-backdrop .backdrop-arrows,.home-hero-facets,.home-hero-arrows,.home-route-lines,.home-live i,.about-facets,.about-arrows{animation-duration:4s;animation-iteration-count:1}
+/* Ease to rest within five seconds and retain the endpoint instead of snapping back. */
+.auth-facets,.auth-arrows,.console-backdrop .backdrop-facets,.console-backdrop .backdrop-arrows,.home-hero-facets,.home-hero-arrows,.home-route-lines,.home-live i,.about-facets,.about-arrows{animation-duration:4s;animation-iteration-count:1;animation-timing-function:ease-out;animation-fill-mode:forwards}
 #pause-live-updates{margin:auto 8px 0;padding:10px;color:var(--muted);background:none;border:0;text-align:left;font:12px 'Ubuntu Sans';cursor:pointer}
 #pause-live-updates+.about-link{margin-top:0}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 @media(forced-colors:active){
+ :where(button,a,input,select,textarea,summary,[tabindex]):focus-visible{outline-color:Highlight!important}
+ .choice:has(input:focus-visible),.animated-checkbox:has(input:focus-visible),.pricing-scope-options label:has(input:focus-visible),.pricing-target-options label:has(input:focus-visible),.switch-label>input:focus-visible+.switch-track,.activity-filter-option>input:focus-visible+.activity-filter-check{outline-color:Highlight}
  :where(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="color"],[type="file"],[type="button"],[type="submit"],[type="reset"],[type="image"]),textarea,select):focus-visible{outline:2px solid Highlight!important;outline-offset:2px}
  .password-input:focus-within,.search:focus-within,.model-filter:focus-within{outline:2px solid Highlight;outline-offset:2px}
  .password-input input:focus-visible,.search>input:focus-visible,.model-filter input:focus-visible{outline:none!important}

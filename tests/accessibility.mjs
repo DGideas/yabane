@@ -105,6 +105,93 @@ async function checkFieldFocus(page, project, selector, frameSelector = selector
     await page.emulateMedia({forcedColors: 'none'});
   }
 }
+async function checkControlFocus(page, project, selector, frameSelector = selector) {
+  const control = page.locator(selector).first();
+  const frame = page.locator(frameSelector).first();
+  const before = await frame.boundingBox();
+  // Enter keyboard modality even when the preceding workflow used the pointer.
+  await page.keyboard.press('Tab');
+  await control.focus();
+  const edge = await frame.evaluate(element => {
+    const style = getComputedStyle(element);
+    const luminance = color => (color.match(/[\d.]+/g) || []).slice(0, 3).map(Number).map(value => {
+      const channel = value / 255;
+      return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+    // Overlapping edges contrast with the surrounding surface, including
+    // filled buttons and checked switches; dark heroes use a white edge.
+    let surface = element.parentElement;
+    while (getComputedStyle(surface).backgroundColor === 'rgba(0, 0, 0, 0)' && surface.parentElement) surface = surface.parentElement;
+    const colors = [luminance(style.outlineColor), luminance(getComputedStyle(surface).backgroundColor)].sort((a, b) => b - a);
+    return {
+      active: element === document.activeElement || element.contains(document.activeElement) || element.previousElementSibling === document.activeElement,
+      width: parseFloat(style.outlineWidth), style: style.outlineStyle,
+      offset: parseFloat(style.outlineOffset), shadow: style.boxShadow,
+      contrast: (colors[0] + .05) / (colors[1] + .05),
+    };
+  });
+  assert.equal(edge.active, true, `${selector}: keyboard focus`);
+  assert.equal(edge.style, 'solid', `${selector}: single solid focus edge`);
+  assert.equal(edge.width, 3, `${selector}: thick focus edge`);
+  assert.ok(edge.offset < 0, `${selector}: separated double border`);
+  assert.ok(edge.contrast >= 3, `${selector}: focus contrast ${edge.contrast.toFixed(2)}:1`);
+  assert.notEqual(edge.shadow, 'none', `${selector}: missing diffuse glow`);
+  assert.doesNotMatch(edge.shadow, /inset|0px 0px 0px/, `${selector}: duplicate hard shadow ring`);
+  const after = await frame.boundingBox();
+  assert.equal(after.width, before.width, `${selector}: focus changes width`);
+  assert.equal(after.height, before.height, `${selector}: focus changes height`);
+  if (frameSelector !== selector) {
+    assert.equal(await control.evaluate(element => getComputedStyle(element).outlineStyle), 'none', `${selector}: duplicate input outline`);
+  }
+  if (process.env.YABANE_UI_SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.YABANE_UI_SCREENSHOT_DIR, `${project.name}-${selector.replace(/[^a-z0-9]+/gi, '-')}-control-focus.png`)});
+  if (project.engine === chromium) {
+    await page.emulateMedia({forcedColors: 'active'});
+    assert.equal(await frame.evaluate(element => getComputedStyle(element).outlineColor), await page.evaluate(() => {
+      const sample = document.createElement('span');
+      sample.style.color = 'Highlight';
+      document.body.append(sample);
+      const color = getComputedStyle(sample).color;
+      sample.remove();
+      return color;
+    }), `${selector}: forced-colors system focus edge`);
+    await page.emulateMedia({forcedColors: 'none'});
+  }
+}
+async function checkDecorativeMotion(page, selector) {
+  await page.emulateMedia({reducedMotion: 'no-preference'});
+  const samples = await page.locator(selector).evaluateAll(elements => elements.map(element => {
+    const animation = element.getAnimations()[0];
+    if (!animation) return {name: element.classList.value, missing: true};
+    const timing = animation.effect.getComputedTiming();
+    animation.pause();
+    const snapshot = () => {
+      const style = getComputedStyle(element);
+      return [style.transform, style.strokeDashoffset].join(' ');
+    };
+    animation.currentTime = 0;
+    const start = snapshot();
+    animation.currentTime = timing.endTime - 1;
+    const nearEnd = snapshot();
+    animation.finish();
+    const end = snapshot();
+    animation.currentTime = timing.endTime + 1000;
+    return {name: animation.animationName, duration: timing.endTime, fill: timing.fill, easing: getComputedStyle(element).animationTimingFunction, start, nearEnd, end, settled: snapshot()};
+  }));
+  assert.ok(samples.length >= 2, `${selector}: missing decorative motion fixtures`);
+  for (const sample of samples) {
+    assert.ok(!sample.missing, `${sample.name}: missing animation`);
+    assert.ok(sample.duration <= 5000, `${sample.name}: motion exceeds five seconds`);
+    assert.equal(sample.fill, 'forwards', `${sample.name}: endpoint must persist`);
+    assert.equal(sample.easing, 'ease-out', `${sample.name}: must decelerate into rest`);
+    assert.notEqual(sample.start, sample.end, `${sample.name}: fixture did not move`);
+    const values = value => (value.match(/-?[\d.]+/g) || []).map(Number);
+    const end = values(sample.end);
+    assert.ok(values(sample.nearEnd).every((value, index) => Math.abs(value - end[index]) < .01), `${sample.name}: jumps at animation completion`);
+    assert.equal(sample.settled, sample.end, `${sample.name}: snaps back after completion`);
+  }
+  await page.emulateMedia({reducedMotion: 'reduce'});
+  assert.equal(await page.locator(selector).evaluateAll(elements => elements.flatMap(element => element.getAnimations()).length), 0, `${selector}: ignores reduced motion`);
+}
 async function noOverflow(page, label) {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), false, `${label}: horizontal overflow`);
 }
@@ -140,6 +227,8 @@ try {
       await audit(page, `${project.name}: ${project.name === 'chrome-desktop' ? 'setup' : 'login'}`);
       await checkFieldFocus(page, project, '#login-form [name="username"]');
       await checkFieldFocus(page, project, '#login-form [name="password"]', '#login-form .password-input');
+      await checkControlFocus(page, project, '#login-form .login-submit');
+      await checkDecorativeMotion(page, '.auth-facets,.auth-arrows');
       await page.locator('.skip-link').focus();
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate(() => document.activeElement.id), 'login-title');
@@ -153,6 +242,8 @@ try {
       await page.keyboard.press('Enter');
       assert.equal(await page.evaluate(() => document.activeElement.matches('main h1')), true);
       if (await page.locator('#settings-search').isVisible()) await checkFieldFocus(page, project, '#settings-search', '.topbar .search');
+      await checkControlFocus(page, project, '#account-menu');
+      await checkDecorativeMotion(page, '.console-backdrop .backdrop-facets,.console-backdrop .backdrop-arrows');
       await page.emulateMedia({reducedMotion: 'no-preference'});
       const longAnimations = await page.evaluate(() => document.getAnimations().filter(animation => {
         const timing = animation.effect.getComputedTiming();
@@ -179,9 +270,13 @@ try {
       await page.keyboard.press('Enter');
       await audit(page, `${project.name}: provider step 1`);
       await checkFieldFocus(page, project, '#display-name');
+      await checkControlFocus(page, project, '#provider-dialog .close-dialog');
+      await checkControlFocus(page, project, '#next-step');
       await page.locator('#display-name').fill('Accessible fixture');
       await page.locator('#next-step').click();
       await audit(page, `${project.name}: provider step 2`);
+      await checkControlFocus(page, project, '#api-type-choices input', '#api-type-choices .choice');
+      await checkControlFocus(page, project, '#requires-credential', '#provider-dialog .animated-checkbox');
       await page.keyboard.press('Escape');
       await page.locator('#provider-dialog').waitFor({state: 'hidden'});
       await page.waitForFunction(() => document.activeElement === document.querySelector('#open-provider'));
@@ -205,9 +300,13 @@ try {
       for (const id of dialogs) {
         await page.evaluate(id => showDialog(document.getElementById(id)), id);
         await audit(page, `${project.name}: ${id}`);
+        if (id === 'about-dialog') {
+          await checkDecorativeMotion(page, '.about-facets,.about-arrows');
+          await checkControlFocus(page, project, '#about-dialog .close-about');
+        }
         const tabs = page.locator(`#${id} [role="tablist"]:visible [role="tab"]`);
         if (await tabs.count() > 1) {
-          await tabs.first().focus();
+          await checkControlFocus(page, project, `#${id} [role="tablist"]:visible [role="tab"]`);
           await page.keyboard.press('ArrowRight');
           assert.equal(await tabs.nth(1).getAttribute('aria-selected'), 'true', `${id}: arrow selection`);
           assert.equal(await tabs.nth(1).evaluate(tab => tab === document.activeElement), true, `${id}: arrow focus`);
@@ -238,6 +337,8 @@ try {
       await page.locator('.provider-list-item').first().click();
       await page.locator('.endpoint-card').waitFor();
       await audit(page, `${project.name}: Provider detail`);
+      await checkControlFocus(page, project, '#provider-detail .add-credential');
+      await checkControlFocus(page, project, '#provider-detail .credential-actions summary');
       await page.locator('.browse-provider-models').click();
       await audit(page, `${project.name}: Provider catalog`);
       await checkFieldFocus(page, project, '#provider-detail .model-filter input', '#provider-detail .model-filter');
@@ -274,8 +375,12 @@ try {
       await openConsoleView(page, 'pricing');
       await page.locator('#open-pricing-editor').click();
       await audit(page, `${project.name}: price editor`);
+      await checkControlFocus(page, project, '.pricing-target-options input', '.pricing-target-options label');
       await page.locator('#cancel-pricing-edit').click();
+      await openConsoleView(page, 'access');
+      await checkControlFocus(page, project, '#auth-enabled', '.switch-label:has(#auth-enabled) .switch-track');
       await openConsoleView(page, 'activity');
+      await checkControlFocus(page, project, '#activity-range-trigger');
       await page.locator('#recent-activity-logs .activity-request-row').first().click();
       await audit(page, `${project.name}: populated Activity detail`);
       await page.keyboard.press('Escape');
@@ -284,6 +389,7 @@ try {
       await page.keyboard.press('Escape');
       await page.locator('#activity-filter-trigger').click();
       await audit(page, `${project.name}: Activity filters`);
+      await checkControlFocus(page, project, '.activity-filter-option input', '.activity-filter-option .activity-filter-check');
       await page.keyboard.press('Escape');
       await page.locator('.show-request-explorer').click();
       assert.equal(await page.locator('[data-activity-tab="requests"]').getAttribute('tabindex'), '0');
@@ -310,6 +416,7 @@ try {
       await noOverflow(page, `${project.name}: docs`);
       await page.locator('.docs-op[data-method="post"]').first().click();
       await audit(page, `${project.name}: docs operation`);
+      await checkControlFocus(page, project, '.docs-op.active');
       await checkFieldFocus(page, project, '#docs-body');
       await noOverflow(page, `${project.name}: docs operation`);
       assert.deepEqual(errors, [], `${project.name}: browser errors`);
