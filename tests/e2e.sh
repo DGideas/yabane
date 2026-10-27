@@ -536,7 +536,7 @@ admin -f -X PATCH "$base/admin/providers/codebuddy" -H 'content-type: applicatio
 : >codebuddy-requests.jsonl
 jq '.model = "codebuddy/glm-5.3"' instruction-role-request.json >codebuddy-request.json
 codebuddy_call=$(curl -sf -D codebuddy-success-headers.txt -X POST "$base/v1/chat/completions" -H "Authorization: Bearer $unrestricted_secret" -H 'content-type: application/json' \
-  -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' -H 'User-Agent: caller-agent' -H 'user-agent: another-caller-agent' \
+  -H 'x-conversation-id: 0e37df36f0e23361ad6e1b6f1a9f11b9' -H 'x-request-id: caller-trace' -H 'x-user-id: someone-else' -H 'x-ide-version: 9.9.9' -H 'x-agent-runtime: cloud-agent' -H 'User-Agent: caller-agent' -H 'user-agent: another-caller-agent' \
   -H 'X-Yabane-Request-Id: internal-marker' -H 'x-yabane-custom: first-marker' -H 'X-Yabane-Custom: second-marker' -H 'x-caller-note: kept' \
   --data-binary @codebuddy-request.json)
 # The deployment answers SSE, and Yabane returns one aggregated response to a caller
@@ -546,13 +546,14 @@ codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | ta
 [[ $(printf '%s' "$codebuddy_request" | jq -r .path) == /v2/chat/completions ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers.authorization') == 'Bearer ck-e2e-12345678' ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-user-id"]') == anonymous_12345678 ]]
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"]') == 'CLI|2.164.0|craft|main' ]]
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["user-agent"]') == 'CLI/2.164.0 CodeBuddy/2.164.0' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"] + "|" + .headers["x-agent-runtime"]') == 'CLI|2.179.3|craft|main|local-agent' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["user-agent"]') == 'CLI/2.179.3 CodeBuddy/2.179.3' ]]
 [[ $(printf '%s' "$codebuddy_request" | jq '[.headers | keys[] | ascii_downcase | select(startswith("x-yabane-"))] | length') == 0 ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-caller-note"]') == kept ]]
 [[ $(tr -d '\r' <codebuddy-success-headers.txt | awk 'tolower($1) == "x-yabane-request-id:" { print $2 }') == req-* ]]
-# A caller cannot name an identity or a client version on this Endpoint...
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-version"] != "9.9.9"') == true ]]
+# A caller cannot name an identity, a client version, or an agent runtime on this
+# Endpoint...
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-version"] != "9.9.9" and .headers["x-agent-runtime"] == "local-agent"') == true ]]
 # ...while the conversation and tracing it declared are kept, and the per-exchange
 # message identifier is a fresh UUIDv7 in the shape the deployment validates.
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-conversation-id"]') == 0e37df36f0e23361ad6e1b6f1a9f11b9 ]]

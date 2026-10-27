@@ -49,7 +49,7 @@ const DEFAULT_BASE_URL_HINT: &str = "https://copilot.tencent.com/v2";
 /// This catalog is maintained explicitly rather than discovered over the wire
 /// or read from the bundled product configuration, which can go stale.
 ///
-/// Snapshot fetched from the live CN `/v3/config` on 2026-10-21 using the CLI
+/// Snapshot fetched from the live CN `/v3/config` on 2026-11-03 using the CLI
 /// identity and an API key: only the IDs advertised by the `cli` agent, plus the
 /// separately verified `auto` selector. The config's full `models` array also
 /// includes legacy and image entries not advertised to this client; those are
@@ -58,34 +58,36 @@ const MODELS: &[&str] = &[
     "auto",
     "deepseek-v4-pro",
     "deepseek-v4.1-flash",
-    "glm-5.1",
     "glm-5.2",
     "glm-5.3",
     "glm-5.3-flash",
-    "glm-5v-turbo",
     "hy3",
     "hy3-x",
     "hy4-preview",
-    "kimi-k2.6",
-    "kimi-k2.7",
     "kimi-k2.8-preview",
     "kimi-k3-1",
+    "kimi-k3.1-pro",
     "mimo-v2.6-pro",
     "minimax-m2.7",
-    "minimax-m3",
     "minimax-m3.1-flash",
     "space-bunny",
     "step-5-preview",
 ];
 
-/// Client identity aligned with CodeBuddy CLI 2.164.0 (bundled in Agent SDK
-/// 0.3.276). The CLI's UserAgentHttpInterceptor sends both platform and product
-/// segments; IDE headers alone no longer suffice for CN channel verification.
-/// Keep their versions together, and do not claim a Node/Python SDK runtime.
+/// Client identity aligned with CodeBuddy CLI 2.179.3. The CLI's
+/// UserAgentHttpInterceptor sends both platform and product segments; IDE
+/// headers alone no longer suffice for CN channel verification. Keep their
+/// versions together, and do not claim a Node/Python SDK runtime.
 const IDE_TYPE: &str = "CLI";
-const IDE_VERSION: &str = "2.164.0";
+const IDE_VERSION: &str = "2.179.3";
 const AGENT_INTENT: &str = "craft";
 const AGENT_TYPE: &str = "main";
+/// The runtime this Endpoint claims: the CLI's local-conversation form. The
+/// caller's agent loop and tool execution happen on its own machine, not in a
+/// CodeBuddy cloud sandbox or between agents, so the request presents the
+/// `local-agent` form rather than the CLI's `other` fallback for an unstated
+/// runtime. The service's other runtimes are `cloud-agent` and `agent-agent`.
+const AGENT_RUNTIME: &str = "local-agent";
 
 /// Header names CodeBuddy clients use. Header names are case-insensitive on the
 /// wire and `HeaderName::from_static` requires lowercase, so these are written
@@ -95,6 +97,7 @@ const HEADER_IDE_NAME: &str = "x-ide-name";
 const HEADER_IDE_VERSION: &str = "x-ide-version";
 const HEADER_AGENT_INTENT: &str = "x-agent-intent";
 const HEADER_AGENT_TYPE: &str = "x-agent-type";
+const HEADER_AGENT_RUNTIME: &str = "x-agent-runtime";
 const HEADER_CONVERSATION_ID: &str = "x-conversation-id";
 const HEADER_CONVERSATION_REQUEST_ID: &str = "x-conversation-request-id";
 const HEADER_CONVERSATION_MESSAGE_ID: &str = "x-conversation-message-id";
@@ -111,6 +114,7 @@ const ENDPOINT_OWNED_HEADERS: &[&str] = &[
     "x-ide-version",
     "x-agent-intent",
     "x-agent-type",
+    "x-agent-runtime",
     "x-conversation-id",
     "x-conversation-request-id",
     "x-conversation-message-id",
@@ -300,6 +304,7 @@ fn write_client_identity(headers: &mut HeaderMap, caller: CallerIdentifiers) {
         ),
         header(HEADER_AGENT_INTENT, AGENT_INTENT),
         header(HEADER_AGENT_TYPE, AGENT_TYPE),
+        header(HEADER_AGENT_RUNTIME, AGENT_RUNTIME),
     ] {
         headers.insert(name, value);
     }
@@ -354,8 +359,8 @@ mod tests {
     };
 
     use super::{
-        AGENT_INTENT, AGENT_TYPE, CodeBuddyEndpoint, ENDPOINT_TYPE, IDE_TYPE, IDE_VERSION,
-        anonymous_user_id,
+        AGENT_INTENT, AGENT_RUNTIME, AGENT_TYPE, CodeBuddyEndpoint, ENDPOINT_TYPE, IDE_TYPE,
+        IDE_VERSION, anonymous_user_id,
     };
 
     fn request<'a>(
@@ -442,9 +447,13 @@ mod tests {
         assert_eq!(headers["x-ide-type"], IDE_TYPE);
         assert_eq!(headers["x-ide-name"], IDE_TYPE);
         assert_eq!(headers["x-ide-version"], IDE_VERSION);
-        assert_eq!(headers["user-agent"], "CLI/2.164.0 CodeBuddy/2.164.0");
+        assert_eq!(
+            headers["user-agent"],
+            format!("{IDE_TYPE}/{IDE_VERSION} CodeBuddy/{IDE_VERSION}")
+        );
         assert_eq!(headers["x-agent-intent"], AGENT_INTENT);
         assert_eq!(headers["x-agent-type"], AGENT_TYPE);
+        assert_eq!(headers["x-agent-runtime"], AGENT_RUNTIME);
     }
 
     /// A key shorter than the suffix this Endpoint reports is used whole rather
@@ -489,6 +498,7 @@ mod tests {
         headers.insert("x-ide-type", HeaderValue::from_static("VSCode"));
         headers.insert("x-agent-type", HeaderValue::from_static("subagent"));
         headers.insert("x-agent-intent", HeaderValue::from_static("ask"));
+        headers.insert("x-agent-runtime", HeaderValue::from_static("cloud-agent"));
         headers.insert("User-Agent", HeaderValue::from_static("caller-agent"));
         headers.append(
             "user-agent",
@@ -515,6 +525,7 @@ mod tests {
         assert_eq!(headers["x-ide-type"], IDE_TYPE);
         assert_eq!(headers["x-agent-type"], AGENT_TYPE);
         assert_eq!(headers["x-agent-intent"], AGENT_INTENT);
+        assert_eq!(headers["x-agent-runtime"], AGENT_RUNTIME);
         assert_eq!(
             headers["user-agent"],
             format!("{IDE_TYPE}/{IDE_VERSION} CodeBuddy/{IDE_VERSION}")
