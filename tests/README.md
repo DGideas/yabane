@@ -4,19 +4,16 @@
 
 ```bash
 bash tests/check.sh --quick # syntax, Clippy and all workspace unit tests once
-bash tests/check.sh         # also Core-only, feature-sensitive singles/pairs and HTTP
-bash tests/check.sh --matrix # all 32 Extension subsets, plus the offline HTTP gate
-bash tests/check.sh --full  # complete matrix and browser/authentication E2E
-bash tests/check.sh --load
+bash tests/check.sh         # also process-level HTTP checks
+bash tests/check.sh --full  # also browser/authentication E2E
+bash tests/check.sh --load  # also capacity baseline
 ```
 
-`--quick` checks Rust formatting, JS/shell syntax, strict workspace Clippy and every workspace unit test with all five Extensions enabled. It explicitly omits the feature matrix, HTTP and browser coverage: add relevant process-level tests during iteration and use the default gate before delivery.
+`--quick` checks Rust formatting, JS/shell syntax, strict workspace Clippy and every workspace unit test with all five Extensions enabled. It explicitly omits process-level HTTP and browser coverage: add relevant process-level tests during iteration and use the default gate before delivery.
 
-The default offline gate additionally lints and compiles **all Core tests** in the Core-only, five single-Extension and ten pair builds. Core-only runs every Core test; each other subset runs the feature-sensitive `extensions`, `config`, `control`, `gateway`, `endpoint_signin` and `models` modules. Protocol conversion, Activity durability, storage and authentication still run unfiltered in both all-feature and Core-only builds; they are not repeated in every pair. No bundled Extension is added as a test dependency. `--matrix` and `--full` extend this to **all 32 subsets**, including triples and quadruples (the old gate covered only 17 configurations, not every combination).
+The default offline gate also rebuilds the default binary and runs process-level tests against temporary data directories with fake credentials and loopback servers only. `--full` adds browser and authentication E2E; `--load` adds the capacity baseline. Stage timings and exit statuses are printed as `TIMING`; compilation, test execution and process-level verification are separate stages. Cargo uses its normal parallel test runner; do not increase threads or disable safety cases just to improve a duration. A first uncached build is not comparable to a warm test run. `node tests/check-gate.mjs` verifies mode selection and failure propagation without running a compiler or gateway. `tests/build-identity.mjs` runs the build script against temporary normal/worktree, packed/loose and detached Git references, ensuring build identity stays fresh without watching nonexistent paths.
 
-Stage timings and exit statuses are printed as `TIMING`; compilation, test execution and process-level verification are separate stages. Cargo uses its normal parallel test runner; do not increase threads or disable safety cases just to improve a duration. A first uncached build is not comparable to a warm test run. `node tests/check-gate.mjs` verifies mode selection, matrix completeness, test filtering and failure propagation without running a compiler or gateway. `tests/build-identity.mjs` runs the build script against temporary normal/worktree, packed/loose and detached Git references, ensuring build identity stays fresh without watching nonexistent paths.
-
-Every non-quick mode then rebuilds the default binary and runs the process-level tests, all against temporary data directories with fake credentials and loopback servers only:
+The process-level tests run against temporary data directories with fake credentials and loopback servers only:
 
 - `tests/cooldown-copy.mjs` — structured console history uses recorded delay sources, stays unchanged after policy edits, distinguishes zero from missing, and avoids guessing older/unavailable observations (ENDPOINT-42).
 - `tests/cooldown-layout.mjs` — production console helpers render compact state and collapsed explanations, sort identities without mutating configuration, distinguish weighted/standby/all-cooling allocations, keep disabled cooldowns explicit, exclude zero-weight identities from takeover and escape names (ENDPOINT-40 / ENDPOINT-31 / ENDPOINT-42).

@@ -15,7 +15,7 @@ try {
   await writeFile(path.join(work, 'tests/e2e.sh'), 'echo browser >> "$GATE_CALLS"\n');
   await writeFile(path.join(work, 'tests/behavior-map.sh'), 'true\n');
   await writeFile(path.join(work, 'web/app.js'), '');
-  // Shell fakes keep this dispatch-only test cheap even with 32 subsets.
+  // Shell fakes keep this dispatch-only test cheap without invoking compilers or servers.
   const fake = `#!/usr/bin/env bash
 tool=\${0##*/}
 { printf '%s\\t' "$tool" "$@"; printf '\\n'; } >> "$GATE_CALLS"
@@ -55,30 +55,23 @@ exit 0
   assert.match(quick.result.stdout, /HTTP and browser tests were NOT run/);
   const normal = await run([]);
   assert.equal(normal.result.status, 0);
-  assert.equal(argsFor(normal.calls, 'test').length, 17);
-  const filtered = argsFor(normal.calls, 'test').filter(args => args.includes('--features'));
-  assert.equal(filtered.length, 15);
-  const filters = ['extensions::', 'config::', 'control::', 'gateway::', 'endpoint_signin::', 'models::'];
-  assert.ok(filtered.every(args => JSON.stringify(args.slice(args.indexOf('--') + 1)) === JSON.stringify(filters)));
+  const tests = argsFor(normal.calls, 'test');
+  assert.equal(tests.length, 1);
+  assert.ok(tests[0].includes('--all-features'));
+  assert.ok(!normal.calls.some(c => c.tool === 'cargo' && c.args.includes('--no-default-features')));
+  assert.equal(argsFor(normal.calls, 'clippy').length, 1);
   assert.ok(normal.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/response-limits.mjs'));
-  assert.ok(argsFor(normal.calls, 'test').some(args => args.includes('--no-default-features') && !args.includes('--features')));
   assert.equal(argsFor(normal.calls, 'build').length, 1);
-  for (const mode of ['--matrix', '--full']) {
-    const complete = await run([mode]);
-    assert.equal(complete.result.status, 0);
-    assert.equal(argsFor(complete.calls, 'test').length, 32);
-    const combos = argsFor(complete.calls, 'test').map(args => args.includes('--all-features') ? 'all' : args.includes('--features') ? args[args.indexOf('--features') + 1] : '');
-    assert.equal(new Set(combos).size, 32);
-    const extensions = ['extension-request-defaults', 'extension-traffic-capture', 'extension-openai-subscription', 'extension-openai', 'extension-codebuddy'];
-    const masks = combos.map(combo => combo === 'all' ? 31 : combo.split(',').filter(Boolean).reduce((mask, feature) => {
-      assert.ok(extensions.includes(feature), `unknown feature ${feature}`);
-      return mask | (1 << extensions.indexOf(feature));
-    }, 0)).sort((a, b) => a - b);
-    assert.deepEqual(masks, Array.from({length: 32}, (_, i) => i));
-    assert.ok(complete.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/response-limits.mjs'));
-    assert.equal(complete.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/accessibility.mjs'), mode === '--full');
-    assert.equal(complete.calls.some(c => c.tool === 'browser'), mode === '--full');
-  }
+  const full = await run(['--full']);
+  assert.equal(full.result.status, 0);
+  assert.equal(argsFor(full.calls, 'test').length, 1);
+  assert.equal(argsFor(full.calls, 'clippy').length, 1);
+  assert.ok(full.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/response-limits.mjs'));
+  assert.ok(full.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/accessibility.mjs'));
+  assert.ok(full.calls.some(c => c.tool === 'browser'));
+  const load = await run(['--load']);
+  assert.equal(load.result.status, 0);
+  assert.ok(load.calls.some(c => c.tool === 'node' && c.args[0] === 'tests/load.mjs'));
   const accessibilityFailed = await run(['--full'], 'accessibility');
   assert.equal(accessibilityFailed.result.status, 7);
   assert.ok(!accessibilityFailed.calls.some(c => c.tool === 'browser'), 'accessibility failure blocks browser/success');
@@ -91,9 +84,10 @@ exit 0
   assert.equal(httpFailed.result.status, 7);
   assert.ok(!httpFailed.calls.some(c => c.tool === 'browser'), 'HTTP failure blocks browser/success');
   assert.doesNotMatch(httpFailed.result.stdout, /quality checks passed/);
-  assert.equal((await run(['--unknown'])).result.status, 2);
-  assert.equal((await run(['--quick', '--full'])).result.status, 2);
-  console.log('Quality gate modes, feature filtering, complete matrix and failure propagation passed.');
+  for (const mode of [['--unknown'], ['--quick', '--full']]) {
+    assert.equal((await run(mode)).result.status, 2);
+  }
+  console.log('Quality gate modes and failure propagation passed.');
 } finally {
   await rm(work, { recursive: true, force: true });
 }
