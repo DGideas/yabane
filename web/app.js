@@ -3537,6 +3537,23 @@ function activityBucketLabel(bucket, seconds, full = false) {
   const endLabel = seconds <= 86400 ? end.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : end.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
   return `${startLabel} – ${endLabel}`;
 }
+// Calendar ticks are independent of aggregate centers: a date names local
+// midnight, not whichever hourly bucket happened to survive label thinning.
+function activityDateTicks(buckets, seconds, plotWidth) {
+  if (!buckets.length || seconds <= 86400) return [];
+  const start = buckets[0].start; const end = start + seconds;
+  const cursor = new Date(start * 1000); cursor.setHours(0, 0, 0, 0);
+  if (cursor.getTime() / 1000 < start) cursor.setDate(cursor.getDate() + 1);
+  const days = [];
+  while (cursor.getTime() / 1000 <= end) {
+    const timestamp = cursor.getTime() / 1000;
+    days.push({timestamp, position: (timestamp - start) / seconds, label: cursor.toLocaleDateString([], {month: 'short', day: 'numeric'})});
+    cursor.setDate(cursor.getDate() + 1); cursor.setHours(0, 0, 0, 0);
+  }
+  const budget = Math.max(1, Math.min(8, Math.floor(plotWidth / 90)));
+  const every = Math.max(1, Math.ceil(days.length / budget));
+  return days.filter((_, index) => index % every === 0);
+}
 function activityMetricValue(bucket, metric) { return metric === 'tokens' ? bucket.tokens : metric === 'requests' ? bucket.requests : (bucket.samples ? bucket.latency / bucket.samples : null); }
 function activityFirstByteValue(bucket) { return bucket.first_byte_samples ? bucket.first_byte / bucket.first_byte_samples : null; }
 function activityThroughputValue(bucket) { return bucket.generation && bucket.generation_tokens ? bucket.generation_tokens * 1000 / bucket.generation : null; }
@@ -3672,6 +3689,8 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
   const firstBytePoints = performanceMode ? pointsFor(firstByteValues, leftMax) : []; const throughputPoints = performanceMode ? pointsFor(throughputValues, throughputMax) : [];
   const errorPoints = requestMode ? pointsFor(errorRates, errorScaleMax) : [];
   const grid = [0, .5, 1].map(ratio => { const y = top + ratio * plotHeight; const value = leftMax * (1 - ratio); return `<line x1="${left}" y1="${y}" x2="${width - right}" y2="${y}"></line><text x="${left - 9}" y="${y + 3}" text-anchor="end">${escapeHtml(activityMetricLabel(value, activityChartMetric))}</text>`; }).join('');
+  const dateTicks = activityDateTicks(buckets, seconds, plotWidth);
+  const dateAxis = dateTicks.map(tick => `<text data-timestamp="${tick.timestamp}" x="${left + tick.position * plotWidth}" y="${height - 10}" text-anchor="middle">${escapeHtml(tick.label)}</text>`).join('');
   const labelBudget = Math.max(4, Math.min(8, Math.floor(width / 110)));
   const intervalEvery = Math.max(1, Math.ceil(buckets.length / labelBudget));
   const columnLabels = buckets.map(bucket => activityBucketLabel(bucket, seconds));
@@ -3679,7 +3698,7 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
   let lastShownLabel = '';
   columnLabels.forEach((label, index) => {
     const candidate = index % intervalEvery === 0 || index === columnLabels.length - 1;
-    const show = candidate && label !== lastShownLabel;
+    const show = seconds <= 86400 && candidate && label !== lastShownLabel;
     if (show) lastShownLabel = label;
     shownLabels.push(show ? label : '');
   });
@@ -3714,7 +3733,7 @@ function renderActivityChart(buckets = activityChartBuckets, seconds = activityC
       seriesMarkup = `${primarySeries}<path class="first-byte-line" d="${firstByteLine}"></path><path class="throughput-line" d="${throughputLine}"></path>${rightAxis}`;
     } else seriesMarkup = primarySeries;
   }
-  $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g>${seriesMarkup}</svg><div class="chart-bars" style="--activity-buckets:${buckets.length};--chart-right:${right}px;--point-color:${tokenMode ? '#7c4dff' : '#0b57d0'}">${overlays}</div>`;
+  $('#activity-chart').innerHTML = `<svg class="traffic-area-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g class="traffic-grid">${grid}</g>${seriesMarkup}<g class="traffic-grid traffic-time-axis">${dateAxis}</g></svg><div class="chart-bars" style="--activity-buckets:${buckets.length};--chart-right:${right}px;--point-color:${tokenMode ? '#7c4dff' : '#0b57d0'}">${overlays}</div>`;
   const legend = $('#activity-chart-legend');
   legend.hidden = false;
   legend.innerHTML = tokenMode ? '<span><i class="token-input"></i>Input</span><span><i class="token-output"></i>Output</span><span><i class="token-cache"></i>Cache hit rate</span>' : requestMode ? '<span><i class="request-volume"></i>Requests</span><span><i class="request-errors"></i>Error rate</span>' : '<span><i class="performance-throughput"></i>Throughput tok/s</span><span><i class="performance-first-byte"></i>Time to first token</span><span><i class="performance-latency"></i>Average latency</span>';

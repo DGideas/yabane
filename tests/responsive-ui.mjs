@@ -2134,11 +2134,26 @@ for (const project of projects) {
       await weekStats;
       await page.waitForFunction(() => document.querySelectorAll('#activity-chart .chart-column').length === 168);
       const weekChart = await page.locator('#activity-chart').evaluate(chart => {
-        const labels = [...chart.querySelectorAll('.chart-column small')].map(label => label.textContent).filter(Boolean);
-        return {columns: chart.querySelectorAll('.chart-column').length, granularity: document.querySelector('#traffic-granularity').textContent, visibleLabels: labels.length, hourlyLabels: labels.filter(text => /:\d{2}$/.test(text)).length, pointMarkers: chart.querySelectorAll('.traffic-points circle').length};
+        // ACTIVITY-27: date ticks belong to real local midnights, not bucket centers.
+        const ticks = [...chart.querySelectorAll('.traffic-time-axis text')];
+        const labels = ticks.map(tick => tick.textContent);
+        const timestamps = ticks.map(tick => Number(tick.dataset.timestamp));
+        const dayNumbers = timestamps.map(timestamp => { const date = new Date(timestamp * 1000); return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86400000; });
+        const strides = dayNumbers.slice(1).map((day, index) => day - dayNumbers[index]);
+        const start = activityChartBuckets[0].start;
+        const plotWidth = chart.querySelector('svg').viewBox.baseVal.width - 48 - 42;
+        const aligned = ticks.every((tick, index) => {
+          const date = new Date(timestamps[index] * 1000);
+          const expectedX = 48 + (timestamps[index] - start) / activityChartSeconds * plotWidth;
+          return date.getHours() === 0 && date.getMinutes() === 0 && Math.abs(Number(tick.getAttribute('x')) - expectedX) < .1;
+        });
+        const boxes = ticks.map(tick => tick.getBoundingClientRect());
+        const overlaps = boxes.some((box, index) => index > 0 && boxes[index - 1].right + 8 > box.left);
+        return {columns: chart.querySelectorAll('.chart-column').length, granularity: document.querySelector('#traffic-granularity').textContent, visibleLabels: labels.length, hourlyLabels: labels.filter(text => /:\d{2}$/.test(text)).length, pointMarkers: chart.querySelectorAll('.traffic-points circle').length, aligned, uniformStride: new Set(strides).size === 1, overlaps};
       });
       if (weekChart.columns !== 168 || !weekChart.granularity.startsWith('1-hour')) throw new Error(`${project.name}: 7-day Activity timeline is not rendered at hourly resolution (${JSON.stringify(weekChart)})`);
-      if (weekChart.visibleLabels < 4 || weekChart.visibleLabels > 9 || weekChart.hourlyLabels) throw new Error(`${project.name}: hourly 7-day Activity timeline shows crowded or non-day-boundary labels (${JSON.stringify(weekChart)})`);
+      if (weekChart.visibleLabels < 2 || weekChart.visibleLabels > 8 || weekChart.hourlyLabels) throw new Error(`${project.name}: hourly 7-day Activity timeline shows crowded or non-day-boundary labels (${JSON.stringify(weekChart)})`);
+      if (!weekChart.aligned || !weekChart.uniformStride || weekChart.overlaps) throw new Error(`${project.name}: Activity dates are not evenly thinned local-midnight ticks at their true time positions (${JSON.stringify(weekChart)})`);
       if (weekChart.pointMarkers) throw new Error(`${project.name}: dense hourly Activity timeline still draws per-interval point markers (${JSON.stringify(weekChart)})`);
       const backToDayStats = page.waitForResponse(response => response.url().includes('/admin/activity/stats?since=') && response.url().includes('buckets=48'));
       await page.locator('#activity-range').selectOption('86400');

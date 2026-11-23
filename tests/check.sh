@@ -40,7 +40,7 @@ fi
 # Rebuild before process-level checks so HTTP tests use the default distribution
 # and the current embedded assets, never a stale binary.
 stage default-build cargo build --locked
-for script in openapi-paths cooldown-copy cooldown-layout activity-outcomes; do
+for script in openapi-paths cooldown-copy cooldown-layout activity-outcomes activity-date-axis; do
   stage "$script" node "tests/$script.mjs"
 done
 for script in cooldown-history http-redirects reasoning-conversion stream-semantics activity-recovery client-disconnect stream-completion response-limits shutdown; do
