@@ -4,7 +4,7 @@
 const viewLoaders = {
   home: ['loadDashboard'],
   providers: ['loadProviderActivity', 'refreshProviderState'],
-  activity: ['loadActivity', 'loadActivityPage'], // The overview can start an unawaited page load.
+  activity: ['loadActivity', 'loadActivityPage'], // Observe both overview and nested explorer rendering.
   management: ['loadManagementKeys'],
   models: [], pricing: [], extensions: [], access: [],
 };

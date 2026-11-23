@@ -49,9 +49,10 @@ const DEFAULT_BASE_URL_HINT: &str = "https://copilot.tencent.com/v2";
 /// This catalog is maintained explicitly rather than discovered over the wire
 /// or read from the bundled product configuration, which can go stale.
 ///
-/// Snapshot fetched from the live CN `/v3/config` on 2026-11-04 using the CLI
-/// identity and an API key: only the IDs advertised by the `cli` agent, plus the
-/// separately verified `auto` selector. The config's full `models` array also
+/// Snapshot fetched from the live CN `/v3/config` on 2026-11-23 using the CLI
+/// 2.185.0 identity and a non-secret placeholder API key (config advertisement
+/// requires no working credential): only the IDs advertised by the `cli` agent,
+/// plus the previously verified `auto` selector. The config's full `models` array also
 /// includes legacy and image entries not advertised to this client; those are
 /// deliberately absent. Catalog membership is not a per-model invocation test.
 const MODELS: &[&str] = &[
@@ -61,9 +62,8 @@ const MODELS: &[&str] = &[
     "glm-5.2",
     "glm-5.3",
     "glm-5.3-flash",
-    "hy3",
-    "hy3-x",
-    "hy4free",
+    "hy4flash",
+    "hy4flash-free",
     "hy4std",
     "kimi-k2.8-preview",
     "kimi-k3-1",
@@ -75,12 +75,12 @@ const MODELS: &[&str] = &[
     "step-5-preview",
 ];
 
-/// Client identity aligned with CodeBuddy CLI 2.179.3. The CLI's
+/// Client identity aligned with CodeBuddy CLI 2.185.0. The CLI's
 /// UserAgentHttpInterceptor sends both platform and product segments; IDE
 /// headers alone no longer suffice for CN channel verification. Keep their
 /// versions together, and do not claim a Node/Python SDK runtime.
 const IDE_TYPE: &str = "CLI";
-const IDE_VERSION: &str = "2.179.3";
+const IDE_VERSION: &str = "2.185.0";
 const AGENT_INTENT: &str = "craft";
 const AGENT_TYPE: &str = "main";
 /// The runtime this Endpoint claims: the CLI's local-conversation form. The
@@ -409,7 +409,7 @@ mod tests {
     /// ENDPOINT-45: the catalog uses the CN CLI snapshot rather than all config
     /// entries, so unadvertised legacy, overseas, and auxiliary IDs stay absent.
     #[test]
-    fn the_catalog_holds_only_models_this_credential_kind_may_call() {
+    fn the_catalog_matches_the_cn_cli_advertisement() {
         let models = CodeBuddyEndpoint.models();
         assert!(!models.is_empty());
         for overseas in ["gpt-5.5", "gpt-5.4", "gemini-3.1-pro", "gemini-3.0-flash"] {
@@ -430,9 +430,29 @@ mod tests {
                 "{auxiliary} does not serve chat completions"
             );
         }
-        for model in models {
-            assert!(!model.is_empty());
-        }
+        assert_eq!(
+            models,
+            &[
+                "auto",
+                "deepseek-v4-pro",
+                "deepseek-v4.1-flash",
+                "glm-5.2",
+                "glm-5.3",
+                "glm-5.3-flash",
+                "hy4flash",
+                "hy4flash-free",
+                "hy4std",
+                "kimi-k2.8-preview",
+                "kimi-k3-1",
+                "kimi-k3.1-pro",
+                "mimo-v2.6-pro",
+                "minimax-m2.7",
+                "minimax-m3.1-flash",
+                "space-bunny",
+                "step-5-preview",
+            ]
+        );
+        assert_eq!(IDE_VERSION, "2.185.0");
     }
 
     /// PROXY-64: every request carries the configured key and the identity derived

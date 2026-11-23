@@ -35,10 +35,8 @@ const CREDENTIAL_KINDS: &[ProviderCredentialKind] = &[ProviderCredentialKind {
 }];
 
 // ChatGPT's Codex backend has no supported /models operation, so keep this catalog explicit
-// and update it from pi-ai's OpenAI Codex provider catalog.
+// and update it from pi-ai's OpenAI Codex provider catalog (1.6.0, 2026-11-23).
 const MODELS: &[&str] = &[
-    "gpt-5.3-codex-spark",
-    "gpt-5.5",
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -46,7 +44,14 @@ const MODELS: &[&str] = &[
     "gpt-6-luna",
     "gpt-6-sol",
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
 ];
+
+// pi-ai 1.6.0 supports this short identity. Its default detailed identity names
+// the Node/Bun runtime; a native Rust gateway must not invent that runtime.
+const CODEX_USER_AGENT: HeaderValue = HeaderValue::from_static("pi");
 
 pub fn metadata() -> Extension {
     Extension {
@@ -191,9 +196,7 @@ impl ProviderEndpoint for OpenAiSubscriptionEndpoint {
             HeaderName::from_static("originator"),
             HeaderValue::from_static("pi"),
         );
-        request
-            .headers
-            .insert(header::USER_AGENT, pi_user_agent().clone());
+        request.headers.insert(header::USER_AGENT, CODEX_USER_AGENT);
         request.headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses=experimental"),
@@ -455,23 +458,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Reads the text of a Responses input message, whether it uses the string
-/// shorthand or the list of `input_text` parts.
-fn input_message_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Array(parts) => {
-            let text = parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!text.is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
 pub fn adapt_body(body: &mut Vec<u8>) {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return;
@@ -479,50 +465,26 @@ pub fn adapt_body(body: &mut Vec<u8>) {
     if let Some(object) = value.as_object_mut() {
         object.insert("store".to_owned(), serde_json::Value::Bool(false));
         object.insert("stream".to_owned(), serde_json::Value::Bool(true));
-        // Codex rejects ordinary `system` input messages. Fold only those into
-        // `instructions`; pi sends mid-conversation updates as `developer`
-        // messages and tool declarations as `additional_tools` items, which
-        // must keep their content and position even when instructions exist.
-        let mut system_instructions = Vec::new();
+        // pi-ai 1.6.0 sends system guidance as developer messages in input:
+        // GPT-6.2 appends top-level instructions after input, harming prefix
+        // caching. Do not synthesize instructions or move transcript updates.
+        // Explicit caller instructions remain caller-owned and are preserved.
         if let Some(input) = object
             .get_mut("input")
             .and_then(serde_json::Value::as_array_mut)
         {
-            input.retain(|item| {
-                let Some(message) = item.as_object() else {
-                    return true;
+            for item in input {
+                let Some(message) = item.as_object_mut() else {
+                    continue;
                 };
-                if message.get("role").and_then(serde_json::Value::as_str) != Some("system")
-                    || message
+                if message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+                    && message
                         .get("type")
-                        .is_some_and(|kind| kind.as_str() != Some("message"))
+                        .is_none_or(|kind| kind.as_str() == Some("message"))
                 {
-                    return true;
+                    message.insert("role".to_owned(), serde_json::json!("developer"));
                 }
-                if let Some(text) = message
-                    .get("content")
-                    .and_then(input_message_text)
-                    .filter(|text| !text.is_empty())
-                {
-                    system_instructions.push(text);
-                }
-                false
-            });
-        }
-        if object
-            .get("instructions")
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            let instructions = if system_instructions.is_empty() {
-                "You are a helpful assistant.".to_owned()
-            } else {
-                system_instructions.join("\n\n")
-            };
-            object.insert(
-                "instructions".to_owned(),
-                serde_json::Value::String(instructions),
-            );
+            }
         }
         if let Some(input) = object
             .get("input")
@@ -534,18 +496,14 @@ pub fn adapt_body(body: &mut Vec<u8>) {
                 serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": input}]}]),
             );
         }
-        // Tuning, cache, truncation, and caller-identifier fields the Codex
-        // backend answers with `400 Unsupported parameter: <name>`. A field
-        // whose absence would change the answer, such as
-        // `previous_response_id`, stays in the body so the Provider's own
-        // error reaches the caller instead of silently dropping behavior.
+        // Retain the previously verified exclusions, except max_output_tokens,
+        // temperature and service_tier, which pi-ai 1.6.0 now sends. Forward
+        // their exact caller values, without capability guesses or clamping;
+        // Provider validation and errors remain visible to the caller.
         for name in [
-            "max_output_tokens",
-            "temperature",
             "top_p",
             "truncation",
             "metadata",
-            "service_tier",
             "user",
             "safety_identifier",
             "prompt_cache_options",
@@ -627,6 +585,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_matches_pi_ai_1_6_0() {
+        assert_eq!(
+            ENDPOINT.models(),
+            &[
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-6-astra",
+                "gpt-6-luna",
+                "gpt-6-sol",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-6.2-astra",
+                "gpt-6.2-sol",
+            ]
+        );
+    }
+
+    #[test]
     fn extracts_only_a_non_empty_chatgpt_account_id() {
         let token = jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account-123"}}"#);
         assert_eq!(account_id(&token).unwrap(), "account-123");
@@ -699,13 +676,15 @@ mod tests {
         assert_eq!(headers["x-client-request-id"], "session");
         assert_eq!(value["store"], false);
         assert_eq!(value["stream"], true);
+        assert_eq!(value["max_output_tokens"], 100);
+        assert_eq!(value["temperature"], 0.2);
+        assert_eq!(value["service_tier"], "auto");
+        assert!(value.get("instructions").is_none());
+        assert_eq!(headers[header::USER_AGENT], "pi");
         for dropped in [
-            "max_output_tokens",
-            "temperature",
             "top_p",
             "truncation",
             "metadata",
-            "service_tier",
             "user",
             "safety_identifier",
             "prompt_cache_options",
@@ -729,18 +708,26 @@ mod tests {
     }
 
     #[test]
-    fn folds_only_system_input_messages_into_instructions() {
+    fn system_messages_become_developer_messages_in_place() {
         let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"developer","content":"Keep this update in place."},{"role":"system","content":"Late note."}]}"#.to_vec();
 
         adapt_body(&mut body);
 
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["instructions"], "Be terse.\n\nLate note.");
-        assert_eq!(value["input"].as_array().unwrap().len(), 2);
-        assert_eq!(value["input"][0]["role"], "user");
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["input"].as_array().unwrap().len(), 4);
         assert_eq!(
-            value["input"][1],
+            value["input"][0],
+            serde_json::json!({"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Be terse."}]})
+        );
+        assert_eq!(value["input"][1]["role"], "user");
+        assert_eq!(
+            value["input"][2],
             serde_json::json!({"role": "developer", "content": "Keep this update in place."})
+        );
+        assert_eq!(
+            value["input"][3],
+            serde_json::json!({"role": "developer", "content": "Late note."})
         );
     }
 
@@ -764,6 +751,7 @@ mod tests {
                 "status": "completed", "arguments": {"query": "late_tool", "limit": 1}},
             {"type": "tool_search_output", "call_id": "search_1", "execution": "client",
                 "status": "completed", "tools": [{"type": "function", "name": "late_tool"}]},
+            {"type": "configuration_update", "reasoning": {"effort": "high"}},
             {"type": "function_call", "call_id": "call_1", "name": "late_tool", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_1", "output": "done"},
             {"type": "future_item", "role": "system", "content": "Not an ordinary message"}
@@ -779,10 +767,7 @@ mod tests {
 
             let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(value["input"], input);
-            assert_eq!(
-                value["instructions"],
-                instructions.unwrap_or("You are a helpful assistant.")
-            );
+            assert_eq!(value.get("instructions"), request.get("instructions"));
             let prepared = body.clone();
             adapt_body(&mut body);
             assert_eq!(
@@ -793,15 +778,76 @@ mod tests {
     }
 
     #[test]
-    fn caller_instructions_win_over_input_system_messages() {
+    fn explicit_instructions_and_system_message_content_both_survive() {
         let mut body = br#"{"model":"gpt-6-astra","instructions":"Caller prompt","input":[{"role":"system","content":"Input prompt"},{"role":"user","content":"hello"}]}"#.to_vec();
 
         adapt_body(&mut body);
 
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["instructions"], "Caller prompt");
-        assert_eq!(value["input"].as_array().unwrap().len(), 1);
-        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            value["input"][0],
+            serde_json::json!({"role": "developer", "content": "Input prompt"})
+        );
+        assert_eq!(value["input"][1]["role"], "user");
+    }
+
+    /// PROXY-17: pi's client-side defaults/clamps are not gateway policy.
+    /// Preserve even unsupported values so the Provider can reject them visibly.
+    #[test]
+    fn output_controls_are_preserved_without_model_inference_or_clamping() {
+        for model in ["gpt-6.2-sol", "gpt-5.3-codex-spark", "custom-model"] {
+            for limit in [
+                serde_json::json!(1),
+                serde_json::json!(128000),
+                serde_json::Value::Null,
+            ] {
+                let request = serde_json::json!({
+                    "model": model, "input": [], "max_output_tokens": limit,
+                    "temperature": 0.37, "service_tier": "priority",
+                    "reasoning": {"effort": "high"}, "unknown_field": "preserved"
+                });
+                let mut body = serde_json::to_vec(&request).unwrap();
+                adapt_body(&mut body);
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                for field in [
+                    "model",
+                    "input",
+                    "max_output_tokens",
+                    "temperature",
+                    "service_tier",
+                    "reasoning",
+                    "unknown_field",
+                ] {
+                    assert_eq!(value[field], request[field], "{model}: {field}");
+                }
+                assert!(!value.as_object().unwrap().contains_key("instructions"));
+            }
+        }
+    }
+
+    #[test]
+    fn system_role_adaptation_preserves_non_text_content_and_message_fields() {
+        let mut expected = serde_json::json!({"input": [
+            {"type": "message", "role": "system", "content": [
+                {"type": "input_text", "text": "Guidance"},
+                {"type": "input_image", "image_url": "https://example.test/image.png"}
+            ], "id": "msg-1", "metadata": {"role": "system"}},
+            {"role": "system", "content": null},
+            {"type": "additional_tools", "role": "system", "tools": []},
+            {"type": "future_item", "role": "system", "content": "kept"},
+            {"type": null, "role": "system", "content": "kept"}
+        ]});
+        let mut body = serde_json::to_vec(&expected).unwrap();
+        adapt_body(&mut body);
+        expected["input"][0]["role"] = serde_json::json!("developer");
+        expected["input"][1]["role"] = serde_json::json!("developer");
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["input"], expected["input"]);
+        let prepared = body.clone();
+        adapt_body(&mut body);
+        assert_eq!(body, prepared);
     }
 
     #[test]
@@ -973,7 +1019,7 @@ mod tests {
         assert!(!headers.contains_key(header::CONTENT_ENCODING));
         assert!(!headers.contains_key("session-id"));
         assert!(!headers.contains_key("x-client-request-id"));
-        assert_eq!(headers[header::USER_AGENT], pi_user_agent());
+        assert_eq!(headers[header::USER_AGENT], CODEX_USER_AGENT);
         assert_ne!(headers[header::USER_AGENT], "caller-agent");
         assert_eq!(headers[header::ACCEPT_ENCODING], "identity");
     }

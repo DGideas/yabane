@@ -2009,7 +2009,7 @@
           "Inference"
         ],
         "summary": "Proxy OpenAI Responses",
-        "description": "Yabane prefers a native Responses Endpoint and otherwise converts the request and successful response to the configured Provider protocol. ChatGPT Plus/Pro subscription Endpoints require stream=true when calling the Provider and use the explicitly configured Codex backend adapter. Cross-protocol requests with non-null previous_response_id or conversation return 400; supply full input history instead. Generic conversion omits provider-specific reasoning and groups assistant text within a tool-call batch so results remain adjacent. Native Responses history is forwarded unchanged.",
+        "description": "Yabane prefers a native Responses Endpoint and otherwise converts the request and successful response to the configured Provider protocol. ChatGPT Plus/Pro subscription Endpoints require stream=true when calling the Provider and use the explicitly configured pi-ai 1.6.0-aligned Codex backend adapter: ordinary system input messages become developer messages in place, no default instructions are added, explicit instructions are preserved, and max_output_tokens, temperature, and service_tier reach the Provider unchanged. This remains one HTTP/SSE request without retries or WebSocket fallback. Cross-protocol requests with non-null previous_response_id or conversation return 400; supply full input history instead. Generic conversion omits provider-specific reasoning and groups assistant text within a tool-call batch so results remain adjacent. Native Responses history is forwarded unchanged except for a selected Endpoint type's declared wire adaptation.",
         "security": [
           {
             "gatewayKey": []

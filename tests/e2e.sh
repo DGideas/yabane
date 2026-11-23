@@ -319,9 +319,9 @@ openai_oauth_id=$(printf '%s' "$openai_oauth" | jq -r .id)
 # refresh publishes the Endpoint type's own catalog instead of calling one. The
 # catalog mirrors pi-ai's `openai-codex` provider catalog: a model pi-ai removed
 # because the backend stopped serving it must not be offered here, and a model
-# pi-ai added must be. GPT-5.4 and GPT-5.4 mini were removed; GPT-6 Sol and
-# GPT-6 Luna were added, and GPT-6.1 Sol joined them as pi-ai's Codex default.
-[[ $(admin -f -X POST "$base/admin/providers/subscription-fixture/models/refresh" | jq -r '.models | join(",")') == 'gpt-5.3-codex-spark,gpt-5.5,gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra,gpt-6-luna,gpt-6-sol,gpt-6.1-sol' ]]
+# pi-ai added must be. In 1.6.0 GPT-5.3 Codex Spark and GPT-5.5 are absent;
+# GPT-6.1 Terra, GPT-6.2 Astra and GPT-6.2 Sol are present.
+[[ $(admin -f -X POST "$base/admin/providers/subscription-fixture/models/refresh" | jq -r '.models | join(",")') == 'gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-6-astra,gpt-6-luna,gpt-6-sol,gpt-6.1-sol,gpt-6.1-terra,gpt-6.2-astra,gpt-6.2-sol' ]]
 # An Endpoint type that owns its own identity refuses pasted secrets, and one
 # that owns its own sign-in cannot be created through the plain Endpoint API.
 [[ $(admin_status -X POST "$base/admin/providers/subscription-fixture/credentials" -H 'content-type: application/json' -d '{"endpoint_id":"chatgpt","name":"Pasted key","secret":"sk-not-subscription","weight":100}') == 400 ]]
@@ -528,10 +528,11 @@ admin -f -X DELETE "$base/admin/providers/versioned-root" >/dev/null
 codebuddy_models=$(jq -r '[.[] | select(.id == "codebuddy") | .endpoint_types[].id] | join(",")' <<<"$extensions")
 [[ $codebuddy_models == codebuddy_cn ]]
 [[ $(admin_status -X POST "$base/admin/providers" -H 'content-type: application/json' -d "{\"id\":\"codebuddy\",\"name\":\"CodeBuddy\",\"endpoint\":{\"id\":\"cn\",\"api_type\":\"codebuddy_cn\",\"base_url\":\"http://127.0.0.1:$upstream_port/v2\",\"requires_credential\":true,\"credential_secret\":\"ck-e2e-12345678\"}}") == 204 ]]
-admin -f -X POST "$base/admin/providers/codebuddy/models/refresh" >/dev/null
-# The catalog is explicit, so it is published without asking the deployment for a
-# `/models` operation that does not exist, and the refresh is not an error.
-admin -f "$base/admin/providers" | jq -e '.[] | select(.id == "codebuddy") | .model_discovery_error == null and (.discovered_models | length > 0)' >/dev/null
+# The bundled 2.185.0 CLI snapshot is published without any network discovery;
+# removed Hunyuan IDs must not survive alongside the new Flash IDs.
+[[ $(admin -f -X POST "$base/admin/providers/codebuddy/models/refresh" | jq -r '.models | join(",")') == 'auto,deepseek-v4-pro,deepseek-v4.1-flash,glm-5.2,glm-5.3,glm-5.3-flash,hy4flash,hy4flash-free,hy4std,kimi-k2.8-preview,kimi-k3-1,kimi-k3.1-pro,mimo-v2.6-pro,minimax-m2.7,minimax-m3.1-flash,space-bunny,step-5-preview' ]]
+admin -f "$base/admin/providers" | jq -e '.[] | select(.id == "codebuddy") | .model_discovery_error == null' >/dev/null
+[[ $(curl -sf "$base/v1/models" -H "Authorization: Bearer $unrestricted_secret" | jq -r '[.data[].id | select(startswith("codebuddy/"))] | sort | join(",")') == 'codebuddy/auto,codebuddy/deepseek-v4-pro,codebuddy/deepseek-v4.1-flash,codebuddy/glm-5.2,codebuddy/glm-5.3,codebuddy/glm-5.3-flash,codebuddy/hy4flash,codebuddy/hy4flash-free,codebuddy/hy4std,codebuddy/kimi-k2.8-preview,codebuddy/kimi-k3-1,codebuddy/kimi-k3.1-pro,codebuddy/mimo-v2.6-pro,codebuddy/minimax-m2.7,codebuddy/minimax-m3.1-flash,codebuddy/space-bunny,codebuddy/step-5-preview' ]]
 admin -f -X PATCH "$base/admin/providers/codebuddy" -H 'content-type: application/json' -d '{"extra_headers":{"x-yabane-from-defaults":"internal-marker"}}' >/dev/null
 : >codebuddy-requests.jsonl
 jq '.model = "codebuddy/glm-5.3"' instruction-role-request.json >codebuddy-request.json
@@ -546,8 +547,8 @@ codebuddy_request=$(jq -c 'select(.path != null)' <codebuddy-requests.jsonl | ta
 [[ $(printf '%s' "$codebuddy_request" | jq -r .path) == /v2/chat/completions ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers.authorization') == 'Bearer ck-e2e-12345678' ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-user-id"]') == anonymous_12345678 ]]
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"] + "|" + .headers["x-agent-runtime"]') == 'CLI|2.179.3|craft|main|local-agent' ]]
-[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["user-agent"]') == 'CLI/2.179.3 CodeBuddy/2.179.3' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-ide-type"] + "|" + .headers["x-ide-version"] + "|" + .headers["x-agent-intent"] + "|" + .headers["x-agent-type"] + "|" + .headers["x-agent-runtime"]') == 'CLI|2.185.0|craft|main|local-agent' ]]
+[[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["user-agent"]') == 'CLI/2.185.0 CodeBuddy/2.185.0' ]]
 [[ $(printf '%s' "$codebuddy_request" | jq '[.headers | keys[] | ascii_downcase | select(startswith("x-yabane-"))] | length') == 0 ]]
 [[ $(printf '%s' "$codebuddy_request" | jq -r '.headers["x-caller-note"]') == kept ]]
 [[ $(tr -d '\r' <codebuddy-success-headers.txt | awk 'tolower($1) == "x-yabane-request-id:" { print $2 }') == req-* ]]

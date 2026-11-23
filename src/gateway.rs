@@ -2556,16 +2556,15 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["stream"], true);
         assert_eq!(value["store"], false);
-        assert_eq!(value["instructions"], "You are a helpful assistant.");
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["temperature"], 0.2);
+        assert_eq!(value["service_tier"], "auto");
         assert_eq!(value["input"][0]["role"], "user");
         assert_eq!(value["input"][0]["content"][0]["text"], "hello");
         for dropped in [
-            "max_output_tokens",
-            "temperature",
             "top_p",
             "truncation",
             "metadata",
-            "service_tier",
             "user",
             "safety_identifier",
             "prompt_cache_options",
@@ -2586,35 +2585,39 @@ mod tests {
 
     #[cfg(feature = "extension-openai-subscription")]
     #[test]
-    fn codex_adapter_folds_array_content_system_messages_into_instructions() {
+    fn codex_adapter_keeps_system_guidance_inline_as_developer_messages() {
         // VS Code's native Responses mode sends the system prompt as a message
         // item whose content is a list of input_text parts, which the Codex
         // backend refuses with `400 System messages are not allowed`.
         let mut body = br#"{"model":"gpt-6-astra","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"Be terse."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},{"role":"system","content":"Late note."}]}"#.to_vec();
         yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["instructions"], "Be terse.\n\nLate note.");
-        assert_eq!(value["input"].as_array().unwrap().len(), 1);
-        assert_eq!(value["input"][0]["role"], "user");
+        assert!(value.get("instructions").is_none());
+        assert_eq!(value["input"].as_array().unwrap().len(), 3);
+        assert_eq!(value["input"][0]["role"], "developer");
+        assert_eq!(value["input"][0]["content"][0]["text"], "Be terse.");
+        assert_eq!(value["input"][1]["role"], "user");
+        assert_eq!(value["input"][2]["role"], "developer");
+        assert_eq!(value["input"][2]["content"], "Late note.");
     }
 
     #[cfg(feature = "extension-openai-subscription")]
     #[test]
-    fn codex_adapter_preserves_leading_developer_guidance_and_removes_output_limit() {
+    fn codex_adapter_preserves_leading_developer_guidance_and_output_limit() {
         let mut body = br#"{"model":"gpt-5.6-sol","input":[{"role":"developer","content":"Client guidance"},{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":128000}"#.to_vec();
         let original: serde_json::Value = serde_json::from_slice(&body).unwrap();
         yabane_extension_openai_subscription::adapt_body(&mut body);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["instructions"], "You are a helpful assistant.");
+        assert!(value.get("instructions").is_none());
         assert_eq!(value["input"], original["input"]);
-        assert!(value.get("max_output_tokens").is_none());
+        assert_eq!(value["max_output_tokens"], 128000);
     }
 
     #[cfg(feature = "extension-openai-subscription")]
     #[test]
     fn codex_request_preparation_preserves_pi_mid_conversation_updates() {
-        // PROXY-17: pi keeps initial instructions outside input and sends later
-        // updates inline. Exercise the Endpoint hook, not just its body helper.
+        // PROXY-17: preserve explicit caller instructions and inline updates.
+        // Exercise the Endpoint hook, not just its body helper.
         let request = serde_json::json!({
             "model": "gpt-6.1-sol",
             "instructions": "Base prompt",
@@ -2875,17 +2878,8 @@ mod tests {
         assert_eq!(sanitized["authorization"], "Bearer access-token");
         assert_eq!(sanitized["chatgpt-account-id"], "account-123");
         assert_eq!(sanitized["originator"], "pi");
-        assert_eq!(
-            sanitized["user-agent"],
-            yabane_extension_openai_subscription::pi_user_agent()
-        );
+        assert_eq!(sanitized["user-agent"], "pi");
         assert_ne!(sanitized["user-agent"], "pi (test-os; test-arch)");
-        assert!(
-            sanitized["user-agent"]
-                .to_str()
-                .unwrap()
-                .starts_with("pi (")
-        );
         assert_eq!(sanitized["openai-beta"], "responses=experimental");
         assert_eq!(sanitized["accept-encoding"], "identity");
         assert!(!sanitized.contains_key("content-encoding"));

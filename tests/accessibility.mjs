@@ -221,7 +221,11 @@ try {
       });
       const page = await context.newPage();
       const errors = [];
-      page.on('pageerror', error => errors.push(error.message));
+      page.on('pageerror', error => {
+        errors.push(error.stack || error.message);
+        console.error(`${project.name}: browser error at ${page.url()}: ${error.stack || error.message}`);
+      });
+      page.on('requestfailed', request => console.error(`${project.name}: failed request ${request.method()} ${request.url()}: ${request.failure()?.errorText}`));
       await page.goto(base);
       await page.locator('#login-screen').waitFor({state: 'visible'});
       await audit(page, `${project.name}: ${project.name === 'chrome-desktop' ? 'setup' : 'login'}`);
@@ -406,10 +410,47 @@ try {
         finally { window.fetch = originalFetch; }
       });
       assert.equal(pausedRequests, 0);
-      const resumed = page.waitForResponse(response => response.url().includes('/admin/activity/stats'));
-      await page.evaluate(() => document.querySelector('#pause-live-updates').click());
-      assert.equal(await page.locator('#pause-live-updates').getAttribute('aria-pressed'), 'false');
-      assert.ok((await resumed).ok());
+      // ACTIVITY-35 / SVC-62: the real resume click must return a refresh that
+      // includes the explorer, not just overview response headers. Hold the
+      // explorer at an explicit reached/release gate; no timing guess proves it.
+      const explorerReached = Promise.withResolvers();
+      const releaseExplorer = Promise.withResolvers();
+      const explorerRoute = '**/admin/activity/logs/page?*';
+      await page.route(explorerRoute, async route => {
+        explorerReached.resolve();
+        await releaseExplorer.promise;
+        await route.continue();
+      });
+      const explorerRequest = page.waitForRequest(request => request.url().includes('/admin/activity/logs/page?'));
+      const resumed = page.evaluate(async () => {
+        const originalRefresh = window.refreshVisibleView;
+        let completion;
+        window.__resumeRefreshComplete = false;
+        window.refreshVisibleView = (...args) => (completion = originalRefresh(...args));
+        try {
+          document.querySelector('#pause-live-updates').click();
+          if (!completion || typeof completion.then !== 'function') throw new Error('Resume did not return its refresh promise');
+          await completion;
+          window.__resumeRefreshComplete = true;
+        } finally {
+          window.refreshVisibleView = originalRefresh;
+        }
+      });
+      // Observe an early rejection even while the request gate is being reached.
+      resumed.catch(() => {});
+      try {
+        await explorerRequest;
+        await explorerReached.promise;
+        assert.equal(await page.locator('#pause-live-updates').getAttribute('aria-pressed'), 'false');
+        assert.equal(await page.evaluate(() => window.__resumeRefreshComplete), false, `${project.name}: refresh completed before its explorer response`);
+      } finally {
+        releaseExplorer.resolve();
+        await resumed;
+        await page.unroute(explorerRoute);
+      }
+      assert.equal(await page.evaluate(() => window.__resumeRefreshComplete), true);
+      assert.ok(await page.locator('#activity-logs .activity-request-row').count());
+      await page.evaluate(() => { delete window.__resumeRefreshComplete; });
       await page.goto(`${base}/docs`);
       await page.locator('.docs-op').first().waitFor();
       await audit(page, `${project.name}: docs`);

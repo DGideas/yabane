@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {setTimeout as delay} from 'node:timers/promises';
 import {chromium, webkit} from 'playwright';
 import {openConsoleView} from './console-view-helper.mjs';
 
@@ -46,7 +45,7 @@ const server = createServer((request, response) => {
       }
       async function loadActivity() {
         document.querySelector('#recent-activity-logs td').textContent = 'New overview';
-        loadActivityPage(); // Intentionally not awaited, like the console's explorer load.
+        await loadActivityPage();
       }
       document.querySelectorAll('.nav').forEach(button => button.onclick = () => {
         document.querySelectorAll('.nav').forEach(node => node.classList.toggle('active', node === button));
@@ -72,9 +71,9 @@ try {
         navigation.catch(() => {});
         try {
           await page.waitForFunction(() => window.headersReceived === true, undefined, {timeout: 2000});
-          // Deliberate negative-test hold, not a readiness heuristic: the helper must
-          // remain pending even after fetch() has resolved and several frames passed.
-          await delay(150);
+          // The server has sent only a JSON prefix and is waiting at releaseBody;
+          // prove the loader is still pending without using elapsed time as evidence.
+          assert.ok(await page.evaluate(() => window.__yabaneViewLoad.pending > 0));
           assert.equal(settled, false, `${view}: accepted headers/stale DOM before the body arrived`);
           assert.match(await page.locator(selector).textContent(), /^Stale/);
         } finally {

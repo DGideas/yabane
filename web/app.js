@@ -3933,7 +3933,9 @@ async function loadActivity(requestedLogLimit) {
     $('#recent-activity-logs').innerHTML = activityOverviewLogs.length ? activityOverviewLogs.slice(0, 8).map((log, index) => activityRow(log, false, index)).join('') : '<tr><td colspan="6"><div class="activity-empty">No requests in this period.</div></td></tr>';
     activityFilterOptions = stats.filter_options || {providers: [], models: [], api_keys: []};
     renderActivityFilterOptions();
-    if (explorerVisible) loadActivityPage();
+    // The refresh is complete only after the visible explorer has parsed and
+    // rendered its page too; do not detach that work from the overview promise.
+    if (explorerVisible) await loadActivityPage();
   })().finally(() => { activityLoadPromise = null; });
   return activityLoadPromise;
 }
@@ -4196,11 +4198,10 @@ async function loadProviderActivity() {
 
 function refreshVisibleView() {
   if (!adminSession?.authenticated || document.hidden) return;
-  if (!$('#home-view').hidden) loadDashboard();
-  else if (!$('#activity-view').hidden) loadActivity();
+  if (!$('#home-view').hidden) return loadDashboard();
+  else if (!$('#activity-view').hidden) return loadActivity();
   else if (!$('#providers-view').hidden) {
-    refreshProviderState();
-    if (!selectedProviderId) loadProviderActivity();
+    return Promise.all([refreshProviderState(), ...(!selectedProviderId ? [loadProviderActivity()] : [])]);
   }
 }
 let liveUpdatesPaused = false;
